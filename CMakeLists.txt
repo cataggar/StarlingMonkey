@@ -36,13 +36,8 @@ include("openssl")
 include("host_api")
 include("build-crates")
 
-<<<<<<< HEAD
-add_library(extension_api INTERFACE include/extension-api.h runtime/encode.h)
-target_link_libraries(extension_api INTERFACE rust-url spidermonkey)
-=======
 add_library(extension_api INTERFACE include/extension-api.h runtime/encode.h runtime/decode.h)
 target_link_libraries(extension_api INTERFACE rust-url spidermonkey)
->>>>>>> fetch-rework
 target_include_directories(extension_api INTERFACE include deps/include runtime)
 
 include("builtins")
