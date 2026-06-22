@@ -304,7 +304,14 @@ bool create_initializer_global(Engine *engine) {
 bool init_js(const EngineConfig& config) {
   JS_Init();
 
-  JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes);
+  // Bumped from JS::DefaultHeapMaxBytes (32 MiB) to 1 GiB so that
+  // SpiderMonkey contexts created by componentize-js-built guests
+  // can host large workloads (e.g. compiling Azure ARM TypeSpec
+  // specs) without `mozalloc_abort`. The upstream cap is too low
+  // for any non-trivial JS server-side workload, and is not exposed
+  // through StarlingMonkey's `config-parser.h` — it has to be
+  // changed here and the embedding wasm rebuilt.
+  JSContext *cx = JS_NewContext(1024 * 1024 * 1024);
   if (!cx) {
     return false;
   }
