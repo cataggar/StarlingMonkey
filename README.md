@@ -77,6 +77,40 @@ A key difference is that `starling.wasm` can only be used for runtime-evaluation
 while `starling-raw.wasm` can be used to build a WebAssembly Component that is specialized for a specific
 JavaScript application, and as a result has much faster startup times.
 
+## Building with Zig (experimental)
+
+An alternative build uses [Zig](https://ziglang.org/) 0.17 as the C/C++ toolchain
+(`zig cc`/`zig c++` targeting `wasm32-wasi`) instead of wasi-sdk, driven by
+`build.zig` rather than CMake. This is experimental and currently Linux/x86_64 only.
+
+Requirements: `zig` 0.17, `rustup` (the toolchain in `rust-toolchain.toml` plus the
+`wasm32-wasip1` target), `python3`, a host `clang`/`clang++`, `make`, `curl`, `git`.
+
+```console
+# 1. Build the native dependencies (SpiderMonkey from source, OpenSSL, Rust crates)
+#    with the Zig toolchain. This clones and compiles SpiderMonkey, so it takes a while.
+./deps/build-deps.sh
+
+# 2. Build starling-raw.wasm (+ componentize.sh, adapter and tools in zig-out/bin)
+zig build -Doptimize=ReleaseSmall
+
+# 3. Optionally, componentize + validate a smoke test
+zig build smoke-test
+```
+
+The runtime can then be componentized and served just like the CMake build:
+
+```console
+zig-out/bin/componentize.sh path/to/index.js -o index.wasm
+zig-out/bin/wasmtime serve -S cli --dir . index.wasm
+```
+
+Notes:
+- SpiderMonkey must be built from source with Zig because the upstream prebuilt
+  artifacts use a libc++ ABI incompatible with Zig's.
+- `deps/patches/mozalloc-abort-wasi.patch` and `deps/zig-wrappers/wasi-compat.h`
+  bridge small differences between Zig's and wasi-sdk's wasi-libc.
+
 ## Using StarlingMonkey with dynamically loaded JS code
 
 The following command will build the `starling.wasm` runtime module in the `cmake-build-release`
