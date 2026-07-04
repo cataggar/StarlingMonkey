@@ -30,3 +30,19 @@
 /tests/integration/*/*.log
 /deps/*.lock
 /deps/*-source
+
+# Zig build (zig17 conversion)
+/.zig-cache/
+/zig-out/
+/deps/sm-obj-zig/
+/deps/mozbuild-state/
+/deps/openssl-zig/
+/deps/sm-build*.log
+/deps/sm-configure.log
+/zig-pkg/
+/deps/openssl-src/
+/deps/openssl-*.tar.gz
+/deps/openssl-build.log
+/deps/link.log
+/deps/rust-staticlib-build/
+/deps/mozconfig-zig

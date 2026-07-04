@@ -1,0 +1,44 @@
+.{
+    .name = .starlingmonkey,
+    .version = "0.3.0",
+    .fingerprint = 0x990a2f6e2fa7fb45,
+    .minimum_zig_version = "0.17.0",
+
+    // NOTE: These are host-specific prebuilt tool tarballs (x86_64-linux only for
+    // now). A complete port needs per-host variants selected via b.lazyDependency.
+    // Mirrors cmake/{binaryen,wasm-tools,weval,wasmtime}.cmake.
+    .dependencies = .{
+        .binaryen = .{
+            .url = "https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz",
+            .hash = "N-V-__8AADnP4RI-nJiN3GhgftX3jprhTXMo1ddBLDfb6fCV",
+            .lazy = true,
+        },
+        .@"wasm-tools" = .{
+            .url = "https://github.com/bytecodealliance/wasm-tools/releases/download/v1.235.0/wasm-tools-1.235.0-x86_64-linux.tar.gz",
+            .hash = "N-V-__8AACbjNwEv1iqZzcX1Qz8UAMhdgq7JN5ES-HSQrxML",
+            .lazy = true,
+        },
+        .weval = .{
+            .url = "https://github.com/bytecodealliance/weval/releases/download/v0.4.1/weval-v0.4.1-x86_64-linux.tar.xz",
+            .hash = "N-V-__8AAEenqwHFOFkilUp1QXeqpfqbvC3eRiCpOT4TYSsT",
+            .lazy = true,
+        },
+        .wasmtime = .{
+            .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v42.0.1/wasmtime-v42.0.1-x86_64-linux.tar.xz",
+            .hash = "N-V-__8AAA3KCgTdVORHX_BFrwyIyjWq-cr8fhr9WEOCLhtU",
+            .lazy = true,
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "builtins",
+        "runtime",
+        "host-apis",
+        "crates",
+        "include",
+        "deps",
+        "LICENSE",
+    },
+}

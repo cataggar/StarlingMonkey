@@ -1,0 +1,13 @@
+diff --git a/memory/mozalloc/mozalloc_abort.cpp b/memory/mozalloc/mozalloc_abort.cpp
+index 85bcb95042..d29397f1bc 100644
+--- a/memory/mozalloc/mozalloc_abort.cpp
++++ b/memory/mozalloc/mozalloc_abort.cpp
+@@ -57,7 +57,7 @@ void fillAbortMessage(char (&msg)[N], uintptr_t retAddress) {
+ }
+ #endif
+ 
+-#if defined(XP_UNIX) && !defined(MOZ_ASAN) && !defined(MOZ_TSAN) &&    \
++#if defined(XP_UNIX) && !defined(__wasi__) && !defined(MOZ_ASAN) && !defined(MOZ_TSAN) &&    \
+     !defined(MOZ_UBSAN) && !defined(LIBFUZZER) && !defined(AFLFUZZ) && \
+     !defined(FUZZING_JS_FUZZILLI)
+ // Define abort() here, so that it is used instead of the system abort(). This
