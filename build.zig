@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
 
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
     const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
+    const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
 
     // SpiderMonkey artifacts built from source with Zig (see deps/mozconfig-zig).
     const sm_dist = b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
@@ -145,7 +146,65 @@ pub fn build(b: *std.Build) void {
     // SpiderMonkey static lib (must be the Zig-built one; libc++ __1).
     link_mod.addObjectFile(b.path(sm_lib));
 
-    b.installArtifact(exe);
+    // ---- Post-build: wasm-opt (port of the CMakeLists.txt USE_WASM_OPT block) ----
+    var raw_wasm: std.Build.LazyPath = exe.getEmittedBin();
+    if (use_wasm_opt and !is_debug) {
+        if (b.lazyDependency("binaryen", .{})) |bin_dep| {
+            const wo = std.Build.Step.Run.create(b, "wasm-opt");
+            wo.addFileArg(bin_dep.path("binaryen-version_123/bin/wasm-opt"));
+            wo.addArgs(&.{
+                "--strip-debug",             "-O3",
+                "--enable-bulk-memory",      "--enable-bulk-memory-opt",
+                "--enable-sign-ext",         "--enable-mutable-globals",
+                "--enable-nontrapping-float-to-int", "--enable-multivalue",
+                "--enable-reference-types",  "--enable-extended-const",
+            });
+            wo.addArg("-o");
+            const opt_out = wo.addOutputFileArg("starling-raw.wasm");
+            wo.addFileArg(exe.getEmittedBin());
+            raw_wasm = opt_out;
+        }
+    }
+    const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
+    b.getInstallStep().dependOn(&install_raw.step);
+
+    // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
+    // Install the preview1 adapter and a generated componentize.sh next to
+    // starling-raw.wasm so the runtime can be turned into a component.
+    const adapter = b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" });
+    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(adapter), "preview1-adapter.wasm").step);
+
+    // componentize.sh references the tools via `$(dirname "$0")/…`, so install them
+    // alongside it (relocatable, mirrors the CMake build directory layout).
+    if (b.lazyDependency("wasm-tools", .{})) |d|
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasm-tools-1.235.0-x86_64-linux/wasm-tools"), "wasm-tools").step);
+    if (b.lazyDependency("wasmtime", .{})) |d|
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasmtime-v42.0.1-x86_64-linux/wasmtime"), "wasmtime").step);
+    if (b.lazyDependency("weval", .{})) |d|
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval-v0.4.1-x86_64-linux/weval"), "weval").step);
+
+    const componentize_sh = renderComponentizeScript(b);
+    b.getInstallStep().dependOn(&b.addInstallBinFile(componentize_sh, "componentize.sh").step);
+
+    // `zig build smoke-test`: componentize a trivial script and validate the
+    // resulting component. Runs the *installed* componentize.sh so it finds
+    // starling-raw.wasm, the adapter and the tools next to itself. (The full
+    // multi-module e2e smoke.js needs the test harness's --strip-path-prefix and
+    // is covered by the ported test suite, not this build step.)
+    const smoke = b.step("smoke-test", "Componentize a trivial script and validate the component");
+    const smoke_js = b.addWriteFiles().add("smoke.js", "addEventListener('fetch', e => e.respondWith(new Response('ok')));\nconsole.log('smoke ok');\n");
+    b.getInstallStep().dependOn(&b.addInstallBinFile(smoke_js, "smoke.js").step);
+    const smoke_out = b.getInstallPath(.bin, "smoke.wasm");
+    const smoke_run = std.Build.Step.Run.create(b, "componentize smoke");
+    smoke_run.addArgs(&.{ "bash", b.getInstallPath(.bin, "componentize.sh"), b.getInstallPath(.bin, "smoke.js"), "-o", smoke_out });
+    smoke_run.step.dependOn(b.getInstallStep());
+    if (b.lazyDependency("wasm-tools", .{})) |d| {
+        const validate = std.Build.Step.Run.create(b, "validate smoke component");
+        validate.addFileArg(d.path("wasm-tools-1.235.0-x86_64-linux/wasm-tools"));
+        validate.addArgs(&.{ "validate", "--features", "all", smoke_out });
+        validate.step.dependOn(&smoke_run.step);
+        smoke.dependOn(&validate.step);
+    }
 
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the
@@ -155,6 +214,34 @@ pub fn build(b: *std.Build) void {
     addStarlingSources(ctx, cc_mod);
     const cc_step = b.step("cc", "Compile the StarlingMonkey C++ sources (objects only)");
     cc_step.dependOn(&cc_lib.step);
+}
+
+// Render componentize.sh from componentize.sh.in, pointing the tool paths at the
+// binaries installed next to it (resolved at runtime via `$(dirname "$0")`).
+fn renderComponentizeScript(b: *std.Build) std.Build.LazyPath {
+    const template = @embedFile("componentize.sh.in");
+    var buf = std.ArrayList(u8).empty;
+    const gpa = b.allocator;
+    var rest: []const u8 = template;
+    const subs = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
+        .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
+        .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
+        .{ .from = "@AOT@", .to = "0" },
+    };
+    outer: while (rest.len != 0) {
+        for (subs) |s| {
+            if (std.mem.startsWith(u8, rest, s.from)) {
+                buf.appendSlice(gpa, s.to) catch @panic("OOM");
+                rest = rest[s.from.len..];
+                continue :outer;
+            }
+        }
+        buf.append(gpa, rest[0]) catch @panic("OOM");
+        rest = rest[1..];
+    }
+    const wf = b.addWriteFiles();
+    return wf.add("componentize.sh", buf.items);
 }
 
 fn addStarlingSources(ctx: Ctx, mod: *std.Build.Module) void {
