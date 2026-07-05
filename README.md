@@ -111,13 +111,14 @@ Notes:
 - `deps/patches/mozalloc-abort-wasi.patch` and `deps/zig-wrappers/wasi-compat.h`
   bridge small differences between Zig's and wasi-sdk's wasi-libc.
 
-> **Known limitation.** Zig 0.17 bundles clang 22, which miscompiles this
-> SpiderMonkey release (Firefox 147, originally built with clang ~19). The
-> resulting runtime executes synchronous JavaScript and serves HTTP, but async
-> paths (e.g. top-level `await`) are unreliable and the build is sensitive to the
-> optimization level. Making the runtime fully correct requires SpiderMonkey/
-> toolchain work (UB fixes, opt-flag tuning, or a compatible clang) and is
-> tracked separately from this build-system conversion.
+> **Known limitation.** The runtime built this way executes synchronous
+> JavaScript and serves HTTP correctly, but there is an outstanding bug where an
+> async function's resumption after `await` corrupts the scope chain (globals
+> resolve to garbage after a top-level `await`). It reproduces with both the C++
+> and portable-baseline interpreters, so it is a deep SpiderMonkey/toolchain
+> codegen issue (Zig 0.17 bundles clang 22; this SpiderMonkey release predates
+> it). Resolving it needs SpiderMonkey-level debugging and is tracked separately
+> from this build-system conversion.
 
 ## Using StarlingMonkey with dynamically loaded JS code
 
