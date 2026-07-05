@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 # zig cc wrapper targeting wasm32-wasi for the StarlingMonkey SpiderMonkey/OpenSSL builds.
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec zig cc -target wasm32-wasi \
   -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
-  -include "$here/wasi-compat.h" \
   "$@"

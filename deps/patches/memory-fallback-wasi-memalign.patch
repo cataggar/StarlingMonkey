@@ -1,0 +1,23 @@
+diff --git a/memory/build/Fallback.cpp b/memory/build/Fallback.cpp
+index 6f1791bed9..74705ef6ac 100644
+--- a/memory/build/Fallback.cpp
++++ b/memory/build/Fallback.cpp
+@@ -4,6 +4,18 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#if defined(__wasi__)
++// Zig's wasi-libc gates out the memalign()/valloc() declarations, but mozilla's
++// configure still detects HAVE_MEMALIGN, so the SystemMalloc fallback below
++// references an (undeclared) ::memalign. Declare them here, before the mozilla
++// headers, mirroring the wasi-sdk headers. The symbols are provided at link time.
++#  include <stddef.h>
++extern "C" {
++void* memalign(size_t alignment, size_t size);
++void* valloc(size_t size);
++}
++#endif
++
+ #include "mozmemory.h"
+ #include "mozjemalloc.h"
+ #include <stdlib.h>
