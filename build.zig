@@ -184,7 +184,13 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval-v0.4.1-x86_64-linux/weval"), "weval").step);
 
     const componentize_sh = renderComponentizeScript(b);
-    b.getInstallStep().dependOn(&b.addInstallBinFile(componentize_sh, "componentize.sh").step);
+    const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
+    b.getInstallStep().dependOn(&inst_componentize.step);
+    // Installed generated files aren't executable; componentize.sh is invoked
+    // directly (e.g. by tests/test.sh), so mark it +x after install.
+    const chmod = b.addSystemCommand(&.{ "chmod", "+x", b.getInstallPath(.bin, "componentize.sh") });
+    chmod.step.dependOn(&inst_componentize.step);
+    b.getInstallStep().dependOn(&chmod.step);
 
     // `zig build smoke-test`: componentize a trivial script and validate the
     // resulting component. Runs the *installed* componentize.sh so it finds
@@ -205,6 +211,13 @@ pub fn build(b: *std.Build) void {
         validate.step.dependOn(&smoke_run.step);
         smoke.dependOn(&validate.step);
     }
+
+    // `zig build test`: run the e2e + integration suites (tests/run-suite.sh)
+    // against the installed runtime in zig-out/bin.
+    const test_step = b.step("test", "Run the e2e and integration test suites");
+    const suite = b.addSystemCommand(&.{ "bash", "tests/run-suite.sh", b.getInstallPath(.bin, "") });
+    suite.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&suite.step);
 
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the

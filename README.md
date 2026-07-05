@@ -111,6 +111,14 @@ Notes:
 - `deps/patches/mozalloc-abort-wasi.patch` and `deps/zig-wrappers/wasi-compat.h`
   bridge small differences between Zig's and wasi-sdk's wasi-libc.
 
+> **Known limitation.** Zig 0.17 bundles clang 22, which miscompiles this
+> SpiderMonkey release (Firefox 147, originally built with clang ~19). The
+> resulting runtime executes synchronous JavaScript and serves HTTP, but async
+> paths (e.g. top-level `await`) are unreliable and the build is sensitive to the
+> optimization level. Making the runtime fully correct requires SpiderMonkey/
+> toolchain work (UB fixes, opt-flag tuning, or a compatible clang) and is
+> tracked separately from this build-system conversion.
+
 ## Using StarlingMonkey with dynamically loaded JS code
 
 The following command will build the `starling.wasm` runtime module in the `cmake-build-release`
