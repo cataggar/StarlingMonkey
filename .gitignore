@@ -37,7 +37,7 @@
 /deps/sm-obj-zig/
 /deps/mozbuild-state/
 /deps/openssl-zig/
-/deps/sm-build*.log
+/deps/sm-*.log
 /deps/sm-configure.log
 /zig-pkg/
 /deps/openssl-src/
