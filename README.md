@@ -108,17 +108,20 @@ zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 Notes:
 - SpiderMonkey must be built from source with Zig because the upstream prebuilt
   artifacts use a libc++ ABI incompatible with Zig's.
-- `deps/patches/mozalloc-abort-wasi.patch` and `deps/zig-wrappers/wasi-compat.h`
-  bridge small differences between Zig's and wasi-sdk's wasi-libc.
+- Three small SpiderMonkey patches (`deps/patches/`) bridge differences between
+  Zig's and wasi-sdk's wasi-libc: skipping mozalloc's `abort()` override,
+  declaring `memalign`/`valloc` for the memory fallback, and — most importantly —
+  giving the GC properly 1 MiB-aligned chunks (Zig's `posix_memalign` caps
+  alignment at the 64 KiB page size, which would otherwise corrupt the GC heap).
 
-> **Known limitation.** The runtime built this way executes synchronous
-> JavaScript and serves HTTP correctly, but there is an outstanding bug where an
-> async function's resumption after `await` corrupts the scope chain (globals
-> resolve to garbage after a top-level `await`). It reproduces with both the C++
-> and portable-baseline interpreters, so it is a deep SpiderMonkey/toolchain
-> codegen issue (Zig 0.17 bundles clang 22; this SpiderMonkey release predates
-> it). Resolving it needs SpiderMonkey-level debugging and is tracked separately
-> from this build-system conversion.
+Run the test suite against the Zig build with:
+
+```console
+zig build test
+```
+
+This runs the e2e and integration suites (`tests/run-suite.sh`) against the
+runtime in `zig-out/bin`.
 
 ## Using StarlingMonkey with dynamically loaded JS code
 
