@@ -36,10 +36,12 @@ if [[ "$FORCE" == "--force" || ! -f "$SM_LIB" ]]; then
   if [[ ! -d "$SM_SRC/.git" ]]; then
     git clone --depth 1 --branch "$SM_TAG" "$SM_REPO" "$SM_SRC"
   fi
-  # Skip mozalloc's abort() override on wasi (collides with Zig libc's abort),
-  # and declare memalign/valloc for the memory/build fallback (Zig wasi-libc
-  # gates them out).
-  for p in mozalloc-abort-wasi.patch memory-fallback-wasi-memalign.patch; do
+  # Wasi build fixes:
+  #  * mozalloc-abort:      skip mozalloc's abort() override (collides with Zig libc)
+  #  * fallback-memalign:   declare memalign/valloc for the memory/build fallback
+  #  * gc-aligned-alloc:    the GC needs 1 MiB-aligned chunks, but Zig's wasi-libc
+  #                         posix_memalign() caps alignment at the page size
+  for p in mozalloc-abort-wasi.patch memory-fallback-wasi-memalign.patch gc-wasi-aligned-alloc.patch; do
     git -C "$SM_SRC" apply --check "$DEPS/patches/$p" 2>/dev/null \
       && git -C "$SM_SRC" apply "$DEPS/patches/$p" || true
   done

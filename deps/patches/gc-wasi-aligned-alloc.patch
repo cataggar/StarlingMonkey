@@ -1,0 +1,76 @@
+diff --git a/js/src/gc/Memory.cpp b/js/src/gc/Memory.cpp
+index c8b5b70770..3756322182 100644
+--- a/js/src/gc/Memory.cpp
++++ b/js/src/gc/Memory.cpp
+@@ -232,6 +232,29 @@ static inline size_t OffsetFromAligned(void* region, size_t alignment) {
+   return uintptr_t(region) % alignment;
+ }
+ 
++#ifdef __wasi__
++// Zig's wasi-libc posix_memalign() does not honor alignments larger than the
++// wasm page size (64 KiB), but the GC needs ChunkSize (1 MiB) aligned chunks.
++// Over-allocate and align manually, stashing the base pointer just before the
++// returned region so WasiAlignedFree() can recover it.
++static inline void* WasiAlignedAlloc(size_t alignment, size_t length) {
++  void* base = malloc(length + alignment + sizeof(void*));
++  if (!base) {
++    return nullptr;
++  }
++  uintptr_t aligned =
++      (uintptr_t(base) + sizeof(void*) + alignment - 1) & ~(alignment - 1);
++  reinterpret_cast<void**>(aligned)[-1] = base;
++  return reinterpret_cast<void*>(aligned);
++}
++
++static inline void WasiAlignedFree(void* region) {
++  if (region) {
++    free(reinterpret_cast<void**>(region)[-1]);
++  }
++}
++#endif
++
+ template <Commit commit, StallAndRetry retry = StallAndRetry::No>
+ static inline void* MapInternal(void* desired, size_t length) {
+   void* region = nullptr;
+@@ -245,13 +268,11 @@ static inline void* MapInternal(void* desired, size_t length) {
+     region = VirtualAlloc(desired, length, flags, DWORD(PageAccess::ReadWrite));
+   }
+ #elif defined(__wasi__)
+-  if (int err = posix_memalign(&region, gc::SystemPageSize(), length)) {
+-    MOZ_RELEASE_ASSERT(err == ENOMEM);
++  region = WasiAlignedAlloc(gc::SystemPageSize(), length);
++  if (!region) {
+     return nullptr;
+   }
+-  if (region) {
+-    memset(region, 0, length);
+-  }
++  memset(region, 0, length);
+ #else
+   int flags = MAP_PRIVATE | MAP_ANON;
+   region = MozTaggedAnonymousMmap(desired, length, int(PageAccess::ReadWrite),
+@@ -270,7 +291,7 @@ static inline void UnmapInternal(void* region, size_t length) {
+ #ifdef XP_WIN
+   MOZ_RELEASE_ASSERT(VirtualFree(region, 0, MEM_RELEASE) != 0);
+ #elif defined(__wasi__)
+-  free(region);
++  WasiAlignedFree(region);
+ #else
+   if (munmap(region, length)) {
+     MOZ_RELEASE_ASSERT(errno == ENOMEM);
+@@ -552,13 +573,10 @@ void* MapAlignedPages(size_t length, size_t alignment,
+   }
+ 
+ #ifdef __wasi__
+-  void* region = nullptr;
+-  if (int err = posix_memalign(&region, alignment, length)) {
+-    MOZ_ASSERT(err == ENOMEM);
+-    (void)err;
++  void* region = WasiAlignedAlloc(alignment, length);
++  if (!region) {
+     return nullptr;
+   }
+-  MOZ_ASSERT(region != nullptr);
+   memset(region, 0, length);
+   return region;
+ #else
