@@ -57,11 +57,10 @@ uint32_t dispatch_error(JSContext *cx, const char *context) {
 // ComponentizeJS/jco's generated glue looks up export functions by camelCase
 // identifier (a kebab-case WIT name like "echo-color" becomes "echoColor"),
 // not by the literal kebab-case string. `resolve_export_function` below
-// tries the literal name first (preserving this bridge's original,
-// already-tested convention -- a module can still expose a non-identifier
-// name via `export { impl as "big-add" }`), and only falls back to the
-// camelCase spelling if the literal property doesn't exist, so JS written
-// against either convention resolves correctly.
+// tries literal names first for both interface namespaces and functions
+// (preserving this bridge's original, already-tested convention -- a module
+// can still expose a non-identifier name via `export { impl as "big-add" }`),
+// and only falls back to camelCase when the literal property doesn't exist.
 std::string kebab_to_camel_case(std::string_view kebab) {
   std::string out;
   out.reserve(kebab.size());
@@ -75,6 +74,24 @@ std::string kebab_to_camel_case(std::string_view kebab) {
     upper_next = false;
   }
   return out;
+}
+
+bool resolve_property_lookup(JSContext *cx, JS::HandleObject object, std::string_view literal_name,
+                             std::string *lookup_name, bool *has_property) {
+  *lookup_name = literal_name;
+  if (!JS_HasProperty(cx, object, lookup_name->c_str(), has_property)) {
+    return false;
+  }
+  if (*has_property) {
+    return true;
+  }
+
+  std::string camel_name = kebab_to_camel_case(literal_name);
+  if (camel_name == literal_name) {
+    return true;
+  }
+  *lookup_name = std::move(camel_name);
+  return JS_HasProperty(cx, object, lookup_name->c_str(), has_property);
 }
 
 // Shared by both dispatch bridges. WABT names root-function exports with
@@ -116,15 +133,17 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
       return false;
     }
 
-    std::string interface_lookup(interface_name);
+    std::string literal_interface_name(interface_name);
+    std::string interface_lookup;
     bool has_interface = false;
-    if (!JS_HasProperty(cx, namespace_object, interface_lookup.c_str(), &has_interface)) {
+    if (!resolve_property_lookup(cx, namespace_object, interface_name, &interface_lookup,
+                                 &has_interface)) {
       *error_context = "resolving a JavaScript interface namespace";
       return false;
     }
     if (!has_interface) {
       JS_ReportErrorUTF8(cx, "JavaScript module does not export an '%s' interface namespace",
-                         interface_lookup.c_str());
+                         literal_interface_name.c_str());
       *error_context = "resolving a JavaScript interface namespace";
       return false;
     }
@@ -143,17 +162,11 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
     namespace_object = &interface_value.toObject();
   }
 
-  std::string lookup_name = function_name;
-  std::string camel_name = kebab_to_camel_case(function_name);
-  if (camel_name != function_name) {
-    bool has_literal = false;
-    if (!JS_HasProperty(cx, namespace_object, function_name.c_str(), &has_literal)) {
-      *error_context = "resolving a JavaScript module export";
-      return false;
-    }
-    if (!has_literal) {
-      lookup_name = camel_name;
-    }
+  std::string lookup_name;
+  bool has_function = false;
+  if (!resolve_property_lookup(cx, namespace_object, function_name, &lookup_name, &has_function)) {
+    *error_context = "resolving a JavaScript module export";
+    return false;
   }
 
   if (!JS_GetProperty(cx, namespace_object, lookup_name.c_str(), out_function)) {

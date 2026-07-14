@@ -1,1 +1,1 @@
-export const api = { add: 42 };
+export const api = { phantom: 42 };

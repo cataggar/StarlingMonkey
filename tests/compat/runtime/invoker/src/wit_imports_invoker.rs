@@ -264,6 +264,14 @@ fn val_to_json(val: &Val) -> serde_json::Value {
 struct Call {
     function: String,
     args: Vec<serde_json::Value>,
+    #[serde(default = "default_interface")]
+    interface: Option<String>,
+}
+
+const API_INTERFACE: &str = "test:wit-imports/api@1.2.3";
+
+fn default_interface() -> Option<String> {
+    Some(API_INTERFACE.to_string())
 }
 
 fn resolve_func(
@@ -271,27 +279,40 @@ fn resolve_func(
     store: &mut Store<Host>,
     component: &Component,
     engine: &Engine,
+    interface: Option<&str>,
     name: &str,
 ) -> Result<wasmtime::component::Func> {
-    if let Some(f) = instance.get_func(&mut *store, name) {
-        return Ok(f);
+    let Some(interface) = interface else {
+        component
+            .component_type()
+            .exports(engine)
+            .find(|(export_name, _)| *export_name == name)
+            .with_context(|| format!("component root does not export function '{name}'"))?;
+        return instance
+            .get_func(&mut *store, name)
+            .with_context(|| format!("component root export '{name}' is not a function"));
+    };
+
+    let interface_ty = component
+        .component_type()
+        .exports(engine)
+        .find_map(|(export_name, item)| (export_name == interface).then_some(item))
+        .with_context(|| format!("component does not export exact interface '{interface}'"))?;
+    let wasmtime::component::types::ComponentItem::ComponentInstance(iface) = interface_ty else {
+        anyhow::bail!("component export '{interface}' is not an interface instance");
+    };
+    if !iface.exports(engine).any(|(fname, _)| fname == name) {
+        anyhow::bail!("interface '{interface}' does not export function '{name}'");
     }
-    for (export_name, item) in component.component_type().exports(engine) {
-        if let wasmtime::component::types::ComponentItem::ComponentInstance(iface) = item {
-            if iface.exports(engine).any(|(fname, _)| fname == name) {
-                let (_, iface_idx) = instance
-                    .get_export(&mut *store, None, export_name)
-                    .with_context(|| format!("resolving interface export '{export_name}'"))?;
-                let (_, func_idx) = instance
-                    .get_export(&mut *store, Some(&iface_idx), name)
-                    .with_context(|| format!("resolving function '{name}' in '{export_name}'"))?;
-                return instance
-                    .get_func(&mut *store, &func_idx)
-                    .with_context(|| format!("export '{export_name}#{name}' is not a function"));
-            }
-        }
-    }
-    anyhow::bail!("export '{}' not found (checked top-level and nested interfaces)", name)
+    let (_, iface_idx) = instance
+        .get_export(&mut *store, None, interface)
+        .with_context(|| format!("resolving exact interface export '{interface}'"))?;
+    let (_, func_idx) = instance
+        .get_export(&mut *store, Some(&iface_idx), name)
+        .with_context(|| format!("resolving function '{name}' in exact interface '{interface}'"))?;
+    instance
+        .get_func(&mut *store, &func_idx)
+        .with_context(|| format!("export '{interface}#{name}' is not a function"))
 }
 
 fn call_and_finalize<T>(
@@ -823,15 +844,24 @@ fn main() -> Result<()> {
         .map_err(anyhow::Error::from)
         .context("instantiating component")?;
 
-    let mut func_cache: HashMap<String, wasmtime::component::Func> = HashMap::new();
+    let mut func_cache: HashMap<(Option<String>, String), wasmtime::component::Func> =
+        HashMap::new();
     let mut out = Vec::new();
     let mut stderr_pos = 0usize;
     for call in &calls {
-        let func = match func_cache.get(&call.function) {
+        let cache_key = (call.interface.clone(), call.function.clone());
+        let func = match func_cache.get(&cache_key) {
             Some(f) => *f,
             None => {
-                let f = resolve_func(&instance, &mut store, &component, &engine, &call.function)?;
-                func_cache.insert(call.function.clone(), f);
+                let f = resolve_func(
+                    &instance,
+                    &mut store,
+                    &component,
+                    &engine,
+                    call.interface.as_deref(),
+                    &call.function,
+                )?;
+                func_cache.insert(cache_key, f);
                 f
             }
         };

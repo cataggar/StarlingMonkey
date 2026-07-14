@@ -50,5 +50,6 @@ world js-dispatch {
   export wasi:cli/run@0.2.10;
   export wasi:http/incoming-handler@0.2.10;
   export test:wit-imports/api@1.2.3;
+  export test:wit-imports/incoming-handler@1.2.3;
   export root-add: func(a: u32, b: u32) -> u32;
 }
