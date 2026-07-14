@@ -38,6 +38,8 @@
 #     queried via the side-channel `note-count` import) proves the
 #     canonical-ABI import genuinely ran, not merely that the JS call site
 #     didn't throw.
+#   * nested option parity: `option<option<u32>>` preserves outer none,
+#     some-none, and some-some across both export and reverse-import paths.
 #   * requirement 5 (every synchronous type, reverse direction): nesting (a
 #     list of lists), `char`/`option<char>`, `list<u8>` (a genuine JS
 #     `Uint8Array`, plus its `option<list<u8>>` nested/optional form),
@@ -132,6 +134,11 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-xor-bytes", "args": [[1, 2, 3], 255]},
   {"function": "run-optional-bytes", "args": [[1, 2, 3]]},
   {"function": "run-optional-bytes", "args": [null]},
+  {"function": "run-describe-nested-option", "args": [{"nested": {"tag": "none"}}]},
+  {"function": "run-describe-nested-option", "args": [{"nested": {"tag": "some", "val": null}}]},
+  {"function": "run-describe-nested-option", "args": [{"nested": {"tag": "some", "val": 42}}]},
+  {"function": "run-identity-nested-option", "args": [{"nested": {"tag": "some", "val": null}}]},
+  {"function": "run-identity-nested-option", "args": [{"nested": {"tag": "some", "val": 42}}]},
 
   {"function": "run-swap-tuple", "args": [[5, "abc"]]},
 
@@ -228,25 +235,35 @@ assert_field "run-xor-bytes XORs a direct list<u8> result" 16 "rec['value']" "[2
 assert_field "run-optional-bytes (some) reverses the wrapped list<u8>" 17 "rec['value']" "[3, 2, 1]"
 assert_field "run-optional-bytes (none) round-trips as None" 18 "rec['value']" "None"
 
+# option<option<u32>>: the tagged JSON input here maps to the exact
+# ComponentizeJS JS representation. The descriptor proves JS -> host
+# lowering distinguishes every canonical state; identity covers host -> JS
+# lifting and the enclosing export's lowering back to Wasmtime.
+assert_field "nested option outer none remains distinct" 19 "rec['value']" "none"
+assert_field "nested option some-none remains distinct" 20 "rec['value']" "some-none"
+assert_field "nested option some-some preserves payload" 21 "rec['value']" "some-some-42"
+assert_field "nested option some-none reverse result returns inner none" 22 "rec['value']" "{'nested': None}"
+assert_field "nested option some-some reverse result preserves payload" 23 "rec['value']" "{'nested': 42}"
+
 # tuple: position AND type swapped, with a real transform on each element.
-assert_field "run-swap-tuple swaps position/type and transforms both elements" 19 "rec['value']" "['ABC', 6]"
+assert_field "run-swap-tuple swaps position/type and transforms both elements" 24 "rec['value']" "['ABC', 6]"
 
 # enum / option<enum>: cycles red -> green -> blue -> red.
-assert_field "run-color cycles red -> green" 20 "rec['value']" "green"
-assert_field "run-option-color (some) cycles blue -> red" 21 "rec['value']" "red"
-assert_field "run-option-color (none) round-trips as None" 22 "rec['value']" "None"
+assert_field "run-color cycles red -> green" 25 "rec['value']" "green"
+assert_field "run-option-color (some) cycles blue -> red" 26 "rec['value']" "red"
+assert_field "run-option-color (none) round-trips as None" 27 "rec['value']" "None"
 
 # flags (3 labels, well under the 32-label limit) / option<flags>: every
 # bit flipped.
-assert_field "run-permissions flips every bit ({read} -> {write, execute})" 23 "rec['value']" "['write', 'execute']"
-assert_field "run-option-permissions (some) flips every bit ({read,write} -> {execute})" 24 "rec['value']" "['execute']"
-assert_field "run-option-permissions (none) round-trips as None" 25 "rec['value']" "None"
+assert_field "run-permissions flips every bit ({read} -> {write, execute})" 28 "rec['value']" "['write', 'execute']"
+assert_field "run-option-permissions (some) flips every bit ({read,write} -> {execute})" 29 "rec['value']" "['execute']"
+assert_field "run-option-permissions (none) round-trips as None" 30 "rec['value']" "None"
 
 # variant: a void case and two differently-typed payload cases, each with
 # its own deterministic transform.
-assert_field "run-shape: empty -> circle(1)" 26 "rec['value']" "{'tag': 'circle', 'val': 1}"
-assert_field "run-shape: circle(2) -> circle(4)" 27 "rec['value']" "{'tag': 'circle', 'val': 4}"
-assert_field "run-shape: named('hi') -> named('hi!')" 28 "rec['value']" "{'tag': 'named', 'val': 'hi!'}"
+assert_field "run-shape: empty -> circle(1)" 31 "rec['value']" "{'tag': 'circle', 'val': 1}"
+assert_field "run-shape: circle(2) -> circle(4)" 32 "rec['value']" "{'tag': 'circle', 'val': 4}"
+assert_field "run-shape: named('hi') -> named('hi!')" 33 "rec['value']" "{'tag': 'named', 'val': 'hi!'}"
 
 # result<T,E>: this export's own top-level return type gets
 # ComponentizeJS's throw-means-err convention (unlike the plain {tag,val}
@@ -254,13 +271,13 @@ assert_field "run-shape: named('hi') -> named('hi!')" 28 "rec['value']" "{'tag':
 # doc comment), so both a both-payload result<s32,string> and a
 # void-ok-payload result<_,string> are exercised here as the export's own
 # result, not the host import's raw shape.
-assert_field "run-checked-div ok: 10/2 = 5" 29 "rec['value']" "{'tag': 'ok', 'val': 5}"
-assert_field "run-checked-div err: division by zero" 30 "rec['value']" "{'tag': 'err', 'val': 'division by zero'}"
-assert_field "run-validate-non-negative ok (void payload, no 'val' key)" 31 "rec['value']" "{'tag': 'ok'}"
-assert_field "run-validate-non-negative err: negative value rejected" 32 "rec['value']" "{'tag': 'err', 'val': 'value is negative'}"
+assert_field "run-checked-div ok: 10/2 = 5" 34 "rec['value']" "{'tag': 'ok', 'val': 5}"
+assert_field "run-checked-div err: division by zero" 35 "rec['value']" "{'tag': 'err', 'val': 'division by zero'}"
+assert_field "run-validate-non-negative ok (void payload, no 'val' key)" 36 "rec['value']" "{'tag': 'ok'}"
+assert_field "run-validate-non-negative err: negative value rejected" 37 "rec['value']" "{'tag': 'err', 'val': 'value is negative'}"
 
-assert_field "run-boom host trap propagates" 33 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 33 \
+assert_field "run-boom host trap propagates" 38 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 38 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"

@@ -447,7 +447,10 @@ bool encode_to_js(JSContext *cx, const StarlingJsValue &v, JS::MutableHandleValu
     return true;
   }
   case STARLING_JS_OPTION_NONE:
-    out.setNull();
+    // A direct WIT option<T>::none lifts to JavaScript undefined. Nested
+    // options are represented by the Zig encoder as {tag, val} records so
+    // their three canonical states remain distinguishable.
+    out.setUndefined();
     return true;
   case STARLING_JS_OPTION_SOME:
     if (!v.option_ptr) {

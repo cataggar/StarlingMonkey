@@ -1,11 +1,8 @@
 package compat:options;
 
 // Phase 0 compatibility fixture: option<T> arguments/results for a numeric,
-// string and record payload. See manifest.json known_deviations
-// "option-none-representation" for how "none" differs between the current
-// Zig/WABT JSON bridge (JS `null`) and the pinned ComponentizeJS reference
-// (JS `undefined`); this fixture's JS is written portably (`== null`) so the
-// same source produces matching observable behavior under both.
+// string and record payload. WIT `none` is lifted as JavaScript `undefined`,
+// while both JavaScript `null` and `undefined` lower to WIT `none`.
 world js-exports {
   record point {
     x: s32,

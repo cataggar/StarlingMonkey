@@ -197,6 +197,20 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
                 other => anyhow::bail!("result tag must be 'ok' or 'err', got '{}'", other),
             }
         }
+        // JSON has no native spelling for option<option<T>>::none versus
+        // some(none). For this E2E driver's nested-option probes, use the
+        // same tagged JavaScript shape ComponentizeJS exposes.
+        (Type::Option(opt_ty), J::Object(obj)) if matches!(opt_ty.ty(), Type::Option(_)) => {
+            match obj.get("tag").and_then(|v| v.as_str()) {
+                Some("none") => Val::Option(None),
+                Some("some") => Val::Option(Some(Box::new(json_to_val(
+                    &opt_ty.ty(),
+                    obj.get("val").context("nested option 'some' requires 'val'")?,
+                )?))),
+                Some(other) => anyhow::bail!("nested option tag must be 'none' or 'some', got '{}'", other),
+                None => anyhow::bail!("nested option JSON requires a string 'tag'"),
+            }
+        }
         (Type::Option(_), J::Null) => Val::Option(None),
         (Type::Option(opt_ty), v) => Val::Option(Some(Box::new(json_to_val(&opt_ty.ty(), v)?))),
         (ty, v) => anyhow::bail!("unsupported type/value combination: {:?} / {}", ty, v),
@@ -588,6 +602,46 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
                     Val::Option(Some(Box::new(Val::List(reversed))))
                 }
             };
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "describe-nested-option",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Record(fields) = &args[0] else {
+                return Err(wasm_err("describe-nested-option: expected nested-option-argument"));
+            };
+            let outer = fields
+                .iter()
+                .find(|(name, _)| name == "nested")
+                .map(|(_, value)| value)
+                .ok_or_else(|| wasm_err("describe-nested-option: missing 'nested' field"))?;
+            let Val::Option(outer) = outer else {
+                return Err(wasm_err("describe-nested-option: expected option<option<u32>> field"));
+            };
+            results[0] = Val::String(match outer {
+                None => "none".to_string(),
+                Some(inner) => match inner.as_ref() {
+                    Val::Option(None) => "some-none".to_string(),
+                    Val::Option(Some(value)) => match value.as_ref() {
+                        Val::U32(value) => format!("some-some-{value}"),
+                        _ => return Err(wasm_err("describe-nested-option: expected u32 payload")),
+                    },
+                    _ => return Err(wasm_err("describe-nested-option: expected inner option")),
+                },
+            });
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "identity-nested-option",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Record(fields) = &args[0] else {
+                return Err(wasm_err("identity-nested-option: expected nested-option-argument"));
+            };
+            results[0] = Val::Record(fields.clone());
             Ok(())
         },
     )?;

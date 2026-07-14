@@ -97,6 +97,15 @@ interface host {
     xor-bytes: func(bytes: list<u8>, key: u8) -> list<u8>;
     identity-optional-bytes: func(bytes: option<list<u8>>) -> option<list<u8>>;
 
+    // Nested options use the ComponentizeJS `{tag:"none"|"some", val?}`
+    // shape on the JavaScript side. The descriptor distinguishes all three
+    // canonical states; identity verifies the reverse result path too.
+    record nested-option-argument {
+        nested: option<option<u32>>,
+    }
+    describe-nested-option: func(value: nested-option-argument) -> string;
+    identity-nested-option: func(value: nested-option-argument) -> nested-option-argument;
+
     // `tuple`: swaps position and type, and transforms both elements
     // (increments the number, upper-cases the string) to prove real host
     // computation rather than a bare positional passthrough.
@@ -197,6 +206,11 @@ interface api {
     run-sum-bytes: func(bytes: list<u8>) -> u32;
     run-xor-bytes: func(bytes: list<u8>, key: u8) -> list<u8>;
     run-optional-bytes: func(bytes: option<list<u8>>) -> option<list<u8>>;
+    record nested-option-argument {
+        nested: option<option<u32>>,
+    }
+    run-describe-nested-option: func(value: nested-option-argument) -> string;
+    run-identity-nested-option: func(value: nested-option-argument) -> nested-option-argument;
 
     run-swap-tuple: func(t: tuple<u32, string>) -> tuple<string, u32>;
 

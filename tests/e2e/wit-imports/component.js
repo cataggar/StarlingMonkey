@@ -52,6 +52,8 @@ import {
   "sum-bytes" as sumBytes,
   "xor-bytes" as xorBytes,
   "identity-optional-bytes" as identityOptionalBytes,
+  "describe-nested-option" as describeNestedOption,
+  "identity-nested-option" as identityNestedOption,
   "swap-tuple" as swapTuple,
   "next-color" as nextColor,
   "next-option-color" as nextOptionColor,
@@ -177,6 +179,16 @@ function runOptionalBytes(bytes) {
   return identityOptionalBytes(bytes);
 }
 export { runOptionalBytes as "run-optional-bytes" };
+
+function runDescribeNestedOption(value) {
+  return describeNestedOption(value);
+}
+export { runDescribeNestedOption as "run-describe-nested-option" };
+
+function runIdentityNestedOption(value) {
+  return identityNestedOption(value);
+}
+export { runIdentityNestedOption as "run-identity-nested-option" };
 
 // `tuple`: a plain positional JS Array both ways.
 function runSwapTuple(t) {

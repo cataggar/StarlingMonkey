@@ -214,6 +214,12 @@ struct StarlingJsValue {
 // a scratch `out_result` in that case; the arena may still hold
 // string/record bookkeeping).
 //
+// A direct `STARLING_JS_OPTION_NONE` encodes to JavaScript `undefined`.
+// The Zig side represents an `option<option<T>>` with a regular
+// `STARLING_JS_RECORD` `{tag:"none"|"some", val?}` tree before it reaches
+// this generic encoder, so neither this tag nor `STARLING_JS_UNDEFINED`
+// needs a lossy overloaded meaning.
+//
 // `result_is_wit_result` must be true iff the export's own return type is
 // directly a WIT `result<T, E>` (i.e. `Result` in js_dispatch.zig's
 // `callNative` is exactly `wit_types.Result(T, E)`, not merely containing one

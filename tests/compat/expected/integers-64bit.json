@@ -65,9 +65,7 @@
       ],
       "result": null,
       "confidence": "reference-verified",
-      "notes": "Same option<T> none-representation deviation as known_deviations option-none-representation; both null and undefined lower back to none, so this case's own args/result round-trip is unaffected.",
-      "bridge_none_representation": "null",
-      "reference_none_representation": "undefined"
+      "notes": "Both JavaScript null and undefined lower back to WIT none."
     },
     {
       "id": "sum-list-basic",
