@@ -458,6 +458,9 @@ bool encode_to_js(JSContext *cx, const StarlingJsValue &v, JS::MutableHandleValu
     out.setObject(*arr);
     return true;
   }
+  case STARLING_JS_UNDEFINED:
+    out.setUndefined();
+    return true;
   }
   JS_ReportErrorASCII(cx, "native dispatch: unrecognized argument tag");
   return false;

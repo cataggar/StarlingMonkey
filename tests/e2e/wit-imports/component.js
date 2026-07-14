@@ -14,8 +14,20 @@
 //   * host functions can be called repeatedly and the manifest correctly
 //     distinguishes each named import (requirement 5's "repeated calls");
 //   * a host-side trap (`boom`) propagates back through JS and out through
-//     the export call as a genuine wasm trap, not a swallowed error.
-import { add, "sum-list" as sumList, greet, scale, boom } from "test:wit-imports/host@1.2.3";
+//     the export call as a genuine wasm trap, not a swallowed error;
+//   * a WIT import with no result (`note`) surfaces to JavaScript as
+//     exactly `undefined` -- never `false`/`null` -- and its host-side
+//     implementation genuinely ran (proven via the side-channel
+//     `note-count` import, not just "no exception was thrown").
+import {
+  add,
+  "sum-list" as sumList,
+  greet,
+  scale,
+  boom,
+  note,
+  "note-count" as noteCount,
+} from "test:wit-imports/host@1.2.3";
 
 export function runAdd(a, b) {
   return add(a, b);
@@ -60,3 +72,22 @@ function runBoom() {
   return boom();
 }
 export { runBoom as "run-boom" };
+
+function runNote() {
+  // `note` has no WIT result: the call's own return value must be
+  // JavaScript `undefined`, never `false` (a stray bool tag) or `null`
+  // (the option-none tag, which means something different -- WIT
+  // `option::none`, not "no result").
+  const result = note();
+  return result === undefined;
+}
+export { runNote as "run-note" };
+
+function runNoteCount() {
+  // A second, independent host import used purely to observe `note`'s
+  // side effect (an incrementing host-side counter) -- proving the
+  // canonical-ABI import actually executed on the host, not merely that
+  // the JS call site returned without throwing.
+  return noteCount();
+}
+export { runNoteCount as "run-note-count" };

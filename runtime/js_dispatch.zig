@@ -44,6 +44,16 @@ pub const NativeTag = enum(u32) {
     // a plain Array (matches ComponentizeJS 0.21.0). Reuses `str_ptr`/
     // `str_len` (see js_dispatch.h).
     bytes = 9,
+    // A WIT function with no result, encoding to JavaScript `undefined` --
+    // never `false` (`.bool_`) or `null` (`.option_none`, which is
+    // option-`none`'s tag, not void's). Encode-direction only: see the
+    // matching `STARLING_JS_UNDEFINED` doc comment in js_dispatch.h for why
+    // `decodeNative` deliberately has no corresponding "this means the
+    // result was void" special case (real JS `undefined`/`null` returned
+    // from an *export* still decodes through `.option_none` as before).
+    // Keep the numeric value in sync with `STARLING_JS_UNDEFINED` there --
+    // deliberately `10`, not `9`: `.bytes` (above) already claimed `9`.
+    undefined_ = 10,
 };
 
 // Mirrors `struct StarlingJsValue` in js_dispatch.h field-for-field. Both
@@ -280,6 +290,7 @@ pub fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) Na
         return .{ .tag = .bytes, .str_ptr = value.bytes.ptr, .str_len = value.bytes.len };
     }
     return switch (@typeInfo(T)) {
+        .void => .{ .tag = .undefined_ },
         .bool => .{ .tag = .bool_, .bool_val = @intFromBool(value) },
         .int => blk: {
             // The `bigint_*` fit/sign flags mirror what `JS::BigIntIsInt64`/
@@ -619,6 +630,26 @@ pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.
         );
     }
     return switch (@typeInfo(T)) {
+        // Only reachable if some future caller passes `void` through here
+        // directly (today's call sites -- `callNative`/`callJson` -- both
+        // special-case `Result == void` *before* ever calling `decodeNative`,
+        // to avoid touching `out_arena` unnecessarily). Kept for symmetry
+        // with `encodeNative`'s `.void` arm and so this function has a real
+        // typed contract for every WIT result shape, not just the ones
+        // exercised by the current two call sites. A real JS export
+        // returning `undefined`/`null` decodes (via `decode_from_js` in
+        // js_dispatch.cpp) to `.option_none`, never `.undefined_` -- that
+        // tag is produced only by `encodeNative` on the reverse
+        // (`--js-imports`) path -- so both are accepted here.
+        .void => blk: {
+            if (value.tag != .option_none and value.tag != .undefined_) {
+                std.debug.panic(
+                    "native dispatch: expected a void (undefined) result, got a JavaScript value of kind {t}",
+                    .{value.tag},
+                );
+            }
+            break :blk {};
+        },
         .bool => blk: {
             if (value.tag != .bool_) {
                 std.debug.panic(
@@ -1117,6 +1148,37 @@ test "round-trips an optional u64 through option_some/option_none" {
     const encoded_none = encodeNative(?u64, absent, arena.allocator());
     try std.testing.expectEqual(NativeTag.option_none, encoded_none.tag);
     try std.testing.expectEqual(absent, decodeNative(?u64, &encoded_none, arena.allocator()));
+}
+
+test "encodes void as its own dedicated tag, never bool_/option_none" {
+    // The reverse (`--js-imports`) bridge's generated dispatch trampoline
+    // calls `encodeNative(void, {}, alloc)` for a WIT import with no
+    // result; `encode_to_js` (js_dispatch.cpp) then converts `.undefined_`
+    // to a real JavaScript `undefined`. Before this fix the generator
+    // hard-coded `.tag = .bool_` (JS `false`); `.option_none` (JS `null`)
+    // would be equally wrong, since that tag means WIT `option::none`, not
+    // "no result at all".
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const encoded = encodeNative(void, {}, arena.allocator());
+    try std.testing.expectEqual(NativeTag.undefined_, encoded.tag);
+    try std.testing.expect(encoded.tag != .bool_);
+    try std.testing.expect(encoded.tag != .option_none);
+}
+
+test "decodeNative(void, ...) accepts either the undefined tag or a real export's option_none shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const from_import_bridge: NativeValue = .{ .tag = .undefined_ };
+    decodeNative(void, &from_import_bridge, arena.allocator());
+
+    // A real void *export* result decodes (via decode_from_js) to
+    // `.option_none` (JS undefined/null with no target-type context) --
+    // `decodeNative(void, ...)` must accept that shape too.
+    const from_export_result: NativeValue = .{ .tag = .option_none };
+    decodeNative(void, &from_export_result, arena.allocator());
 }
 
 test "decodes a present optional from the C++ shape (concrete tag, no option_some wrapper)" {

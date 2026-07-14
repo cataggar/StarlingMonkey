@@ -25,6 +25,8 @@
 // Prints one JSON line (a JSON array, one record per call) to stdout, in
 // the exact same `{"ok": ..., ...}` shape as compat-invoker.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use wasmtime::component::{Component, Linker, Type, Val};
@@ -310,6 +312,28 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
             },
         )?;
     }
+
+    // `note`/`note-count`: a void host import (`note` has no WIT result)
+    // plus a side-channel query import so the test can observe `note`'s
+    // real side effect (this counter incrementing) rather than merely
+    // asserting the JS call site didn't throw. Both share one counter via
+    // `Arc<AtomicU32>` -- `func_new` closures must be `Send + Sync`, so
+    // interior mutability (not a captured `&mut`) is required here.
+    let note_count = Arc::new(AtomicU32::new(0));
+    host.func_new("note", {
+        let note_count = note_count.clone();
+        move |_store, _ty, _args: &[Val], _results: &mut [Val]| -> wasmtime::Result<()> {
+            note_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })?;
+    host.func_new("note-count", {
+        let note_count = note_count.clone();
+        move |_store, _ty, _args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            results[0] = Val::U32(note_count.load(Ordering::SeqCst));
+            Ok(())
+        }
+    })?;
 
     Ok(())
 }

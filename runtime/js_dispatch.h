@@ -89,6 +89,22 @@ enum StarlingJsTag : uint32_t {
   // `STARLING_JS_STRING` uses (this tag only changes how encode_to_js builds
   // the JS value and how decode_from_js recognizes one on the way back).
   STARLING_JS_BYTES = 9,
+  // A WIT function with no result. Encodes (encode_to_js) to JavaScript
+  // `undefined` -- *never* `false` (a stray `STARLING_JS_BOOL`) or `null`
+  // (`STARLING_JS_OPTION_NONE`, which is option-`none`'s tag, not void's).
+  // This is encode-direction only (the reverse `--js-imports` bridge, where
+  // a host import with no result must hand JavaScript back exactly
+  // `undefined`): `decode_from_js` never *produces* this tag -- a real JS
+  // `undefined`/`null` returned from an *export* still decodes to
+  // `STARLING_JS_OPTION_NONE` as before (see `decode_from_js` below), since
+  // that direction has no target type to know it's looking at a `void`
+  // rather than an absent optional. Keep this in sync with `NativeTag` in
+  // runtime/js_dispatch.zig (`.undefined_`), which must carry the identical
+  // numeric value. Deliberately `10`, not `9`: `STARLING_JS_BYTES` (above)
+  // claimed `9` first when the synchronous value-parity and WIT-imports
+  // bridges were integrated, and every existing tag's original numeric
+  // value is preserved rather than renumbered to make room.
+  STARLING_JS_UNDEFINED = 10,
 };
 
 struct StarlingJsValue;

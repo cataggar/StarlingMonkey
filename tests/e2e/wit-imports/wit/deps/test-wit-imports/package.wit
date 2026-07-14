@@ -43,6 +43,16 @@ interface host {
     // enclosing JS export call as a genuine wasm trap, not a catchable
     // JS exception.
     boom: func() -> u32;
+
+    // A WIT import with no result: JavaScript must observe exactly
+    // `undefined` from calling this (never `false`/`null` -- see
+    // js_dispatch.h's `STARLING_JS_UNDEFINED`/js_dispatch.zig's
+    // `NativeTag.undefined_`). `note-count` is a second, side-channel host
+    // import that lets the test prove `note`'s host implementation
+    // genuinely ran (its observable side effect: incrementing a host-side
+    // counter) rather than merely returning without error.
+    note: func();
+    note-count: func() -> u32;
 }
 
 interface api {
@@ -61,6 +71,12 @@ interface api {
     run-repeated-add: func() -> list<s64>;
     // Lets JS's own call to a *host* function propagate a real wasm trap.
     run-boom: func() -> u32;
+    // Calls the void host import `note` and reports whether JavaScript
+    // observed exactly `undefined` (`note() === undefined`), then reports
+    // the host-side counter via `note-count` so the test can independently
+    // confirm the canonical-ABI import actually ran (not a no-op stub).
+    run-note: func() -> bool;
+    run-note-count: func() -> u32;
 }
 
 world js-exports {

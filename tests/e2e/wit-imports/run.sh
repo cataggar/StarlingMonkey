@@ -32,6 +32,12 @@
 #   * requirement 5 (versioned interface names): the fixture's import/export
 #     both use the versioned identifier `test:wit-imports/{host,api}@1.2.3`
 #     throughout.
+#   * void import result contract: `note` (a WIT import with no result)
+#     surfaces to JavaScript as exactly `undefined`, and its host-side
+#     implementation's observable side effect (an incrementing counter,
+#     queried via the side-channel `note-count` import) proves the
+#     canonical-ABI import genuinely ran, not merely that the JS call site
+#     didn't throw.
 #
 # Usage: run.sh [zig-binary] [install-prefix]
 #   zig-binary defaults to `zig` on PATH; install-prefix defaults to
@@ -94,6 +100,11 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-greet", "args": ["world"]},
   {"function": "run-scale", "args": [3, 4, 10]},
   {"function": "run-repeated-add", "args": []},
+  {"function": "run-note-count", "args": []},
+  {"function": "run-note", "args": []},
+  {"function": "run-note-count", "args": []},
+  {"function": "run-note", "args": []},
+  {"function": "run-note-count", "args": []},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -136,8 +147,13 @@ assert_field "run-sum-list exact u64 wraparound (1+2+u64::MAX mod 2**64)" 1 "rec
 assert_field "run-greet string round-trip" 2 "rec['value']" "Hello from host, world!"
 assert_field "run-scale nested record bridged across independent point types" 3 "rec['value']" "{'x': 30, 'y': 40}"
 assert_field "run-repeated-add calls host import 5 times" 4 "rec['value']" "[10, 11, 12, 13, 14]"
-assert_field "run-boom host trap propagates" 5 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 5 \
+assert_field "note-count starts at 0 (before any 'note' call)" 5 "rec['value']" "0"
+assert_field "run-note: JS observes exactly undefined for a void import" 6 "rec['value']" "True"
+assert_field "note-count is 1 after one 'note' call (host side effect proves the import ran)" 7 "rec['value']" "1"
+assert_field "run-note: undefined result is consistent across repeated calls" 8 "rec['value']" "True"
+assert_field "note-count is 2 after a second 'note' call" 9 "rec['value']" "2"
+assert_field "run-boom host trap propagates" 10 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 10 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"
