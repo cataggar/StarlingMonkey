@@ -20,10 +20,10 @@
     "wasmtime_invoker_pin": {
       "repository_pin": "42.0.1",
       "repository_pin_source": "cmake/wasmtime.cmake, build.zig.zon",
-      "invoker_pin": "27",
-      "status": "blocked, not silently retained",
-      "blocker": "The published `wasmtime` 42.0.1 crate requires rustc >= 1.91.0 (Cargo.toml rust-version=\"1.91.0\", edition=\"2024\"); this repository's rust-toolchain.toml pins rustc 1.88.0. `cargo build` under that pinned toolchain fails with rustc-1.88.0-is-not-supported errors for wasmtime@42.0.1 and 35+ of its cranelift/pulley/wiggle dependencies. `cargo update -p cranelift-codegen --precise <older>` cannot resolve it either: wasmtime-internal-cranelift@42.0.1 requires cranelift-codegen = \"^0.129.1\", and every published 0.129.x release already requires rustc 1.91.0. See tests/compat/runtime/README.md's 'Wasmtime version' section and tests/compat/runtime/invoker/Cargo.toml's comment for the reproduced error and reasoning.",
-      "resolution": "Revisit once this repository's Rust toolchain is bumped to >= 1.91.0, or a future Wasmtime release restores rustc-1.88 compatibility."
+      "invoker_pin": "42.0.1",
+      "status": "matched exactly, via a scoped host-only Rust 1.91 toolchain",
+      "note": "tests/compat/runtime/invoker/Cargo.toml pins wasmtime/wasmtime-wasi/wasmtime-wasi-http to exact =42.0.1, matching this repository's own pin (see repository_pin_source). The published wasmtime 42.0.1 crate requires rustc >= 1.91.0 (edition 2024), newer than this repository's root rust-toolchain.toml (channel 1.88.0, pinned for producing wasm32-wasip1 artifacts); this is not a blocker because tests/compat/runtime/invoker is a standalone host-side test tool that produces no wasm32-wasip1 output and is never linked into StarlingMonkey itself. It carries its own nested tests/compat/runtime/invoker/rust-toolchain.toml pinning exact Rust 1.91.0 (profile=minimal, host-only), independently of and without changing the repository root's toolchain; rustup resolves the nearest rust-toolchain.toml by walking up from cwd, and both tests/compat/runtime/lib/run_bridge_tests.py's build_invoker() and tests/compat/reference/run-reference.mjs invoke cargo with an absolute cwd inside invoker/, so this is honored regardless of the caller's own working directory. See tests/compat/runtime/README.md's 'Wasmtime version' section for the exact API adaptations (invoker/src/main.rs) and verification commands.",
+      "verified_by": "cargo metadata (run from tests/compat/runtime/invoker) reports wasmtime/wasmtime-wasi/wasmtime-wasi-http all resolved to exact 42.0.1; rustc --version there reports 1.91.0. Both the real bridge (run-bridge-tests.sh) and reference (run-reference.mjs) suites were re-run to 11/11 against this exact pin; see git history for this repository's compat harness commits for the reproduced output."
     },
     "bridge_source_reviewed": [
       "runtime/js_dispatch.cpp",

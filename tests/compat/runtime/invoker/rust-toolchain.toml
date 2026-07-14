@@ -1,0 +1,19 @@
+# Scoped toolchain override for compat-invoker only.
+#
+# compat-invoker is a standalone host-side test tool (a small Rust binary
+# that drives the official `wasmtime` crate's Component Model API -- see
+# ../README.md's "Why a separate Rust tool" section); it produces no
+# wasm32-wasip1 artifact and is never linked into or shipped as part of
+# StarlingMonkey itself. rustup resolves the *nearest* rust-toolchain.toml
+# by walking up from the current directory, so pinning an exact, newer
+# Rust version here does not affect (and is not affected by) the
+# repository root's ../../../../rust-toolchain.toml, which stays pinned to
+# Rust 1.88.0 for production wasm32-wasip1 builds.
+#
+# 1.91.0 is required because this crate now pins the exact Wasmtime
+# 42.0.1 release (matching cmake/wasmtime.cmake / build.zig.zon), whose
+# published Cargo.toml declares rust-version = "1.91.0" and edition =
+# "2024". See ../README.md's "Wasmtime version" section for details.
+[toolchain]
+channel = "1.91.0"
+profile = "minimal"

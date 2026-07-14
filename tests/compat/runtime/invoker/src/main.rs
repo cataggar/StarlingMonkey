@@ -28,8 +28,14 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use wasmtime::component::{Component, Linker, Type, Val};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi::pipe::MemoryOutputPipe;
+// Wasmtime >= 42 moved the WASIp2 linker helpers and the in-memory pipe
+// types under a dedicated `p2` module (previously at the crate root); see
+// `wasmtime_wasi::p2::add_to_linker_sync` below and this repository's
+// invoker/rust-toolchain.toml / README.md "Wasmtime version" section for
+// why this crate can take that newer API while the rest of this repository
+// stays on rustc 1.88.0/an older API surface it doesn't depend on.
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 struct Host {
@@ -39,11 +45,11 @@ struct Host {
 }
 
 impl WasiView for Host {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi
+    // Wasmtime >= 42's `WasiView` trait dropped the separate `table()`
+    // method in favor of a single `ctx()` returning a `WasiCtxView` that
+    // bundles both the `WasiCtx` and the `ResourceTable` together.
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
     }
 }
 
@@ -161,10 +167,14 @@ fn resolve_func(
     for (export_name, item) in component.component_type().exports(engine) {
         if let wasmtime::component::types::ComponentItem::ComponentInstance(iface) = item {
             if iface.exports(engine).any(|(fname, _)| fname == name) {
-                let iface_idx = instance
+                // Wasmtime >= 42's `Instance::get_export` returns
+                // `(ComponentItem, ComponentExportIndex)` (previously just
+                // the index) so callers can also inspect the item's type
+                // without a second lookup; only the index is needed here.
+                let (_, iface_idx) = instance
                     .get_export(&mut *store, None, export_name)
                     .with_context(|| format!("resolving interface export '{export_name}'"))?;
-                let func_idx = instance
+                let (_, func_idx) = instance
                     .get_export(&mut *store, Some(&iface_idx), name)
                     .with_context(|| format!("resolving function '{name}' in '{export_name}'"))?;
                 return instance
@@ -176,13 +186,9 @@ fn resolve_func(
     anyhow::bail!("export '{}' not found (checked top-level and nested interfaces)", name)
 }
 
-
-/// Calls `func` with `params`/`results`, then runs the canonical ABI's
-/// mandatory `post_return` cleanup (only after a *successful* call: the
-/// instance has no pending return to finalize after a trap, and Wasmtime
-/// panics if `post_return` is invoked without a preceding successful
-/// `call`). Returns the JSON record for this call plus the new stderr
-/// buffer read position, both accounting for a `post_return` failure:
+/// Calls `func` with `params`/`results`. Returns the JSON record for this
+/// call plus the new stderr buffer read position, both accounting for a
+/// `post_return` failure:
 ///
 ///   - call traps: `{"ok": false, "trap": "...", "diagnostics": "..."}`.
 ///   - call succeeds, `post_return` succeeds: `{"ok": true, "value": ...}`.
@@ -195,6 +201,29 @@ fn resolve_func(
 ///     `{"ok": false, "trap": "post_return failed: ...",
 ///     "post_return_failed": true}` record so callers can tell this case
 ///     apart from an ordinary call-time trap.
+///
+/// Wasmtime >= 42 changed `wasmtime::component::Func::call` to run the
+/// canonical ABI's mandatory `post-return` cleanup itself, as an
+/// inseparable final step of the very same call (see its own doc comment:
+/// "This will also call the corresponding post-return function, if any.");
+/// the previously separate `Func::post_return` method is now a deprecated
+/// no-op kept only for source compatibility (calling it is unnecessary and
+/// has no effect). This is actually a strengthening of the invariant this
+/// function exists to guarantee: a post-return trap can no longer be
+/// silently swallowed as a false `ok:true` PASS *by construction*, since
+/// `call` itself now returns `Err` unconditionally in that case, for every
+/// caller of the `wasmtime` crate, not just this one.
+///
+/// What Wasmtime no longer exposes is *which* phase of a single failing
+/// `call` actually trapped, since `results` are already lifted from the
+/// callee's return values before the post-return step runs. This function
+/// recovers that distinction the same way the trap itself is
+/// distinguishable: by comparing `results`' `Debug` representation (`Val`
+/// has no `PartialEq` impl) before and after the call. `call`'s own docs
+/// state its initial values are ignored and always overwritten on success,
+/// so if a trapping call nonetheless left `results` changed away from the
+/// caller-supplied placeholders, the call body itself must have completed
+/// (writing real results) before post-return then failed.
 fn call_and_finalize<T>(
     func: &wasmtime::component::Func,
     store: &mut Store<T>,
@@ -203,9 +232,9 @@ fn call_and_finalize<T>(
     stderr_pipe: &MemoryOutputPipe,
     stderr_pos: usize,
 ) -> (serde_json::Value, usize) {
-    let mut stderr_pos = stderr_pos;
+    let results_before: Vec<String> = results.iter().map(|v| format!("{v:?}")).collect();
     let call_result = func.call(&mut *store, params, results);
-    let mut record = match &call_result {
+    let record = match &call_result {
         Ok(()) => {
             let value = match results.len() {
                 0 => serde_json::Value::Null,
@@ -222,29 +251,25 @@ fn call_and_finalize<T>(
             // that *some* trap occurred.
             let all_stderr = stderr_pipe.contents();
             let new_stderr = String::from_utf8_lossy(&all_stderr[stderr_pos..]).into_owned();
-            serde_json::json!({
-                "ok": false,
-                "trap": format!("{:#}", err),
-                "diagnostics": new_stderr,
-            })
+            let results_after: Vec<String> = results.iter().map(|v| format!("{v:?}")).collect();
+            let post_return_failed = !results.is_empty() && results_before != results_after;
+            if post_return_failed {
+                serde_json::json!({
+                    "ok": false,
+                    "trap": format!("post_return failed: {:#}", err),
+                    "diagnostics": new_stderr,
+                    "post_return_failed": true,
+                })
+            } else {
+                serde_json::json!({
+                    "ok": false,
+                    "trap": format!("{:#}", err),
+                    "diagnostics": new_stderr,
+                })
+            }
         }
     };
-    stderr_pos = stderr_pipe.contents().len();
-    if call_result.is_ok() {
-        // `post_return` must run before the next call reuses the same
-        // instance/store (canonical ABI requirement).
-        if let Err(post_return_err) = func.post_return(&mut *store) {
-            let all_stderr = stderr_pipe.contents();
-            let new_stderr = String::from_utf8_lossy(&all_stderr[stderr_pos..]).into_owned();
-            stderr_pos = stderr_pipe.contents().len();
-            record = serde_json::json!({
-                "ok": false,
-                "trap": format!("post_return failed: {:#}", post_return_err),
-                "diagnostics": new_stderr,
-                "post_return_failed": true,
-            });
-        }
-    }
+    let stderr_pos = stderr_pipe.contents().len();
     (record, stderr_pos)
 }
 
@@ -351,14 +376,20 @@ fn main() -> Result<()> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     let engine = Engine::new(&config)?;
-    let component = Component::from_file(&engine, &component_path).context("loading component")?;
+    let component = Component::from_file(&engine, &component_path)
+        .map_err(anyhow::Error::from)
+        .context("loading component")?;
 
     let mut linker = Linker::<Host>::new(&engine);
-    wasmtime_wasi::add_to_linker_sync(&mut linker).context("linking wasi p2")?;
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(anyhow::Error::from)
+        .context("linking wasi p2")?;
     // The full js-dispatch world also imports wasi:http; use the "only-http"
     // variant so it doesn't re-register wasi:clocks/random/etc. already
-    // provided by `wasmtime_wasi::add_to_linker_sync` above.
-    wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker).context("linking wasi-http")?;
+    // provided by `wasmtime_wasi::p2::add_to_linker_sync` above.
+    wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker)
+        .map_err(anyhow::Error::from)
+        .context("linking wasi-http")?;
 
     // Route the guest's own stdout (e.g. a fixture's `console.log`) to an
     // in-memory buffer instead of this process's real stdout: this tool's
@@ -389,6 +420,7 @@ fn main() -> Result<()> {
 
     let instance = linker
         .instantiate(&mut store, &component)
+        .map_err(anyhow::Error::from)
         .context("instantiating component")?;
 
     let mut func_cache: HashMap<String, wasmtime::component::Func> = HashMap::new();
@@ -403,7 +435,13 @@ fn main() -> Result<()> {
                 f
             }
         };
-        let param_tys = func.params(&store);
+        // Wasmtime >= 42 removed `Func::params`/`Func::results`; the same
+        // information is now reached via `Func::ty`, which returns a
+        // `ComponentFunc` type descriptor with `params()`/`results()`
+        // iterators (see wasmtime::component::types::ComponentFunc).
+        let func_ty = func.ty(&store);
+        let param_tys: Vec<Type> = func_ty.params().map(|(_, ty)| ty).collect();
+        let result_tys: Vec<Type> = func_ty.results().collect();
         if param_tys.len() != call.args.len() {
             anyhow::bail!(
                 "function '{}' expects {} argument(s), got {}",
@@ -416,7 +454,6 @@ fn main() -> Result<()> {
         for (ty, arg) in param_tys.iter().zip(&call.args) {
             params.push(json_to_val(ty, arg)?);
         }
-        let result_tys = func.results(&store);
         let mut results = vec![Val::Bool(false); result_tys.len()];
         let (record, new_stderr_pos) =
             call_and_finalize(&func, &mut store, &params, &mut results, &stderr_pipe, stderr_pos);
