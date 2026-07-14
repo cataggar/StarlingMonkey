@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 
-#set -euo pipefail
+set -euo pipefail
 
 wizer="${WIZER:-@WASMTIME_DIR@/wasmtime wizer}"
 wasm_tools="${WASM_TOOLS:-@WASM_TOOLS_BIN@}"
 weval="${WEVAL:-@WEVAL_BIN@}"
+wabt="${WABT:-wabt}"
+component_world="@COMPONENT_WORLD@"
+component_wit="@COMPONENT_WIT_DIR@"
 aot=@AOT@
 preopen_dir="${PREOPEN_DIR:-}"
 
@@ -127,4 +130,19 @@ else
   cp "$(dirname "$0")/starling-raw.wasm" "$OUT_FILE"
 fi
 
-$wasm_tools component new -v --adapt "wasi_snapshot_preview1=$(dirname "$0")/preview1-adapter.wasm" --output "$OUT_FILE" "$OUT_FILE"
+if [[ -n "$component_world" ]]; then
+  stripped="${OUT_FILE}.stripped.$$"
+  embedded="${OUT_FILE}.embedded.$$"
+  component="${OUT_FILE}.component.$$"
+  trap 'rm -f "$stripped" "$embedded" "$component"' EXIT
+
+  "$wabt" module strip -o "$stripped" "$OUT_FILE"
+  "$wabt" component embed --world "$component_world" -o "$embedded" "$component_wit" "$stripped"
+  "$wabt" component new --adapt "wasi_snapshot_preview1=$(dirname "$0")/preview1-adapter.wasm" -o "$component" "$embedded"
+  mv "$component" "$OUT_FILE"
+
+  rm -f "$stripped" "$embedded"
+  trap - EXIT
+else
+  "$wasm_tools" component new -v --adapt "wasi_snapshot_preview1=$(dirname "$0")/preview1-adapter.wasm" --output "$OUT_FILE" "$OUT_FILE"
+fi

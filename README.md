@@ -105,6 +105,26 @@ zig-out/bin/componentize.sh path/to/index.js -o index.wasm
 zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 ```
 
+To expose synchronous WIT exports implemented by same-named JavaScript module
+exports, configure the WIT package and world at build time. The generated Zig
+bindings dispatch typed arguments and results through StarlingMonkey, and the
+installed `componentize.sh` uses `cataggar/wabt` to embed and wrap that world:
+
+```console
+zig build -Doptimize=ReleaseSmall \
+  -Dcomponent-wit=host-apis/wasi-0.2.10/wit \
+  -Dcomponent-world=js-dispatch \
+  -Ddispatch-wit=host-apis/wasi-0.2.10/wit/deps/starling-js \
+  -Ddispatch-world=js-exports
+
+WABT=/path/to/wabt zig-out/bin/componentize.sh app.js -o app.wasm
+zig-out/bin/wasmtime run -S http --invoke 'add(2, 3)' app.wasm
+```
+
+The JavaScript bridge currently supports synchronous JSON-representable
+primitives, strings, lists, records, options, and functions without a result.
+Promise results are rejected.
+
 Notes:
 - SpiderMonkey must be built from source with Zig because the upstream prebuilt
   artifacts use a libc++ ABI incompatible with Zig's.

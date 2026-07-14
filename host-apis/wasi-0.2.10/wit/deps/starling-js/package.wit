@@ -1,0 +1,18 @@
+package starling:js;
+
+interface api {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  add: func(a: u32, b: u32) -> u32;
+  greet: func(name: string) -> string;
+  notify: func(message: string);
+  move: func(point: point, dx: s32, dy: s32) -> point;
+  maybe: func(value: option<u32>) -> option<u32>;
+}
+
+world js-exports {
+  export api;
+}
