@@ -17,7 +17,7 @@
 
 import { componentize } from "@bytecodealliance/componentize-js";
 import { execFileSync } from "node:child_process";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 const HERE = new URL(".", import.meta.url).pathname;
@@ -48,6 +48,28 @@ function parseWit(text) {
   return { imports, exports };
 }
 
+function comparable(results) {
+  return Object.fromEntries(Object.entries(results).map(([name, result]) => {
+    if (!result.ok) {
+      return [name, { error: result.error }];
+    }
+    return [name, {
+      imports: [...result.imports].sort(),
+      exports: [...result.exports].sort(),
+    }];
+  }));
+}
+
+function sorted(value) {
+  if (Array.isArray(value)) return value.map(sorted);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, sorted(value[key])]),
+    );
+  }
+  return value;
+}
+
 async function main() {
   const results = {};
   const scratch = path.join(HERE, ".scratch");
@@ -75,7 +97,21 @@ async function main() {
     await rm(scratch, { recursive: true, force: true });
   }
   await writeFile(`${HERE}actual-import-surfaces.json`, JSON.stringify(results, null, 2) + "\n");
-  console.log(`\nWrote ${HERE}actual-import-surfaces.json -- diff against expected/import-surfaces.json`);
+  const expected = JSON.parse(await readFile(`${HERE}expected/import-surfaces.json`, "utf8"));
+  const actualComparable = comparable(results);
+  const expectedComparable = Object.fromEntries(
+    Object.entries(expected).map(([name, result]) => [name, {
+      imports: [...result.imports].sort(),
+      exports: [...result.exports].sort(),
+    }]),
+  );
+  if (JSON.stringify(sorted(actualComparable)) !== JSON.stringify(sorted(expectedComparable))) {
+    console.error(`\nFAIL feature surfaces differ from expected/import-surfaces.json`);
+    console.error(`Wrote ${HERE}actual-import-surfaces.json for inspection`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`\nPASS all feature surfaces match expected/import-surfaces.json`);
 }
 
 await main();

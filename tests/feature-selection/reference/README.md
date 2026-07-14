@@ -58,8 +58,8 @@ node probe.mjs /path/to/wasm-tools   # defaults to `wasm-tools` on PATH
 ```
 
 This writes `actual-import-surfaces.json` (gitignored scratch output) next
-to this README; diff it against `expected/import-surfaces.json` to check for
-drift (e.g. after a ComponentizeJS version bump). The checked-in
+to this README, compares it with `expected/import-surfaces.json`, and exits
+nonzero on drift (e.g. after a ComponentizeJS version bump). The checked-in
 `expected/import-surfaces.json` was captured against the pinned `0.21.0`
 release and is believed stable, since it reflects the (fixed, pinned) npm
 release's own WASI-closure construction, not anything about StarlingMonkey.

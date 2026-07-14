@@ -45,6 +45,8 @@ tests/compat/
                           # Wasmtime; see runtime/README.md
   reference/              # explicitly opt-in ComponentizeJS reference mode
                           # (requires Node.js >= 22.12); see reference/README.md
+    contracts/            # executable 0.21 target contract for behavior not
+                          # implemented by both pipelines yet
 ```
 
 ## Two harness modes: structural (fast) vs runtime (real bridge)
@@ -147,6 +149,12 @@ It requires Node.js >= 22.12 and a Rust toolchain (`cargo`), is never
 invoked by the normal build/test flow, and must be run manually via one
 deterministic command: `cd reference && npm install && node
 run-reference.mjs`. See `reference/README.md`.
+
+`reference/contracts/run.mjs` separately freezes namespace topology, exact
+option shapes, wide-flags limits, root imports, resources, canonical async
+support, CLI/API options, and AOT behavior. These target-contract probes stay
+outside `manifest.json` until both implementations support the behavior being
+compared.
 
 ## Known deviations
 

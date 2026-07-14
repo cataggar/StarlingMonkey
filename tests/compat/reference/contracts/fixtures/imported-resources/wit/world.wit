@@ -1,0 +1,16 @@
+package contract:imported-resources@0.1.0;
+
+interface host {
+  resource counter {
+    constructor(initial: u32);
+    increment: func(by: u32) -> u32;
+    value: func() -> u32;
+  }
+
+  read: func(value: borrow<counter>) -> u32;
+}
+
+world probe {
+  import host;
+  export use-counter: func(initial: u32) -> u32;
+}

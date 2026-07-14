@@ -192,6 +192,23 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
                 other => anyhow::bail!("result tag must be 'ok' or 'err', got '{}'", other),
             }
         }
+        // Contract probes need to distinguish option<option<T>>::none from
+        // option<option<T>>::some(none), which plain JSON null cannot do.
+        // Keep null as the legacy shorthand and accept an explicit tagged
+        // form for nested option inputs.
+        (Type::Option(_), J::Object(obj))
+            if obj.get("$option").and_then(J::as_str) == Some("none") =>
+        {
+            Val::Option(None)
+        }
+        (Type::Option(opt_ty), J::Object(obj))
+            if obj.get("$option").and_then(J::as_str) == Some("some") =>
+        {
+            let inner = obj
+                .get("value")
+                .context("tagged option some-case requires a 'value' field")?;
+            Val::Option(Some(Box::new(json_to_val(&opt_ty.ty(), inner)?)))
+        }
         (Type::Option(_), J::Null) => Val::Option(None),
         (Type::Option(opt_ty), v) => Val::Option(Some(Box::new(json_to_val(&opt_ty.ty(), v)?))),
         (ty, v) => anyhow::bail!("unsupported type/value combination: {:?} / {}", ty, v),

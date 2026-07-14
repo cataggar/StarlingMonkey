@@ -1,0 +1,305 @@
+{
+  "aot": {
+    "calls": [
+      {
+        "ok": true,
+        "value": 42
+      }
+    ],
+    "status": "ok",
+    "surface": {
+      "exports": [
+        "contract:namespace/api@0.1.0"
+      ],
+      "imports": []
+    }
+  },
+  "asyncFunction": {
+    "error": {
+      "category": "canonical-async-function-unsupported",
+      "class": "RuntimeError"
+    },
+    "status": "error"
+  },
+  "cli": {
+    "apiOptions": [
+      "aotCache",
+      "debug",
+      "debugBuild",
+      "disableFeatures",
+      "enableAot",
+      "enableFeatures",
+      "engine",
+      "env",
+      "preview2Adapter",
+      "runtimeArgs",
+      "sourcePath",
+      "wevalBin",
+      "witPath",
+      "wizerBin",
+      "worldName"
+    ],
+    "cliOptions": [
+      "--aot",
+      "--aot-cache-dir",
+      "--aot-min-stack-size",
+      "--debug-bindings",
+      "--disable",
+      "--enable-wizer-logging",
+      "--engine",
+      "--help",
+      "--out",
+      "--preview2-adapter",
+      "--runtime-args",
+      "--use-debug-build",
+      "--version",
+      "--weval-bin",
+      "--wit",
+      "--wizer-bin",
+      "--world-name"
+    ],
+    "debugOptions": [
+      "binary",
+      "binaryPath",
+      "bindings",
+      "bindingsDir",
+      "wizerLogging"
+    ],
+    "moduleExports": [
+      "DEFAULT_FEATURES",
+      "componentize",
+      "version"
+    ],
+    "status": "ok",
+    "version": "0.21.0"
+  },
+  "componentizejsVersion": "0.21.0",
+  "contractVersion": 1,
+  "flags": {
+    "32": {
+      "calls": [
+        {
+          "ok": true,
+          "value": [
+            "flag-a31"
+          ]
+        },
+        {
+          "ok": true,
+          "value": {
+            "first": true,
+            "last": true,
+            "set-count": 2
+          }
+        }
+      ],
+      "status": "ok",
+      "surface": {
+        "exports": [
+          "describe32: func(value: flags32) -> observation",
+          "echo32: func(value: flags32) -> flags32"
+        ],
+        "imports": []
+      }
+    },
+    "33": {
+      "error": {
+        "category": "flags-over-32-unsupported",
+        "class": "ComponentError"
+      },
+      "status": "error"
+    },
+    "64": {
+      "error": {
+        "category": "flags-over-32-unsupported",
+        "class": "ComponentError"
+      },
+      "status": "error"
+    },
+    "65": {
+      "error": {
+        "category": "flags-over-32-unsupported",
+        "class": "ComponentError"
+      },
+      "status": "error"
+    }
+  },
+  "future": {
+    "error": {
+      "category": "canonical-future-unsupported",
+      "class": "RuntimeError"
+    },
+    "status": "error"
+  },
+  "namespace": {
+    "flat": {
+      "error": {
+        "category": "missing-interface-namespace",
+        "class": "Error"
+      },
+      "status": "error"
+    },
+    "positive": {
+      "calls": [
+        {
+          "ok": true,
+          "value": 42
+        }
+      ],
+      "status": "ok",
+      "surface": {
+        "exports": [
+          "contract:namespace/api@0.1.0"
+        ],
+        "imports": []
+      }
+    }
+  },
+  "options": {
+    "calls": [
+      {
+        "ok": true,
+        "value": "undefined"
+      },
+      {
+        "ok": true,
+        "value": [
+          "undefined",
+          "undefined",
+          "value"
+        ]
+      },
+      {
+        "ok": true,
+        "value": {
+          "has-val": false,
+          "kind": "none",
+          "value-shape": "missing"
+        }
+      },
+      {
+        "ok": true,
+        "value": {
+          "has-val": true,
+          "kind": "some",
+          "value-shape": "undefined"
+        }
+      },
+      {
+        "ok": true,
+        "value": {
+          "has-val": true,
+          "kind": "some",
+          "value-shape": "value"
+        }
+      },
+      {
+        "ok": true,
+        "value": null
+      },
+      {
+        "ok": true,
+        "value": null
+      }
+    ],
+    "status": "ok",
+    "surface": {
+      "exports": [
+        "aggregate-shapes: func(value: aggregate) -> list<string>",
+        "direct-shape: func(value: option<u32>) -> string",
+        "lower-null: func() -> option<u32>",
+        "lower-undefined: func() -> option<u32>",
+        "nested-shape: func(value: option<option<u32>>) -> nested-observation"
+      ],
+      "imports": []
+    }
+  },
+  "resources": {
+    "exported": {
+      "declarations": [
+        "borrow-value: func(value: borrow<counter>) -> u32;",
+        "constructor(initial: u32);",
+        "from-double: static func(value: u32) -> counter;",
+        "increment: func(by: u32) -> u32;",
+        "resource counter {",
+        "take-value: func(value: counter) -> u32;",
+        "value: func() -> u32;"
+      ],
+      "surface": {
+        "exports": [
+          "contract:resources/api@0.1.0"
+        ],
+        "imports": []
+      }
+    },
+    "imported": {
+      "apiImports": [
+        [
+          "contract:imported-resources/host@0.1.0",
+          "read"
+        ],
+        [
+          "contract:imported-resources/host@0.1.0",
+          "[constructor]counter"
+        ],
+        [
+          "contract:imported-resources/host@0.1.0",
+          "[method]counter.increment"
+        ],
+        [
+          "contract:imported-resources/host@0.1.0",
+          "[method]counter.value"
+        ],
+        [
+          "contract:imported-resources/host@0.1.0",
+          "[resource-drop]counter"
+        ]
+      ],
+      "declarations": [
+        "constructor(initial: u32);",
+        "increment: func(by: u32) -> u32;",
+        "read: func(value: borrow<counter>) -> u32;",
+        "resource counter {",
+        "value: func() -> u32;"
+      ],
+      "surface": {
+        "exports": [
+          "use-counter: func(initial: u32) -> u32"
+        ],
+        "imports": [
+          "contract:imported-resources/host@0.1.0"
+        ]
+      }
+    },
+    "status": "ok"
+  },
+  "rootImport": {
+    "apiImports": [
+      [
+        "add-one",
+        "default"
+      ]
+    ],
+    "status": "ok",
+    "surface": {
+      "exports": [
+        "call-root: func(value: u32) -> u32"
+      ],
+      "imports": [
+        "add-one: func(value: u32) -> u32"
+      ]
+    }
+  },
+  "stream": {
+    "error": {
+      "category": "canonical-stream-unsupported",
+      "class": "RuntimeError"
+    },
+    "status": "error"
+  },
+  "tools": {
+    "node": "22.12.0",
+    "wasmTools": "wasm-tools 1.235.0 (e26d5ebea 2025-06-13)",
+    "weval": "weval 0.4.1"
+  }
+}

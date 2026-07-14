@@ -1,0 +1,6 @@
+package contract:root@0.1.0;
+
+world probe {
+  import add-one: func(value: u32) -> u32;
+  export call-root: func(value: u32) -> u32;
+}

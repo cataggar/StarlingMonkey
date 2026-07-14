@@ -67,6 +67,7 @@ tests/compat/reference/node_modules/
 tests/compat/reference/.jco-out/
 tests/compat/reference/.node-cache/
 tests/compat/reference/.component-cache/
+tests/compat/reference/contracts/.scratch/
 
 # Feature-selection (cataggar/StarlingMonkey#6 Phase 6): the opt-in
 # ComponentizeJS reference probe's Node.js dependencies/scratch output, and
@@ -84,4 +85,3 @@ tests/feature-selection/.build/
 tests/compat/runtime/.wabt-cache/
 tests/compat/runtime/.cache/
 tests/compat/runtime/invoker/target/
-

@@ -1,0 +1,17 @@
+package contract:resources@0.1.0;
+
+interface api {
+  resource counter {
+    constructor(initial: u32);
+    from-double: static func(value: u32) -> counter;
+    increment: func(by: u32) -> u32;
+    value: func() -> u32;
+  }
+
+  borrow-value: func(value: borrow<counter>) -> u32;
+  take-value: func(value: counter) -> u32;
+}
+
+world probe {
+  export api;
+}

@@ -1,0 +1,19 @@
+package contract:options@0.1.0;
+
+world probe {
+  record aggregate {
+    direct: option<u32>,
+    items: list<option<u32>>,
+  }
+  record nested-observation {
+    kind: string,
+    has-val: bool,
+    value-shape: string,
+  }
+
+  export direct-shape: func(value: option<u32>) -> string;
+  export aggregate-shapes: func(value: aggregate) -> list<string>;
+  export nested-shape: func(value: option<option<u32>>) -> nested-observation;
+  export lower-null: func() -> option<u32>;
+  export lower-undefined: func() -> option<u32>;
+}
