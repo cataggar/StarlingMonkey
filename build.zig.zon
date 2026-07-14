@@ -10,22 +10,22 @@
     .dependencies = .{
         .binaryen = .{
             .url = "https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz",
-            .hash = "N-V-__8AADnP4RI-nJiN3GhgftX3jprhTXMo1ddBLDfb6fCV",
+            .hash = "N-V-__8AADnP4RLTHueblJvHO_umKT0px7N7v0VWFBu-o0MK",
             .lazy = true,
         },
         .@"wasm-tools" = .{
             .url = "https://github.com/bytecodealliance/wasm-tools/releases/download/v1.235.0/wasm-tools-1.235.0-x86_64-linux.tar.gz",
-            .hash = "N-V-__8AACbjNwEv1iqZzcX1Qz8UAMhdgq7JN5ES-HSQrxML",
+            .hash = "N-V-__8AACbjNwH7u3Z4JI3s4jFc9AynPC1AM0jb5MMubpXt",
             .lazy = true,
         },
         .weval = .{
             .url = "https://github.com/bytecodealliance/weval/releases/download/v0.4.1/weval-v0.4.1-x86_64-linux.tar.xz",
-            .hash = "N-V-__8AAEenqwHFOFkilUp1QXeqpfqbvC3eRiCpOT4TYSsT",
+            .hash = "N-V-__8AAEenqwEbgblk_u10bu6PFSSAfv0wdz86DwvEExu5",
             .lazy = true,
         },
         .wasmtime = .{
             .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v42.0.1/wasmtime-v42.0.1-x86_64-linux.tar.xz",
-            .hash = "N-V-__8AAA3KCgTdVORHX_BFrwyIyjWq-cr8fhr9WEOCLhtU",
+            .hash = "N-V-__8AAA3KCgQaOf7fOhpQGN_vZKVJxFxqR_n1pGn2Z0S9",
             .lazy = true,
         },
         .wasip3 = .{

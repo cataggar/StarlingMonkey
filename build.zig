@@ -196,7 +196,7 @@ pub fn build(b: *std.Build) void {
     if (use_wasm_opt and !is_debug) {
         if (b.lazyDependency("binaryen", .{})) |bin_dep| {
             const wo = std.Build.Step.Run.create(b, "wasm-opt");
-            wo.addFileArg(bin_dep.path("binaryen-version_123/bin/wasm-opt"));
+            wo.addFileArg(bin_dep.path("bin/wasm-opt"));
             wo.addArgs(&.{
                 "--strip-debug",                     "-O3",
                 "--enable-bulk-memory",              "--enable-bulk-memory-opt",
@@ -231,11 +231,11 @@ pub fn build(b: *std.Build) void {
     // componentize.sh references the tools via `$(dirname "$0")/…`, so install them
     // alongside it (relocatable, mirrors the CMake build directory layout).
     if (b.lazyDependency("wasm-tools", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasm-tools-1.235.0-x86_64-linux/wasm-tools"), "wasm-tools").step);
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasm-tools"), "wasm-tools").step);
     if (b.lazyDependency("wasmtime", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasmtime-v42.0.1-x86_64-linux/wasmtime"), "wasmtime").step);
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasmtime"), "wasmtime").step);
     if (b.lazyDependency("weval", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval-v0.4.1-x86_64-linux/weval"), "weval").step);
+        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval"), "weval").step);
 
     const componentize_sh = renderComponentizeScript(b, component_world);
     const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
@@ -267,7 +267,7 @@ pub fn build(b: *std.Build) void {
     smoke_run.step.dependOn(b.getInstallStep());
     if (b.lazyDependency("wasm-tools", .{})) |d| {
         const validate = std.Build.Step.Run.create(b, "validate smoke component");
-        validate.addFileArg(d.path("wasm-tools-1.235.0-x86_64-linux/wasm-tools"));
+        validate.addFileArg(d.path("wasm-tools"));
         validate.addArgs(&.{ "validate", "--features", "all" });
         validate.addFileArg(smoke_out);
         validate.step.dependOn(&smoke_run.step);
