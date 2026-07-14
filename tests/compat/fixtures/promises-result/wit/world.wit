@@ -1,4 +1,4 @@
-package compat:promises-result;
+package starling:js;
 
 // Integration fixture (feat/js-bridge-parity-integration): async
 // (Promise-returning) counterparts to advanced-types' `divide`/
@@ -18,7 +18,11 @@ package compat:promises-result;
 // for the same reason as 'promises-rejected'/'promises-deadlock' (a
 // trapped Wasmtime component instance is poisoned for further calls in
 // the same store).
+interface api {
+   divide-async: func(a: u32, b: u32) -> result<u32, string>;
+   checked-negate-async: func(value: s32) -> result<s32>;
+}
+
 world js-exports {
-  export divide-async: func(a: u32, b: u32) -> result<u32, string>;
-  export checked-negate-async: func(value: s32) -> result<s32>;
+  export api;
 }

@@ -12,7 +12,7 @@
 // matches E (here, a raw string) lowers as Err(reason) -- exactly like a
 // synchronous throw of that same string would (see advanced-types'
 // `divide`), not a hard dispatch failure.
-export async function divideAsync(a, b) {
+async function divideAsync(a, b) {
   if (b === 0) {
     return Promise.reject("division by zero");
   }
@@ -23,9 +23,11 @@ export async function divideAsync(a, b) {
 // never inspects the rejection reason's shape at all when E is void, so
 // *any* reason -- even a plain object, as used here -- becomes a bare
 // Err() with no payload.
-export async function checkedNegateAsync(value) {
+async function checkedNegateAsync(value) {
   if (value === -2147483648) {
     return Promise.reject({ note: "shape is irrelevant when E is void" });
   }
   return -value;
 }
+
+export const api = { divideAsync, checkedNegateAsync };

@@ -77,14 +77,14 @@ std::string kebab_to_camel_case(std::string_view kebab) {
   return out;
 }
 
-// Shared by both the JSON and the typed-native bridge: looks up
-// `<top-level module>[function_name]` (the bare WIT function name, taken
-// verbatim from after the last '#' of the qualified export name -- e.g.
-// "starling:js/api#big-add" -> "big-add"; a module can expose that literal
-// (non-identifier) name via `export { impl as "big-add" }`, or, matching
-// ComponentizeJS, a camelCase identifier export like `export function
-// bigAdd(...)`). Assumes `cx` is valid and its realm has already been
-// entered by the caller.
+// Shared by both dispatch bridges. WABT names root-function exports with
+// their bare WIT name and interface functions as
+// `<package>/<interface>[@version]#<function>`. Root functions are resolved
+// directly on the module namespace. Interface functions are resolved
+// through the matching JavaScript namespace object, e.g.
+// `starling:js/api#big-add` -> `module.api.bigAdd`. This is the
+// ComponentizeJS 0.21 export contract; an interface function must never
+// fall back to a same-named flat module export.
 bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
                              const uint8_t *export_name_ptr, size_t export_name_len,
                              const char **error_context, std::string *out_function_name) {
@@ -101,6 +101,48 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
       separator == std::string_view::npos ? export_name : export_name.substr(separator + 1));
 
   JS::RootedObject namespace_object(cx, &module_namespace.toObject());
+  if (separator != std::string_view::npos) {
+    std::string_view interface_id = export_name.substr(0, separator);
+    size_t slash = interface_id.rfind('/');
+    std::string_view interface_name =
+        slash == std::string_view::npos ? interface_id : interface_id.substr(slash + 1);
+    size_t version = interface_name.find('@');
+    if (version != std::string_view::npos) {
+      interface_name = interface_name.substr(0, version);
+    }
+    if (interface_name.empty() || function_name.empty()) {
+      JS_ReportErrorASCII(cx, "invalid qualified JavaScript export name");
+      *error_context = "parsing a qualified JavaScript module export";
+      return false;
+    }
+
+    std::string interface_lookup(interface_name);
+    bool has_interface = false;
+    if (!JS_HasProperty(cx, namespace_object, interface_lookup.c_str(), &has_interface)) {
+      *error_context = "resolving a JavaScript interface namespace";
+      return false;
+    }
+    if (!has_interface) {
+      JS_ReportErrorUTF8(cx, "JavaScript module does not export an '%s' interface namespace",
+                         interface_lookup.c_str());
+      *error_context = "resolving a JavaScript interface namespace";
+      return false;
+    }
+
+    JS::RootedValue interface_value(cx);
+    if (!JS_GetProperty(cx, namespace_object, interface_lookup.c_str(), &interface_value)) {
+      *error_context = "resolving a JavaScript interface namespace";
+      return false;
+    }
+    if (!interface_value.isObject()) {
+      JS_ReportErrorUTF8(cx, "JavaScript module export '%s' is not an interface namespace object",
+                         interface_lookup.c_str());
+      *error_context = "resolving a JavaScript interface namespace";
+      return false;
+    }
+    namespace_object = &interface_value.toObject();
+  }
+
   std::string lookup_name = function_name;
   std::string camel_name = kebab_to_camel_case(function_name);
   if (camel_name != function_name) {

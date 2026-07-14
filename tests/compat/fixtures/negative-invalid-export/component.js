@@ -2,4 +2,6 @@
 // function, even though the WIT world declares it as `func`.
 //
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0).
-export const phantom = 42;
+const phantom = 42;
+
+export const api = { phantom };

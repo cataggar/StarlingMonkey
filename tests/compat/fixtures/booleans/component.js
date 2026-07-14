@@ -3,18 +3,20 @@
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0). Not copied
 // from ComponentizeJS; see ../../manifest.json for provenance and expected
 // value shapes.
-export function negate(value) {
+function negate(value) {
   return !value;
 }
 
-export function both(a, b) {
+function both(a, b) {
   return a && b;
 }
 
-export function either(a, b) {
+function either(a, b) {
   return a || b;
 }
 
-export function majority(a, b, c) {
+function majority(a, b, c) {
   return (a + b + c) >= 2;
 }
+
+export const api = { negate, both, either, majority };

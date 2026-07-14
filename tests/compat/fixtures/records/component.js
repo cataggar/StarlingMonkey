@@ -2,16 +2,18 @@
 // (rectangle.topleft/bottomright).
 //
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0).
-export function translate(point, dx, dy) {
+function translate(point, dx, dy) {
   return { x: point.x + dx, y: point.y + dy };
 }
 
-export function area(rect) {
+function area(rect) {
   const width = rect.bottomright.x - rect.topleft.x;
   const height = rect.bottomright.y - rect.topleft.y;
   return width * height;
 }
 
-export function identity(point) {
+function identity(point) {
   return point;
 }
+
+export const api = { translate, area, identity };

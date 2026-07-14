@@ -6,42 +6,42 @@
 // runtime_verification fields for this fixture).
 //
 // Independently authored for cataggar/StarlingMonkey#6 (sync-value-parity).
-export function echoChar(c) {
+function echoChar(c) {
   return c;
 }
 
-export function echoBytes(data) {
+function echoBytes(data) {
   return data;
 }
 
-export function bytesLen(data) {
+function bytesLen(data) {
   return data.length;
 }
 
-export function swapPair(pair) {
+function swapPair(pair) {
   return [pair[1], pair[0]];
 }
 
-export function echoDirection(d) {
+function echoDirection(d) {
   return d;
 }
 
-export function echoPerms(p) {
+function echoPerms(p) {
   return p;
 }
 
-export function echoShape(s) {
+function echoShape(s) {
   return s;
 }
 
-export function echoWrappedResult(w) {
+function echoWrappedResult(w) {
   return w;
 }
 
 // The export's own top-level return type is `result<u32, string>`:
 // ComponentizeJS's calling convention returns the Ok payload directly and
 // signals Err by throwing.
-export function divide(a, b) {
+function divide(a, b) {
   if (b === 0) {
     throw "division by zero";
   }
@@ -50,25 +50,27 @@ export function divide(a, b) {
 
 // `result<s32>` (E is void, per WIT's err-omitted shorthand): failure is
 // signaled by throwing anything at all.
-export function checkedNegate(value) {
+function checkedNegate(value) {
   if (value === -2147483648) {
     throw new Error("negating i32::MIN would overflow");
   }
   return -value;
 }
 
-export function echoMultiWordRecord(r) {
+function echoMultiWordRecord(r) {
   return r;
 }
 
-export function echoMultiWordFlags(f) {
+function echoMultiWordFlags(f) {
   return f;
 }
 
-export function echoMultiWordEnum(e) {
+function echoMultiWordEnum(e) {
   return e;
 }
 
-export function echoMultiWordVariant(v) {
+function echoMultiWordVariant(v) {
   return v;
 }
+
+export const api = { echoChar, echoBytes, bytesLen, swapPair, echoDirection, echoPerms, echoShape, echoWrappedResult, divide, checkedNegate, echoMultiWordRecord, echoMultiWordFlags, echoMultiWordEnum, echoMultiWordVariant };

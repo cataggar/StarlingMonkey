@@ -32,6 +32,8 @@
 #   * requirement 5 (versioned interface names): the fixture's import/export
 #     both use the versioned identifier `test:wit-imports/{host,api}@1.2.3`
 #     throughout.
+#   * root-function preservation: `root-add` remains a callable top-level
+#     export beside the versioned named `api` interface.
 #   * void import result contract: `note` (a WIT import with no result)
 #     surfaces to JavaScript as exactly `undefined`, and its host-side
 #     implementation's observable side effect (an incrementing counter,
@@ -152,6 +154,7 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-validate-non-negative", "args": [5]},
   {"function": "run-validate-non-negative", "args": [-1]},
 
+  {"function": "root-add", "args": [20, 22]},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -259,8 +262,10 @@ assert_field "run-checked-div err: division by zero" 30 "rec['value']" "{'tag': 
 assert_field "run-validate-non-negative ok (void payload, no 'val' key)" 31 "rec['value']" "{'tag': 'ok'}"
 assert_field "run-validate-non-negative err: negative value rejected" 32 "rec['value']" "{'tag': 'err', 'val': 'value is negative'}"
 
-assert_field "run-boom host trap propagates" 33 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 33 \
+assert_field "root function export remains callable beside the api namespace" 33 "rec['value']" "42"
+
+assert_field "run-boom host trap propagates" 34 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 34 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"

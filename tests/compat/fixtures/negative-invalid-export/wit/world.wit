@@ -1,7 +1,11 @@
-package compat:negative-invalid-export;
+package starling:js;
 
 // Phase 0 negative fixture: the world declares `phantom` as a function, but
 // component.js exports a non-function value under that name.
+interface api {
+   phantom: func() -> u32;
+}
+
 world js-exports {
-  export phantom: func() -> u32;
+  export api;
 }

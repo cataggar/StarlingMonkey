@@ -15,13 +15,12 @@ regardless.
 ## What it does, per fixture
 
 1. **Generate a full WIT closure** (`../lib/gen_bridge_wit.py`): each
-   fixture's `wit/world.wit` declares its exports directly on the world
-   (see manifest.json's `interface-export-flattening` known deviation).
-   This script rewrites that into `interface api { ... } world js-exports {
-   export api; }` and splices it into a copy of
+   fixture already declares the exact `package starling:js; interface api {
+   ... } world js-exports { export api; }` topology used by both pipelines.
+   The script copies it unchanged into
    `host-apis/wasi-0.2.10/wit` (the full WASI 0.2.10 closure StarlingMonkey's
    `js-dispatch` world already imports and exports `starling:js/api` from),
-   without modifying the original fixture files.
+   without flattening or rewriting the interface.
 2. **Build the reactor**: `zig build -Doptimize=ReleaseSmall
    -Dcomponent-wit=<generated> -Dcomponent-world=js-dispatch
    -Ddispatch-wit=<generated>/deps/starling-js -Ddispatch-world=js-exports
@@ -31,7 +30,8 @@ regardless.
    fixture's `component.js`, using a `wabt` binary built by
    `build-wabt.sh` (see below).
 4. **Validate**: `wasm-tools validate` on the componentized output.
-5. **Invoke**: run every declared case/sequence through `invoker`
+5. **Invoke**: require the exact `starling:js/api` component export, then
+   run every declared case/sequence through `invoker`
    (`compat-invoker`), instantiating the component once per fixture and
    calling each export in the manifest's declared order (required for the
    `repeated-calls` fixture's module-level state to be observable the way

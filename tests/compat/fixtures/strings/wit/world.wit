@@ -1,9 +1,13 @@
-package compat:strings;
+package starling:js;
 
 // Phase 0 compatibility fixture: string arguments/results, including empty and
 // multi-byte/astral Unicode content.
+interface api {
+   identity: func(value: string) -> string;
+   concat: func(a: string, b: string) -> string;
+   length: func(value: string) -> u32;
+}
+
 world js-exports {
-  export identity: func(value: string) -> string;
-  export concat: func(a: string, b: string) -> string;
-  export length: func(value: string) -> u32;
+  export api;
 }

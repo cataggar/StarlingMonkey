@@ -233,4 +233,5 @@ interface api {
 world js-exports {
     import host;
     export api;
+    export root-add: func(a: u32, b: u32) -> u32;
 }

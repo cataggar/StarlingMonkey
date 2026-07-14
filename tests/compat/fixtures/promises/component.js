@@ -4,11 +4,11 @@
 //
 // Independently authored for cataggar/StarlingMonkey#6 (promise-sync phase).
 
-export function resolveadd(a, b) {
+function resolveadd(a, b) {
   return Promise.resolve(a + b);
 }
 
-export async function asyncadd(a, b) {
+async function asyncadd(a, b) {
   // Nested awaits force a multi-hop microtask chain rather than a single
   // resolved-promise tick, exercising js::RunJobs being driven more than
   // once by EventLoop::pump_until_promise_settled.
@@ -17,7 +17,7 @@ export async function asyncadd(a, b) {
   return left + right;
 }
 
-export function thenableadd(a, b) {
+function thenableadd(a, b) {
   // Not a real Promise instance -- a duck-typed thenable object, matching
   // the JS spec's PromiseResolve/then-chaining semantics that
   // resolve_promise_like reuses via JS::NewPromiseObject + JS::ResolvePromise
@@ -29,14 +29,14 @@ export function thenableadd(a, b) {
   };
 }
 
-export function timeoutadd(a, b) {
+function timeoutadd(a, b) {
   return new Promise((resolve) => {
     setTimeout(() => resolve(a + b), 0);
   });
 }
 
 let lastNotified = "";
-export async function asyncnotify(message) {
+async function asyncnotify(message) {
   // No console.log: only asserts on module-level state, avoiding a
   // stdio-related trap seen in some sandboxed wasmtime CLI invocations
   // when a guest writes to stderr/stdout (see
@@ -45,13 +45,15 @@ export async function asyncnotify(message) {
   lastNotified = message;
 }
 
-export function resolvepoint(p, dx, dy) {
+function resolvepoint(p, dx, dy) {
   return Promise.resolve({ x: p.x + dx, y: p.y + dy });
 }
 
 let asyncCalls = 0;
-export async function asyncincrement() {
+async function asyncincrement() {
   await Promise.resolve();
   asyncCalls += 1;
   return asyncCalls;
 }
+
+export const api = { resolveadd, asyncadd, thenableadd, timeoutadd, asyncnotify, resolvepoint, asyncincrement };

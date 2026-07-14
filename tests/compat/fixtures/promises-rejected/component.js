@@ -3,6 +3,8 @@
 //
 // Independently authored for cataggar/StarlingMonkey#6 (promise-sync phase).
 
-export async function reject() {
+async function reject() {
   throw new Error("promises-rejected: reject always rejects");
 }
+
+export const api = { reject };

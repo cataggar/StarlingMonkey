@@ -3,22 +3,24 @@
 // reference and the real StarlingMonkey bridge.
 //
 // Independently authored for cataggar/StarlingMonkey#6 (sync-value-parity).
-export function bigAdd(a, b) {
+function bigAdd(a, b) {
   return a + b;
 }
 
-export function bigSub(a, b) {
+function bigSub(a, b) {
   return a - b;
 }
 
-export function labelId(label, id) {
+function labelId(label, id) {
   return { label, id };
 }
 
-export function maybeBig(value) {
+function maybeBig(value) {
   return value == null ? null : value + 1n;
 }
 
-export function sumList(values) {
+function sumList(values) {
   return values.reduce((acc, v) => acc + v, 0n);
 }
+
+export const api = { bigAdd, bigSub, labelId, maybeBig, sumList };

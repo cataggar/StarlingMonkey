@@ -1,4 +1,4 @@
-package compat:options;
+package starling:js;
 
 // Phase 0 compatibility fixture: option<T> arguments/results for a numeric,
 // string and record payload. See manifest.json known_deviations
@@ -6,13 +6,17 @@ package compat:options;
 // Zig/WABT JSON bridge (JS `null`) and the pinned ComponentizeJS reference
 // (JS `undefined`); this fixture's JS is written portably (`== null`) so the
 // same source produces matching observable behavior under both.
-world js-exports {
+interface api {
   record point {
     x: s32,
     y: s32,
   }
 
-  export maybenumber: func(value: option<u32>) -> option<u32>;
-  export maybestring: func(value: option<string>) -> option<string>;
-  export maybepoint: func(value: option<point>) -> option<point>;
+   maybenumber: func(value: option<u32>) -> option<u32>;
+   maybestring: func(value: option<string>) -> option<string>;
+   maybepoint: func(value: option<point>) -> option<point>;
+}
+
+world js-exports {
+  export api;
 }
