@@ -2,6 +2,7 @@
 
 #include "extension-api.h"
 #include "decode.h"
+#include "encode.h"
 
 #include "js/Array.h"
 #include "js/BigInt.h"
@@ -359,13 +360,12 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
   }
   if (v.isString()) {
     JS::RootedString str(cx, v.toString());
-    JS::UniqueChars utf8(JS_EncodeStringToUTF8(cx, str));
-    if (!utf8) {
+    auto utf8 = core::encode(cx, str);
+    if (!utf8.ptr) {
       return false;
     }
-    size_t len = std::strlen(utf8.get());
-    const uint8_t *bytes = arena.copy_bytes(utf8.get(), len);
-    *out = {.tag = STARLING_JS_STRING, .str_ptr = bytes, .str_len = len};
+    const uint8_t *bytes = arena.copy_bytes(utf8.ptr.get(), utf8.len);
+    *out = {.tag = STARLING_JS_STRING, .str_ptr = bytes, .str_len = utf8.len};
     return true;
   }
   if (v.isObject()) {
@@ -421,13 +421,12 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
         return false;
       }
       JS::RootedString name_str(cx, id.toString());
-      JS::UniqueChars name_utf8(JS_EncodeStringToUTF8(cx, name_str));
-      if (!name_utf8) {
+      auto name_utf8 = core::encode(cx, name_str);
+      if (!name_utf8.ptr) {
         return false;
       }
-      size_t name_len = std::strlen(name_utf8.get());
-      fields[n++] = {.name_ptr = arena.copy_bytes(name_utf8.get(), name_len),
-                     .name_len = name_len,
+      fields[n++] = {.name_ptr = arena.copy_bytes(name_utf8.ptr.get(), name_utf8.len),
+                     .name_len = name_utf8.len,
                      .value = nested};
     }
     *out = {.tag = STARLING_JS_RECORD, .fields_ptr = fields, .fields_len = n};

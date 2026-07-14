@@ -36,6 +36,7 @@ interface api {
     id: u64,
   }
   label-id: func(label: string, id: u64) -> labeled-id;
+  nul-label: func(id: u64) -> labeled-id;
 
   // Optional 64-bit round trips (both `some` and `none`), decoded from the
   // "bare tag, no option_some wrapper" shape that decode_from_js actually

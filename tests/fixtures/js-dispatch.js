@@ -46,6 +46,11 @@ function labelIdImpl(label, id) {
 }
 export { labelIdImpl as "label-id" };
 
+function nulLabelImpl(id) {
+  return { label: "a\0b", id };
+}
+export { nulLabelImpl as "nul-label" };
+
 // Optional 64-bit round trips, both present and absent.
 function maybeBigImpl(value) {
   return value === null ? null : value + 1n;

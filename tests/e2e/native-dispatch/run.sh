@@ -111,6 +111,9 @@ expect_eq "tag-point nested record + u64" \
 expect_eq "label-id record(string, u64) -- UAF regression" \
   'label-id("hi", 18446744073709551615)' \
   '{label: "hi-tagged", id: 18446744073709551615}'
+expect_eq "nul-label preserves embedded NUL bytes" \
+  "nul-label(1)" \
+  '{label: "a\u{0}b", id: 1}'
 
 # --- Optional i64/u64 some/none --------------------------------------------
 expect_eq "maybe-big none" "maybe-big(none)" "none"
