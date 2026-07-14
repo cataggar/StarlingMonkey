@@ -121,6 +121,18 @@ WABT=/path/to/wabt zig-out/bin/componentize.sh app.js -o app.wasm
 zig-out/bin/wasmtime run -S http --invoke 'add(2, 3)' app.wasm
 ```
 
+SpiderMonkey's garbage-collected heap has a 1 GiB ceiling by default. This is
+only a limit; it does not reserve or commit 1 GiB when the context is created.
+Constrained hosts can lower it while componentizing:
+
+```console
+zig-out/bin/componentize.sh --js-heap-limit-mib 256 app.js -o app.wasm
+```
+
+Runtime-evaluated components can set the same option through their WASI
+arguments or `STARLINGMONKEY_CONFIG`. Values must be whole MiB in the range
+1–4095.
+
 The JavaScript bridge currently supports synchronous JSON-representable
 primitives, strings, lists, records, options, and functions without a result.
 Promise results are rejected.

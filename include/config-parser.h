@@ -104,6 +104,14 @@ public:
           config_->init_location = mozilla::Some(args[i + 1]);
           i++;
         }
+      } else if (args[i] == "--js-heap-limit-mib") {
+        if (i + 1 >= args.size() ||
+            !parse_js_heap_limit_mib(args[i + 1], &config_->js_heap_limit_bytes)) {
+          std::cerr << "Invalid --js-heap-limit-mib value: expected an integer from 1 to "
+                    << std::numeric_limits<uint32_t>::max() / BYTES_PER_MIB << std::endl;
+          exit(1);
+        }
+        i++;
       } else if (args[i].starts_with("--")) {
         std::cerr << "Unknown option: " << args[i] << std::endl;
         exit(1);

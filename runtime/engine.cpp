@@ -304,7 +304,7 @@ bool create_initializer_global(Engine *engine) {
 bool init_js(const EngineConfig& config) {
   JS_Init();
 
-  JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes);
+  JSContext *cx = JS_NewContext(config.js_heap_limit_bytes);
   if (!cx) {
     return false;
   }

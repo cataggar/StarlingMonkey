@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "builtin.h"
+#include "heap-limit.h"
 #include "jsapi.h"
 #include "mozilla/WeakPtr.h"
 
@@ -29,6 +30,7 @@ namespace api {
 class AsyncTask;
 
 struct EngineConfig {
+  uint32_t js_heap_limit_bytes = starling::DEFAULT_JS_HEAP_LIMIT_BYTES;
   mozilla::Maybe<std::string> content_script_path = mozilla::Nothing();
   mozilla::Maybe<std::string> content_script = mozilla::Nothing();
   mozilla::Maybe<std::string> path_prefix = mozilla::Nothing();

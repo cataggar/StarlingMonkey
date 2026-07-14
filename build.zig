@@ -461,6 +461,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(js_dispatch_tests).step);
+    const heap_limit_tests = b.addSystemCommand(&.{ "bash", "tests/js-heap-limit/run.sh" });
+    heap_limit_tests.addArg(b.graph.zig_exe);
+    if (b.lazyDependency("wasmtime", .{})) |d|
+        heap_limit_tests.addFileArg(d.path("wasmtime"));
+    test_step.dependOn(&heap_limit_tests.step);
     const suite = b.addSystemCommand(&.{ "bash", "tests/run-suite.sh" });
     suite.addDirectoryArg(b.graph.path(.install_prefix, "bin"));
     suite.step.dependOn(b.getInstallStep());
