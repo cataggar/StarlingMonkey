@@ -14,12 +14,30 @@
 //     surface, so `wabt component embed --world js-dispatch` gives the
 //     resulting component a genuine, Wasmtime-linkable custom import.
 //
-// `api` and `host` intentionally do NOT share the `point` record type via
-// `use` -- each declares its own nominally-independent `record point`. The
-// JS glue (run-scale in component.js) bridges between them dynamically by
-// JS object shape (`{x, y}`), which is all js_dispatch's untyped
-// encode_to_js/decode_from_js pair needs; no WIT-level type sharing across
-// interfaces is required for two interfaces to interoperate through JS.
+// `api` and `host` intentionally do NOT share types via `use` -- each
+// declares its own nominally-independent copies of every shared shape
+// (`point`, `color`, `permissions`, `shape`). The JS glue in component.js
+// bridges between them dynamically by JS value shape (object/array/string/
+// boolean), which is all js_dispatch's untyped encode_to_js/decode_from_js
+// pair needs; no WIT-level type sharing across interfaces is required for
+// two interfaces to interoperate through JS.
+//
+// Every function below is wired all the way through the reverse
+// (JS-imports) bridge using cataggar/wabt's merged `--js-imports` codegen
+// (see build.zig.zon's `.wasip3` pin): `nativeBridgeSupported` in
+// build/bindgen/component_bindgen.zig accepts every WIT type used here
+// (bool/integers/f32/f64/char/string/option<T>/list<T> (including a direct
+// `list<u8>`, bridged as `wit_types.ByteList`)/tuple/record/variant/enum/
+// flags (<=32 labels)/result<T,E>, recursively) and `lowerParams` lowers
+// every one of them (including `char` and a direct `list<u8>` parameter)
+// through the generic, reflection-based `lowerAggregateParam` path. The
+// only WIT shapes this bridge does not (and, per flags' 32-bit backing
+// representation, structurally cannot) support are resources, async
+// imports, world-level (non-interface) function imports, and a `flags`
+// type with more than 32 labels -- see tests/compat/manifest.json's
+// `wit-imports-flags-over-32-labels-unsupported` known_deviation for the
+// last of those (the only genuine remaining limitation; the other three
+// are explicit, permanent scope boundaries, not bugs).
 package test:wit-imports@1.2.3;
 
 interface host {
@@ -54,76 +72,93 @@ interface host {
     note: func();
     note-count: func() -> u32;
 
-    // -- advanced synchronous value types (integration requirement 5: WIT
-    // imports must support every synchronous type the native bridge
-    // handles for exports -- char/bytes/tuple/enum/flags/variant/result/
-    // nesting, see tests/compat/fixtures/advanced-types/ for the export
-    // side of the same type set -- everywhere WABT's `--js-imports`
-    // bindgen (cataggar/wabt) allows it). These reuse the exact same
-    // encode_to_js/decode_from_js and STARLING_JS_* tagged-value bridge as
-    // the export direction, just with the encode/decode roles reversed.
-    //
-    // Of that type set, only `list<list<u32>>` nesting is wired into this
-    // E2E fixture. Everything else the native bridge supports for exports
-    // -- `char`, `list<u8>` (bytes), `tuple`, `enum`, `flags`, `variant`,
-    // `result<T,E>` -- hits one of two real bugs in the pinned
-    // `cataggar/wabt` commit's `--js-imports` codegen, each empirically
-    // confirmed against this fixture's own `wasip3-bindgen --js-imports`
-    // invocation (and, for the second, a full `zig build`):
-    //
-    //   1. `char`/`tuple`/`enum`/`flags`/`variant`/`result<T,E>` are
-    //      rejected outright by `nativeBridgeSupported` in
-    //      component_bindgen.zig -- a conservative allow-list (bool/
-    //      integers/f32/f64/string, list/option/record recursively) written
-    //      before js_dispatch.zig grew encodeNative/decodeNative support
-    //      for those shapes (in the independently-developed
-    //      sync-value-parity branch). Its own doc comment anticipates
-    //      exactly this ("keep this in sync ... if it ever grows"). E.g.:
-    //        error: generating bindings for world 'js-exports': UnsupportedWitType
-    //          imported function '...#identity-char': parameter 'c' has a WIT
-    //          type not supported by the JS import bridge (bool/integers/f32/
-    //          f64/string/option<T>/list<T>/record only -- resource, variant,
-    //          enum, flags, tuple, result<T,E>, char, future/stream need a
-    //          further WABT phase)
-    //
-    //   2. `list<u8>` (bytes) *passes* that gate (list/option recursion
-    //      already covers a `u8` element type) but its generated import
-    //      wrapper's parameter-lowering fast path (`lowerParams`'s `.list`
-    //      arm in component_bindgen.zig) unconditionally emits `<param>.ptr`
-    //      / `<param>.len`, assuming every `list<T>` Zig-side parameter is a
-    //      bare `[]const T`. In `--dispatch` mode (the mode `--js-imports`
-    //      always runs in) `zigType()` deliberately maps `list<u8>` one
-    //      level deeper, to the wrapper struct `wit_types.ByteList = struct
-    //      { bytes: []const u8 }` (so the JS bridge can tell a byte list
-    //      apart from a bare `list<u32>`-like list at runtime -- see that
-    //      struct's own doc comment), and `lowerParams` never accounts for
-    //      that indirection. The result is a genuine Zig **compile error**
-    //      (not a generation-time rejection) as soon as any function takes
-    //      a bare `list<u8>` *parameter*: `error: no field named 'ptr' in
-    //      struct 'wit_types.ByteList'`. (`list<u8>` used only as a
-    //      *result* is unaffected: the indirect-result path lifts through
-    //      the fully-generic, reflection-based `wit_types.lift`, which
-    //      already round-trips `ByteList` correctly -- proven by this same
-    //      pinned commit's own `Char/ByteList wrappers have the same
-    //      canonical layout as their bare payload` unit test.)
-    //
-    // Both are narrow, well-understood, single-function-body fixes (no
-    // codegen redesign: `emitImportWrapper`/`emitJsImportBridge` are
-    // otherwise fully generic over the WIT type graph). A focused,
-    // fully-tested (but, per this integration's "do not push/post"
-    // constraint, unpublished) fix for both has been prepared for
-    // cataggar/wabt -- see tests/compat/manifest.json's
-    // `wit-imports-native-bridge-type-gate` known_deviation for the exact
-    // branch/commit and root-cause/fix summary.
-
     // Nesting: a `list` of `list<u32>`s, proving composite-of-composite
     // types round-trip through the reverse bridge, not just single-level
-    // types. Unlike a bare `list<u8>` (see the doc comment above this
-    // function), no element of this type is ever wrapped in `ByteList`
-    // (that wrapper only applies to a *direct* `list<u8>`, never a
-    // `list<u32>` nested inside another `list`), so neither of the two
-    // bugs described above applies here.
+    // types.
     sum-nested-lists: func(rows: list<list<u32>>) -> u32;
+
+    // -- advanced synchronous value types (integration requirement 5: WIT
+    // imports must support every synchronous type the native bridge
+    // handles for exports -- see tests/compat/fixtures/advanced-types/ for
+    // the export side of the same type set) --
+
+    // `char`: shifts the codepoint by one (proves real host computation,
+    // not a bare passthrough) and its `option<char>` counterpart (`none`
+    // stays `none`; `some` shifts the same way).
+    identity-char: func(c: char) -> char;
+    identity-option-char: func(c: option<char>) -> option<char>;
+
+    // `list<u8>` (bytes): a genuine JS `Uint8Array` on the JS side of this
+    // bridge (see component.js's shape assertion). `sum-bytes` proves a
+    // direct `list<u8>` *parameter* lowers correctly; `xor-bytes` proves a
+    // direct `list<u8>` *result* lifts correctly; `identity-optional-bytes`
+    // covers the nested/optional case (`list<u8>` inside an `option<T>`).
+    sum-bytes: func(bytes: list<u8>) -> u32;
+    xor-bytes: func(bytes: list<u8>, key: u8) -> list<u8>;
+    identity-optional-bytes: func(bytes: option<list<u8>>) -> option<list<u8>>;
+
+    // `tuple`: swaps position and type, and transforms both elements
+    // (increments the number, upper-cases the string) to prove real host
+    // computation rather than a bare positional passthrough.
+    swap-tuple: func(t: tuple<u32, string>) -> tuple<string, u32>;
+
+    // `enum`: cycles red -> green -> blue -> red, and its `option<enum>`
+    // counterpart.
+    enum color {
+        red,
+        green,
+        blue,
+    }
+    next-color: func(c: color) -> color;
+    next-option-color: func(c: option<color>) -> option<color>;
+
+    // `flags` (3 labels, well under the 32-label limit WABT's native
+    // bridge supports -- see the package doc comment's
+    // `wit-imports-flags-over-32-labels-unsupported` reference): flips
+    // every bit, and its `option<flags>` counterpart.
+    flags permissions {
+        read,
+        write,
+        execute,
+    }
+    toggle-permissions: func(p: permissions) -> permissions;
+    toggle-option-permissions: func(p: option<permissions>) -> option<permissions>;
+
+    // `variant`: one void case (`empty`) and two payload cases of
+    // different types (`circle`'s `u32`, `named`'s `string`), transformed
+    // deterministically (`empty` -> `circle(1)`; `circle(r)` ->
+    // `circle(r * 2)`; `named(s)` -> `named(s + "!")`) to prove real host
+    // computation across every case, including the void one. `u32` (not
+    // `f64`) is deliberately used for `circle`'s payload: mixing a float
+    // payload with a same-slot non-float payload in one variant hits a
+    // genuine, narrow, pre-existing bug in the pinned commit's shared
+    // `wit_types.zig` flat calling convention (`joinCore` widens the
+    // shared slot to `i64`, but neither `flatLift`/`coreSlotTo` nor
+    // `fillFlat`/`setSlot` perform the bit-reinterpretation that widening
+    // requires -- a genuine `error: canon: cannot widen f64 into i64`).
+    // This is orthogonal to cataggar/wabt PR #335 (which fixed the
+    // `--js-imports`-specific bindgen in component_bindgen.zig, not this
+    // shared runtime helper) and would affect the export direction
+    // identically for the same shape, so it is out of this integration's
+    // scope; `u32`+`string` already proves discriminant-based dispatch
+    // across heterogeneous payload types without depending on it.
+    variant shape {
+        empty,
+        circle(u32),
+        named(string),
+    }
+    identity-shape: func(s: shape) -> shape;
+
+    // `result<T, E>`: both payload (`checked-div`, dividing by zero
+    // yields `err(string)`) and a void-payload `ok` case
+    // (`validate-non-negative`, `ok` carries nothing, `err` carries the
+    // reason as a `string`) -- reverse-bridge imports never get
+    // ComponentizeJS's top-level throw-means-err calling convention (that
+    // is an *export* calling convention only; see js_dispatch.h and
+    // component.js's doc comments), so both surface to JS as the ordinary
+    // `{tag, val}` object, `val` omitted for the void `ok` case.
+    checked-div: func(a: s32, b: s32) -> result<s32, string>;
+    validate-non-negative: func(n: s32) -> result<_, string>;
 }
 
 interface api {
@@ -150,6 +185,49 @@ interface api {
     run-note-count: func() -> u32;
 
     run-sum-nested-lists: func(rows: list<list<u32>>) -> u32;
+
+    // -- advanced synchronous value types (requirement 5) --
+
+    run-char: func(c: char) -> char;
+    run-option-char: func(c: option<char>) -> option<char>;
+
+    // Asserts `bytes instanceof Uint8Array` client-side (no host call
+    // needed for the shape check itself; see component.js).
+    run-bytes-is-uint8array: func(bytes: list<u8>) -> bool;
+    run-sum-bytes: func(bytes: list<u8>) -> u32;
+    run-xor-bytes: func(bytes: list<u8>, key: u8) -> list<u8>;
+    run-optional-bytes: func(bytes: option<list<u8>>) -> option<list<u8>>;
+
+    run-swap-tuple: func(t: tuple<u32, string>) -> tuple<string, u32>;
+
+    enum color {
+        red,
+        green,
+        blue,
+    }
+    run-color: func(c: color) -> color;
+    run-option-color: func(c: option<color>) -> option<color>;
+
+    flags permissions {
+        read,
+        write,
+        execute,
+    }
+    run-permissions: func(p: permissions) -> permissions;
+    run-option-permissions: func(p: option<permissions>) -> option<permissions>;
+
+    variant shape {
+        empty,
+        circle(u32),
+        named(string),
+    }
+    run-shape: func(s: shape) -> shape;
+
+    // Top-level export return type: `result<T, E>` here DOES get
+    // ComponentizeJS's throw-means-err calling convention (unlike the
+    // `host` import direction above) -- see component.js.
+    run-checked-div: func(a: s32, b: s32) -> result<s32, string>;
+    run-validate-non-negative: func(n: s32) -> result<_, string>;
 }
 
 world js-exports {

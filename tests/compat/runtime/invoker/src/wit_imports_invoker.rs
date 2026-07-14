@@ -60,7 +60,13 @@ impl WasiHttpView for Host {
 // deliberately near-identical copies of the same-named helpers in
 // main.rs (not shared via a lib crate, so this file can evolve
 // independently without risking the reviewed compat-invoker binary). See
-// main.rs for the full rationale comments on each.
+// main.rs for the full rationale comments on each, including the JSON
+// conventions for `char`/`tuple`/`enum`/`flags`/`variant`/`result<T,E>`
+// (a direct `list<u8>` needs no special case here: at the Wasmtime `Val`
+// level it is an ordinary `Type::List`/`Val::List` of `U8`s, same as any
+// other `list<T>` -- the `Uint8Array` shape is purely a JS-side/component
+// concern, asserted in component.js, not something this invoker's JSON
+// bridge needs to know about).
 fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
     use serde_json::Value as J;
     Ok(match (ty, value) {
@@ -76,6 +82,16 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
         (Type::Float32, v) => Val::Float32(v.as_f64().context("expected f32")? as f32),
         (Type::Float64, v) => Val::Float64(v.as_f64().context("expected f64")?),
         (Type::String, J::String(s)) => Val::String(s.clone()),
+        (Type::Char, J::String(s)) => {
+            let mut chars = s.chars();
+            let c = chars
+                .next()
+                .with_context(|| format!("expected a single-character string for char, got '{}'", s))?;
+            if chars.next().is_some() {
+                anyhow::bail!("expected exactly one Unicode scalar value for char, got '{}'", s);
+            }
+            Val::Char(c)
+        }
         (Type::List(list_ty), J::Array(items)) => {
             let elem_ty = list_ty.ty();
             let mut vals = Vec::with_capacity(items.len());
@@ -93,6 +109,93 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
                 vals.push((field.name.to_string(), json_to_val(&field.ty, field_value)?));
             }
             Val::Record(vals)
+        }
+        (Type::Tuple(tuple_ty), J::Array(items)) => {
+            let elem_types: Vec<Type> = tuple_ty.types().collect();
+            if elem_types.len() != items.len() {
+                anyhow::bail!(
+                    "tuple arity mismatch: expected {} elements, got {}",
+                    elem_types.len(),
+                    items.len()
+                );
+            }
+            let mut vals = Vec::with_capacity(items.len());
+            for (elem_ty, item) in elem_types.iter().zip(items) {
+                vals.push(json_to_val(elem_ty, item)?);
+            }
+            Val::Tuple(vals)
+        }
+        (Type::Enum(enum_ty), J::String(s)) => {
+            if !enum_ty.names().any(|n| n == s) {
+                anyhow::bail!("unknown enum case '{}'", s);
+            }
+            Val::Enum(s.clone())
+        }
+        // Flags are encoded as a JSON array of the *set* flag names (order-
+        // independent), matching `Val::Flags`' own representation (a list
+        // of set names, not a full name->bool map).
+        (Type::Flags(flags_ty), J::Array(items)) => {
+            let valid: Vec<&str> = flags_ty.names().collect();
+            let mut set = Vec::with_capacity(items.len());
+            for item in items {
+                let name = item.as_str().context("expected a flag name string")?;
+                if !valid.contains(&name) {
+                    anyhow::bail!("unknown flag '{}'", name);
+                }
+                set.push(name.to_string());
+            }
+            Val::Flags(set)
+        }
+        // Variants/results are encoded uniformly as `{"tag": "<case>", "val":
+        // <payload, omitted if the case has none>}` -- a `result<T,E>` is
+        // just a 2-case variant with fixed tag names `ok`/`err`.
+        (Type::Variant(variant_ty), J::Object(obj)) => {
+            let tag = obj
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .context("variant JSON requires a string 'tag'")?;
+            let case = variant_ty
+                .cases()
+                .find(|c| c.name == tag)
+                .with_context(|| format!("unknown variant case '{}'", tag))?;
+            let payload = match case.ty {
+                Some(ty) => Some(Box::new(json_to_val(
+                    &ty,
+                    obj.get("val")
+                        .with_context(|| format!("variant case '{}' has a payload but JSON has no 'val'", tag))?,
+                )?)),
+                None => None,
+            };
+            Val::Variant(tag.to_string(), payload)
+        }
+        (Type::Result(result_ty), J::Object(obj)) => {
+            let tag = obj
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .context("result JSON requires a string 'tag' of 'ok' or 'err'")?;
+            match tag {
+                "ok" => {
+                    let payload = match result_ty.ok() {
+                        Some(ty) => Some(Box::new(json_to_val(
+                            &ty,
+                            obj.get("val").context("result ok-case has a payload but JSON has no 'val'")?,
+                        )?)),
+                        None => None,
+                    };
+                    Val::Result(Ok(payload))
+                }
+                "err" => {
+                    let payload = match result_ty.err() {
+                        Some(ty) => Some(Box::new(json_to_val(
+                            &ty,
+                            obj.get("val").context("result err-case has a payload but JSON has no 'val'")?,
+                        )?)),
+                        None => None,
+                    };
+                    Val::Result(Err(payload))
+                }
+                other => anyhow::bail!("result tag must be 'ok' or 'err', got '{}'", other),
+            }
         }
         (Type::Option(_), J::Null) => Val::Option(None),
         (Type::Option(opt_ty), v) => Val::Option(Some(Box::new(json_to_val(&opt_ty.ty(), v)?))),
@@ -121,6 +224,33 @@ fn val_to_json(val: &Val) -> serde_json::Value {
             let mut map = serde_json::Map::new();
             for (name, v) in fields {
                 map.insert(name.clone(), val_to_json(v));
+            }
+            J::Object(map)
+        }
+        Val::Tuple(items) => J::Array(items.iter().map(val_to_json).collect()),
+        Val::Enum(name) => J::String(name.clone()),
+        Val::Flags(names) => J::Array(names.iter().map(|n| J::String(n.clone())).collect()),
+        Val::Variant(tag, payload) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String(tag.clone()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
+            }
+            J::Object(map)
+        }
+        Val::Result(Ok(payload)) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String("ok".to_string()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
+            }
+            J::Object(map)
+        }
+        Val::Result(Err(payload)) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String("err".to_string()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
             }
             J::Object(map)
         }
@@ -335,11 +465,12 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
         }
     })?;
 
-    // -- advanced synchronous value types (requirement 5), scoped to what
-    // the pinned WABT's `--js-imports` bindgen currently accepts (see
+    // -- advanced synchronous value types (requirement 5): every
+    // synchronous type the native bridge supports for exports, now also
+    // wired through the reverse (JS-imports) direction -- see
     // ../../../../e2e/wit-imports/wit/deps/test-wit-imports/package.wit's
-    // doc comment for why char/list<u8>/tuple/enum/flags/variant/result
-    // are not wired in here) --
+    // doc comment for the upstream cataggar/wabt fix (PR #335) that made
+    // this possible, and component.js for the JS-side assertions --
 
     host.func_new(
         "sum-nested-lists",
@@ -360,6 +491,272 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
                 }
             }
             results[0] = Val::U32(sum);
+            Ok(())
+        },
+    )?;
+
+    // `char`/`option<char>`: shifts the codepoint by one -- proves real
+    // host computation, not a bare passthrough.
+    fn shift_char(c: char) -> char {
+        char::from_u32((c as u32).wrapping_add(1)).unwrap_or('\u{FFFD}')
+    }
+
+    host.func_new(
+        "identity-char",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Char(c) = &args[0] else {
+                return Err(wasm_err("identity-char: expected char"));
+            };
+            results[0] = Val::Char(shift_char(*c));
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "identity-option-char",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Option(opt) = &args[0] else {
+                return Err(wasm_err("identity-option-char: expected option<char>"));
+            };
+            results[0] = match opt {
+                None => Val::Option(None),
+                Some(inner) => {
+                    let Val::Char(c) = inner.as_ref() else {
+                        return Err(wasm_err("identity-option-char: expected option<char>"));
+                    };
+                    Val::Option(Some(Box::new(Val::Char(shift_char(*c)))))
+                }
+            };
+            Ok(())
+        },
+    )?;
+
+    // `list<u8>` (bytes): `sum-bytes` proves a direct `list<u8>`
+    // *parameter* lowers correctly; `xor-bytes` proves a direct `list<u8>`
+    // *result* lifts correctly; `identity-optional-bytes` covers the
+    // nested/optional case.
+    host.func_new(
+        "sum-bytes",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::List(items) = &args[0] else {
+                return Err(wasm_err("sum-bytes: expected list<u8>"));
+            };
+            let mut sum: u32 = 0;
+            for item in items {
+                let Val::U8(v) = item else {
+                    return Err(wasm_err("sum-bytes: expected list<u8> elements"));
+                };
+                sum = sum.wrapping_add(*v as u32);
+            }
+            results[0] = Val::U32(sum);
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "xor-bytes",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let (Val::List(items), Val::U8(key)) = (&args[0], &args[1]) else {
+                return Err(wasm_err("xor-bytes: expected (list<u8>, u8)"));
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Val::U8(v) = item else {
+                    return Err(wasm_err("xor-bytes: expected list<u8> elements"));
+                };
+                out.push(Val::U8(v ^ key));
+            }
+            results[0] = Val::List(out);
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "identity-optional-bytes",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Option(opt) = &args[0] else {
+                return Err(wasm_err("identity-optional-bytes: expected option<list<u8>>"));
+            };
+            results[0] = match opt {
+                None => Val::Option(None),
+                Some(inner) => {
+                    let Val::List(items) = inner.as_ref() else {
+                        return Err(wasm_err("identity-optional-bytes: expected option<list<u8>>"));
+                    };
+                    let mut reversed = items.clone();
+                    reversed.reverse();
+                    Val::Option(Some(Box::new(Val::List(reversed))))
+                }
+            };
+            Ok(())
+        },
+    )?;
+
+    // `tuple`: swaps position and type, and transforms both elements
+    // (increments the number, upper-cases the string) to prove real host
+    // computation rather than a bare positional passthrough.
+    host.func_new(
+        "swap-tuple",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Tuple(items) = &args[0] else {
+                return Err(wasm_err("swap-tuple: expected tuple<u32, string>"));
+            };
+            let [Val::U32(n), Val::String(s)] = &items[..] else {
+                return Err(wasm_err("swap-tuple: expected tuple<u32, string>"));
+            };
+            results[0] = Val::Tuple(vec![Val::String(s.to_uppercase()), Val::U32(n.wrapping_add(1))]);
+            Ok(())
+        },
+    )?;
+
+    // `enum`/`option<enum>`: cycles red -> green -> blue -> red.
+    fn next_color(c: &str) -> wasmtime::Result<&'static str> {
+        Ok(match c {
+            "red" => "green",
+            "green" => "blue",
+            "blue" => "red",
+            other => return Err(wasm_err(format!("next-color: unknown case '{other}'"))),
+        })
+    }
+
+    host.func_new(
+        "next-color",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Enum(c) = &args[0] else {
+                return Err(wasm_err("next-color: expected enum color"));
+            };
+            results[0] = Val::Enum(next_color(c)?.to_string());
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "next-option-color",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Option(opt) = &args[0] else {
+                return Err(wasm_err("next-option-color: expected option<color>"));
+            };
+            results[0] = match opt {
+                None => Val::Option(None),
+                Some(inner) => {
+                    let Val::Enum(c) = inner.as_ref() else {
+                        return Err(wasm_err("next-option-color: expected option<color>"));
+                    };
+                    Val::Option(Some(Box::new(Val::Enum(next_color(c)?.to_string()))))
+                }
+            };
+            Ok(())
+        },
+    )?;
+
+    // `flags`/`option<flags>` (3 labels): flips every bit.
+    const PERMISSION_LABELS: [&str; 3] = ["read", "write", "execute"];
+    fn toggle_permissions(set: &[String]) -> Vec<String> {
+        PERMISSION_LABELS
+            .iter()
+            .filter(|name| !set.iter().any(|s| s == *name))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    host.func_new(
+        "toggle-permissions",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Flags(set) = &args[0] else {
+                return Err(wasm_err("toggle-permissions: expected flags permissions"));
+            };
+            results[0] = Val::Flags(toggle_permissions(set));
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "toggle-option-permissions",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Option(opt) = &args[0] else {
+                return Err(wasm_err("toggle-option-permissions: expected option<permissions>"));
+            };
+            results[0] = match opt {
+                None => Val::Option(None),
+                Some(inner) => {
+                    let Val::Flags(set) = inner.as_ref() else {
+                        return Err(wasm_err("toggle-option-permissions: expected option<permissions>"));
+                    };
+                    Val::Option(Some(Box::new(Val::Flags(toggle_permissions(set)))))
+                }
+            };
+            Ok(())
+        },
+    )?;
+
+    // `variant` (one void case, two payload cases of different types):
+    // `empty` -> `circle(1)`; `circle(r)` -> `circle(r * 2)`; `named(s)`
+    // -> `named(s + "!")` -- exercises every case, including the void
+    // one, with a real deterministic transform. `u32` (not `f64`) is
+    // deliberately used for `circle`'s payload -- see package.wit's doc
+    // comment on the `shape` variant for why a float payload sharing a
+    // variant slot with a non-float payload hits an unrelated,
+    // pre-existing `wit_types.zig` flat-ABI bug, out of this
+    // integration's scope.
+    host.func_new(
+        "identity-shape",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Variant(tag, payload) = &args[0] else {
+                return Err(wasm_err("identity-shape: expected variant shape"));
+            };
+            results[0] = match (tag.as_str(), payload) {
+                ("empty", None) => Val::Variant("circle".to_string(), Some(Box::new(Val::U32(1)))),
+                ("circle", Some(p)) => {
+                    let Val::U32(r) = p.as_ref() else {
+                        return Err(wasm_err("identity-shape: circle payload must be u32"));
+                    };
+                    Val::Variant("circle".to_string(), Some(Box::new(Val::U32(r.wrapping_mul(2)))))
+                }
+                ("named", Some(p)) => {
+                    let Val::String(s) = p.as_ref() else {
+                        return Err(wasm_err("identity-shape: named payload must be string"));
+                    };
+                    Val::Variant("named".to_string(), Some(Box::new(Val::String(format!("{s}!")))))
+                }
+                (other, _) => return Err(wasm_err(format!("identity-shape: unrecognized case '{other}'"))),
+            };
+            Ok(())
+        },
+    )?;
+
+    // `result<T, E>`: `checked-div` covers the both-payload form (`err` on
+    // division by zero); `validate-non-negative` covers the void-ok-payload
+    // form (`ok` carries nothing, `err` carries the reason). Neither gets
+    // ComponentizeJS's throw-means-err convention here -- that is an
+    // *export's own top-level return type* calling convention only (see
+    // component.js); a host import always yields the ordinary `{tag, val}`
+    // object to its JS caller.
+    host.func_new(
+        "checked-div",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let (Val::S32(a), Val::S32(b)) = (&args[0], &args[1]) else {
+                return Err(wasm_err("checked-div: expected (s32, s32)"));
+            };
+            results[0] = if *b == 0 {
+                Val::Result(Err(Some(Box::new(Val::String("division by zero".to_string())))))
+            } else {
+                Val::Result(Ok(Some(Box::new(Val::S32(a.wrapping_div(*b))))))
+            };
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "validate-non-negative",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::S32(n) = &args[0] else {
+                return Err(wasm_err("validate-non-negative: expected s32"));
+            };
+            results[0] = if *n >= 0 {
+                Val::Result(Ok(None))
+            } else {
+                Val::Result(Err(Some(Box::new(Val::String("value is negative".to_string())))))
+            };
             Ok(())
         },
     )?;

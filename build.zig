@@ -595,7 +595,14 @@ pub fn build(b: *std.Build) void {
     // across independently-declared WIT types, repeated calls to the same
     // import, real host-trap propagation, and -- by re-instantiating with
     // the host import deliberately omitted -- Wasmtime's own actionable
-    // "missing import" diagnostic. Like `compat-bridge-test`, this is
+    // "missing import" diagnostic. Also exercises every other synchronous
+    // type the native bridge supports (char/option<char>, list<u8> bytes
+    // including a nested/optional case, tuple, enum/option<enum>,
+    // flags/option<flags>, variant with void and payload cases, and
+    // result<T,E> both-payload and void-ok-payload forms), each through a
+    // real host-side transform, now that cataggar/wabt PR #335 (see
+    // build.zig.zon's `.wasip3` pin) fixed the reverse (`--js-imports`)
+    // bridge's type gate and lowering for all of them. Like `compat-bridge-test`, this is
     // deliberately NOT part of `test`: it requires a Rust toolchain and
     // takes on the order of several minutes end to end (fresh Zig build +
     // Cranelift compilation under load), so it must be invoked explicitly.

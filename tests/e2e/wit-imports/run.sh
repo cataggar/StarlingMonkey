@@ -38,23 +38,22 @@
 #     queried via the side-channel `note-count` import) proves the
 #     canonical-ABI import genuinely ran, not merely that the JS call site
 #     didn't throw.
-#   * requirement 5 (every synchronous type, reverse direction, where the
-#     pinned WABT's `--js-imports` bindgen currently allows it): nesting (a
-#     list of lists) round-trips through the reverse bridge. `char`,
-#     `list<u8>` (bytes), `tuple`, `enum`, `flags`, `variant`, and
-#     `result<T,E>` do NOT yet -- two real, narrow bugs in the pinned
-#     commit's component_bindgen.zig: (1) `nativeBridgeSupported`'s type
-#     gate is a conservative allow-list written before js_dispatch.zig grew
-#     support for char/tuple/enum/flags/variant/result (in the
-#     independently-developed sync-value-parity branch); (2) `list<u8>`
-#     passes that gate but its generated import-parameter-lowering fast
-#     path forgets the `wit_types.ByteList` wrapper indirection dispatch
-#     mode uses for a *direct* `list<u8>`, causing a genuine Zig compile
-#     error. See tests/compat/manifest.json's
-#     `wit-imports-native-bridge-type-gate` known_deviation for the exact
-#     empirical diagnostics and a focused, fully-tested (but, per this
-#     integration's "do not push/post" constraint, unpublished)
-#     cataggar/wabt fix for both.
+#   * requirement 5 (every synchronous type, reverse direction): nesting (a
+#     list of lists), `char`/`option<char>`, `list<u8>` (a genuine JS
+#     `Uint8Array`, plus its `option<list<u8>>` nested/optional form),
+#     `tuple`, `enum`/`option<enum>`, `flags`/`option<flags>` (<=32
+#     labels), `variant` (a void case and payload cases of different
+#     types), and `result<T,E>` (both a both-payload form and a
+#     void-ok-payload form) all round-trip through the reverse bridge,
+#     each with a real host-side transform (not a bare passthrough) so the
+#     assertions prove the host import actually ran. This is enabled by
+#     cataggar/wabt PR #335 (build.zig.zon's `.wasip3` pin), which fixed
+#     `nativeBridgeSupported`'s type gate and `list<u8>`'s import-parameter
+#     lowering in build/bindgen/component_bindgen.zig. The one type this
+#     bridge structurally cannot support is a `flags` with more than 32
+#     labels (a 32-bit backing representation limit, not a bug) -- see
+#     tests/compat/manifest.json's
+#     `wit-imports-flags-over-32-labels-unsupported` known_deviation.
 #
 # Usage: run.sh [zig-binary] [install-prefix]
 #   zig-binary defaults to `zig` on PATH; install-prefix defaults to
@@ -123,6 +122,36 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-note", "args": []},
   {"function": "run-note-count", "args": []},
   {"function": "run-sum-nested-lists", "args": [[[1, 2], [3, 4], [5, 6]]]},
+
+  {"function": "run-char", "args": ["A"]},
+  {"function": "run-option-char", "args": ["m"]},
+  {"function": "run-option-char", "args": [null]},
+
+  {"function": "run-bytes-is-uint8array", "args": [[1, 2, 3]]},
+  {"function": "run-sum-bytes", "args": [[1, 2, 3, 4]]},
+  {"function": "run-xor-bytes", "args": [[1, 2, 3], 255]},
+  {"function": "run-optional-bytes", "args": [[1, 2, 3]]},
+  {"function": "run-optional-bytes", "args": [null]},
+
+  {"function": "run-swap-tuple", "args": [[5, "abc"]]},
+
+  {"function": "run-color", "args": ["red"]},
+  {"function": "run-option-color", "args": ["blue"]},
+  {"function": "run-option-color", "args": [null]},
+
+  {"function": "run-permissions", "args": [["read"]]},
+  {"function": "run-option-permissions", "args": [["read", "write"]]},
+  {"function": "run-option-permissions", "args": [null]},
+
+  {"function": "run-shape", "args": [{"tag": "empty"}]},
+  {"function": "run-shape", "args": [{"tag": "circle", "val": 2}]},
+  {"function": "run-shape", "args": [{"tag": "named", "val": "hi"}]},
+
+  {"function": "run-checked-div", "args": [10, 2]},
+  {"function": "run-checked-div", "args": [10, 0]},
+  {"function": "run-validate-non-negative", "args": [5]},
+  {"function": "run-validate-non-negative", "args": [-1]},
+
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -170,21 +199,68 @@ assert_field "run-note: JS observes exactly undefined for a void import" 6 "rec[
 assert_field "note-count is 1 after one 'note' call (host side effect proves the import ran)" 7 "rec['value']" "1"
 assert_field "run-note: undefined result is consistent across repeated calls" 8 "rec['value']" "True"
 assert_field "note-count is 2 after a second 'note' call" 9 "rec['value']" "2"
-
-# -- advanced synchronous value types (requirement 5), scoped to what the
-# pinned WABT's `--js-imports` bindgen currently accepts: nesting (a list
-# of lists). char, list<u8> (bytes), tuple, enum, flags, variant, and
-# result<T,E> do NOT yet -- see this fixture's package.wit and
-# tests/compat/manifest.json's `wit-imports-native-bridge-type-gate`
-# known_deviation. Must run BEFORE run-boom below: this invoker
-# instantiates the component once and replays every call against that same
-# instance (see wit_imports_invoker.rs's main()), and a real Wasmtime trap
-# poisons the instance for any later call ("cannot enter component
-# instance") -- so the deliberately-trapping call has to be last.
 assert_field "run-sum-nested-lists sums a nested list<list<u32>>" 10 "rec['value']" "21"
 
-assert_field "run-boom host trap propagates" 11 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 11 \
+# -- advanced synchronous value types (requirement 5): every remaining
+# type the native bridge supports, now wired through the reverse
+# (JS-imports) direction by cataggar/wabt PR #335. Each case below applies
+# a real host-side transform (see wit_imports_invoker.rs's
+# `add_host_import`), so a passing assertion proves the host import
+# genuinely executed and its result genuinely round-tripped back through
+# the export call, not merely that componentization succeeded. Must all
+# run BEFORE run-boom below: this invoker instantiates the component once
+# and replays every call against that same instance (see
+# wit_imports_invoker.rs's main()), and a real Wasmtime trap poisons the
+# instance for any later call ("cannot enter component instance") -- so
+# the deliberately-trapping call has to be last.
+
+# char / option<char>: codepoint shifted by one; `none` stays `none`.
+assert_field "run-char shifts a codepoint by one" 11 "rec['value']" "B"
+assert_field "run-option-char (some) shifts the wrapped codepoint" 12 "rec['value']" "n"
+assert_field "run-option-char (none) round-trips as None" 13 "rec['value']" "None"
+
+# list<u8> (bytes): a genuine Uint8Array on the JS side; sum/xor prove
+# both parameter-lowering and result-lifting of a *direct* list<u8>;
+# the optional case covers list<u8> nested inside option<T>.
+assert_field "run-bytes-is-uint8array: export argument is a real Uint8Array" 14 "rec['value']" "True"
+assert_field "run-sum-bytes sums a direct list<u8> parameter" 15 "rec['value']" "10"
+assert_field "run-xor-bytes XORs a direct list<u8> result" 16 "rec['value']" "[254, 253, 252]"
+assert_field "run-optional-bytes (some) reverses the wrapped list<u8>" 17 "rec['value']" "[3, 2, 1]"
+assert_field "run-optional-bytes (none) round-trips as None" 18 "rec['value']" "None"
+
+# tuple: position AND type swapped, with a real transform on each element.
+assert_field "run-swap-tuple swaps position/type and transforms both elements" 19 "rec['value']" "['ABC', 6]"
+
+# enum / option<enum>: cycles red -> green -> blue -> red.
+assert_field "run-color cycles red -> green" 20 "rec['value']" "green"
+assert_field "run-option-color (some) cycles blue -> red" 21 "rec['value']" "red"
+assert_field "run-option-color (none) round-trips as None" 22 "rec['value']" "None"
+
+# flags (3 labels, well under the 32-label limit) / option<flags>: every
+# bit flipped.
+assert_field "run-permissions flips every bit ({read} -> {write, execute})" 23 "rec['value']" "['write', 'execute']"
+assert_field "run-option-permissions (some) flips every bit ({read,write} -> {execute})" 24 "rec['value']" "['execute']"
+assert_field "run-option-permissions (none) round-trips as None" 25 "rec['value']" "None"
+
+# variant: a void case and two differently-typed payload cases, each with
+# its own deterministic transform.
+assert_field "run-shape: empty -> circle(1)" 26 "rec['value']" "{'tag': 'circle', 'val': 1}"
+assert_field "run-shape: circle(2) -> circle(4)" 27 "rec['value']" "{'tag': 'circle', 'val': 4}"
+assert_field "run-shape: named('hi') -> named('hi!')" 28 "rec['value']" "{'tag': 'named', 'val': 'hi!'}"
+
+# result<T,E>: this export's own top-level return type gets
+# ComponentizeJS's throw-means-err convention (unlike the plain {tag,val}
+# object the host *import* itself returns -- see component.js's module
+# doc comment), so both a both-payload result<s32,string> and a
+# void-ok-payload result<_,string> are exercised here as the export's own
+# result, not the host import's raw shape.
+assert_field "run-checked-div ok: 10/2 = 5" 29 "rec['value']" "{'tag': 'ok', 'val': 5}"
+assert_field "run-checked-div err: division by zero" 30 "rec['value']" "{'tag': 'err', 'val': 'division by zero'}"
+assert_field "run-validate-non-negative ok (void payload, no 'val' key)" 31 "rec['value']" "{'tag': 'ok'}"
+assert_field "run-validate-non-negative err: negative value rejected" 32 "rec['value']" "{'tag': 'err', 'val': 'value is negative'}"
+
+assert_field "run-boom host trap propagates" 33 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 33 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"
