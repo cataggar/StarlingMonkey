@@ -19,18 +19,13 @@
 //      real componentize-js output, per cataggar/StarlingMonkey#6's
 //      requirement that defects observed here be attributable to
 //      ComponentizeJS itself rather than to a second adapter's own bugs.
-//      (`@bytecodealliance/jco` is no longer a dependency of this script
-//      or this directory's package.json; it remains only as
-//      componentize-js's own internal transitive dependency -- see
-//      README.md "Why jco still appears in package-lock.json".)
 //   3. compares the observed value against manifest.json's result field,
 //      reporting PASS/FAIL the same way run-compat-tests.sh does.
 //
 // For negative fixtures (missing/invalid export), this script instead
 // confirms that componentize() itself rejects with the manifest's declared
 // reference_class/reference_message_contains -- a componentize-js build-time
-// behavior with no wasm execution involved, so it is unaffected by the jco
-// question above.
+// behavior with no wasm execution involved.
 //
 // Usage (from this directory, after `npm install`):
 //   node run-reference.mjs

@@ -19,31 +19,14 @@ directory and does not require Node to be installed. See
 `tests/compat/README.md` for the structural harness and
 `tests/compat/runtime/README.md` for the required real-bridge runtime mode.
 
-## Why Wasmtime, not jco
+## Wasmtime execution
 
-An earlier revision of this script used `@bytecodealliance/jco`'s
-`transpile()` to load the componentized `.wasm` as an importable JS module.
-That makes *jco* (a separate component-model tool with its own bugs and its
-own release cadence) part of the measurement, which risks misattributing a
-jco defect to ComponentizeJS -- exactly the failure mode
-cataggar/StarlingMonkey#6's code review flagged. This script instead writes
-the componentized `.wasm` to `.component-cache/<id>.wasm` and invokes it
-directly through `../runtime/invoker`'s Wasmtime-based dynamic Component
-Model API, so the only non-ComponentizeJS code in the loop is Wasmtime
-itself (the same runtime this repository's own bridge fixtures are invoked
-through -- see `../runtime/README.md`).
-
-### Why jco still appears in package-lock.json
-
-`@bytecodealliance/componentize-js` itself depends on `@bytecodealliance/jco`
-internally (see its own `package.json`) for its own componentization
-process -- this is an implementation detail of what shipping
-"componentize-js@0.21.0" *means*, not something this script chooses or
-invokes. `package.json` in this directory no longer lists `jco` as its own
-`devDependency`, and `run-reference.mjs` never imports it; the transitive
-copy in `node_modules`/`package-lock.json` is unavoidable and is exercised
-only by `componentize()` itself, not by this script's execution/comparison
-step.
+The script writes each componentized `.wasm` to
+`.component-cache/<id>.wasm` and invokes it directly through
+`../runtime/invoker`'s Wasmtime-based dynamic Component Model API. The
+repository's own bridge fixtures use the same runtime path, keeping the
+differential comparison attributable to ComponentizeJS rather than to a
+second component transpiler.
 
 ## Pinned versions
 

@@ -181,6 +181,6 @@ Every fixture's WIT and JavaScript was authored independently from
 publicly documented, observable behavior (the WebAssembly Component Model
 canonical ABI conventions, and ComponentizeJS's own public README/EXAMPLE
 docs) plus hands-on verification against the pinned release performed while
-building this manifest -- not copied from ComponentizeJS's or jco's source
-trees. See `manifest.json`'s `provenance.componentizejs.value_shape_baseline_source`
+building this manifest -- not copied from ComponentizeJS's source tree.
+See `manifest.json`'s `provenance.componentizejs.value_shape_baseline_source`
 and each fixture file's header comment.
