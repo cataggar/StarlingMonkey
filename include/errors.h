@@ -22,6 +22,13 @@ DEF_ERR(RequestHandlerOnly, JSEXN_TYPEERR, "{0} can only be used during request 
                                            "not during initialization", 1)
 DEF_ERR(InitializationOnly, JSEXN_TYPEERR, "{0} can only be used during request handling, "
                                            "not during initialization", 1)
+// cataggar/StarlingMonkey#6 Phase 6 (platform feature selection): thrown
+// when JavaScript requests host functionality this build was configured to
+// disable (`-Dfeature-clocks=false`, etc). Deterministic, catchable failure
+// rather than a silent no-op or an unrecoverable wasm trap -- see
+// docs/feature-selection/README.md.
+DEF_ERR(FeatureDisabled, JSEXN_TYPEERR, "{0} is disabled by build configuration "
+                                        "(feature-selection: {1} disabled)", 2)
 };     // namespace Errors
 
 #endif // CORE_ERRORS_H

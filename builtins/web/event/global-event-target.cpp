@@ -1,5 +1,7 @@
 #include "event-target.h"
 #include "global-event-target.h"
+#include "encode.h"
+#include "errors.h"
 
 namespace {
 JS::PersistentRootedObject GLOBAL_EVENT_TARGET;
@@ -22,6 +24,24 @@ static bool addEventListener(JSContext *cx, unsigned argc, Value *vp) {
   RootedValue type(cx, args.get(0));
   RootedValue callback(cx, args.get(1));
   RootedValue opts(cx, args.get(2));
+
+#if !STARLING_FEATURE_FETCH_EVENT
+  // `fetch-event` disabled (cataggar/StarlingMonkey#6 Phase 6): fail
+  // deterministically here rather than silently registering a listener
+  // that will never be invoked (the incoming-handler dispatch path itself
+  // is never wired up when this feature is disabled -- see
+  // builtins/web/fetch/fetch_event.cpp's `install()`). Only the "fetch"
+  // event type is affected; other event types (e.g. custom events) are
+  // unaffected regardless of this feature.
+  auto encoded = core::encode(cx, type);
+  if (!encoded) {
+    return false;
+  }
+  if (std::string_view(encoded) == "fetch") {
+    return api::throw_error(cx, api::Errors::FeatureDisabled, "addEventListener('fetch', ...)",
+                            "fetch-event");
+  }
+#endif
 
   args.rval().setUndefined();
 

@@ -1,0 +1,5 @@
+package local:probe;
+
+world probe {
+  export handler: func() -> u32;
+}

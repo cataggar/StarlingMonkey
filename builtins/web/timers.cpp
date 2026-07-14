@@ -160,6 +160,16 @@ bool set_interval(JSContext *cx, HandleObject handler, JS::HandleValueVector han
  */
 template <bool repeat> bool setTimeout_or_interval(JSContext *cx, const unsigned argc, Value *vp) {
   REQUEST_HANDLER_ONLY(repeat ? "setInterval" : "setTimeout");
+#if !STARLING_FEATURE_CLOCKS
+  // `clocks` disabled (cataggar/StarlingMonkey#6 Phase 6): fail
+  // deterministically at the JS call site rather than falling through to
+  // MonotonicClock::subscribe/unsubscribe, which the async task scheduler
+  // also relies on internally for immediate-vs-blocking task fairness (see
+  // docs/feature-selection/README.md "clocks" -- those two primitives are
+  // deliberately left real/ungated to avoid breaking unrelated async code).
+  return api::throw_error(cx, api::Errors::FeatureDisabled, repeat ? "setInterval" : "setTimeout",
+                          "clocks");
+#else
   CallArgs args = CallArgsFromVp(argc, vp);
   if (!args.requireAtLeast(cx, repeat ? "setInterval" : "setTimeout", 1)) {
     return false;
@@ -192,6 +202,7 @@ template <bool repeat> bool setTimeout_or_interval(JSContext *cx, const unsigned
 
   args.rval().setInt32(timer_id);
   return true;
+#endif
 }
 
 /**

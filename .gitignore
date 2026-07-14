@@ -68,6 +68,15 @@ tests/compat/reference/.jco-out/
 tests/compat/reference/.node-cache/
 tests/compat/reference/.component-cache/
 
+# Feature-selection (cataggar/StarlingMonkey#6 Phase 6): the opt-in
+# ComponentizeJS reference probe's Node.js dependencies/scratch output, and
+# scratch build prefixes used by tests/feature-selection/run-runtime-tests.sh.
+tests/feature-selection/reference/node_modules/
+tests/feature-selection/reference/.node-cache/
+tests/feature-selection/reference/.scratch/
+tests/feature-selection/reference/actual-import-surfaces.json
+tests/feature-selection/.build/
+
 # Compatibility harness runtime bridge mode (tests/compat/runtime): the
 # patched wabt build, per-fixture build/componentize cache, and the
 # compat-invoker Rust crate's build output. Cargo.lock IS committed (not

@@ -18,6 +18,114 @@ const Ctx = struct {
     wasi023: []const u8,
 };
 
+// ---- Platform feature selection (cataggar/StarlingMonkey#6 Phase 6) ----
+//
+// ComponentizeJS-compatible platform feature defaults/disabling for stdio,
+// random, clocks, http, and fetch-event. Mirrors the pinned ComponentizeJS
+// 0.21.0 `componentize()` API's `disableFeatures`/`enableFeatures` naming
+// (see docs/feature-selection/README.md for the full behavior matrix and
+// documented deviations), but is threaded through typed Zig build options
+// (`-Dfeature-*`) rather than environment variables, since this build
+// produces the componentizer itself rather than consuming it as an npm API.
+const FeatureName = enum {
+    stdio,
+    random,
+    clocks,
+    http,
+    @"fetch-event",
+
+    fn parse(name: []const u8) ?FeatureName {
+        const info = @typeInfo(FeatureName).@"enum";
+        inline for (info.field_names, 0..) |field_name, i| {
+            if (std.mem.eql(u8, name, field_name)) return @enumFromInt(info.field_values[i]);
+        }
+        return null;
+    }
+};
+
+const Features = struct {
+    stdio: bool,
+    random: bool,
+    clocks: bool,
+    http: bool,
+    fetch_event: bool,
+
+    fn get(self: Features, name: FeatureName) bool {
+        return switch (name) {
+            .stdio => self.stdio,
+            .random => self.random,
+            .clocks => self.clocks,
+            .http => self.http,
+            .@"fetch-event" => self.fetch_event,
+        };
+    }
+
+    fn set(self: *Features, name: FeatureName, value: bool) void {
+        switch (name) {
+            .stdio => self.stdio = value,
+            .random => self.random = value,
+            .clocks => self.clocks = value,
+            .http => self.http = value,
+            .@"fetch-event" => self.fetch_event = value,
+        }
+    }
+};
+
+// Splits a comma-separated feature-name list, validating each entry against
+// `FeatureName`. Unknown names and empty entries are hard build errors
+// (`@panic`, aborting the build deterministically) -- this is an intentional,
+// stricter-than-reference deviation: the pinned ComponentizeJS 0.21.0
+// splicer silently ignores unknown `disableFeatures`/`enableFeatures` entries
+// (empirically verified against the real npm package; see
+// docs/feature-selection/README.md "Known deviations"), which this build
+// treats as a conflict per task requirement #4 ("Do not silently fall
+// back.").
+fn parseFeatureList(gpa: std.mem.Allocator, opt_name: []const u8, csv: []const u8) []const FeatureName {
+    var out: std.ArrayList(FeatureName) = .empty;
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " \t");
+        if (name.len == 0) continue;
+        const parsed = FeatureName.parse(name) orelse {
+            std.debug.print(
+                "error: -D{s}: unknown feature '{s}' (known features: stdio, random, clocks, http, fetch-event)\n",
+                .{ opt_name, name },
+            );
+            @panic("unknown feature name");
+        };
+        out.append(gpa, parsed) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
+// Resolves the final `Features` selection from the typed `-Dfeature-*`
+// booleans (defaults, matching ComponentizeJS 0.21.0's "all features enabled
+// by default") plus the ComponentizeJS-CLI-ergonomic `-Ddisable-features`/
+// `-Denable-features` comma lists layered on top. A feature named in both
+// lists simultaneously is a deterministic build-time conflict (task
+// requirement #4), unlike the reference (which silently accepts it).
+fn resolveFeatures(b: *std.Build, defaults: Features) Features {
+    const disable_csv = b.option([]const u8, "disable-features", "Comma-separated ComponentizeJS-style feature names to disable (stdio,random,clocks,http,fetch-event)");
+    const enable_csv = b.option([]const u8, "enable-features", "Comma-separated feature names to explicitly (re-)enable, overriding -Ddisable-features");
+    var features = defaults;
+    const disabled = if (disable_csv) |csv| parseFeatureList(b.allocator, "disable-features", csv) else &.{};
+    const enabled = if (enable_csv) |csv| parseFeatureList(b.allocator, "enable-features", csv) else &.{};
+    for (disabled) |d| {
+        for (enabled) |e| {
+            if (d == e) {
+                std.debug.print(
+                    "error: feature '{s}' appears in both -Ddisable-features and -Denable-features\n",
+                    .{@tagName(d)},
+                );
+                @panic("conflicting feature selection");
+            }
+        }
+    }
+    for (disabled) |d| features.set(d, false);
+    for (enabled) |e| features.set(e, true);
+    return features;
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
@@ -37,6 +145,19 @@ pub fn build(b: *std.Build) void {
     if ((dispatch_wit == null) != (dispatch_world == null)) {
         @panic("-Ddispatch-wit and -Ddispatch-world must be provided together");
     }
+
+    // Platform feature selection (cataggar/StarlingMonkey#6 Phase 6). Typed
+    // per-feature booleans, all defaulting to enabled (matches ComponentizeJS
+    // 0.21.0's "all features enabled by default"; see
+    // docs/feature-selection/README.md).
+    const feature_defaults = Features{
+        .stdio = b.option(bool, "feature-stdio", "Enable WASI stdio (wasi:cli/stdin|stdout|stderr, preview1 fd_write/fd_fdstat_get); default true") orelse true,
+        .random = b.option(bool, "feature-random", "Enable WASI random (wasi:random/random, preview1 random_get); default true") orelse true,
+        .clocks = b.option(bool, "feature-clocks", "Enable WASI clocks (wasi:clocks/monotonic-clock|wall-clock, preview1 clock_time_get/clock_res_get); default true") orelse true,
+        .http = b.option(bool, "feature-http", "Enable outgoing WASI HTTP requests (wasi:http/outgoing-handler, the fetch() call path); default true") orelse true,
+        .fetch_event = b.option(bool, "feature-fetch-event", "Enable the incoming FetchEvent/http-incoming-handler surface (addEventListener('fetch', ...)); default true") orelse true,
+    };
+    const features = resolveFeatures(b, feature_defaults);
 
     // SpiderMonkey artifacts built from source with Zig (see deps/mozconfig-zig).
     const sm_dist = b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
@@ -94,10 +215,36 @@ pub fn build(b: *std.Build) void {
     if (is_debug) cxx_flags.append(gpa, "-DDEBUG=1") catch @panic("OOM");
     if (enable_debugger) cxx_flags.append(gpa, "-DENABLE_JS_DEBUGGER") catch @panic("OOM");
 
+    // Feature-selection macro defines (cataggar/StarlingMonkey#6 Phase 6),
+    // consumed by host_api.cpp/timers.cpp/global-event-target.cpp/
+    // feature_stubs.c (`#if STARLING_FEATURE_*`; default 1 if undefined).
+    // Threaded to both C++ and C compile flags since feature_stubs.c (the
+    // preview1-level stdio/random/clocks stubs) is a plain C source.
+    const feature_defines = [_][]const u8{
+        b.fmt("-DSTARLING_FEATURE_STDIO={d}", .{@intFromBool(features.stdio)}),
+        b.fmt("-DSTARLING_FEATURE_RANDOM={d}", .{@intFromBool(features.random)}),
+        b.fmt("-DSTARLING_FEATURE_CLOCKS={d}", .{@intFromBool(features.clocks)}),
+        b.fmt("-DSTARLING_FEATURE_HTTP={d}", .{@intFromBool(features.http)}),
+        b.fmt("-DSTARLING_FEATURE_FETCH_EVENT={d}", .{@intFromBool(features.fetch_event)}),
+    };
+    cxx_flags.appendSlice(gpa, &feature_defines) catch @panic("OOM");
+    c_flags.appendSlice(gpa, &feature_defines) catch @panic("OOM");
+
     const common_includes = [_][]const u8{ "include", "deps/include", "runtime", sm_include };
 
     // ---- builtins.incl (port of cmake builtins.cmake NS_DEF generation) ----
-    const builtins_incl =
+    // When both `http` and `fetch-event` are disabled, the `fetch`/
+    // `fetch_event` builtins are excluded entirely (deeper pruning than
+    // just gating their host_api call sites: removes `fetch`/Request/
+    // Response/Headers/FetchEvent as JS globals too, which lets wasm-ld
+    // dead-code-eliminate the underlying wasi:http/types host imports from
+    // the componentized surface). This is an intentional deviation from the
+    // reference (whose splicer runs on the compiled binary and always
+    // leaves the JS-facing `fetch`/Request/Response surface present,
+    // failing only at the WASI-import call site) -- see
+    // docs/feature-selection/README.md "Known deviations".
+    const prune_fetch_builtins = !features.http and !features.fetch_event;
+    const builtins_incl_base =
         \\// Generated by build.zig
         \\NS_DEF(builtins::web::global_self)
         \\NS_DEF(builtins::web::queue_microtask)
@@ -116,11 +263,21 @@ pub fn build(b: *std.Build) void {
         \\NS_DEF(builtins::web::worker_location)
         \\NS_DEF(builtins::web::text_codec)
         \\NS_DEF(builtins::web::streams)
+        \\
+    ;
+    const builtins_incl_fetch =
         \\NS_DEF(builtins::web::fetch)
         \\NS_DEF(builtins::web::fetch::fetch_event)
+        \\
+    ;
+    const builtins_incl_tail =
         \\NS_DEF(builtins::web::crypto)
         \\
     ;
+    const builtins_incl = if (prune_fetch_builtins)
+        std.mem.concat(gpa, u8, &.{ builtins_incl_base, builtins_incl_tail }) catch @panic("OOM")
+    else
+        std.mem.concat(gpa, u8, &.{ builtins_incl_base, builtins_incl_fetch, builtins_incl_tail }) catch @panic("OOM");
     const wf = b.addWriteFiles();
     const builtins_incl_dir = wf.add("builtins.incl", builtins_incl).dirname();
 
@@ -248,6 +405,25 @@ pub fn build(b: *std.Build) void {
     chmod.step.dependOn(&inst_componentize.step);
     b.getInstallStep().dependOn(&chmod.step);
 
+    // features.json: a machine-readable record of the resolved feature
+    // selection for this build, installed next to componentize.sh/
+    // starling-raw.wasm (cataggar/StarlingMonkey#6 Phase 6 diagnostics).
+    // Consumed by tests/feature-selection/ to assert build-option ->
+    // resolved-feature mapping without re-parsing build.zig, and useful for
+    // humans inspecting `zig-out/bin/` to see what a given build selected.
+    const features_json = b.fmt(
+        \\{{
+        \\  "stdio": {},
+        \\  "random": {},
+        \\  "clocks": {},
+        \\  "http": {},
+        \\  "fetch-event": {}
+        \\}}
+        \\
+    , .{ features.stdio, features.random, features.clocks, features.http, features.fetch_event });
+    const features_json_file = b.addWriteFiles().add("features.json", features_json);
+    b.getInstallStep().dependOn(&b.addInstallBinFile(features_json_file, "features.json").step);
+
     // `zig build smoke-test`: componentize a trivial script and validate the
     // resulting component. Runs the *installed* componentize.sh so it finds
     // starling-raw.wasm, the adapter and the tools next to itself. (The full
@@ -334,6 +510,39 @@ pub fn build(b: *std.Build) void {
     const compat_bridge_test_step = b.step("compat-bridge-test", "Run the real Zig/WABT/Wasmtime bridge compatibility suite (tests/compat/runtime; required/full, ~15-20 min, not part of `test`)");
     const compat_bridge_run = b.addSystemCommand(&.{ "bash", "tests/compat/runtime/run-bridge-tests.sh" });
     compat_bridge_test_step.dependOn(&compat_bridge_run.step);
+
+    // `zig build feature-selection-test`: fast, Node-free unit/negative
+    // tests for the feature-selection build options (cataggar/
+    // StarlingMonkey#6 Phase 6; see docs/feature-selection/README.md).
+    // Exercises build.zig's `-Dfeature-*`/`-Ddisable-features`/
+    // `-Denable-features` parsing and deterministic `@panic` diagnostics
+    // via `zig build --help` sub-invocations (which run the full build()`
+    // validation logic without compiling anything), so this stays fast
+    // enough to be part of `test` -- see
+    // tests/feature-selection/run-build-option-tests.sh.
+    const feature_selection_test_step = b.step("feature-selection-test", "Run the fast, Node-free feature-selection build-option unit/negative tests (tests/feature-selection)");
+    const feature_selection_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-build-option-tests.sh" });
+    feature_selection_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    feature_selection_test_step.dependOn(&feature_selection_run.step);
+    test_step.dependOn(feature_selection_test_step);
+
+    // `zig build feature-selection-runtime-test`: the REQUIRED/FULL
+    // component-level feature-selection suite
+    // (tests/feature-selection/run-runtime-tests.sh). Unlike
+    // `feature-selection-test` above, this actually builds a full
+    // StarlingMonkey runtime for each of 8 feature combinations,
+    // componentizes representative fixtures, inspects the resulting
+    // import/export surface with `wasm-tools component wit`, and invokes
+    // representative behavior through `wasmtime serve` -- see
+    // docs/feature-selection/README.md. Deliberately NOT a dependency of
+    // `test`/`feature-selection-test`: each combination is a from-scratch
+    // Zig build, so a full run takes several minutes, matching the
+    // `compat-bridge-test` precedent of keeping slow, real-build
+    // verification in its own opt-in step.
+    const feature_selection_runtime_test_step = b.step("feature-selection-runtime-test", "Run the real, full-build feature-selection component tests (tests/feature-selection; required/full, not part of `test`)");
+    const feature_selection_runtime_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-runtime-tests.sh" });
+    feature_selection_runtime_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    feature_selection_runtime_test_step.dependOn(&feature_selection_runtime_run.step);
 
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the
@@ -527,6 +736,19 @@ fn addStarlingSources(ctx: Ctx, mod: *std.Build.Module) void {
         b.pathJoin(&.{ ctx.wasi023, "sockets.cpp" }),
     }, .flags = ctx.cxx_flags, .language = .cpp });
     mod.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ ctx.host_api_dir, "bindings/bindings.c" })), .flags = ctx.c_flags, .language = .c });
+
+    // Preview1-level feature stubs (cataggar/StarlingMonkey#6 Phase 6): a
+    // plain C source overriding the low-level `__imported_wasi_snapshot_
+    // preview1_*` import trampolines that wasi-libc's auto-generated
+    // __wasilibc_real.c declares (see docs/feature-selection/README.md
+    // "preview1-level stubbing" for why this is done at the C symbol level
+    // rather than by post-processing the compiled wasm module: it lets the
+    // normal clang/wasm-ld toolchain assign function indices, avoiding the
+    // index-corruption risk of hand-editing a stripped/unnamed WAT dump).
+    // Included unconditionally; each override is itself `#if
+    // !STARLING_FEATURE_*`-gated, so when a feature is enabled this file
+    // contributes no symbols and the normal WASI import is left untouched.
+    mod.addCSourceFile(.{ .file = b.path("runtime/feature_stubs.c"), .flags = ctx.c_flags, .language = .c });
 }
 
 const runtime_sources = [_][]const u8{

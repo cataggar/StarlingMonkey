@@ -89,27 +89,80 @@ void dump_io_error(wasi_io_streams_stream_error_t err) {
 
 } // namespace
 
+#if !STARLING_FEATURE_RANDOM
+namespace {
+// Deterministic PRNG (splitmix64) substituted for real entropy when the
+// `random` feature is disabled (cataggar/StarlingMonkey#6 Phase 6). Matches
+// the pinned ComponentizeJS 0.21.0 reference's documented behavior:
+// disabling `random` yields deterministic-but-not-secure output rather than
+// a trap, so e.g. `crypto.getRandomValues()` keeps "working" predictably.
+uint64_t stubbed_random_state = UINT64_C(0x2545F4914F6CDD1D);
+
+uint64_t stubbed_random_next() {
+  uint64_t z = (stubbed_random_state += UINT64_C(0x9E3779B97F4A7C15));
+  z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+  z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+  return z ^ (z >> 31);
+}
+} // namespace
+#endif
+
 Result<HostBytes> Random::get_bytes(size_t num_bytes) {
   Result<HostBytes> res;
 
+#if STARLING_FEATURE_RANDOM
   bindings_list_u8_t list{};
   wasi_random_random_get_random_bytes(num_bytes, &list);
   auto ret = HostBytes{
       std::unique_ptr<uint8_t[]>{list.ptr},
       list.len,
   };
+#else
+  auto bytes = std::unique_ptr<uint8_t[]>{new uint8_t[num_bytes]};
+  for (size_t i = 0; i < num_bytes;) {
+    uint64_t r = stubbed_random_next();
+    for (size_t b = 0; b < 8 && i < num_bytes; b++, i++) {
+      bytes[i] = static_cast<uint8_t>(r >> (8 * b));
+    }
+  }
+  auto ret = HostBytes{std::move(bytes), num_bytes};
+#endif
   res.emplace(std::move(ret));
 
   return res;
 }
 
 Result<uint32_t> Random::get_u32() {
+#if STARLING_FEATURE_RANDOM
   return Result<uint32_t>::ok(wasi_random_random_get_random_u64());
+#else
+  return Result<uint32_t>::ok(static_cast<uint32_t>(stubbed_random_next()));
+#endif
 }
 
-uint64_t MonotonicClock::now() { return wasi_clocks_monotonic_clock_now(); }
+uint64_t MonotonicClock::now() {
+#if STARLING_FEATURE_CLOCKS
+  return wasi_clocks_monotonic_clock_now();
+#else
+  // Fixed constant (matches feature_stubs.c's preview1 clock_time_get stub):
+  // disabling `clocks` yields a deterministic, non-advancing "now" rather
+  // than a trap, since `now()` also feeds internal deadline math (see
+  // docs/feature-selection/README.md "clocks" for why subscribe/unsubscribe
+  // are deliberately left real/ungated: the async task scheduler's
+  // immediate-vs-blocking fairness tie-break also goes through
+  // MonotonicClock, and trapping it would break unrelated async code, not
+  // just user-facing timers/Date).
+  return UINT64_C(1000000000);
+#endif
+}
 
-uint64_t MonotonicClock::resolution() { return wasi_clocks_monotonic_clock_resolution(); }
+uint64_t MonotonicClock::resolution() {
+#if STARLING_FEATURE_CLOCKS
+  return wasi_clocks_monotonic_clock_resolution();
+#else
+  MOZ_CRASH("MonotonicClock::resolution: clocks feature is disabled");
+#endif
+}
 
 int32_t MonotonicClock::subscribe(const uint64_t when, const bool absolute) {
   if (absolute) {
@@ -755,6 +808,18 @@ Result<HttpOutgoingBody *> HttpOutgoingRequest::body() {
 
 Result<FutureHttpIncomingResponse *> HttpOutgoingRequest::send() {
   typedef Result<FutureHttpIncomingResponse *> Res;
+#if !STARLING_FEATURE_HTTP
+  // `http` disabled (cataggar/StarlingMonkey#6 Phase 6): outbound requests
+  // fail deterministically without calling wasi:http/outgoing-handler at
+  // all, so wasm-ld can drop the import when nothing else references it.
+  // `fetch()`/Request/Response stay defined regardless (matches the
+  // reference: `disableFeatures: ["http"]` alone still exposes the JS
+  // surface, only outgoing-handler calls fail) -- see
+  // docs/feature-selection/README.md. Unlike the reference's `unreachable`
+  // trap, this fails as a catchable rejected promise, since gating happens
+  // at this C++ call site rather than by splicing the compiled import.
+  return Res::err(154);
+#else
   future_incoming_response_t ret;
   wasi_http_outgoing_handler_error_code_t err;
   auto request_handle = WASIHandle<HttpOutgoingRequest>::cast(handle_state_.get())->take();
@@ -764,6 +829,7 @@ Result<FutureHttpIncomingResponse *> HttpOutgoingRequest::send() {
   auto res = new FutureHttpIncomingResponse(
       std::unique_ptr<HandleState>(new WASIHandle<FutureHttpIncomingResponse>(ret)));
   return Result<FutureHttpIncomingResponse *>::ok(res);
+#endif
 }
 
 void block_on_pollable_handle(PollableHandle handle) {
