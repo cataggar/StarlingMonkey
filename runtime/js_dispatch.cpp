@@ -1,5 +1,6 @@
 #include "js_dispatch.h"
 
+#include "builtin.h"
 #include "extension-api.h"
 #include "decode.h"
 #include "encode.h"
@@ -698,3 +699,203 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
 extern "C" void starling_js_dispatch_native_free(void *arena) {
   delete static_cast<NativeArena *>(arena);
 }
+
+// ---------------------------------------------------------------------------
+// Reverse bridge: host-provided WIT interface imports called *from*
+// JavaScript (see js_dispatch.h for the wire-level contract). Weak fallbacks
+// below let a build with nothing to bridge -- no `--js-imports`, or no
+// eligible interface imports -- link without any Zig-generated definitions
+// at all; a strong `pub export fn` from the generated `component_bindings.zig`
+// (see component_bindgen.zig's `emitJsImportBridge`) overrides these at link
+// time whenever there is at least one such import.
+extern "C" __attribute__((weak)) const uint8_t *starling_js_imports_manifest(size_t *out_len) {
+  *out_len = 0;
+  return nullptr;
+}
+
+extern "C" __attribute__((weak)) uint32_t starling_js_import_dispatch(
+    const uint8_t *name_ptr, size_t name_len, const StarlingJsValue *argv_ptr, size_t argv_len,
+    StarlingJsValue *out_result, void **out_arena) {
+  (void)name_ptr;
+  (void)name_len;
+  (void)argv_ptr;
+  (void)argv_len;
+  *out_result = {};
+  *out_arena = nullptr;
+  return 1; // no JS-bridged imports exist in this build.
+}
+
+extern "C" __attribute__((weak)) void starling_js_import_result_free(void *arena) { (void)arena; }
+
+namespace {
+
+// Bound as reserved slot 1 (`extra`) of each per-import JSFunction created by
+// `wit_imports::install` below; forwards the call to the dispatch key it was
+// registered under, reusing `decode_from_js`/`encode_to_js` -- the same pair
+// used for export arguments/results -- with the roles reversed: arguments
+// come *from* JS (decode) and the result goes back *to* JS (encode).
+bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
+                 JS::CallArgs args) {
+  (void)receiver;
+  JS::RootedString key_str(cx, extra.toString());
+  auto key_utf8 = core::encode(cx, key_str);
+  if (!key_utf8.ptr) {
+    return false;
+  }
+  std::string dispatch_key(key_utf8.ptr.get(), key_utf8.len);
+
+  NativeArena arg_arena;
+  std::vector<StarlingJsValue> argv;
+  argv.reserve(args.length());
+  for (unsigned i = 0; i < args.length(); ++i) {
+    JS::RootedValue arg(cx, args.get(i));
+    StarlingJsValue encoded{};
+    if (!decode_from_js(cx, arg, arg_arena, &encoded)) {
+      return false;
+    }
+    argv.push_back(encoded);
+  }
+  static const StarlingJsValue no_args{};
+  const StarlingJsValue *argv_ptr = argv.empty() ? &no_args : argv.data();
+
+  StarlingJsValue out_result{};
+  void *out_arena = nullptr;
+  uint32_t status = starling_js_import_dispatch(
+      reinterpret_cast<const uint8_t *>(dispatch_key.data()), dispatch_key.size(), argv_ptr,
+      argv.size(), &out_result, &out_arena);
+  if (status != 0) {
+    // Build-time-impossible in practice (the dispatch key came straight from
+    // the manifest this function was registered from), but reported
+    // explicitly rather than silently returning `undefined` in case the
+    // manifest and dispatch table ever disagree.
+    JS_ReportErrorUTF8(cx,
+                       "no host import is registered for '%s' -- the component's world does "
+                       "not declare a matching import, or the host did not link an "
+                       "implementation for it",
+                       dispatch_key.c_str());
+    return false;
+  }
+
+  JS::RootedValue result_val(cx);
+  bool ok = encode_to_js(cx, out_result, &result_val);
+  starling_js_import_result_free(out_arena);
+  if (!ok) {
+    return false;
+  }
+  args.rval().set(result_val);
+  return true;
+}
+
+// Splits one manifest TSV line "<iface-id>\t<js-name>\t<dispatch-key>\t<arity>"
+// into its four columns. Returns false (rather than asserting) on a
+// malformed line so a corrupt/mismatched manifest is an actionable JS
+// exception rather than an out-of-bounds read.
+bool parse_manifest_line(std::string_view line, std::string_view *iface_id,
+                         std::string_view *js_name, std::string_view *dispatch_key,
+                         unsigned *arity) {
+  size_t t1 = line.find('\t');
+  if (t1 == std::string_view::npos) return false;
+  size_t t2 = line.find('\t', t1 + 1);
+  if (t2 == std::string_view::npos) return false;
+  size_t t3 = line.find('\t', t2 + 1);
+  if (t3 == std::string_view::npos) return false;
+
+  *iface_id = line.substr(0, t1);
+  *js_name = line.substr(t1 + 1, t2 - t1 - 1);
+  *dispatch_key = line.substr(t2 + 1, t3 - t2 - 1);
+  std::string_view arity_str = line.substr(t3 + 1);
+  unsigned value = 0;
+  for (char c : arity_str) {
+    if (c < '0' || c > '9') return false;
+    value = value * 10 + static_cast<unsigned>(c - '0');
+  }
+  *arity = value;
+  return true;
+}
+
+} // namespace
+
+namespace builtins {
+namespace wit_imports {
+
+// Registers one builtin ES module per WIT interface id found in the
+// `--js-imports`-generated manifest (see js_dispatch.h), each exposing its
+// bridged functions under their verbatim WIT names (matching
+// `resolve_export_function`'s export-side convention and ComponentizeJS's
+// own module/export naming for versioned package/interface identifiers, so
+// `import { "get-flag" as getFlag } from "test:flags/imports@1.2.3"` resolves
+// with no hand-written glue). Runs during `install_builtins`, i.e. before
+// any content script executes, so imports are available the moment user
+// code's top-level `import` statements run.
+bool install(api::Engine *engine) {
+  JSContext *cx = engine->cx();
+  size_t manifest_len = 0;
+  const uint8_t *manifest_ptr = starling_js_imports_manifest(&manifest_len);
+  if (!manifest_ptr || manifest_len == 0) {
+    return true; // Nothing to bridge -- default behavior is unaffected.
+  }
+  std::string_view manifest(reinterpret_cast<const char *>(manifest_ptr), manifest_len);
+
+  std::string current_id;
+  JS::RootedObject current_obj(cx);
+
+  size_t pos = 0;
+  while (pos < manifest.size()) {
+    size_t nl = manifest.find('\n', pos);
+    if (nl == std::string_view::npos) break;
+    std::string_view line = manifest.substr(pos, nl - pos);
+    pos = nl + 1;
+    if (line.empty()) continue;
+
+    std::string_view iface_id, js_name, dispatch_key;
+    unsigned arity = 0;
+    if (!parse_manifest_line(line, &iface_id, &js_name, &dispatch_key, &arity)) {
+      JS_ReportErrorUTF8(cx, "malformed js_import_manifest line: '%.*s'", (int)line.size(),
+                         line.data());
+      return false;
+    }
+
+    if (current_id.empty() || current_id != iface_id) {
+      if (!current_id.empty()) {
+        JS::RootedValue module_val(cx, JS::ObjectValue(*current_obj));
+        if (!engine->define_builtin_module(current_id.c_str(), module_val)) {
+          return false;
+        }
+      }
+      current_id.assign(iface_id);
+      current_obj = JS_NewPlainObject(cx);
+      if (!current_obj) {
+        return false;
+      }
+    }
+
+    std::string dispatch_key_str(dispatch_key);
+    JS::RootedString key_str(cx,
+                             JS_NewStringCopyN(cx, dispatch_key_str.data(), dispatch_key_str.size()));
+    if (!key_str) {
+      return false;
+    }
+    JS::RootedValue extra(cx, JS::StringValue(key_str));
+    std::string js_name_str(js_name);
+    JS::RootedObject method(cx, create_internal_method<call_import>(cx, current_obj, extra, arity,
+                                                                    js_name_str.c_str()));
+    if (!method) {
+      return false;
+    }
+    JS::RootedValue method_val(cx, JS::ObjectValue(*method));
+    if (!JS_DefineProperty(cx, current_obj, js_name_str.c_str(), method_val, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+
+  if (!current_id.empty()) {
+    JS::RootedValue module_val(cx, JS::ObjectValue(*current_obj));
+    if (!engine->define_builtin_module(current_id.c_str(), module_val)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace wit_imports
+} // namespace builtins

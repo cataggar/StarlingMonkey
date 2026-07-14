@@ -28,17 +28,16 @@
             .hash = "N-V-__8AAA3KCgQaOf7fOhpQGN_vZKVJxFxqR_n1pGn2Z0S9",
             .lazy = true,
         },
-        // sync-value-parity: temporarily pinned to a local worktree
-        // (/work/wabt-sync-value-parity, cataggar/wabt commit
-        // 5ee61e0787f95b43593111846eff9931746ab0ea on branch
-        // feat/sync-value-parity-types) rather than a pushed git+https
-        // commit, per this phase's WABT-coordination constraint: WABT
-        // changes are developed in a dedicated worktree/branch and must
-        // not be pushed/posted from here. Once that commit is pushed
-        // upstream, replace this with a git+https pin (matching the
-        // previous entry's shape) and drop this comment.
+        // Merged WABT prerequisite (cataggar/wabt PR #334, merged to the
+        // `wasip3` branch): combines the sync-value-parity typed
+        // `char`/`list<u8>` dispatch wrappers with the wit-imports
+        // `--js-imports` mode (explicit async/resource/root-function-import
+        // diagnostics, true void/undefined generation). A portable
+        // git+https pin (not a local sibling-worktree `.path`), so a clean
+        // clone builds without any `/work` sibling directories present.
         .wasip3 = .{
-            .path = "../wabt-sync-value-parity",
+            .url = "git+https://github.com/cataggar/wabt#0191aff9b0c8d7acc46d3b8a48c5af4110f721d5",
+            .hash = "wasip3-0.3.0-Kmwy2txHBgDPN7LFtObzKchtrvhBKKTVxcH-bQLyLMCs",
         },
     },
 

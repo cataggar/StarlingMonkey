@@ -272,6 +272,7 @@ pub fn build(b: *std.Build) void {
     ;
     const builtins_incl_tail =
         \\NS_DEF(builtins::web::crypto)
+        \\NS_DEF(builtins::wit_imports)
         \\
     ;
     const builtins_incl = if (prune_fetch_builtins)
@@ -305,7 +306,7 @@ pub fn build(b: *std.Build) void {
         const bindgen = b.addRunArtifact(dep.artifact("wasip3-bindgen"));
         bindgen.addArg("--wit");
         addWitArg(b, bindgen, b.path(wit_dir));
-        bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "-o" });
+        bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "--js-imports", "-o" });
         generated_bindings = bindgen.addOutputFileArg("component_bindings.zig");
     }
 
@@ -579,6 +580,29 @@ pub fn build(b: *std.Build) void {
     const feature_selection_runtime_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-runtime-tests.sh" });
     feature_selection_runtime_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_runtime_test_step.dependOn(&feature_selection_runtime_run.step);
+    // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
+    // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
+    // reactor against a fixture-specific WIT world that additionally
+    // *imports* a custom `test:wit-imports/host@1.2.3` interface (not just
+    // the usual export-only js-dispatch world), componentizes
+    // tests/e2e/wit-imports/component.js against it (a JS module that
+    // `import`s host functions with zero user-written glue), and drives
+    // every export through a Wasmtime 42 host that implements the custom
+    // import dynamically (tests/compat/runtime/invoker's
+    // `wit-imports-invoker` binary, since `wasmtime run --invoke` cannot
+    // supply arbitrary custom component imports). Exercises exact s64/u64
+    // BigInt (including 2**64 wraparound), strings, nested records bridged
+    // across independently-declared WIT types, repeated calls to the same
+    // import, real host-trap propagation, and -- by re-instantiating with
+    // the host import deliberately omitted -- Wasmtime's own actionable
+    // "missing import" diagnostic. Like `compat-bridge-test`, this is
+    // deliberately NOT part of `test`: it requires a Rust toolchain and
+    // takes on the order of several minutes end to end (fresh Zig build +
+    // Cranelift compilation under load), so it must be invoked explicitly.
+    const wit_imports_e2e_test_step = b.step("wit-imports-e2e-test", "Run the WIT interface-imports E2E suite (tests/e2e/wit-imports; requires Rust, not part of `test`)");
+    const wit_imports_e2e_run = b.addSystemCommand(&.{ "bash", "tests/e2e/wit-imports/run.sh" });
+    wit_imports_e2e_run.addArg(b.graph.zig_exe);
+    wit_imports_e2e_test_step.dependOn(&wit_imports_e2e_run.step);
 
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the

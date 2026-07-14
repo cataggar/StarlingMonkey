@@ -8,6 +8,15 @@ publish = false
 name = "compat-invoker"
 path = "src/main.rs"
 
+[[bin]]
+# Used only by tests/e2e/wit-imports/run.sh: a Wasmtime host that both
+# consumes the fixture's exports and *implements* its custom WIT import
+# (test:wit-imports/host@1.2.3) via the dynamic `LinkerInstance::func_new`
+# API. See src/wit_imports_invoker.rs for why this needs to be a separate
+# binary from compat-invoker.
+name = "wit-imports-invoker"
+path = "src/wit_imports_invoker.rs"
+
 [dependencies]
 # NOTE: this repository itself pins Wasmtime v42.0.1 (cmake/wasmtime.cmake,
 # build.zig.zon). These pins now match it exactly. The published `wasmtime`

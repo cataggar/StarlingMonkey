@@ -252,4 +252,57 @@ extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uin
 // returned `StarlingJsValue` tree after calling this.
 extern "C" STARLING_ENGINE_EXPORT void starling_js_dispatch_native_free(void *arena);
 
+// ---------------------------------------------------------------------------
+// Reverse bridge: host-provided WIT interface imports called *from*
+// JavaScript. These three symbols are emitted by the WABT `wasip3-bindgen`
+// generator's `--js-imports` mode (see component_bindgen.zig's
+// `emitJsImportBridge`) whenever the world imports at least one interface
+// function whose full parameter/result type graph is representable by the
+// same tagged-value vocabulary as the export bridge above (bool/integers/
+// f32/f64/string/option<T>/list<T>/record, recursively). `js_dispatch.cpp`
+// provides weak default fallbacks (see the `.cpp` file) so a build with no
+// eligible imports -- or without `--dispatch`/`--js-imports` at all -- still
+// links, with an empty manifest and a dispatch function that always reports
+// "not found"; this keeps default behavior byte-for-byte unchanged for
+// components with no custom imports.
+//
+// `wit_imports::install` (js_dispatch.cpp) parses the manifest, groups
+// entries by interface id, and registers one builtin ES module per interface
+// id (via `Engine::define_builtin_module`) whose properties are native
+// JSFunctions that forward to `starling_js_import_dispatch`. Arguments are
+// built from JS values via the very same `decode_from_js` used for export
+// *results*, and the dispatch result is converted back to JS via the very
+// same `encode_to_js` used for export *arguments* -- only the direction each
+// helper is called from is reversed; no new codec is introduced.
+
+// Returns a pointer to a TSV byte string, one line per JS-bridged import:
+// "<iface-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". `*out_len` is
+// set to its length (0 and a possibly-null pointer when there is nothing to
+// bridge). The returned buffer is static (owned by the wasm module's data
+// segment); callers must not free it.
+extern "C" STARLING_ENGINE_EXPORT const uint8_t *starling_js_imports_manifest(size_t *out_len);
+
+// Looks up `<iface-id>#<js-export-name>` (the same dispatch-key spelling as
+// one manifest line's third column) and, if found, decodes `argv` (built by
+// the caller via `decode_from_js`) into the callee's concrete WIT parameter
+// types, invokes the generated typed import wrapper, and encodes its result
+// into `*out_result`/`*out_arena` (to later be read with `encode_to_js` and
+// released via `starling_js_import_result_free`). Returns 0 on success, 1 if
+// `name` does not match any bridged import (a build-time-impossible case in
+// practice, since the caller only ever dispatches keys taken from the
+// manifest -- guarded defensively anyway). A real Wasmtime host trap raised
+// from within the underlying canonical-ABI import call unwinds the entire
+// instance and never returns here at all, which is the correct/expected
+// component-model behavior for host trap propagation.
+extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_import_dispatch(const uint8_t *name_ptr,
+                                                size_t name_len,
+                                                const StarlingJsValue *argv_ptr,
+                                                size_t argv_len,
+                                                StarlingJsValue *out_result,
+                                                void **out_arena);
+
+// Frees an arena returned via `starling_js_import_dispatch`'s `*out_arena`.
+// `arena` may be null.
+extern "C" STARLING_ENGINE_EXPORT void starling_js_import_result_free(void *arena);
+
 #endif

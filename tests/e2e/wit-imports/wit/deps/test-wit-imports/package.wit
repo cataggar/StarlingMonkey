@@ -1,0 +1,69 @@
+// wit-imports E2E fixture: a self-contained package declaring both a
+// host-provided *imported* interface (`host`) and the fixture's own JS
+// *exported* interface (`api`), used by tests/e2e/wit-imports/run.sh.
+//
+// This directory is deliberately isolated (no cross-package `use`) so it
+// can be pointed at directly by both:
+//   * `wasip3-bindgen --wit <this dir> --world js-exports --dispatch
+//     js_dispatch --js-imports` (generates the Zig-side typed import
+//     wrappers + the JS-callable reverse bridge for `host`, plus the
+//     existing export-shell/dispatch codegen for `api`), and
+//   * this fixture's own copy of the full `js-dispatch` world
+//     (../js-dispatch.wit), which imports `test:wit-imports/host@1.2.3`
+//     and exports `test:wit-imports/api@1.2.3` alongside the usual WASI
+//     surface, so `wabt component embed --world js-dispatch` gives the
+//     resulting component a genuine, Wasmtime-linkable custom import.
+//
+// `api` and `host` intentionally do NOT share the `point` record type via
+// `use` -- each declares its own nominally-independent `record point`. The
+// JS glue (run-scale in component.js) bridges between them dynamically by
+// JS object shape (`{x, y}`), which is all js_dispatch's untyped
+// encode_to_js/decode_from_js pair needs; no WIT-level type sharing across
+// interfaces is required for two interfaces to interoperate through JS.
+package test:wit-imports@1.2.3;
+
+interface host {
+    record point {
+        x: u32,
+        y: u32,
+    }
+
+    // Exact s64/u64 BigInt round trips through the reverse (import) bridge.
+    add: func(a: s64, b: s64) -> s64;
+    sum-list: func(xs: list<u64>) -> u64;
+
+    // string lifting/lowering.
+    greet: func(name: string) -> string;
+
+    // A nested record argument/result.
+    scale: func(p: point, factor: u32) -> point;
+
+    // Always traps host-side; used to prove a real Wasmtime host trap
+    // propagates all the way out through the JS import call and the
+    // enclosing JS export call as a genuine wasm trap, not a catchable
+    // JS exception.
+    boom: func() -> u32;
+}
+
+interface api {
+    record point {
+        x: u32,
+        y: u32,
+    }
+
+    run-add: func(a: s64, b: s64) -> s64;
+    run-sum-list: func(xs: list<u64>) -> u64;
+    run-greet: func(name: string) -> string;
+    run-scale: func(x: u32, y: u32, factor: u32) -> point;
+    // Calls the host `add` import multiple times, with different
+    // arguments, from a single export invocation -- proving each call is
+    // independently dispatched (not cached/memoized at the first call).
+    run-repeated-add: func() -> list<s64>;
+    // Lets JS's own call to a *host* function propagate a real wasm trap.
+    run-boom: func() -> u32;
+}
+
+world js-exports {
+    import host;
+    export api;
+}

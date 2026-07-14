@@ -1,0 +1,53 @@
+// Own copy of host-apis/wasi-0.2.10/wit/js-dispatch.wit for the
+// tests/e2e/wit-imports fixture -- see run.sh. Deliberately NOT the shared
+// file: this world additionally imports `test:wit-imports/host@1.2.3`, and
+// that import must not leak into the shared js-dispatch world (every other
+// suite -- default export 22/22, native-dispatch, compat 11/11 -- builds
+// against the shared host-apis/wasi-0.2.10/wit/js-dispatch.wit unmodified;
+// adding a real component-level import there would make Wasmtime require a
+// host implementation for it in every one of those suites too, breaking
+// requirement 6's "no default-behavior change for components with no
+// custom imports"). Everything else here is identical to the shared file.
+package local:bindings;
+
+world js-dispatch {
+  import wasi:cli/environment@0.2.10;
+  import wasi:cli/exit@0.2.10;
+  import wasi:io/error@0.2.10;
+  import wasi:io/poll@0.2.10;
+  import wasi:io/streams@0.2.10;
+  import wasi:cli/stdin@0.2.10;
+  import wasi:cli/stdout@0.2.10;
+  import wasi:cli/stderr@0.2.10;
+  import wasi:cli/terminal-input@0.2.10;
+  import wasi:cli/terminal-output@0.2.10;
+  import wasi:cli/terminal-stdin@0.2.10;
+  import wasi:cli/terminal-stdout@0.2.10;
+  import wasi:cli/terminal-stderr@0.2.10;
+  import wasi:clocks/monotonic-clock@0.2.10;
+  import wasi:clocks/wall-clock@0.2.10;
+  import wasi:clocks/timezone@0.2.10;
+  import wasi:filesystem/types@0.2.10;
+  import wasi:filesystem/preopens@0.2.10;
+  import wasi:sockets/network@0.2.10;
+  import wasi:sockets/instance-network@0.2.10;
+  import wasi:sockets/udp@0.2.10;
+  import wasi:sockets/udp-create-socket@0.2.10;
+  import wasi:sockets/tcp@0.2.10;
+  import wasi:sockets/tcp-create-socket@0.2.10;
+  import wasi:sockets/ip-name-lookup@0.2.10;
+  import wasi:random/random@0.2.10;
+  import wasi:random/insecure@0.2.10;
+  import wasi:random/insecure-seed@0.2.10;
+  import wasi:http/types@0.2.10;
+  import wasi:http/outgoing-handler@0.2.10;
+
+  // The custom WIT interface import this fixture exercises -- resolved via
+  // deps/test-wit-imports/package.wit, versioned per ComponentizeJS-style
+  // module-specifier conventions.
+  import test:wit-imports/host@1.2.3;
+
+  export wasi:cli/run@0.2.10;
+  export wasi:http/incoming-handler@0.2.10;
+  export test:wit-imports/api@1.2.3;
+}

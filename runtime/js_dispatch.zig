@@ -30,7 +30,7 @@ var result_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 // strictly additive, bounded extension of the existing dispatch, not a
 // replacement of it.
 
-const NativeTag = enum(u32) {
+pub const NativeTag = enum(u32) {
     bool_ = 0,
     i64_ = 1,
     u64_ = 2,
@@ -49,7 +49,7 @@ const NativeTag = enum(u32) {
 // Mirrors `struct StarlingJsValue` in js_dispatch.h field-for-field. Both
 // sides live in the same wasm module, so this is exchanged by pointer, not
 // serialized.
-const NativeValue = extern struct {
+pub const NativeValue = extern struct {
     tag: NativeTag,
     bool_val: u8 = 0,
     i64_val: i64 = 0,
@@ -78,7 +78,7 @@ const NativeValue = extern struct {
 // (not embedded by value) to match the C++ side, which needs it that way to
 // keep `StarlingJsValue`/`StarlingJsField` mutually referencing without a
 // forward-declaration ordering problem.
-const NativeField = extern struct {
+pub const NativeField = extern struct {
     name_ptr: ?[*]const u8 = null,
     name_len: usize = 0,
     value: ?*const NativeValue = null,
@@ -173,6 +173,21 @@ fn isWitResultType(comptime T: type) bool {
     };
 }
 
+// Reversal-direction counterpart: `--js-imports`-generated dispatch code
+// (see component_bindgen.zig's `emitJsImportBridge`) builds its own result
+// `NativeValue` tree in a heap-allocated `ArenaAllocator` per call (the
+// import direction has no C++-owned `NativeArena` to free -- the tree is
+// entirely Zig-side, going *into* JS instead of coming *out of* it), and
+// frees it through this same public name so both directions share one
+// symbol the C++ host glue can call generically.
+pub fn freeNativeArena(arena: ?*anyopaque) void {
+    if (arena) |ptr| {
+        const a: *std.heap.ArenaAllocator = @ptrCast(@alignCast(ptr));
+        a.deinit();
+        std.heap.wasm_allocator.destroy(a);
+    }
+}
+
 // Recursively checks whether `T`'s type graph (struct fields, optional
 // children) contains an exact `i64`/`u64` anywhere -- the only types JSON
 // cannot carry losslessly -- or any of the shapes JSON can't represent in
@@ -241,7 +256,13 @@ fn needsNative(comptime Result: type, comptime Args: type) bool {
 // the caller (`callNative`) backs with a short-lived arena freed after the
 // dispatch call returns; string payloads are referenced directly (no copy)
 // since the source value already outlives the call.
-fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) NativeValue {
+// `pub`: the WABT `--js-imports` bindgen's generated reverse canonical-ABI
+// import wrapper (a separate Zig file compiled into the same module; see
+// component_bindgen.zig's `emitJsImportBridge`) calls this directly to
+// encode an import call's *result* on the way back into the host, reusing
+// the exact same tag vocabulary/encoding rules as the export-argument
+// direction below.
+pub fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) NativeValue {
     // `wit_types.Char`/`wit_types.ByteList` are plain single-field structs
     // (see wit_types.zig), so they'd otherwise fall into the generic
     // `.@"struct"` record arm below and encode as `{"codepoint": N}` /
@@ -538,7 +559,12 @@ fn wrapFloatToInt(comptime T: type, d: f64) T {
 // backed by the C++-owned result arena that `callNative` frees right after
 // this returns -- see the ownership contract in js_dispatch.h and the
 // `defer`-ordering note in `callNative` below.
-fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.Allocator) T {
+// `pub`: the WABT `--js-imports` bindgen's generated reverse canonical-ABI
+// import wrapper calls this directly to decode an import call's *arguments*
+// on the way in from the host (mirroring `encodeNative`'s note above),
+// reusing the exact same tag vocabulary/decoding rules as the export-result
+// direction below.
+pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.Allocator) T {
     // See the matching note in `encodeNative`: `wit_types.Char`/
     // `wit_types.ByteList` must be special-cased by type identity before the
     // generic `.@"struct"` arm, or they'd expect a `{"codepoint": ...}` /

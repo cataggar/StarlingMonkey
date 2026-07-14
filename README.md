@@ -189,6 +189,43 @@ ComponentizeJS reference mode (`tests/compat/reference/`) is a separate,
 Node-only, one-command script not wired into either Zig build step; see
 `tests/compat/reference/README.md`.
 
+### WIT interface imports
+
+JavaScript modules can also `import` WIT interfaces and synchronously call
+host-provided component imports, through generated reverse canonical-ABI
+wrappers -- matching ComponentizeJS 0.21.0 observable behavior. Pass
+`--js-imports` (already wired in for `-Dcomponent-wit`/`-Ddispatch-wit`
+builds) and any interface the dispatch world *imports* becomes a StarlingMonkey
+builtin ES module, keyed by its versioned WIT identifier (e.g.
+`import { add } from "test:wit-imports/host@1.2.3";`) — with no user-written
+glue required. Arguments and results are converted with the same strict typed
+lifting/lowering helpers used for exports (`runtime/js_dispatch.zig`/`.cpp`):
+exact s64/u64 BigInt, strings, records, options, lists, and nested values.
+Host traps propagate back through the wasm export call as JS exceptions, and
+a component instantiated against a linker that doesn't implement a required
+import fails deterministically at instantiation time with an actionable
+diagnostic (this is enforced by the host, e.g. Wasmtime, not silently
+skipped). Resource-typed imports, async imports, and root-level (non-interface)
+function imports are not yet supported; the WABT bindgen fork used by this
+build (`cataggar/wabt`, see `build.zig.zon`'s `.wasip3` dependency) rejects
+those with a build-time diagnostic rather than silently omitting them.
+
+See `tests/e2e/wit-imports/` for the full fixture (a custom
+`test:wit-imports/host@1.2.3` interface implemented by a Wasmtime host, and
+`test:wit-imports/api@1.2.3` exported back to it) and run its E2E suite,
+which builds the fixture, componentizes it, and drives every export/import
+call (including repeated calls, exact BigInt arithmetic, nested records,
+host-trap propagation, and the missing-import diagnostic) through a
+purpose-built Wasmtime 42 host, with:
+
+```console
+zig build wit-imports-e2e-test
+```
+
+Like `compat-bridge-test`, this is not part of `zig build test` because it
+requires a Rust toolchain and takes several minutes; see
+`tests/e2e/wit-imports/run.sh` for the exact steps it automates.
+
 
 ## Using StarlingMonkey with dynamically loaded JS code
 
