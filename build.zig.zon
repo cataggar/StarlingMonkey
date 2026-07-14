@@ -29,7 +29,7 @@
             .lazy = true,
         },
         .wasip3 = .{
-            .url = "git+https://github.com/cataggar/wabt#9105e3051730461d498a14b65afda5f38d94c7b4",
+            .url = "git+https://github.com/cataggar/wabt#5c8fe2802df7a168700109027b41576b30e50339",
             .hash = "wasip3-0.3.0-Kmwy2luOBQD8XGPmKQYnmW925jElwaaCSsqk6nqvDG_7",
         },
     },
