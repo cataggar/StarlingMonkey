@@ -111,9 +111,20 @@ if [[ "$FORCE" == "--force" || ! -f "$SSL_INSTALL/libx32/libcrypto.a" ]]; then
     ( cd "$SSL_SRC" && patch -p1 < "$DEPS/patches/getuid.patch" && patch -p1 < "$DEPS/patches/rand.patch" )
   fi
   ( cd "$SSL_SRC"
+    # -fPIC: passed through Configure as a bare compiler flag, it lands in
+    # both $useradd{CFLAGS} and $useradd{CXXFLAGS} (see Configure's generic
+    # "-something" arg handling), so it reaches every libcrypto object file's
+    # compile command. -no-asm means every crypto primitive is compiled from
+    # C (no perlasm-generated .S files, so there is no separate
+    # assembly/ASFLAGS step to keep in sync) -- this is what makes a single
+    # -fPIC flag here sufficient to cover "compile and assembly-equivalent
+    # steps" consistently. Without it, libcrypto.a's objects contain
+    # absolute-address relocations (R_WASM_MEMORY_ADDR_SLEB/LEB) that
+    # wasm-ld rejects when the archive is later pulled into a
+    # `-dynamic -fPIC` wasm32-wasi dylib (see deps/verify-openssl-pic.sh).
     CC="$WRAP/zig-cc" AR="$WRAP/zig-ar" RANLIB="$WRAP/zig-ranlib" \
       ./Configure linux-x32 --prefix="$SSL_INSTALL" --openssldir="$SSL_INSTALL" \
-        -static -no-sock -no-asm -no-ui-console -no-egd -no-afalgeng -no-tests \
+        -static -fPIC -no-sock -no-asm -no-ui-console -no-egd -no-afalgeng -no-tests \
         -no-stdio -no-threads no-dso -DHAVE_FORK=0 -DNO_SYSLOG -DNO_CHMOD \
         -DOPENSSL_NO_SECURE_MEMORY --with-rand-seed=getrandom
     make -j"$(nproc)"
