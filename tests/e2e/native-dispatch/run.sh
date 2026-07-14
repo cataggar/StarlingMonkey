@@ -138,9 +138,9 @@ expect_core_diagnostic() {
     return
   fi
   if [ "$status" -ne 0 ]; then
-    if grep -Fq "$expected_diagnostic" <<<"$actual" && \
+    if grep -Fxq "Error: $expected_diagnostic" <<<"$actual" && \
        grep -Fq 'wasm trap:' <<<"$actual"; then
-      echo "PASS $name (call-time trap contained distinct guest diagnostic)"
+      echo "PASS $name (call-time trap contained exact guest diagnostic)"
       return
     fi
     echo "FAIL $name: expected a call-time trap with guest diagnostic [$expected_diagnostic]: $actual"
@@ -337,7 +337,10 @@ for shape in flat missing-namespace nonobject-namespace missing-member noncallab
     nonobject-namespace)
       diagnostic="JavaScript module export 'api' is not an interface namespace object"
       ;;
-    missing-member|noncallable-member)
+    missing-member)
+      diagnostic="JavaScript module does not export 'phantom'"
+      ;;
+    noncallable-member)
       diagnostic="JavaScript module export 'phantom' is not a function"
       ;;
   esac

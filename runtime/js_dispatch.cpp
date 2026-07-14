@@ -168,6 +168,11 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
     *error_context = "resolving a JavaScript module export";
     return false;
   }
+  if (!has_function) {
+    JS_ReportErrorUTF8(cx, "JavaScript module does not export '%s'", function_name.c_str());
+    *error_context = "resolving a JavaScript module export";
+    return false;
+  }
 
   if (!JS_GetProperty(cx, namespace_object, lookup_name.c_str(), out_function)) {
     *error_context = "resolving a JavaScript module export";
