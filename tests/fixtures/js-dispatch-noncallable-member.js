@@ -1,1 +1,6 @@
-export const api = { phantom: 42 };
+export const api = {
+  present() {
+    return 1;
+  },
+  phantom: 42,
+};

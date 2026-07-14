@@ -12,10 +12,10 @@
         "reference_class": "componentization-error",
         "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
         "reference_confidence": "reference-verified",
-        "bridge_class": "call-time-trap",
+        "bridge_class": "componentization-error",
         "bridge_message_contains": "does not export 'phantom'",
         "bridge_confidence": "build-verified",
-        "bridge_source": "runtime/js_dispatch.cpp: resolve_property_lookup checks literal and camelCase spellings, then emits an explicit missing-export diagnostic before JS_GetProperty; non-callable properties retain the distinct \"is not a function\" diagnostic -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+        "bridge_source": "WABT emits starling_js_exports_manifest from the exact dispatch shell names; runtime/js.cpp calls starling_validate_required_exports after module evaluation in the shared Wizer/weval initializer, and runtime/js_dispatch.cpp rejects a missing own property before artifact publication -- see tests/compat/runtime (bridge/negative-missing-export)"
       }
     }
   ],

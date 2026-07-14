@@ -1,3 +1,5 @@
+export { api, rootAdd } from "./component.js";
+
 const literalIncomingHandler = {
   "kebab-interface-add": (value) => value + 1,
 };

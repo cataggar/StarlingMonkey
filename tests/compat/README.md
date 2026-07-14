@@ -175,11 +175,10 @@ evidence and confidence levels. Summary, as of this manifest:
   option at any depth use native dispatch, which lifts `none` as JavaScript
   `undefined` and preserves all three nested-option states exactly like
   ComponentizeJS 0.21.
-- **Missing/invalid export detection timing**: ComponentizeJS detects a
-  missing or non-function WIT export at componentization (build) time
-  (reference-verified); the bridge detects this lazily at call time, with
-  distinct missing-member and non-callable diagnostics (build-verified).
-  See the two `negative-*` fixtures.
+- **Missing/invalid exports**: resolved. Both pipelines reject missing or
+  non-callable required exports during componentization. The bridge validates
+  WABT's exact root/interface export manifest after JavaScript module
+  evaluation and before Wizer/weval publishes an artifact.
 
 ## Provenance
 

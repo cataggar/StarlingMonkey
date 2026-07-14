@@ -1,1 +1,5 @@
-export const api = {};
+export const api = {
+  present() {
+    return 1;
+  },
+};

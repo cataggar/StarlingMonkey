@@ -8,6 +8,7 @@
 #include "extension-api.h"
 #include "config-parser.h"
 #include "host_api.h"
+#include "js_dispatch.h"
 #include "wasi/api.h"
 #include "wasi/libc-environ.h"
 #include "wizer.h"
@@ -65,6 +66,9 @@ void wizen() {
   auto config = config_parser.take();
   config->pre_initialize = true;
   ENGINE = new api::Engine(std::move(config));
+  if (!starling_validate_required_exports()) {
+    ENGINE->abort("validating required JavaScript exports");
+  }
   ENGINE->finish_pre_initialization();
 
   // Ensure that the monotonic clock is always increasing, even across multiple resumptions.

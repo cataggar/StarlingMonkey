@@ -12,10 +12,10 @@
         "reference_class": "componentization-error",
         "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
         "reference_confidence": "reference-verified",
-        "bridge_class": "call-time-trap",
+        "bridge_class": "componentization-error",
         "bridge_message_contains": "is not a function",
         "bridge_confidence": "build-verified",
-        "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call; the \"is not a function\" text is emitted by the JS engine's own panic diagnostic on stderr, not the wasm trap message itself -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+        "bridge_source": "WABT emits starling_js_exports_manifest from the exact dispatch shell names; runtime/js.cpp calls starling_validate_required_exports after module evaluation in the shared Wizer/weval initializer, and runtime/js_dispatch.cpp rejects a non-callable own property before artifact publication -- see tests/compat/runtime (bridge/negative-invalid-export)"
       }
     }
   ],

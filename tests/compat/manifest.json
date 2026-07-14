@@ -38,15 +38,8 @@
     }
   },
   "bridge": {
-    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) root export or member of the matching named-interface namespace object, then JSON.stringifies the return value back across the boundary. Any signature containing an option (at any depth), i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved. Wrong JavaScript kinds or invalid discriminants trap, while correct numeric kinds wrap with ComponentizeJS-compatible ECMAScript semantics. Promise/thenable results are pumped to settlement and then lowered normally. The same tagged-value tree drives reverse JavaScript calls to host-provided versioned-interface and root-function WIT imports through WABT `--js-imports` wrappers; this compatibility harness exercises the export direction, with dedicated import coverage in tests/e2e/wit-imports/.",
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. The generated shell also exposes an exact root/interface export manifest that the shared Wizer/weval initializer validates after JavaScript module evaluation, rejecting missing namespaces/members and non-callable exports before publishing an artifact. Signatures containing only bool/numeric-scalar/string/list/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) root export or member of the matching named-interface namespace object, then JSON.stringifies the return value back across the boundary. Any signature containing an option (at any depth), i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved. Wrong JavaScript kinds or invalid discriminants trap, while correct numeric kinds wrap with ComponentizeJS-compatible ECMAScript semantics. Promise/thenable results are pumped to settlement and then lowered normally. The same tagged-value tree drives reverse JavaScript calls to host-provided versioned-interface and root-function WIT imports through WABT `--js-imports` wrappers; this compatibility harness exercises the export direction, with dedicated import coverage in tests/e2e/wit-imports/.",
     "known_deviations": [
-      {
-        "id": "missing-export-detection-timing",
-        "summary": "The pinned ComponentizeJS reference rejects a WIT-declared export that JavaScript does not implement (or implements as a non-function) at componentization time, with a message naming the missing/invalid export. The current Zig/WABT bridge resolves the JS export lazily by name on each call (see js_dispatch.cpp's own-property lookup and JS::IsCallable check), so the same mistake is only observed as a call-time trap, not a componentization-time failure: build-verified by actually building and componentizing both negative fixtures' reactors and invoking the missing/invalid export through Wasmtime (tests/compat/runtime), which traps rather than failing componentization. The wasm trap itself carries no message text (a bare `unreachable`); the runtime prints a distinct \"does not export\" diagnostic for a missing own property and \"is not a function\" for a non-callable property to the guest's stderr stream, which tests/compat/runtime/invoker captures alongside the trap for comparison.",
-        "phase_addressed": 2,
-        "confidence": "build-verified",
-        "evidence": "tests/compat/fixtures/negative-missing-export, tests/compat/fixtures/negative-invalid-export; tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
-      },
       {
         "id": "componentizejs-u32-high-bit-defect",
         "summary": "Empirically, values of a plain `u32` argument/result at or above 2^31 (2147483648) did not round-trip correctly through the pinned ComponentizeJS 0.21.0 reference in this environment (e.g. echou32(4294967295) returned 4292870144, echou32(2147483648) returned 0), even in a minimal single-function isolated world. This was re-verified by invoking the real componentize-js output directly through Wasmtime (tests/compat/runtime/invoker), with no other transpiler in the call path, so the defect is attributable to ComponentizeJS/its embedded engine itself, not to a transpilation adapter. Root cause not diagnosed here (candidates include the embedded engine's own canonical-ABI numeric lifting/lowering); root-caused and either fixed upstream or worked around in a later phase. The current Zig/WABT bridge (runtime/js_dispatch.zig, which serializes numbers as JSON decimal text parsed by JS as an exact float64) has been build-verified unaffected: the actual reactor was built and its echou32 export invoked through Wasmtime for the same boundary values (0, 2147483647, 2147483648, 4294967295), all of which round-tripped correctly (see fixtures/numeric-primitives runtime_verification).",
@@ -264,13 +257,13 @@
     },
     {
       "category": "missing-or-invalid-export",
-      "status": "supported-as-trap",
+      "status": "supported",
       "phase": 0,
       "fixtures": [
         "negative-missing-export",
         "negative-invalid-export"
       ],
-      "notes": "Detection timing differs between pipelines; see known_deviations missing-export-detection-timing."
+      "notes": "Both pipelines reject missing and non-callable required exports during componentization. StarlingMonkey validates the generated exact root/interface export manifest after module evaluation in the shared Wizer/weval initializer."
     },
     {
       "category": "kebab-case-and-naming",
@@ -1010,7 +1003,7 @@
       "js_file": "component.js",
       "expected_file": "expected/negative-missing-export.json",
       "description": "The world declares `phantom`, which component.js does not implement.",
-      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
+      "runtime_verification": "build-verified: componentization rejects the missing export before producing an artifact (tests/compat/runtime/run-bridge-tests.sh negative-missing-export)",
       "negative": true,
       "cases": [
         {
@@ -1021,10 +1014,10 @@
             "reference_class": "componentization-error",
             "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
             "reference_confidence": "reference-verified",
-            "bridge_class": "call-time-trap",
+            "bridge_class": "componentization-error",
             "bridge_message_contains": "does not export 'phantom'",
             "bridge_confidence": "build-verified",
-            "bridge_source": "runtime/js_dispatch.cpp: resolve_property_lookup checks literal and camelCase spellings, then emits an explicit missing-export diagnostic before JS_GetProperty; non-callable properties retain the distinct \"is not a function\" diagnostic -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+            "bridge_source": "WABT emits starling_js_exports_manifest from the exact dispatch shell names; runtime/js.cpp calls starling_validate_required_exports after module evaluation in the shared Wizer/weval initializer, and runtime/js_dispatch.cpp rejects a missing own property before artifact publication -- see tests/compat/runtime (bridge/negative-missing-export)"
           }
         }
       ]
@@ -1038,7 +1031,7 @@
       "js_file": "component.js",
       "expected_file": "expected/negative-invalid-export.json",
       "description": "The world declares `phantom` as a function, but component.js exports a non-function value under that name.",
-      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
+      "runtime_verification": "build-verified: componentization rejects the non-callable export before producing an artifact (tests/compat/runtime/run-bridge-tests.sh negative-invalid-export)",
       "negative": true,
       "cases": [
         {
@@ -1049,10 +1042,10 @@
             "reference_class": "componentization-error",
             "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
             "reference_confidence": "reference-verified",
-            "bridge_class": "call-time-trap",
+            "bridge_class": "componentization-error",
             "bridge_message_contains": "is not a function",
             "bridge_confidence": "build-verified",
-            "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call; the \"is not a function\" text is emitted by the JS engine's own panic diagnostic on stderr, not the wasm trap message itself -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+            "bridge_source": "WABT emits starling_js_exports_manifest from the exact dispatch shell names; runtime/js.cpp calls starling_validate_required_exports after module evaluation in the shared Wizer/weval initializer, and runtime/js_dispatch.cpp rejects a non-callable own property before artifact publication -- see tests/compat/runtime (bridge/negative-invalid-export)"
           }
         }
       ]

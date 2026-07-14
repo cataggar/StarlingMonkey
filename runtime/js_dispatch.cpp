@@ -316,6 +316,60 @@ bool resolve_promise_like(JSContext *cx, const char *function_name, bool result_
 
 } // namespace
 
+extern "C" __attribute__((weak)) const uint8_t *starling_js_exports_manifest(size_t *out_len) {
+  *out_len = 0;
+  return nullptr;
+}
+
+bool starling_validate_required_exports() {
+  size_t manifest_len = 0;
+  const uint8_t *manifest_ptr = starling_js_exports_manifest(&manifest_len);
+  if (manifest_len == 0) {
+    return true;
+  }
+
+  JSContext *cx = api::Engine::cx();
+  if (!cx || !manifest_ptr) {
+    return false;
+  }
+  JSAutoRealm realm(cx, api::Engine::global());
+  std::string_view manifest(reinterpret_cast<const char *>(manifest_ptr), manifest_len);
+
+  size_t pos = 0;
+  while (pos < manifest.size()) {
+    size_t newline = manifest.find('\n', pos);
+    if (newline == std::string_view::npos) {
+      JS_ReportErrorASCII(cx, "malformed JavaScript export manifest: unterminated entry");
+      return false;
+    }
+    std::string_view line = manifest.substr(pos, newline - pos);
+    pos = newline + 1;
+    if (line.size() < 3 || line[1] != '\t' || (line[0] != 'I' && line[0] != 'R')) {
+      JS_ReportErrorUTF8(cx, "malformed JavaScript export manifest entry '%.*s'",
+                         static_cast<int>(line.size()), line.data());
+      return false;
+    }
+
+    std::string_view export_name = line.substr(2);
+    bool is_interface = export_name.find('#') != std::string_view::npos;
+    if (export_name.empty() || (line[0] == 'I') != is_interface) {
+      JS_ReportErrorUTF8(cx, "malformed JavaScript export manifest entry '%.*s'",
+                         static_cast<int>(line.size()), line.data());
+      return false;
+    }
+
+    JS::RootedValue function(cx);
+    const char *error_context = "validating a JavaScript module export";
+    std::string function_name;
+    if (!resolve_export_function(
+            cx, &function, reinterpret_cast<const uint8_t *>(export_name.data()),
+            export_name.size(), &error_context, &function_name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
                                          size_t export_name_len,
                                          const uint8_t *args_json_ptr,

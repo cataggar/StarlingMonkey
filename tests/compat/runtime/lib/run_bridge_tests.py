@@ -10,9 +10,10 @@ cataggar/wabt#331's reactor-export-lift fix), invokes its exports through
 Wasmtime (via tests/compat/runtime/invoker, "compat-invoker" -- a small host
 built on the official `wasmtime` Rust crate, not a CLI string parser and not
 a second component transpiler), and compares observed values/traps against
-manifest.json's checked-in expectations. Negative fixtures are built and
-invoked the same way, to build-verify the bridge's actual call-time-trap
-behavior, not just statically reason about js_dispatch.cpp's source.
+manifest.json's checked-in expectations. Export-surface negative fixtures
+must fail during componentization, proving export preflight runs after module
+evaluation and before artifact publication. Runtime-negative fixtures still
+componentize successfully and are invoked to verify their declared traps.
 
 This is deliberately NOT part of `zig build test` or `zig build compat-test`
 (see build.zig's `compat-bridge-test` step): a full run takes on the order
@@ -320,8 +321,58 @@ def run_positive_fixture(fixture, zig, wabt, wasm_tools, invoker, reporter) -> N
 
 def run_negative_fixture(fixture, zig, wabt, wasm_tools, invoker, reporter) -> None:
     label = f"bridge/{fixture['id']}"
+    expected_classes = {
+        case.get("expect_error", {}).get("bridge_class")
+        for case in fixture.get("cases", [])
+    }
+    if expected_classes not in ({"componentization-error"}, {"call-time-trap"}):
+        reporter.report(
+            FAIL,
+            label,
+            f"negative fixture has unsupported or mixed bridge classes: "
+            f"{sorted(repr(value) for value in expected_classes)}",
+        )
+        return
+
     try:
         bin_dir = build_reactor(zig, fixture)
+    except RuntimeError as err:
+        reporter.report(FAIL, label, str(err)[-2000:])
+        return
+
+    if expected_classes == {"componentization-error"}:
+        component_path = COMPONENT_CACHE_DIR / f"{fixture['id']}.wasm"
+        component_path.unlink(missing_ok=True)
+        try:
+            componentize(bin_dir, fixture, wabt)
+        except RuntimeError as err:
+            failure = str(err)
+            mismatches = []
+            if component_path.exists():
+                mismatches.append(
+                    f"failed componentization left an output artifact at {component_path}"
+                )
+            for case in fixture.get("cases", []):
+                needle = case["expect_error"].get("bridge_message_contains")
+                if needle and needle not in failure:
+                    mismatches.append(
+                        f"{case['id']}: componentization error did not contain "
+                        f"{needle!r}: {failure[-2000:]}"
+                    )
+            if mismatches:
+                reporter.report(FAIL, label, "; ".join(mismatches))
+            else:
+                reporter.report(PASS, label)
+            return
+
+        reporter.report(
+            FAIL,
+            label,
+            "expected componentization to reject the export surface, but it succeeded",
+        )
+        return
+
+    try:
         component_path = componentize(bin_dir, fixture, wabt)
         validate(wasm_tools, component_path)
         calls = calls_for_fixture(fixture)
@@ -332,16 +383,22 @@ def run_negative_fixture(fixture, zig, wabt, wasm_tools, invoker, reporter) -> N
 
     mismatches = []
     for call, observed in zip(calls, results):
-        c = call["_case"]
-        expect = c.get("expect_error", {})
-        needle = expect.get("bridge_message_contains")
+        case = call["_case"]
+        needle = case["expect_error"].get("bridge_message_contains")
         if observed["ok"]:
-            mismatches.append(f"{c['id']}: expected a call-time trap, call succeeded with {observed.get('value')!r}")
+            mismatches.append(
+                f"{case['id']}: expected a call-time trap, call succeeded with "
+                f"{observed.get('value')!r}"
+            )
             continue
         if needle:
             haystack = observed["trap"] + "\n" + observed.get("diagnostics", "")
             if needle not in haystack:
-                mismatches.append(f"{c['id']}: trap/diagnostics did not contain {needle!r}; trap={observed['trap']!r} diagnostics={observed.get('diagnostics', '')!r}")
+                mismatches.append(
+                    f"{case['id']}: trap/diagnostics did not contain {needle!r}; "
+                    f"trap={observed['trap']!r} "
+                    f"diagnostics={observed.get('diagnostics', '')!r}"
+                )
     if mismatches:
         reporter.report(FAIL, label, "; ".join(mismatches))
     else:

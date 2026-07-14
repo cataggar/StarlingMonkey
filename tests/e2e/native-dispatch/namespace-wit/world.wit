@@ -8,4 +8,5 @@ interface api {
 
 world js-exports {
   export api;
+  export root-required: func() -> u32;
 }

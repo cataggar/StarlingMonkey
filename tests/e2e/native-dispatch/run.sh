@@ -32,9 +32,9 @@
 #     (camelCased on the JS side) vs. multi-word enum/variant case labels
 #     (kept in their original kebab-case spelling), and a kebab-case export
 #     name resolved only via the camelCase JS export-name fallback
-#   * named-interface topology: `api` is required to be an object containing
-#     callable members; flat, missing, non-object, and non-callable shapes
-#     all trap instead of being flattened
+#   * export preflight: named-interface and root exports are validated during
+#     componentization; flat, missing, inherited, non-object, and non-callable
+#     shapes fail before an artifact is published
 #   * a battery of wrong-type/invalid-discriminant negative cases for every
 #     new value class above, asserting each traps instead of silently
 #     decoding to a plausible-looking but wrong value
@@ -126,29 +126,35 @@ expect_trap() {
   echo "PASS $name (trapped with exit $status)"
 }
 
-# expect_core_diagnostic NAME CORE_MODULE EXPECTED_DIAGNOSTIC [INVOKE_EXPR]
-expect_core_diagnostic() {
-  local name="$1" core_module="$2" expected_diagnostic="$3"
-  local invoke_expr="${4:-starling:js/api#phantom}" actual status
-  actual=$(timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/wasmtime" run \
-    -S cli -W unknown-imports-trap \
-    --invoke "$invoke_expr" "$core_module" 2>&1) && status=0 || status=$?
+# expect_componentization_diagnostic NAME FIXTURE OUTPUT EXPECTED_DIAGNOSTIC
+expect_componentization_diagnostic() {
+  local name="$1" fixture="$2" output="$3" expected_diagnostic="$4" actual status
+  rm -f "$output"
+  actual=$(WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+    WASM_TOOLS_BIN="$NAMESPACE_BIN/wasm-tools" \
+    timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/componentize.sh" \
+      "$fixture" -o "$output" 2>&1) && status=0 || status=$?
   if [ "$status" -eq 124 ]; then
-    echo "FAIL $name: invocation timed out after ${TIMEOUT_SECS}s"
+    echo "FAIL $name: componentization timed out after ${TIMEOUT_SECS}s"
     fail=1
     return
   fi
-  if [ "$status" -ne 0 ]; then
-    if grep -Fxq "Error: $expected_diagnostic" <<<"$actual" && \
-       grep -Fq 'wasm trap:' <<<"$actual"; then
-      echo "PASS $name (call-time trap contained exact guest diagnostic)"
-      return
-    fi
-    echo "FAIL $name: expected a call-time trap with guest diagnostic [$expected_diagnostic]: $actual"
-  else
-    echo "FAIL $name: expected a call-time trap, but invocation succeeded: $actual"
+  if [ "$status" -eq 0 ]; then
+    echo "FAIL $name: expected componentization to fail, but it succeeded"
+    fail=1
+    return
   fi
-  fail=1
+  if ! grep -Fxq "Error: $expected_diagnostic" <<<"$actual"; then
+    echo "FAIL $name: expected diagnostic [$expected_diagnostic]: $actual"
+    fail=1
+    return
+  fi
+  if [ -e "$output" ]; then
+    echo "FAIL $name: failed componentization published $output"
+    fail=1
+    return
+  fi
+  echo "PASS $name (componentization rejected the export surface)"
 }
 
 # --- Existing scalar/record regressions -----------------------------------
@@ -314,16 +320,8 @@ expect_eq "multi-word-echo resolves via the camelCase export-name fallback" \
   "multi-word-echo(5)" "6"
 
 # --- Named-interface topology ---------------------------------------------
-# Missing-export validation intentionally remains call-time behavior here,
-# but interface-qualified dispatch must reject every invalid namespace
-# shape. A flat `phantom` must not stand in for `api.phantom`.
-#
-# Use a focused real WIT interface and retain each Wizer-frozen core reactor
-# for stderr assertions. Invoking that core export directly keeps the guest
-# diagnostic visible; invoking the subsequently adapted component masks a
-# first stderr write behind the preview1 adapter's lazy initialization trap.
-# The componentized form is still built and validated below, while the core
-# invocation proves the dispatch failure itself happens at call time.
+# A focused world verifies that componentization validates the exact
+# JavaScript root/interface topology before publishing an artifact.
 NAMESPACE_WIT="$PREFIX/namespace-wit"
 python3 tests/compat/lib/gen_bridge_wit.py \
   host-apis/wasi-0.2.10/wit \
@@ -339,20 +337,10 @@ NAMESPACE_PREFIX="$PREFIX/namespace-runtime"
   -Ddispatch-world=js-exports
 NAMESPACE_BIN="$NAMESPACE_PREFIX/bin"
 
-for shape in flat missing-namespace nonobject-namespace missing-member noncallable-member; do
+for shape in flat missing-namespace nonobject-namespace missing-member \
+  noncallable-member inherited-member missing-root noncallable-root; do
   fixture="$REPO_ROOT/tests/fixtures/js-dispatch-$shape.js"
-  core_module="$PREFIX/js-dispatch-$shape.core.wasm"
   shape_component="$PREFIX/js-dispatch-$shape.wasm"
-  echo "[native-dispatch e2e] componentizing namespace-shape fixture: $shape"
-  echo " $fixture" | WASMTIME_BACKTRACE_DETAILS=1 \
-    "$NAMESPACE_BIN/wasmtime" wizer \
-      -S cli -S inherit-env -W bulk-memory -W unknown-imports-trap \
-      --dir "$(dirname "$fixture")" \
-      -o "$core_module" "$NAMESPACE_BIN/starling-raw.wasm"
-  WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
-  WASM_TOOLS_BIN="$NAMESPACE_BIN/wasm-tools" \
-    "$NAMESPACE_BIN/componentize.sh" "$fixture" -o "$shape_component"
-  "$NAMESPACE_BIN/wasm-tools" validate --features all "$shape_component"
   case "$shape" in
     flat|missing-namespace)
       diagnostic="JavaScript module does not export an 'api' interface namespace"
@@ -366,14 +354,18 @@ for shape in flat missing-namespace nonobject-namespace missing-member noncallab
     noncallable-member)
       diagnostic="JavaScript module export 'phantom' is not a function"
       ;;
+    inherited-member)
+      diagnostic="JavaScript module does not export 'to-string'"
+      ;;
+    missing-root)
+      diagnostic="JavaScript module does not export 'root-required'"
+      ;;
+    noncallable-root)
+      diagnostic="JavaScript module export 'rootRequired' is not a function"
+      ;;
   esac
-  expect_core_diagnostic "interface namespace rejects $shape shape" \
-    "$core_module" "$diagnostic"
-  if [ "$shape" = missing-member ]; then
-    expect_core_diagnostic "interface namespace rejects inherited prototype members" \
-      "$core_module" "JavaScript module does not export 'to-string'" \
-      "starling:js/api#to-string"
-  fi
+  expect_componentization_diagnostic "export preflight rejects $shape shape" \
+    "$fixture" "$shape_component" "$diagnostic"
 done
 
 if [ "$fail" -ne 0 ]; then

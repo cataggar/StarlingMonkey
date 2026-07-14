@@ -29,15 +29,20 @@ regardless.
 3. **Componentize**: run the installed `componentize.sh` against the
    fixture's `component.js`, using a `wabt` binary built by
    `build-wabt.sh` (see below).
-4. **Validate**: `wasm-tools validate` on the componentized output.
-5. **Invoke**: require the exact `starling:js/api` component export, then
+4. **Validate**: for positive and runtime-negative fixtures, `wasm-tools
+   validate` on the componentized output. Export-surface negative fixtures
+   must instead fail during componentization with the declared preflight
+   diagnostic.
+5. **Invoke**: for positive and runtime-negative fixtures, require the exact
+   `starling:js/api` component export, then
    run every declared case/sequence through `invoker`
    (`compat-invoker`), instantiating the component once per fixture and
    calling each export in the manifest's declared order (required for the
    `repeated-calls` fixture's module-level state to be observable the way
    a real embedder would see it).
-6. **Compare**: observed JSON values against `result`/`bridge_result`; for
-   negative fixtures, confirm a call-time wasm trap whose message contains
+6. **Compare**: observed JSON values against `result`/`bridge_result`;
+   runtime-negative fixtures compare invocation traps and export-surface
+   negatives compare componentization failures against
    `expect_error.bridge_message_contains`.
 
 ## Why a wabt build step (`build-wabt.sh`)
