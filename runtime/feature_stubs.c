@@ -51,6 +51,8 @@
 #include <stdint.h>
 #include <wasi/api.h>
 
+#include "feature-defaults.h"
+
 #if !STARLING_FEATURE_STDIO
 
 int32_t __imported_wasi_snapshot_preview1_fd_write(int32_t fd, int32_t iovs_ptr, int32_t iovs_len,

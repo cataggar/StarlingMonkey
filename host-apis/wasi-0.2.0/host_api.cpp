@@ -1,6 +1,7 @@
 #include "host_api.h"
 #include "bindings/bindings.h"
 #include "handles.h"
+#include "feature-defaults.h"
 
 static std::optional<wasi_clocks_monotonic_clock_own_pollable_t> immediately_ready;
 

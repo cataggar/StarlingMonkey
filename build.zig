@@ -524,6 +524,18 @@ pub fn build(b: *std.Build) void {
     const feature_selection_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-build-option-tests.sh" });
     feature_selection_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_test_step.dependOn(&feature_selection_run.step);
+
+    // Fast, Node-free preprocessor/compile regression coverage for
+    // include/feature-defaults.h (review follow-up: CMake and any
+    // non-Zig compiler path left STARLING_FEATURE_* undefined, silently
+    // compiling every gated feature as disabled). Proves, independent of
+    // build.zig, that every macro defaults to 1 when undefined and that
+    // explicit 0/1 definitions (as Zig always passes) remain authoritative
+    // with no redefinition warnings -- see
+    // tests/feature-selection/run-macro-default-tests.sh.
+    const feature_selection_macro_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-macro-default-tests.sh" });
+    feature_selection_macro_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    feature_selection_test_step.dependOn(&feature_selection_macro_run.step);
     test_step.dependOn(feature_selection_test_step);
 
     // `zig build feature-selection-runtime-test`: the REQUIRED/FULL

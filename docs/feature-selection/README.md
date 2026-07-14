@@ -215,6 +215,22 @@ phase's fixtures and tests do).
 
 ## 5. Implementation summary
 
+- `include/feature-defaults.h` (new, review follow-up): a shared header
+  that `#define`s each `STARLING_FEATURE_*` macro to `1` only when it
+  isn't already defined. Zig always threads explicit
+  `-DSTARLING_FEATURE_*=0/1` (see below), so under Zig this header is a
+  no-op; but CMake (and any other non-Zig compiler invocation) never
+  defined these macros at all, so `#if STARLING_FEATURE_*` /
+  `#if !STARLING_FEATURE_*` silently evaluated as `#if 0` / `#if !0`,
+  compiling every gated feature as *disabled* by default under CMake. This
+  header is included from every one of the five sources below that gates
+  behavior on these macros, restoring Zig's enabled-by-default contract
+  for CMake and any other build system without requiring changes to
+  CMakeLists.txt/cmake/*.cmake themselves. It lives in `include/`, which
+  is already on the include path for every affected target (both under
+  CMake -- `extension_api`'s `INTERFACE include`, `host_api`'s
+  `target_include_directories(host_api PRIVATE include)` -- and under Zig
+  -- `common_includes` in build.zig).
 - `build.zig` ("Platform feature selection" section): `FeatureName` enum,
   `Features` struct, `parseFeatureList`/`resolveFeatures` (typed
   `-Dfeature-*` booleans plus `-Ddisable-features`/`-Denable-features` CSV
@@ -282,6 +298,63 @@ phase's fixtures and tests do).
   for differential comparison against
   `tests/feature-selection/reference/expected/import-surfaces.json` (the
   source of the "Reference" column in the behavior matrix above).
+- `tests/feature-selection/run-macro-default-tests.sh` (new, review
+  follow-up) -- fast (~1s), Node-free, network-free, part of `zig build
+  test` (via `feature-selection-test`). Compiles small C and C++ probes
+  that `#include "feature-defaults.h"` using the pinned Zig toolchain's
+  bundled compiler (`zig cc`/`zig c++`, native host target -- no wasi-sdk
+  or network dependency), with `-Wall -Wextra -Werror`. 8 cases (C and C++
+  x 4 scenarios) proving: no explicit macros => all five default to `1`;
+  explicit `0` for all five => all stay `0`; a mixed
+  explicit/implicit combination => each macro is independent (explicitly
+  set ones keep their value, unset ones still default); and explicit `1`
+  for all five (mirroring Zig's own enabled-by-default `-D...=1`) compiles
+  with zero warnings, i.e. the header's `#ifndef` guards never trigger a
+  macro-redefinition warning against an already-authoritative define.
+
+### CMake validation (review follow-up)
+
+The five gated sources were also verified through a **real, from-scratch
+CMake configure** (`cmake -S . -B build-verify`, default `HOST_API`, which
+resolves to `wasi-0.2.10` and pulls in `host-apis/wasi-0.2.0/host_api.cpp`
+via a relative path -- see `host-apis/wasi-0.2.10/host_api.cmake`), using
+network access to fetch wasi-sdk, the prebuilt SpiderMonkey release
+tarball, and OpenSSL. This is a one-time, manually-run verification, not
+wired into any automated test tier: a full CMake configure needs network
+access and downloads on the order of several hundred MB (wasi-sdk +
+SpiderMonkey + OpenSSL), so it isn't "cheap" enough to run on every `zig
+build test`/CI invocation, unlike `run-macro-default-tests.sh` above.
+
+For each of `host-apis/wasi-0.2.0/host_api.cpp`,
+`builtins/web/timers.cpp`, `builtins/web/event/global-event-target.cpp`,
+and `builtins/web/fetch/fetch_event.cpp` (the four gated sources CMake
+actually compiles -- `runtime/feature_stubs.c` is Zig-only, referenced
+nowhere in `CMakeLists.txt`/`cmake/*.cmake`, since its `wasm-ld` symbol-
+override trick is specific to Zig's bundled wasi-libc), the exact command
+from the configured build's `compile_commands.json` was used to:
+
+1. **Compile as-is (no explicit `-D`)**: succeeded, and the enabled-path
+   code (e.g. `wasi_random_random_get_random_bytes`,
+   `wasi_clocks_monotonic_clock_now`, `handler_args.infallibleAppend`,
+   `JS_AtomizeAndPinString(engine->cx(), "fetch")`) was present in the
+   preprocessed output, while the corresponding disabled-path code (e.g.
+   the `stubbed_random_next` PRNG fallback, the `FeatureDisabled` throws)
+   was absent -- proving default-on under CMake's real flags/include
+   shape, matching Zig's default.
+2. **Compile with an explicit override** (e.g. `-DSTARLING_FEATURE_CLOCKS=0`
+   added to the real command for `timers.cpp`): succeeded with zero
+   warnings/errors despite CMake's own `-Werror` (`cmake/compile-
+   flags.cmake`), and the disabled-path code became present / enabled-path
+   code absent in the preprocessed output -- proving the override is
+   honored and the header never causes a redefinition diagnostic.
+
+`cmake --build . --target host_api` (the real static-library build, not
+just a manual compiler invocation) was also run standalone and succeeded.
+Full end-to-end CMake linking/componentizing was not attempted (would
+additionally require Rust/corrosion and Wasmtime/wasm-tools artifacts
+beyond what this check needed); this validation is scoped to compiling the
+five affected translation units through CMake's real configured
+flags/include shape, per the review requirement.
 
 Run everything:
 

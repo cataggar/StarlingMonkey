@@ -1,6 +1,7 @@
 #include "timers.h"
 
 #include "event_loop.h"
+#include "feature-defaults.h"
 
 #include <algorithm>
 #include <ctime>

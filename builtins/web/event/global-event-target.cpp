@@ -2,6 +2,7 @@
 #include "global-event-target.h"
 #include "encode.h"
 #include "errors.h"
+#include "feature-defaults.h"
 
 namespace {
 JS::PersistentRootedObject GLOBAL_EVENT_TARGET;
