@@ -32,6 +32,11 @@
 #   * requirement 5 (versioned interface names): the fixture's import/export
 #     both use the versioned identifier `test:wit-imports/{host,api}@1.2.3`
 #     throughout.
+#   * kebab-case interface namespace mapping: the exact versioned
+#     `test:wit-imports/incoming-handler@1.2.3` export resolves through the
+#     ComponentizeJS `incomingHandler` spelling, while a second component
+#     proves literal namespace/member spellings take precedence when both
+#     literal and camelCase properties exist.
 #   * root-function preservation: `root-add` remains a callable top-level
 #     export beside the versioned named `api` interface.
 #   * void import result contract: `note` (a WIT import with no result)
@@ -105,7 +110,15 @@ echo "[wit-imports e2e] confirming test:wit-imports/host@1.2.3 is a real compone
   echo "FAIL: componentized output does not declare test:wit-imports/api@1.2.3 as an export"
   exit 1
 }
-echo "PASS component declares versioned import/export interface names"
+"$BIN/wasm-tools" component wit "$COMPONENT" | grep -q 'export test:wit-imports/incoming-handler@1.2.3;' || {
+  echo "FAIL: componentized output does not declare the kebab-case versioned interface export"
+  exit 1
+}
+"$BIN/wasm-tools" component wit "$COMPONENT" | grep -q 'export root-add: func' || {
+  echo "FAIL: componentized output moved root-add away from the component root"
+  exit 1
+}
+echo "PASS component declares exact versioned interfaces and root-function topology"
 for root_import in add-one root-note root-note-count root-boom root-transform root-chain; do
   "$BIN/wasm-tools" component wit "$COMPONENT" | grep -q "import ${root_import}: func" || {
     echo "FAIL: componentized output does not declare root function import ${root_import}"
@@ -177,7 +190,8 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-root-note-count", "args": []},
   {"function": "run-root-transform", "args": [{"coordinate": {"x": 5, "y": 8}, "labels": ["alpha", "beta"]}]},
   {"function": "run-root-chain", "args": [{"tag": "item", "val": {"x": 5, "y": 8}}]},
-  {"function": "root-add", "args": [20, 22]},
+  {"function": "root-add", "args": [20, 22], "interface": null},
+  {"function": "kebab-interface-add", "args": [41], "interface": "test:wit-imports/incoming-handler@1.2.3"},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -308,8 +322,11 @@ assert_field "root use alias chain lowers and lifts through its source interface
   "rec['value']" "{'tag': 'item', 'val': {'x': 8, 'y': 12}}"
 assert_field "root function export remains callable beside the api namespace" 47 "rec['value']" "42"
 
-assert_field "run-boom host trap propagates" 48 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 48 \
+assert_field "kebab-case versioned interface resolves through camelCase namespace/member fallback" 48 \
+  "rec['value']" "42"
+
+assert_field "run-boom host trap propagates" 49 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 49 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] invoking root-boom in a fresh instance"
@@ -320,6 +337,25 @@ OUTPUT_JSON="$PREFIX/root_trap_output.json"
 assert_field "root-boom host trap propagates" 0 "rec['ok']" "False"
 assert_field "root-boom trap names the world-level host function" 0 \
   "'root-boom: deliberate host-side trap' in rec['trap']" "True"
+
+echo "[wit-imports e2e] checking literal namespace/member precedence over camelCase"
+LITERAL_COMPONENT="$PREFIX/wit-imports-literal-names.wasm"
+WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+WASM_TOOLS_BIN="$BIN/wasm-tools" \
+  "$BIN/componentize.sh" tests/e2e/wit-imports/component-literal-names.js -o "$LITERAL_COMPONENT"
+"$BIN/wasm-tools" validate --features all "$LITERAL_COMPONENT"
+LITERAL_CALLS_JSON="$PREFIX/calls_literal_names.json"
+cat > "$LITERAL_CALLS_JSON" <<'EOF'
+[
+  {"function": "kebab-interface-add", "args": [41], "interface": "test:wit-imports/incoming-handler@1.2.3"}
+]
+EOF
+LITERAL_OUTPUT_JSON="$PREFIX/output_literal_names.json"
+"$INVOKER" "$LITERAL_COMPONENT" "$LITERAL_CALLS_JSON" > "$LITERAL_OUTPUT_JSON"
+OUTPUT_JSON="$LITERAL_OUTPUT_JSON"
+assert_field "literal kebab-case namespace/member take precedence over camelCase aliases" 0 \
+  "rec['value']" "42"
+OUTPUT_JSON="$PREFIX/output.json"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"
 EMPTY_CALLS_JSON="$PREFIX/calls_empty.json"

@@ -126,21 +126,28 @@ expect_trap() {
   echo "PASS $name (trapped with exit $status)"
 }
 
-# expect_component_trap NAME COMPONENT INVOKE_EXPR
-expect_component_trap() {
-  local name="$1" component="$2" expr="$3" status
-  timeout "$TIMEOUT_SECS" "$WASMTIME" run -S http --invoke "$expr" "$component" >/dev/null 2>&1 && status=0 || status=$?
+# expect_core_diagnostic NAME CORE_MODULE EXPECTED_DIAGNOSTIC
+expect_core_diagnostic() {
+  local name="$1" core_module="$2" expected_diagnostic="$3" actual status
+  actual=$(timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/wasmtime" run \
+    -S cli -W unknown-imports-trap \
+    --invoke 'starling:js/api#phantom' "$core_module" 2>&1) && status=0 || status=$?
   if [ "$status" -eq 124 ]; then
-    echo "FAIL $name: invoking '$expr' timed out after ${TIMEOUT_SECS}s"
+    echo "FAIL $name: invocation timed out after ${TIMEOUT_SECS}s"
     fail=1
     return
   fi
-  if [ "$status" -eq 0 ]; then
-    echo "FAIL $name: invoking '$expr' expected a trap, but it exited 0"
-    fail=1
-    return
+  if [ "$status" -ne 0 ]; then
+    if grep -Fq "$expected_diagnostic" <<<"$actual" && \
+       grep -Fq 'wasm trap:' <<<"$actual"; then
+      echo "PASS $name (call-time trap contained distinct guest diagnostic)"
+      return
+    fi
+    echo "FAIL $name: expected a call-time trap with guest diagnostic [$expected_diagnostic]: $actual"
+  else
+    echo "FAIL $name: expected a call-time trap, but invocation succeeded: $actual"
   fi
-  echo "PASS $name (trapped with exit $status)"
+  fail=1
 }
 
 # --- Existing scalar/record regressions -----------------------------------
@@ -308,15 +315,56 @@ expect_eq "multi-word-echo resolves via the camelCase export-name fallback" \
 # --- Named-interface topology ---------------------------------------------
 # Missing-export validation intentionally remains call-time behavior here,
 # but interface-qualified dispatch must reject every invalid namespace
-# shape. A flat `add` must not stand in for `api.add`.
-for shape in flat missing-namespace nonobject-namespace noncallable-member; do
+# shape. A flat `phantom` must not stand in for `api.phantom`.
+#
+# Use a focused real WIT interface and retain each Wizer-frozen core reactor
+# for stderr assertions. Invoking that core export directly keeps the guest
+# diagnostic visible; invoking the subsequently adapted component masks a
+# first stderr write behind the preview1 adapter's lazy initialization trap.
+# The componentized form is still built and validated below, while the core
+# invocation proves the dispatch failure itself happens at call time.
+NAMESPACE_WIT="$PREFIX/namespace-wit"
+python3 tests/compat/lib/gen_bridge_wit.py \
+  host-apis/wasi-0.2.10/wit \
+  tests/e2e/native-dispatch/namespace-wit \
+  "$NAMESPACE_WIT" >/dev/null
+NAMESPACE_WIT_REL="$(realpath --relative-to="$REPO_ROOT" "$NAMESPACE_WIT")"
+NAMESPACE_PREFIX="$PREFIX/namespace-runtime"
+"$ZIG_BIN" build install --prefix "$NAMESPACE_PREFIX" \
+  -Doptimize=ReleaseSmall \
+  -Dcomponent-wit="$NAMESPACE_WIT_REL" \
+  -Dcomponent-world=js-dispatch \
+  -Ddispatch-wit="$NAMESPACE_WIT_REL/deps/starling-js" \
+  -Ddispatch-world=js-exports
+NAMESPACE_BIN="$NAMESPACE_PREFIX/bin"
+
+for shape in flat missing-namespace nonobject-namespace missing-member noncallable-member; do
+  fixture="$REPO_ROOT/tests/fixtures/js-dispatch-$shape.js"
+  core_module="$PREFIX/js-dispatch-$shape.core.wasm"
   shape_component="$PREFIX/js-dispatch-$shape.wasm"
   echo "[native-dispatch e2e] componentizing namespace-shape fixture: $shape"
+  echo " $fixture" | WASMTIME_BACKTRACE_DETAILS=1 \
+    "$NAMESPACE_BIN/wasmtime" wizer \
+      -S cli -S inherit-env -W bulk-memory -W unknown-imports-trap \
+      --dir "$(dirname "$fixture")" \
+      -o "$core_module" "$NAMESPACE_BIN/starling-raw.wasm"
   WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
-  WASM_TOOLS_BIN="$BIN/wasm-tools" \
-    "$BIN/componentize.sh" "tests/fixtures/js-dispatch-$shape.js" -o "$shape_component"
-  "$BIN/wasm-tools" validate --features all "$shape_component"
-  expect_component_trap "interface namespace rejects $shape shape" "$shape_component" "add(2, 3)"
+  WASM_TOOLS_BIN="$NAMESPACE_BIN/wasm-tools" \
+    "$NAMESPACE_BIN/componentize.sh" "$fixture" -o "$shape_component"
+  "$NAMESPACE_BIN/wasm-tools" validate --features all "$shape_component"
+  case "$shape" in
+    flat|missing-namespace)
+      diagnostic="JavaScript module does not export an 'api' interface namespace"
+      ;;
+    nonobject-namespace)
+      diagnostic="JavaScript module export 'api' is not an interface namespace object"
+      ;;
+    missing-member|noncallable-member)
+      diagnostic="JavaScript module export 'phantom' is not a function"
+      ;;
+  esac
+  expect_core_diagnostic "interface namespace rejects $shape shape" \
+    "$core_module" "$diagnostic"
 done
 
 if [ "$fail" -ne 0 ]; then

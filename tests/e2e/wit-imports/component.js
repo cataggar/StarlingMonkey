@@ -307,6 +307,17 @@ export function rootAdd(a, b) {
   return a + b;
 }
 
+function kebabInterfaceAdd(value) {
+  return value + 1;
+}
+
+// ComponentizeJS maps the kebab-case WIT interface and function names to
+// camelCase JavaScript identifiers. Deliberately provide no literal
+// "incoming-handler" namespace or "kebab-interface-add" member here.
+export const incomingHandler = {
+  kebabInterfaceAdd,
+};
+
 export const api = {
   "run-add": runAdd,
   "run-sum-list": runSumList,

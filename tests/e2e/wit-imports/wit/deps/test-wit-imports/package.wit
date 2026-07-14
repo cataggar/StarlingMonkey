@@ -292,6 +292,10 @@ interface api {
     run-validate-non-negative: func(n: s32) -> result<_, string>;
 }
 
+interface incoming-handler {
+    kebab-interface-add: func(value: u32) -> u32;
+}
+
 world js-exports {
     // ComponentizeJS 0.21 root-function mapping:
     //   import addOne from "add-one";
@@ -326,5 +330,6 @@ world js-exports {
 
     import host;
     export api;
+    export incoming-handler;
     export root-add: func(a: u32, b: u32) -> u32;
 }
