@@ -12,7 +12,8 @@
 // `[[bin]]` target in the same crate/dependency-pinned workspace) so the
 // existing 11/11 compat suite can't regress from this addition.
 //
-// Usage: wit-imports-invoker <component.wasm> <calls.json> [--omit-boom]
+// Usage: wit-imports-invoker <component.wasm> <calls.json>
+//        [--omit-boom] [--omit-root-boom]
 //   calls.json: same shape as compat-invoker's (see main.rs) --
 //   [{"function": "name", "args": [...]}, ...]
 //   --omit-boom: don't register the `boom` host function at all, so
@@ -21,6 +22,8 @@
 //   run.sh; no calls are attempted in this mode (the process exits 2 with
 //   the instantiation error printed to stderr, exactly like an ordinary
 //   instantiation failure).
+//   --omit-root-boom: the equivalent diagnostic probe for the world-level
+//   `root-boom` function import.
 //
 // Prints one JSON line (a JSON array, one record per call) to stdout, in
 // the exact same `{"ok": ..., ...}` shape as compat-invoker.
@@ -357,6 +360,48 @@ fn call_and_finalize<T>(
 /// `wasmtime::Error::msg` instead of `anyhow::bail!`/`anyhow::Context`.
 fn wasm_err(msg: impl Into<String>) -> wasmtime::Error {
     wasmtime::Error::msg(msg.into())
+}
+
+fn add_root_imports(linker: &mut Linker<Host>, include_root_boom: bool) -> Result<()> {
+    let mut root = linker.root();
+
+    root.func_new(
+        "add-one",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::U32(value) = &args[0] else {
+                return Err(wasm_err("add-one: expected u32"));
+            };
+            results[0] = Val::U32(value.wrapping_add(1));
+            Ok(())
+        },
+    )?;
+
+    let note_count = Arc::new(AtomicU32::new(0));
+    root.func_new("root-note", {
+        let note_count = note_count.clone();
+        move |_store, _ty, _args: &[Val], _results: &mut [Val]| -> wasmtime::Result<()> {
+            note_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })?;
+    root.func_new("root-note-count", {
+        let note_count = note_count.clone();
+        move |_store, _ty, _args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            results[0] = Val::U32(note_count.load(Ordering::SeqCst));
+            Ok(())
+        }
+    })?;
+
+    if include_root_boom {
+        root.func_new(
+            "root-boom",
+            |_store, _ty, _args: &[Val], _results: &mut [Val]| -> wasmtime::Result<()> {
+                Err(wasm_err("root-boom: deliberate host-side trap"))
+            },
+        )?;
+    }
+
+    Ok(())
 }
 
 fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> {
@@ -772,13 +817,25 @@ fn main() -> Result<()> {
     } else {
         false
     };
+    let omit_root_boom = if let Some(pos) = args.iter().position(|a| a == "--omit-root-boom") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
     let mut args = args.into_iter();
     let component_path = args
         .next()
-        .context("usage: wit-imports-invoker <component.wasm> <calls.json> [--omit-boom]")?;
+        .context(
+            "usage: wit-imports-invoker <component.wasm> <calls.json> \
+             [--omit-boom] [--omit-root-boom]",
+        )?;
     let calls_path = args
         .next()
-        .context("usage: wit-imports-invoker <component.wasm> <calls.json> [--omit-boom]")?;
+        .context(
+            "usage: wit-imports-invoker <component.wasm> <calls.json> \
+             [--omit-boom] [--omit-root-boom]",
+        )?;
 
     let calls: Vec<Call> = serde_json::from_str(
         &std::fs::read_to_string(&calls_path).context("reading calls.json")?,
@@ -800,6 +857,7 @@ fn main() -> Result<()> {
         .map_err(anyhow::Error::from)
         .context("linking wasi-http")?;
     add_host_import(&mut linker, !omit_boom).context("registering test:wit-imports/host@1.2.3")?;
+    add_root_imports(&mut linker, !omit_root_boom).context("registering root function imports")?;
 
     let stdout_pipe = MemoryOutputPipe::new(64 * 1024);
     let stderr_pipe = MemoryOutputPipe::new(64 * 1024);
@@ -814,10 +872,8 @@ fn main() -> Result<()> {
     };
     let mut store = Store::new(&engine, host);
 
-    // In `--omit-boom` mode, this is expected to fail with Wasmtime's own
-    // "missing import" diagnostic -- that failure IS the assertion (see
-    // run.sh), so it's allowed to propagate via `?` and exit the process
-    // with a non-zero status, same as any other instantiation error.
+    // In either omit mode, this is expected to fail with Wasmtime's own
+    // "missing import" diagnostic. That failure is the assertion in run.sh.
     let instance = linker
         .instantiate(&mut store, &component)
         .map_err(anyhow::Error::from)

@@ -583,12 +583,13 @@ pub fn build(b: *std.Build) void {
     // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
     // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
     // reactor against a fixture-specific WIT world that additionally
-    // *imports* a custom `test:wit-imports/host@1.2.3` interface (not just
-    // the usual export-only js-dispatch world), componentizes
+    // *imports* a custom `test:wit-imports/host@1.2.3` interface and four
+    // world-level functions (not just the usual export-only js-dispatch world),
+    // componentizes
     // tests/e2e/wit-imports/component.js against it (a JS module that
     // `import`s host functions with zero user-written glue), and drives
     // every export through a Wasmtime 42 host that implements the custom
-    // import dynamically (tests/compat/runtime/invoker's
+    // interface and root imports dynamically (tests/compat/runtime/invoker's
     // `wit-imports-invoker` binary, since `wasmtime run --invoke` cannot
     // supply arbitrary custom component imports). Exercises exact s64/u64
     // BigInt (including 2**64 wraparound), strings, nested records bridged
@@ -602,11 +603,13 @@ pub fn build(b: *std.Build) void {
     // result<T,E> both-payload and void-ok-payload forms), each through a
     // real host-side transform, now that cataggar/wabt PR #335 (see
     // build.zig.zon's `.wasip3` pin) fixed the reverse (`--js-imports`)
-    // bridge's type gate and lowering for all of them. Like `compat-bridge-test`, this is
-    // deliberately NOT part of `test`: it requires a Rust toolchain and
-    // takes on the order of several minutes end to end (fresh Zig build +
+    // bridge's type gate and lowering for all of them. Root-function coverage
+    // verifies the default-import convention, arguments/results,
+    // void=>undefined, repeated calls, traps, and missing-import diagnostics.
+    // Like `compat-bridge-test`, this is deliberately NOT part of `test`: it
+    // requires a Rust toolchain and takes several minutes end to end (fresh Zig build +
     // Cranelift compilation under load), so it must be invoked explicitly.
-    const wit_imports_e2e_test_step = b.step("wit-imports-e2e-test", "Run the WIT interface-imports E2E suite (tests/e2e/wit-imports; requires Rust, not part of `test`)");
+    const wit_imports_e2e_test_step = b.step("wit-imports-e2e-test", "Run the WIT interface/root-imports E2E suite (tests/e2e/wit-imports; requires Rust, not part of `test`)");
     const wit_imports_e2e_run = b.addSystemCommand(&.{ "bash", "tests/e2e/wit-imports/run.sh" });
     wit_imports_e2e_run.addArg(b.graph.zig_exe);
     wit_imports_e2e_test_step.dependOn(&wit_imports_e2e_run.step);

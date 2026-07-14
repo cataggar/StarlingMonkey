@@ -272,7 +272,7 @@ extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uin
 extern "C" STARLING_ENGINE_EXPORT void starling_js_dispatch_native_free(void *arena);
 
 // ---------------------------------------------------------------------------
-// Reverse bridge: host-provided WIT interface imports called *from*
+// Reverse bridge: host-provided WIT interface or root-function imports called *from*
 // JavaScript. These three symbols are emitted by the WABT `wasip3-bindgen`
 // generator's `--js-imports` mode (see component_bindgen.zig's
 // `emitJsImportBridge`) whenever the world imports at least one interface
@@ -285,24 +285,23 @@ extern "C" STARLING_ENGINE_EXPORT void starling_js_dispatch_native_free(void *ar
 // "not found"; this keeps default behavior byte-for-byte unchanged for
 // components with no custom imports.
 //
-// `wit_imports::install` (js_dispatch.cpp) parses the manifest, groups
-// entries by interface id, and registers one builtin ES module per interface
-// id (via `Engine::define_builtin_module`) whose properties are native
-// JSFunctions that forward to `starling_js_import_dispatch`. Arguments are
-// built from JS values via the very same `decode_from_js` used for export
-// *results*, and the dispatch result is converted back to JS via the very
-// same `encode_to_js` used for export *arguments* -- only the direction each
-// helper is called from is reversed; no new codec is introduced.
+// `wit_imports::install` (js_dispatch.cpp) parses the manifest, groups entries
+// by JavaScript module id, and registers each builtin ES module via
+// `Engine::define_builtin_module`. Interface imports expose named functions;
+// a world-level function `foo` exposes `default` from module `foo`, matching
+// ComponentizeJS 0.21. Arguments are built from JS values via the same
+// `decode_from_js` used for export results, and results use the same
+// `encode_to_js` used for export arguments.
 
 // Returns a pointer to a TSV byte string, one line per JS-bridged import:
-// "<iface-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". `*out_len` is
-// set to its length (0 and a possibly-null pointer when there is nothing to
-// bridge). The returned buffer is static (owned by the wasm module's data
-// segment); callers must not free it.
+// "<module-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". Interface
+// entries use `<iface-id>, <WIT function>, <iface-id>#<WIT function>`;
+// root entries use `<WIT function>, default, $root#<WIT function>`. `*out_len`
+// is set to its length. The static returned buffer must not be freed.
 extern "C" STARLING_ENGINE_EXPORT const uint8_t *starling_js_imports_manifest(size_t *out_len);
 
-// Looks up `<iface-id>#<js-export-name>` (the same dispatch-key spelling as
-// one manifest line's third column) and, if found, decodes `argv` (built by
+// Looks up the manifest line's dispatch key (`<iface>#<function>` or
+// `$root#<function>`) and, if found, decodes `argv` (built by
 // the caller via `decode_from_js`) into the callee's concrete WIT parameter
 // types, invokes the generated typed import wrapper, and encodes its result
 // into `*out_result`/`*out_arena` (to later be read with `encode_to_js` and

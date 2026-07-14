@@ -31,13 +31,12 @@
 // flags (<=32 labels)/result<T,E>, recursively) and `lowerParams` lowers
 // every one of them (including `char` and a direct `list<u8>` parameter)
 // through the generic, reflection-based `lowerAggregateParam` path. The
-// only WIT shapes this bridge does not (and, per flags' 32-bit backing
-// representation, structurally cannot) support are resources, async
-// imports, world-level (non-interface) function imports, and a `flags`
-// type with more than 32 labels -- see tests/compat/manifest.json's
-// `wit-imports-flags-over-32-labels-unsupported` known_deviation for the
-// last of those (the only genuine remaining limitation; the other three
-// are explicit, permanent scope boundaries, not bugs).
+// World-level functions are bridged as ComponentizeJS-compatible ESM default
+// imports (module=<WIT function>, export=default) over canonical `$root` core
+// imports. The only WIT shapes this bridge does not support are resources,
+// async imports, and a `flags` type with more than 32 labels -- see
+// tests/compat/manifest.json's
+// `wit-imports-flags-over-32-labels-unsupported` known_deviation.
 package test:wit-imports@1.2.3;
 
 interface host {
@@ -184,6 +183,14 @@ interface api {
     run-note: func() -> bool;
     run-note-count: func() -> u32;
 
+    // Root-function import coverage: arguments/results, repeated calls, a
+    // void result observed as JavaScript `undefined`, and host trapping.
+    run-root-add: func(value: u32) -> u32;
+    run-root-repeated: func(value: u32) -> list<u32>;
+    run-root-note: func() -> bool;
+    run-root-note-count: func() -> u32;
+    run-root-boom: func() -> u32;
+
     run-sum-nested-lists: func(rows: list<list<u32>>) -> u32;
 
     // -- advanced synchronous value types (requirement 5) --
@@ -231,6 +238,15 @@ interface api {
 }
 
 world js-exports {
+    // ComponentizeJS 0.21 root-function mapping:
+    //   import addOne from "add-one";
+    // Each function becomes a distinct ESM module with a default export,
+    // while the generated core wasm imports `$root` / the verbatim WIT name.
+    import add-one: func(value: u32) -> u32;
+    import root-note: func();
+    import root-note-count: func() -> u32;
+    import root-boom: func() -> u32;
+
     import host;
     export api;
 }
