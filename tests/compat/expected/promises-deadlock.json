@@ -1,0 +1,23 @@
+{
+  "fixture": "promises-deadlock",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises-deadlock/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "deadlock-basic",
+      "function": "deadlock",
+      "args": [],
+      "expect_error": {
+        "reference_class": "no-progress-trap",
+        "reference_message_contains": "event loop error, but no exception is pending",
+        "reference_confidence": "reference-verified",
+        "bridge_class": "call-time-trap",
+        "bridge_message_contains": "returned a Promise that never settled",
+        "bridge_confidence": "build-verified",
+        "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress once both the microtask queue (js::RunJobs) and the async task queue (api::AsyncTask::select) are exhausted while the promise is still Pending; js_dispatch.cpp's resolve_promise_like prints a deterministic diagnostic to stderr (\"...returned a Promise that never settled -- the JavaScript job queue and async task queue both ran empty while it was still pending (deadlock)\") and returns false so the dispatch entry point traps (bare wasm 'unreachable'), rather than looping forever. This is the deterministic no-progress/deadlock diagnostic required by the promise-sync roadmap phase, not a hang. build-verified via tests/compat/runtime/run-bridge-tests.sh (real Wasmtime 42 crate invoker, which captured this exact diagnostic text on the guest's WASI stderr pipe, 2026-07-14); also cross-checked via tests/e2e/native-dispatch/run.sh's 'promise-deadlock' case, which wraps every wasmtime CLI invocation in a 30s timeout as an independent safety net and observed a fast trap, well under the timeout. The pinned ComponentizeJS 0.21.0 reference (reference_message_contains above) independently detects the same condition -- its own embedded engine's event-loop driver aborts with 'Error while (call) event loop error, but no exception is pending. Aborting, since that doesn't seem recoverable at all.' rather than hanging -- reference-verified via tests/compat/reference/run-reference.mjs, 2026-07-14: componentize() succeeds, and the componentized output traps deterministically (well under a manual 20s timeout probe) when invoked through the same tests/compat/runtime/invoker used for the bridge. The exact diagnostic wording differs between the two independent implementations (expected -- see bridge_message_contains), but both surface a deterministic call-time trap rather than a hang, matching this fixture's requirement."
+      }
+    }
+  ],
+  "negative": true
+}

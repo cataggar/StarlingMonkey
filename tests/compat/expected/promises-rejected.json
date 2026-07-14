@@ -1,0 +1,23 @@
+{
+  "fixture": "promises-rejected",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises-rejected/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "reject-basic",
+      "function": "reject",
+      "args": [],
+      "expect_error": {
+        "reference_class": "promise-rejection",
+        "reference_message_contains": "reject always rejects",
+        "reference_confidence": "reference-verified",
+        "bridge_class": "call-time-trap",
+        "bridge_message_contains": "reject always rejects",
+        "bridge_confidence": "build-verified",
+        "bridge_source": "runtime/js_dispatch.cpp: resolve_promise_like calls Engine::dump_promise_rejection(reason, promise, stderr) once EventLoop::pump_until_promise_settled reports the promise Rejected, then returns false so the dispatch entry point traps; the rejection's Error message is included in that diagnostic, captured by tests/compat/runtime/invoker's WASI stderr pipe as the case's 'diagnostics'. build-verified: run-bridge-tests.sh promises-rejected passed, 2026-07-14."
+      }
+    }
+  ],
+  "negative": true
+}

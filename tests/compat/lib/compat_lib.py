@@ -81,7 +81,7 @@ def world_export_functions(wit_json: dict[str, Any], world_name: str) -> dict[st
     return functions
 
 
-_EXPORT_FUNCTION_RE_TEMPLATE = r"export\s+function\s+{name}\s*\("
+_EXPORT_FUNCTION_RE_TEMPLATE = r"export\s+(?:async\s+)?function\s+{name}\s*\("
 _EXPORT_NONFUNCTION_RE_TEMPLATE = r"export\s+(?:const|let|var)\s+{name}\b"
 
 

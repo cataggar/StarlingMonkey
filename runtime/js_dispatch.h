@@ -174,14 +174,23 @@ struct StarlingJsValue {
 //
 // Calls the named export with `args`, encoding each to a JS value (records ->
 // plain objects by field name, i64/u64 -> exact BigInt, lists -> JS Arrays).
+// If the call returns a Promise (or a thenable), this pumps the engine's
+// event loop -- microtask/job queue plus any queued timer/host-task
+// callbacks -- until it settles, then uses the fulfilled value as if it had
+// been returned directly (see `resolve_promise_like` in js_dispatch.cpp).
 // On success writes the JS return value into `*out_result` (valid until
 // freed) and an opaque arena handle into `*out_arena`; the caller must
 // eventually pass that handle to `starling_js_dispatch_native_free`, even for
 // `void` results (pass a scratch `out_result` in that case; the arena may
 // still hold string/record bookkeeping). Returns 0 on success, non-zero if
-// the export was missing, wasn't callable, returned a Promise, or raised a
-// JS exception (the pending exception is left for the caller to surface as a
-// trap).
+// the export was missing, wasn't callable, raised a JS exception, its
+// returned Promise rejected, or its returned Promise never settled (no
+// further microtask/task progress was possible while still pending -- a
+// deterministic diagnostic, not a hang). The pending exception (if any) is
+// left for the caller to surface as a trap; Promise rejection/deadlock/
+// reentrancy diagnostics are instead dumped directly to stderr (see
+// `resolve_promise_like`), since they aren't always backed by a live JS
+// exception value.
 extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 size_t export_name_len,
                                                 const StarlingJsValue *args_ptr,

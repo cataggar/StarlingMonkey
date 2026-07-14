@@ -53,6 +53,47 @@ interface api {
   // expected, to prove decodeNative traps instead of silently coercing to
   // zero/false.
   wrong-type: func() -> u64;
+
+  // ---------------------------------------------------------------------
+  // promise-sync roadmap phase: a synchronous export's JS implementation is
+  // allowed to return a Promise (or a thenable); the bridge pumps the
+  // engine's event loop until it settles, then lowers the fulfilled value
+  // exactly like a directly-returned one. See runtime/js_dispatch.cpp's
+  // `resolve_promise_like`.
+
+  // Already-settled by the time the export returns (`Promise.resolve(...)`,
+  // no `await`): JSON path (u32 stays representable exactly).
+  promise-resolve-add: func(a: u32, b: u32) -> u32;
+  // A genuine `async function` awaiting a chain of plain (non-timer)
+  // microtasks/nested awaits before returning -- JSON path.
+  promise-add: func(a: u32, b: u32) -> u32;
+  // Rejects (via a thrown `Error`) after an `await`; must surface as a trap
+  // carrying the rejection's message/stack on stderr, not silently decode.
+  promise-reject: func() -> u32;
+  // A non-Promise "thenable" object (`{ then(resolve) { ... } }`); must be
+  // driven to completion exactly like a real Promise per the same duck test
+  // `await`/`Promise.resolve` use.
+  thenable-add: func(a: u32, b: u32) -> u32;
+  // Settles only once a `setTimeout` callback fires: exercises the queued
+  // async-task (not just microtask) side of the pump loop.
+  promise-timeout-add: func(a: u32, b: u32) -> u32;
+  // `void` result reached via a Promise (resolves `undefined`).
+  promise-notify: func(message: string);
+  // `Promise.resolve` of a typed nested record -- JSON path (point has no
+  // 64-bit fields), proving the settled value re-enters the *same* typed
+  // conversion a direct record return would use.
+  promise-resolve-point: func(point: point, dx: s32, dy: s32) -> point;
+  // Deliberately never settles (`new Promise(() => {})`, no executor-side
+  // resolve/reject and nothing else queued): must trap deterministically
+  // (a "no progress" diagnostic) rather than hang the host.
+  promise-deadlock: func() -> u32;
+
+  // Same set of cases again, but for types that force the typed native
+  // (BigInt) dispatch path instead of JSON, proving Promise-settling feeds
+  // into *that* conversion too, exactly.
+  promise-resolve-big-add: func(a: u64, b: u64) -> u64;
+  promise-big-add: func(a: u64, b: u64) -> u64;
+  promise-reject-big: func() -> u64;
 }
 
 world js-exports {

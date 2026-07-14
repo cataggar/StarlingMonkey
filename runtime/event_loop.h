@@ -6,6 +6,26 @@
 
 namespace core {
 
+/**
+ * Outcome of `EventLoop::pump_until_promise_settled`.
+ */
+enum class PromisePumpResult {
+  // The promise transitioned to Fulfilled or Rejected; the caller should
+  // inspect `JS::GetPromiseState`/`JS::GetPromiseResult` to see which.
+  Settled,
+  // Neither the microtask queue nor the async task queue had any further
+  // work to perform, yet the promise is still Pending: nothing left could
+  // ever settle it. A deterministic diagnostic, not a hang.
+  NoProgress,
+  // A JS exception became pending while pumping (either from a microtask
+  // job or from an async task's callback). Left pending for the caller.
+  JSException,
+  // The event loop was already running (e.g. a reentrant synchronous
+  // dispatch call while another pump is in progress); pumping again would
+  // corrupt the single shared task queue, so this is rejected outright.
+  AlreadyRunning,
+};
+
 class EventLoop {
 public:
   /**
@@ -26,6 +46,22 @@ public:
 
   static void incr_event_loop_interest();
   static void decr_event_loop_interest();
+
+  /**
+   * Pump the microtask/job queue and the queued async task list (the same
+   * machinery `run_event_loop` uses) until `promise` settles (fulfills or
+   * rejects), driving nested awaits/microtask chains and any interleaved
+   * timer/host-task callbacks along the way. Unlike `run_event_loop`, this
+   * is keyed on one specific promise's state rather than the global
+   * interest-count bookkeeping, so it composes safely with callers (e.g. a
+   * synchronous WIT export bridge) that must not perturb interest counts
+   * used elsewhere, and it cannot hang: if both the job queue and the async
+   * task queue run dry while `promise` is still Pending, nothing left could
+   * ever settle it, so this returns `NoProgress` instead of blocking
+   * forever.
+   */
+  static PromisePumpResult pump_until_promise_settled(api::Engine *engine,
+                                                      JS::HandleObject promise);
 
   /**
    * Select on the next async tasks

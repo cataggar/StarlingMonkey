@@ -112,9 +112,21 @@ for (const fixture of manifest.fixtures) {
   const label = `reference/${fixture.id}`;
 
   if (fixture.negative) {
+    // Two distinct kinds of "negative" exist across this manifest:
+    //   - componentization-time (negative-missing-export, negative-invalid-export):
+    //     componentize() itself must reject.
+    //   - call-time (promises-rejected, promises-deadlock): the pinned
+    //     ComponentizeJS release can synchronously drive a Promise-returning
+    //     export to completion, so componentization succeeds; the
+    //     rejection/no-progress case must instead surface once the built
+    //     component is actually invoked (mirroring tests/compat/runtime/
+    //     lib/run_bridge_tests.py's run_negative_fixture). Try
+    //     componentizing first and only fall back to call-time trap
+    //     comparison if that unexpectedly succeeds, so a componentization-
+    //     time regression in the first kind is still caught as before.
+    let component;
     try {
-      await componentizeFixture(fixture);
-      report("FAIL", label, "componentize() unexpectedly succeeded for a negative fixture");
+      component = await componentizeFixture(fixture);
     } catch (err) {
       const expectClasses = (fixture.cases ?? [])
         .map((c) => c.expect_error?.reference_message_contains)
@@ -123,7 +135,37 @@ for (const fixture of manifest.fixtures) {
       const matched = expectClasses.some((needle) => message.includes(needle));
       if (matched) report("PASS", label);
       else report("FAIL", label, `error message did not match any expected substring; got: ${message}`);
+      continue;
     }
+
+    const wasmPath = join(CACHE_DIR, `${fixture.id}.wasm`);
+    await writeFile(wasmPath, component);
+    const calls = callsFor(fixture);
+    let results;
+    try {
+      results = await invoke(wasmPath, calls);
+    } catch (err) {
+      report("FAIL", label, `compat-invoker failed: ${(err && err.message) || err}`);
+      continue;
+    }
+    const mismatches = [];
+    for (const [i, call] of calls.entries()) {
+      const c = call.__case;
+      const observed = results[i];
+      const needle = c.expect_error?.reference_message_contains;
+      if (observed.ok) {
+        mismatches.push(`${c.id}: expected a call-time trap, call succeeded with ${JSON.stringify(observed.value)}`);
+        continue;
+      }
+      if (needle) {
+        const haystack = `${observed.trap}\n${observed.diagnostics ?? ""}`;
+        if (!haystack.includes(needle)) {
+          mismatches.push(`${c.id}: trap/diagnostics did not contain ${JSON.stringify(needle)}; trap=${JSON.stringify(observed.trap)} diagnostics=${JSON.stringify(observed.diagnostics)}`);
+        }
+      }
+    }
+    if (mismatches.length === 0) report("PASS", label);
+    else report("FAIL", label, mismatches.join("; "));
     continue;
   }
 

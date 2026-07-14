@@ -206,20 +206,29 @@ def node_selfcheck_fixture(node: str, fixture: dict, reporter: Reporter) -> None
     fid = fixture["id"]
     js_path = compat_lib.COMPAT_DIR / fixture["dir"] / fixture["js_file"]
 
+    # `await` unconditionally: a no-op for a plain synchronously-returned
+    # value, and required so that a Promise/thenable-returning export
+    # (promise-sync roadmap phase; see tests/compat/fixtures/promises) is
+    # actually driven to its fulfilled value here too, instead of pushing
+    # the Promise object itself (which would not match the manifest's
+    # declared fulfilled-value `result`). Fixtures whose promises never
+    # settle (tests/compat/fixtures/promises-negative) are always
+    # `negative: true` and therefore already excluded from this self-check
+    # by main()'s `if fixture.get("negative"): continue`.
     script_lines = [f"const mod = await import({json.dumps(js_path.as_posix())});", "const out = [];"]
     cases = list(fixture.get("cases", []))
     for case in cases:
         args_json = json.dumps(case["args"])
         script_lines.append(
             f"out.push({{id: {json.dumps(case['id'])}, "
-            f"value: mod.{case['function']}(...({args_json}))}});"
+            f"value: await mod.{case['function']}(...({args_json}))}});"
         )
     for seq in fixture.get("sequences", []):
         for index, call in enumerate(seq["calls"]):
             args_json = json.dumps(call["args"])
             script_lines.append(
                 f"out.push({{id: {json.dumps(seq['id'] + '#' + str(index))}, "
-                f"value: mod.{seq['function']}(...({args_json}))}});"
+                f"value: await mod.{seq['function']}(...({args_json}))}});"
             )
     script_lines.append("console.log(JSON.stringify(out.map(o => o.value === undefined ? {...o, value: null, __void: true} : o)));")
     script = "\n".join(script_lines)

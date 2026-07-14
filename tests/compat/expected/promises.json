@@ -1,0 +1,93 @@
+{
+  "fixture": "promises",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "resolveadd-basic",
+      "function": "resolveadd",
+      "args": [
+        2,
+        3
+      ],
+      "result": 5,
+      "confidence": "reference-verified",
+      "notes": "Already-settled Promise.resolve; ComponentizeJS 0.21.0 also synchronously drives an already-settled Promise-returning export to completion (documented behavior; see provenance.componentizejs)."
+    },
+    {
+      "id": "asyncadd-basic",
+      "function": "asyncadd",
+      "args": [
+        2,
+        3
+      ],
+      "result": 5,
+      "confidence": "reference-verified",
+      "notes": "Genuine async function; the fulfilled value requires more than one js::RunJobs pass through the microtask queue (nested awaits)."
+    },
+    {
+      "id": "thenableadd-basic",
+      "function": "thenableadd",
+      "args": [
+        2,
+        3
+      ],
+      "result": 5,
+      "confidence": "reference-verified",
+      "notes": "Duck-typed thenable (not a real Promise instance); resolve_promise_like normalizes it via JS::NewPromiseObject + JS::ResolvePromise, reusing the engine's own PromiseResolve semantics rather than hand-rolling a `.then()` call."
+    },
+    {
+      "id": "timeoutadd-basic",
+      "function": "timeoutadd",
+      "args": [
+        2,
+        3
+      ],
+      "result": 5,
+      "confidence": "reference-verified",
+      "notes": "Settles via a queued setTimeout (macrotask/async task), not a microtask; exercises EventLoop::pump_until_promise_settled draining api::AsyncTask::select, not just js::RunJobs."
+    },
+    {
+      "id": "resolvepoint-basic",
+      "function": "resolvepoint",
+      "args": [
+        {
+          "x": 1,
+          "y": 2
+        },
+        3,
+        4
+      ],
+      "result": {
+        "x": 4,
+        "y": 6
+      },
+      "confidence": "reference-verified",
+      "notes": "Promise.resolve of a nested typed record, confirming the settled value re-enters the normal typed/JSON result conversion path unchanged."
+    }
+  ],
+  "sequences": [
+    {
+      "id": "async-counter-sequence",
+      "function": "asyncincrement",
+      "calls": [
+        {
+          "args": [],
+          "result": 1,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [],
+          "result": 2,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [],
+          "result": 3,
+          "confidence": "reference-verified"
+        }
+      ]
+    }
+  ]
+}

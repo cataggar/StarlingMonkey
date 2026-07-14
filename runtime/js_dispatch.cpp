@@ -3,6 +3,7 @@
 #include "extension-api.h"
 #include "decode.h"
 #include "encode.h"
+#include "event_loop.h"
 
 #include "js/Array.h"
 #include "js/BigInt.h"
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <print>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -56,7 +58,7 @@ uint32_t dispatch_error(JSContext *cx, const char *context) {
 // valid and its realm has already been entered by the caller.
 bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
                              const uint8_t *export_name_ptr, size_t export_name_len,
-                             const char **error_context) {
+                             const char **error_context, std::string *out_function_name) {
   JS::RootedValue module_namespace(cx, api::Engine::script_value());
   if (!module_namespace.isObject()) {
     JS_ReportErrorASCII(cx, "the top-level JavaScript module has no namespace");
@@ -80,6 +82,102 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
     *error_context = "resolving a JavaScript module export";
     return false;
   }
+  *out_function_name = std::move(function_name);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Promise/thenable driving (`promise-sync` roadmap phase): shared by both the
+// JSON and the typed-native bridge. A synchronous WIT export's JavaScript
+// implementation is allowed to return a Promise (or a thenable, per the same
+// duck test `await`/`Promise.resolve` use: an object with a callable `then`);
+// this pumps the engine's existing microtask/job queue and queued async task
+// list (see event_loop.{h,cpp}) until it settles, then hands the fulfilled
+// value back to the caller for the normal typed/JSON conversion below.
+//
+// Left unchanged for anything that *isn't* Promise-or-thenable-shaped
+// (primitives, plain records/lists, etc.): the `!value.isObject()` fast path
+// costs nothing extra, matching the pre-existing synchronous validation, and
+// even for a plain object return value the only extra cost is one property
+// lookup for the (non-callable, non-existent on ordinary records) `then`
+// property.
+//
+// Returns true with `value` updated in place to the fulfilled result (or
+// left untouched if `value` was never Promise-or-thenable-shaped to begin
+// with). Returns false if the Promise rejected, deadlocked (no further
+// microtask/task progress possible while still pending -- a deterministic
+// diagnostic, never a hang), or the event loop was already being pumped by
+// an outer/reentrant call; in every false case, a description has already
+// been dumped to stderr, so the caller should simply propagate failure
+// (return 1) without any further reporting.
+bool resolve_promise_like(JSContext *cx, const char *function_name,
+                          JS::MutableHandleValue value) {
+  if (!value.isObject()) {
+    return true;
+  }
+
+  JS::RootedObject obj(cx, &value.toObject());
+  JS::RootedObject promise(cx);
+  if (JS::IsPromiseObject(obj)) {
+    promise = obj;
+  } else {
+    JS::RootedValue then_val(cx);
+    if (!JS_GetProperty(cx, obj, "then", &then_val)) {
+      api::Engine::dump_pending_exception(
+          "probing a JavaScript export's return value for a Promise/thenable shape");
+      return false;
+    }
+    if (!then_val.isObject() || !JS::IsCallable(&then_val.toObject())) {
+      return true; // Not thenable: `value` is the final result, unchanged.
+    }
+    // Normalize via the engine's own spec-compliant Promise resolution
+    // machinery (`JS::ResolvePromise` performs the same duck-typed
+    // "thenable" chaining `await`/`Promise.resolve` use), rather than
+    // hand-rolling a `then` call: this correctly handles nested thenables,
+    // a `then` that itself throws, etc. without reimplementing any of it.
+    JS::RootedObject wrapper(cx, JS::NewPromiseObject(cx, nullptr));
+    if (!wrapper || !JS::ResolvePromise(cx, wrapper, value)) {
+      api::Engine::dump_pending_exception(
+          "normalizing a thenable JavaScript return value into a Promise");
+      return false;
+    }
+    promise = wrapper;
+  }
+
+  api::Engine *engine = api::Engine::get(cx);
+  if (JS::GetPromiseState(promise) == JS::PromiseState::Pending) {
+    switch (core::EventLoop::pump_until_promise_settled(engine, promise)) {
+    case core::PromisePumpResult::Settled:
+      break;
+    case core::PromisePumpResult::JSException:
+      api::Engine::dump_pending_exception(
+          "running a JavaScript export's Promise to completion");
+      return false;
+    case core::PromisePumpResult::NoProgress:
+      std::println(stderr,
+                   "Error: synchronous component export '{}' returned a Promise that "
+                   "never settled -- the JavaScript job queue and async task queue "
+                   "both ran empty while it was still pending (deadlock)",
+                   function_name);
+      return false;
+    case core::PromisePumpResult::AlreadyRunning:
+      std::println(stderr,
+                   "Error: synchronous component export '{}' returned a Promise, but "
+                   "the event loop is already being pumped by another call "
+                   "(reentrant dispatch is not supported)",
+                   function_name);
+      return false;
+    }
+  }
+
+  JS::PromiseState state = JS::GetPromiseState(promise);
+  if (state == JS::PromiseState::Rejected) {
+    JS::RootedValue reason(cx, JS::GetPromiseResult(promise));
+    engine->dump_promise_rejection(reason, promise, stderr);
+    return false;
+  }
+
+  value.set(JS::GetPromiseResult(promise));
   return true;
 }
 
@@ -101,8 +199,9 @@ extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
 
   JS::RootedValue function(cx);
   const char *error_context = "resolving a JavaScript module export";
+  std::string function_name;
   if (!resolve_export_function(cx, &function, export_name_ptr, export_name_len,
-                               &error_context)) {
+                               &error_context, &function_name)) {
     return dispatch_error(cx, error_context);
   }
 
@@ -149,12 +248,8 @@ extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
   if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
     return dispatch_error(cx, "calling a JavaScript module export");
   }
-  if (return_value.isObject()) {
-    JS::RootedObject return_object(cx, &return_value.toObject());
-    if (JS::IsPromiseObject(return_object)) {
-      JS_ReportErrorASCII(cx, "synchronous component exports cannot return a Promise");
-      return dispatch_error(cx, "calling a JavaScript module export");
-    }
+  if (!resolve_promise_like(cx, function_name.c_str(), &return_value)) {
+    return 1;
   }
 
   JsonBuffer json{cx, {}};
@@ -455,8 +550,9 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
 
   JS::RootedValue function(cx);
   const char *error_context = "resolving a JavaScript module export";
+  std::string function_name;
   if (!resolve_export_function(cx, &function, export_name_ptr, export_name_len,
-                               &error_context)) {
+                               &error_context, &function_name)) {
     return dispatch_error(cx, error_context);
   }
 
@@ -476,12 +572,8 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
   if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
     return dispatch_error(cx, "calling a JavaScript module export");
   }
-  if (return_value.isObject()) {
-    JS::RootedObject return_object(cx, &return_value.toObject());
-    if (JS::IsPromiseObject(return_object)) {
-      JS_ReportErrorASCII(cx, "synchronous component exports cannot return a Promise");
-      return dispatch_error(cx, "calling a JavaScript module export");
-    }
+  if (!resolve_promise_like(cx, function_name.c_str(), &return_value)) {
+    return 1;
   }
 
   auto *arena = new NativeArena();

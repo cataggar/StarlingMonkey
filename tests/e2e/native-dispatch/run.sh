@@ -62,10 +62,21 @@ echo "[native-dispatch e2e] validating component"
 WASMTIME="$BIN/wasmtime"
 fail=0
 
+# Every invocation is bounded (see promise-deadlock below): the pump loop's
+# "no progress" diagnostic must trap deterministically, never hang, but this
+# guards the test itself against ever silently turning a real bug into an
+# indefinite CI hang.
+TIMEOUT_SECS=30
+
 # expect_eq NAME INVOKE_EXPR EXPECTED_STDOUT
 expect_eq() {
   local name="$1" expr="$2" expected="$3" actual status
-  actual=$("$WASMTIME" run -S http --invoke "$expr" "$COMPONENT" 2>&1) && status=0 || status=$?
+  actual=$(timeout "$TIMEOUT_SECS" "$WASMTIME" run -S http --invoke "$expr" "$COMPONENT" 2>&1) && status=0 || status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "FAIL $name: invoking '$expr' timed out after ${TIMEOUT_SECS}s (hung instead of trapping/returning)"
+    fail=1
+    return
+  fi
   if [ "$status" -ne 0 ]; then
     echo "FAIL $name: wasmtime exited $status invoking '$expr': $actual"
     fail=1
@@ -82,7 +93,12 @@ expect_eq() {
 # expect_trap NAME INVOKE_EXPR
 expect_trap() {
   local name="$1" expr="$2" status
-  "$WASMTIME" run -S http --invoke "$expr" "$COMPONENT" >/dev/null 2>&1 && status=0 || status=$?
+  timeout "$TIMEOUT_SECS" "$WASMTIME" run -S http --invoke "$expr" "$COMPONENT" >/dev/null 2>&1 && status=0 || status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "FAIL $name: invoking '$expr' timed out after ${TIMEOUT_SECS}s (hung instead of trapping)"
+    fail=1
+    return
+  fi
   if [ "$status" -eq 0 ]; then
     echo "FAIL $name: invoking '$expr' expected a trap, but it exited 0"
     fail=1
@@ -131,6 +147,33 @@ expect_eq "echo-list round-trips exact values" \
 
 # --- Wrong JS return type must trap, not silently coerce -------------------
 expect_trap "wrong-type traps instead of decoding to 0" "wrong-type()"
+
+# --- promise-sync: synchronous exports whose JS implementation returns a --
+# Promise/thenable are pumped to completion, then lowered exactly like a
+# directly-returned value (JSON path first, then the typed native/BigInt
+# path). See runtime/js_dispatch.cpp's `resolve_promise_like`.
+expect_eq "promise-resolve-add: already-settled Promise.resolve" \
+  "promise-resolve-add(2, 3)" "5"
+expect_eq "promise-add: microtask chain + nested awaits" \
+  "promise-add(2, 3)" "5"
+expect_trap "promise-reject: rejection traps instead of decoding" "promise-reject()"
+expect_eq "thenable-add: non-Promise thenable object" "thenable-add(2, 3)" "5"
+expect_eq "promise-timeout-add: settles via a queued setTimeout task" \
+  "promise-timeout-add(2, 3)" "5"
+expect_eq "promise-notify: void result reached via a Promise" \
+  'promise-notify("hi")' "()"
+expect_eq "promise-resolve-point: Promise.resolve of a typed nested record" \
+  "promise-resolve-point({x: 1, y: 2}, 3, 4)" "{x: 4, y: 6}"
+expect_trap "promise-deadlock: never-settling Promise traps deterministically (no hang)" \
+  "promise-deadlock()"
+
+# Same shapes again through the typed native (BigInt) dispatch path.
+expect_eq "promise-resolve-big-add: Promise.resolve of a typed BigInt" \
+  "promise-resolve-big-add(18446744073709551615, 0)" "18446744073709551615"
+expect_eq "promise-big-add: async function awaiting BigInt values" \
+  "promise-big-add(18446744073709551614, 1)" "18446744073709551615"
+expect_trap "promise-reject-big: rejection traps on the native dispatch path too" \
+  "promise-reject-big()"
 
 if [ "$fail" -ne 0 ]; then
   echo "[native-dispatch e2e] FAILED"

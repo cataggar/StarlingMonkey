@@ -1,0 +1,10 @@
+package compat:promises-deadlock;
+
+// Phase 0 (promise-sync roadmap phase) compatibility fixture: a Promise
+// export that never settles at all (no rejection, no fulfillment, no timer
+// or microtask ever queued to advance it). Kept as its own single-case
+// fixture for the same reason as ../promises-rejected (a trapped component
+// instance is poisoned for any further call in the same store).
+world js-exports {
+  export deadlock: func() -> u32;
+}

@@ -1,0 +1,14 @@
+package compat:promises-rejected;
+
+// Phase 0 (promise-sync roadmap phase) compatibility fixture: a Promise
+// export that rejects. Kept as its own single-case fixture (rather than
+// combined with the no-progress/deadlock case) because a component
+// instance that has trapped once is subsequently unusable for further
+// calls in the same Wasmtime store (the whole instance is poisoned by a
+// trap, not just the one call) -- see manifest.json known_deviations
+// "missing-export-detection-timing" and the two existing single-case
+// negative-missing-export/negative-invalid-export fixtures for the same
+// established convention.
+world js-exports {
+  export reject: func() -> u32;
+}

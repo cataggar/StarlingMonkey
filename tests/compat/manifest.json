@@ -38,7 +38,7 @@
     }
   },
   "bridge": {
-    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell JSON-encodes its typed WIT arguments, calls starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. A returned Promise traps rather than being awaited.",
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell JSON-encodes its typed WIT arguments, calls starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. A returned Promise/thenable is pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way; see known_deviations promise-exports-pumped.",
     "known_deviations": [
       {
         "id": "option-none-representation",
@@ -68,10 +68,11 @@
         "confidence": "documented-not-tested"
       },
       {
-        "id": "promise-rejected",
-        "summary": "A Promise-returned from a JS export traps synchronously (js_dispatch.cpp explicitly rejects JS::IsPromiseObject results) instead of being driven to completion, unlike the pinned ComponentizeJS reference which can synchronously drive Promise-returning exports to completion.",
+        "id": "promise-exports-pumped",
+        "summary": "A Promise/thenable returned from a synchronous WIT export's JS implementation is now pumped to completion: runtime/event_loop.{h,cpp}'s EventLoop::pump_until_promise_settled drives the existing job/microtask queue (js::RunJobs) and, for macrotask-driven promises (e.g. setTimeout), the existing async task queue (api::AsyncTask::select) -- reusing engine machinery rather than a busy spin or arbitrary sleep -- until the promise settles, then js_dispatch.cpp's resolve_promise_like feeds the fulfilled value into the normal typed/JSON result conversion, matching the pinned ComponentizeJS 0.21.0 reference's ability to synchronously drive a Promise-returning export to completion. Non-Promise thenables are duck-typed and normalized via JS::NewPromiseObject + JS::ResolvePromise (the engine's own PromiseResolve semantics), not a hand-rolled `.then()` call. A rejection is surfaced as a call-time trap carrying the rejection's message (Engine::dump_promise_rejection). If both queues are exhausted while the promise is still pending, pump_until_promise_settled returns PromisePumpResult::NoProgress and resolve_promise_like traps deterministically with an explicit diagnostic, rather than looping forever -- see fixtures/promises-deadlock. The pump function is keyed directly on the specific promise's JS::GetPromiseState, not on Engine::run_event_loop's shared interest counter (which timers.cpp's setTimeout does not increment and which can report 'complete' before a queued async task actually runs), so event-loop state is not shared or perturbed across unrelated dispatch calls and one call's rejection/no-progress outcome cannot poison a later call.",
         "phase_addressed": 5,
-        "confidence": "source-verified"
+        "confidence": "build-verified",
+        "evidence": "runtime/event_loop.h, runtime/event_loop.cpp, runtime/js_dispatch.cpp (resolve_promise_like); tests/e2e/native-dispatch/run.sh (promise-resolve-add, promise-add, promise-reject, thenable-add, promise-timeout-add, promise-notify, promise-resolve-point, promise-deadlock, and the BigInt/native-dispatch equivalents, all passing through the real Wasmtime 42 CLI bundled by this repository's build.zig.zon, 2026-07-14); tests/compat/fixtures/promises, tests/compat/fixtures/promises-rejected, tests/compat/fixtures/promises-deadlock (tests/compat/runtime/run-bridge-tests.sh, real Wasmtime 42 crate invoker, 2026-07-14)"
       },
       {
         "id": "json-bridge-overhead",
@@ -122,7 +123,7 @@
     { "category": "kebab-case-and-naming", "status": "untested", "phase": 2, "fixtures": [] },
     { "category": "resources", "status": "unsupported", "phase": 4, "fixtures": [] },
     { "category": "imports", "status": "unsupported", "phase": 3, "fixtures": [] },
-    { "category": "promise-exports", "status": "rejected", "phase": 5, "fixtures": [] }
+    { "category": "promise-exports", "status": "supported", "phase": 5, "fixtures": ["promises", "promises-rejected", "promises-deadlock"], "notes": "A returned Promise/thenable is pumped to completion via EventLoop::pump_until_promise_settled, then its fulfilled value is lowered exactly like a directly-returned value. Rejections and no-progress (deadlock) both surface as deterministic call-time traps rather than hanging; see known_deviations promise-exports-pumped." }
   ],
   "fixtures": [
     {
@@ -370,6 +371,126 @@
             "bridge_message_contains": "is not a function",
             "bridge_confidence": "build-verified",
             "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call; the \"is not a function\" text is emitted by the JS engine's own panic diagnostic on stderr, not the wasm trap message itself -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "promises",
+      "category": "promise-exports",
+      "dir": "fixtures/promises",
+      "wit_dir": "fixtures/promises/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises.json",
+      "description": "Synchronous exports whose JS implementation returns a Promise/thenable: an already-settled Promise.resolve, a genuine async function with nested awaits (multi-hop microtask chain), a duck-typed non-Promise thenable, a setTimeout-driven (async task queue) promise, a void async function, Promise.resolve of a nested typed record, and repeated calls to an async export with module-level state to verify no event-loop/job-queue state leaks across calls. See runtime/js_dispatch.cpp's resolve_promise_like and runtime/event_loop.{h,cpp}'s pump_until_promise_settled. Rejection and no-progress/deadlock cases are in the separate single-case negative fixtures 'promises-rejected' and 'promises-deadlock' (a trapped Wasmtime component instance is poisoned for further calls, so each trapping case needs its own instance).",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises: PASS against the pinned ComponentizeJS 0.21.0 release, 2026-07-14; see git history for the promise-sync commit for reproduced output)",
+      "cases": [
+        {
+          "id": "resolveadd-basic",
+          "function": "resolveadd",
+          "args": [2, 3],
+          "result": 5,
+          "confidence": "reference-verified",
+          "notes": "Already-settled Promise.resolve; ComponentizeJS 0.21.0 also synchronously drives an already-settled Promise-returning export to completion (documented behavior; see provenance.componentizejs)."
+        },
+        {
+          "id": "asyncadd-basic",
+          "function": "asyncadd",
+          "args": [2, 3],
+          "result": 5,
+          "confidence": "reference-verified",
+          "notes": "Genuine async function; the fulfilled value requires more than one js::RunJobs pass through the microtask queue (nested awaits)."
+        },
+        {
+          "id": "thenableadd-basic",
+          "function": "thenableadd",
+          "args": [2, 3],
+          "result": 5,
+          "confidence": "reference-verified",
+          "notes": "Duck-typed thenable (not a real Promise instance); resolve_promise_like normalizes it via JS::NewPromiseObject + JS::ResolvePromise, reusing the engine's own PromiseResolve semantics rather than hand-rolling a `.then()` call."
+        },
+        {
+          "id": "timeoutadd-basic",
+          "function": "timeoutadd",
+          "args": [2, 3],
+          "result": 5,
+          "confidence": "reference-verified",
+          "notes": "Settles via a queued setTimeout (macrotask/async task), not a microtask; exercises EventLoop::pump_until_promise_settled draining api::AsyncTask::select, not just js::RunJobs."
+        },
+        {
+          "id": "resolvepoint-basic",
+          "function": "resolvepoint",
+          "args": [{ "x": 1, "y": 2 }, 3, 4],
+          "result": { "x": 4, "y": 6 },
+          "confidence": "reference-verified",
+          "notes": "Promise.resolve of a nested typed record, confirming the settled value re-enters the normal typed/JSON result conversion path unchanged."
+        }
+      ],
+      "sequences": [
+        {
+          "id": "async-counter-sequence",
+          "function": "asyncincrement",
+          "calls": [
+            { "args": [], "result": 1, "confidence": "reference-verified" },
+            { "args": [], "result": 2, "confidence": "reference-verified" },
+            { "args": [], "result": 3, "confidence": "reference-verified" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "promises-rejected",
+      "category": "promise-exports",
+      "dir": "fixtures/promises-rejected",
+      "wit_dir": "fixtures/promises-rejected/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises-rejected.json",
+      "description": "A Promise export that rejects; must surface as a call-time trap carrying the rejection's message, rather than hang or silently decode a bogus value. Kept as its own single-case fixture (see 'promises-deadlock' for why): a Wasmtime component instance that has trapped once is poisoned for any further call in the same store, so a fixture combining two independently-trapping cases would spuriously fail its second case with a generic 'cannot enter component instance' trap unrelated to that case's own behavior.",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises-rejected: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises-rejected: PASS, 2026-07-14; see git history for the promise-sync commit for reproduced output)",
+      "negative": true,
+      "cases": [
+        {
+          "id": "reject-basic",
+          "function": "reject",
+          "args": [],
+          "expect_error": {
+            "reference_class": "promise-rejection",
+            "reference_message_contains": "reject always rejects",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "reject always rejects",
+            "bridge_confidence": "build-verified",
+            "bridge_source": "runtime/js_dispatch.cpp: resolve_promise_like calls Engine::dump_promise_rejection(reason, promise, stderr) once EventLoop::pump_until_promise_settled reports the promise Rejected, then returns false so the dispatch entry point traps; the rejection's Error message is included in that diagnostic, captured by tests/compat/runtime/invoker's WASI stderr pipe as the case's 'diagnostics'. build-verified: run-bridge-tests.sh promises-rejected passed, 2026-07-14."
+          }
+        }
+      ]
+    },
+    {
+      "id": "promises-deadlock",
+      "category": "promise-exports",
+      "dir": "fixtures/promises-deadlock",
+      "wit_dir": "fixtures/promises-deadlock/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises-deadlock.json",
+      "description": "A Promise export that never settles at all (no rejection, no fulfillment, nothing ever queued to advance it). Must surface as a deterministic call-time trap rather than hang the host. Kept as its own single-case fixture for the same reason as 'promises-rejected' (a trapped component instance is poisoned for any further call in the same store).",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises-deadlock: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises-deadlock: PASS, 2026-07-14; see git history for the promise-sync commit for reproduced output)",
+      "negative": true,
+      "cases": [
+        {
+          "id": "deadlock-basic",
+          "function": "deadlock",
+          "args": [],
+          "expect_error": {
+            "reference_class": "no-progress-trap",
+            "reference_message_contains": "event loop error, but no exception is pending",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "returned a Promise that never settled",
+            "bridge_confidence": "build-verified",
+            "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress once both the microtask queue (js::RunJobs) and the async task queue (api::AsyncTask::select) are exhausted while the promise is still Pending; js_dispatch.cpp's resolve_promise_like prints a deterministic diagnostic to stderr (\"...returned a Promise that never settled -- the JavaScript job queue and async task queue both ran empty while it was still pending (deadlock)\") and returns false so the dispatch entry point traps (bare wasm 'unreachable'), rather than looping forever. This is the deterministic no-progress/deadlock diagnostic required by the promise-sync roadmap phase, not a hang. build-verified via tests/compat/runtime/run-bridge-tests.sh (real Wasmtime 42 crate invoker, which captured this exact diagnostic text on the guest's WASI stderr pipe, 2026-07-14); also cross-checked via tests/e2e/native-dispatch/run.sh's 'promise-deadlock' case, which wraps every wasmtime CLI invocation in a 30s timeout as an independent safety net and observed a fast trap, well under the timeout. The pinned ComponentizeJS 0.21.0 reference (reference_message_contains above) independently detects the same condition -- its own embedded engine's event-loop driver aborts with 'Error while (call) event loop error, but no exception is pending. Aborting, since that doesn't seem recoverable at all.' rather than hanging -- reference-verified via tests/compat/reference/run-reference.mjs, 2026-07-14: componentize() succeeds, and the componentized output traps deterministically (well under a manual 20s timeout probe) when invoked through the same tests/compat/runtime/invoker used for the bridge. The exact diagnostic wording differs between the two independent implementations (expected -- see bridge_message_contains), but both surface a deterministic call-time trap rather than a hang, matching this fixture's requirement."
           }
         }
       ]

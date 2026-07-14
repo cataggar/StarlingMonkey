@@ -1,0 +1,44 @@
+package compat:promises;
+
+// Phase 0 (promise-sync roadmap phase) compatibility fixture: synchronous
+// WIT exports whose JavaScript implementation returns a Promise/thenable.
+// StarlingMonkey pumps its own event loop/job queue until the returned
+// value settles, then lowers the fulfilled value exactly like a directly
+// returned value. See manifest.json known_deviations "promise-exports" and
+// runtime/js_dispatch.cpp's `resolve_promise_like`.
+//
+// Fulfilling cases only -- see ../promises-rejected and ../promises-deadlock for rejection and
+// no-progress (deadlock) traps, which are exercised as a separate negative
+// fixture so this fixture's node-selfcheck (tests/compat/lib/
+// run_compat_tests.py) and reference run can `await` every case's result
+// without risking a hang on a promise that never settles. Export names are
+// single words (no kebab-case) since the structural harness's
+// js_defines_function_export check requires an exact
+// `export function <name>(` match in component.js, unlike the
+// starling:js/api fixture used by tests/e2e/native-dispatch (which uses
+// `export { impl as "kebab-case-name" }` for multi-word exports).
+world js-exports {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  // Already-settled Promise.resolve.
+  export resolveadd: func(a: u32, b: u32) -> u32;
+  // Genuine async function: nested awaits / a multi-hop microtask chain.
+  export asyncadd: func(a: u32, b: u32) -> u32;
+  // A duck-typed thenable object that is not a real Promise instance.
+  export thenableadd: func(a: u32, b: u32) -> u32;
+  // Settles via a macrotask (setTimeout), exercising the async task queue
+  // rather than only the microtask queue.
+  export timeoutadd: func(a: u32, b: u32) -> u32;
+  // A void-returning async function (no observable WIT result).
+  export asyncnotify: func(message: string);
+  // Promise.resolve of a nested typed record.
+  export resolvepoint: func(p: point, dx: s32, dy: s32) -> point;
+  // Repeated-call state: verifies module-level state persists across
+  // separate promise-returning dispatch calls within one component
+  // instance, and that no event-loop/job-queue state leaks between calls
+  // (see manifest.json sequences "async-counter-sequence").
+  export asyncincrement: func() -> u32;
+}
