@@ -4,16 +4,40 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// world-shell-integration: in the monolithic build these functions are kept
+// alive because runtime/js_dispatch.zig's `extern fn` declarations are real
+// call sites, so wasm-ld's default DCE never has to consider removing them.
+// A world-independent "engine" PIC dylib (see build.zig's
+// -Dengine-dylib-experiment) has no such caller inside the module itself --
+// the caller lives in a separately-built "shell" dylib, resolved only at
+// `wasm-tools component link` time -- so, from the engine dylib's own DCE
+// pass, these exports are otherwise indistinguishable from dead code and get
+// garbage-collected despite already having default (non-hidden) visibility.
+// `used` forces retention regardless of any in-module reachability.
+#define STARLING_ENGINE_EXPORT __attribute__((used, visibility("default")))
+
 struct StarlingJSDispatchResult {
   uint8_t *ptr;
   size_t len;
 };
 
-extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
+extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
                                          size_t export_name_len,
                                          const uint8_t *args_json_ptr,
                                          size_t args_json_len,
                                          StarlingJSDispatchResult *result);
+
+// Frees a `StarlingJSDispatchResult.ptr` buffer allocated by
+// `starling_js_dispatch` above (see js_dispatch.cpp: it is backed by plain
+// `std::malloc`). Callers -- including a separately-linked "shell" PIC
+// dylib in the world-shell split build -- must go through this exported
+// wrapper rather than calling libc's `free` directly: a thin shell has no
+// reason to statically link its own copy of wasi-libc (doing so duplicates
+// weak internal libc symbols across the engine and shell modules, which
+// `wasm-tools component link` rejects as duplicate exports when merging
+// the two side modules), and even if it did, its allocator instance would
+// be a distinct one from whatever allocated this buffer in the engine.
+extern "C" STARLING_ENGINE_EXPORT void starling_dispatch_result_free(void *ptr);
 
 // ---------------------------------------------------------------------------
 // Typed native dispatch bridge.
@@ -158,7 +182,7 @@ struct StarlingJsValue {
 // the export was missing, wasn't callable, returned a Promise, or raised a
 // JS exception (the pending exception is left for the caller to surface as a
 // trap).
-extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
+extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 size_t export_name_len,
                                                 const StarlingJsValue *args_ptr,
                                                 size_t args_len,
@@ -168,6 +192,6 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
 // Frees a result arena returned by `starling_js_dispatch_native`. `arena` may
 // be null. Callers must not read through any pointer into a previously
 // returned `StarlingJsValue` tree after calling this.
-extern "C" void starling_js_dispatch_native_free(void *arena);
+extern "C" STARLING_ENGINE_EXPORT void starling_js_dispatch_native_free(void *arena);
 
 #endif

@@ -176,6 +176,8 @@ extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
   return 0;
 }
 
+extern "C" void starling_dispatch_result_free(void *ptr) { std::free(ptr); }
+
 // ---------------------------------------------------------------------------
 // Typed native dispatch bridge (see js_dispatch.h for the wire vocabulary and
 // the import/resource-reversal notes).

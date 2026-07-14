@@ -1,0 +1,4 @@
+package test:demo2;
+world demo2 {
+  export shell-echo: func() -> u32;
+}

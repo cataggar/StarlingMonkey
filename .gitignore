@@ -35,7 +35,19 @@
 /.zig-cache/
 /zig-out/
 /zig-out-native-dispatch-e2e/
+# world-shell-integration: scratch prefixes/artifacts for the engine/shell
+# split experiment (engine-dylib-experiment, shell-dylib-experiment) and its
+# manual wasm-tools component-embed/-link probes; see
+# docs/world-shell-integration.md.
+/zig-out-*/
+/*.component.wasm
+/composed*.wasm
+/shell*-embedded.wasm
+/*.wat
+/*-build.log
+/*-copy.log
 /deps/sm-obj-zig/
+/deps/spidermonkey-source/
 /deps/mozbuild-state/
 /deps/openssl-zig/
 /deps/sm-*.log

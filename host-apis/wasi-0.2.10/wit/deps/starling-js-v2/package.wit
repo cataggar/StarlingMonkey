@@ -1,0 +1,32 @@
+// world-shell-spike fixture: identical to ../starling-js/package.wit plus one
+// extra function (`subtract`), used to simulate a WIT/world change against a
+// warm zig-cache without touching the "real" starling-js world. See
+// docs/world-shell-spike.md for the measurement commands that use this.
+//
+// world-shell-integration: renamed from `starling:js` to `starling:js-v2` --
+// both fixtures live under the same shared `host-apis/wasi-0.2.10/wit/deps`
+// tree, so keeping the identical package name as ../starling-js caused
+// `wasm-tools`/wasip3-bindgen's WIT resolver to reject the *whole* wit/deps
+// tree with "package starling:js is defined in two different locations"
+// whenever something (e.g. tests/e2e/native-dispatch/run.sh's
+// `-Dcomponent-wit=host-apis/wasi-0.2.10/wit`) resolves the full tree rather
+// than pointing directly at one fixture's own subdirectory.
+package starling:js-v2;
+
+interface api {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  add: func(a: u32, b: u32) -> u32;
+  greet: func(name: string) -> string;
+  notify: func(message: string);
+  move: func(point: point, dx: s32, dy: s32) -> point;
+  maybe: func(value: option<u32>) -> option<u32>;
+  subtract: func(a: u32, b: u32) -> u32;
+}
+
+world js-exports {
+  export api;
+}

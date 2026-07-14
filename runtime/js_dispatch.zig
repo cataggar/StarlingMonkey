@@ -13,9 +13,9 @@ extern fn starling_js_dispatch(
     result: *DispatchResult,
 ) u32;
 
-extern fn free(ptr: ?*anyopaque) void;
+extern fn starling_dispatch_result_free(ptr: ?*anyopaque) void;
 
-var result_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+var result_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 
 // ---------------------------------------------------------------------------
 // Typed native dispatch bridge (see runtime/js_dispatch.h for the C++ side
@@ -391,7 +391,7 @@ fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.
 }
 
 fn callNative(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
-    var arg_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    var arg_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
     defer arg_arena.deinit();
     const arg_allocator = arg_arena.allocator();
 
@@ -443,7 +443,7 @@ pub fn call(comptime export_name: []const u8, comptime Result: type, args: anyty
 }
 
 fn callJson(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
-    var args_json: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    var args_json: std.Io.Writer.Allocating = .init(std.heap.wasm_allocator);
     defer args_json.deinit();
     std.json.Stringify.value(args, .{}, &args_json.writer) catch
         @panic("failed to serialize JavaScript arguments");
@@ -460,13 +460,13 @@ fn callJson(comptime export_name: []const u8, comptime Result: type, args: anyty
     }
 
     if (Result == void) {
-        free(if (dispatch_result.ptr) |ptr| @ptrCast(ptr) else null);
+        starling_dispatch_result_free(if (dispatch_result.ptr) |ptr| @ptrCast(ptr) else null);
         return;
     }
 
     const result_ptr = dispatch_result.ptr orelse
         @panic("JavaScript export dispatch returned no result");
-    defer free(@ptrCast(result_ptr));
+    defer starling_dispatch_result_free(@ptrCast(result_ptr));
     _ = result_arena.reset(.retain_capacity);
     return std.json.parseFromSliceLeaky(
         Result,

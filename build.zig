@@ -343,6 +343,90 @@ pub fn build(b: *std.Build) void {
     addStarlingSources(ctx, cc_mod);
     const cc_step = b.step("cc", "Compile the StarlingMonkey C++ sources (objects only)");
     cc_step.dependOn(&cc_lib.step);
+
+    // ---- EXPERIMENT (world-shell-spike): does the full engine link as a PIC
+    // wasm32-wasi dynamic library (dylink.0), so it can later be composed with a
+    // thin WIT-specific shell via `wasm-tools component link` instead of a full
+    // monolithic relink? Gated behind -Dengine-dylib-experiment so it never runs
+    // by default (default build/test behavior is unaffected either way).
+    //
+    // Status: this step is EXPECTED TO FAIL today. It reproduces the exact
+    // blocker documented in docs/world-shell-spike.md: the prebuilt
+    // deps/openssl-zig/libx32/libcrypto.a (and, transitively, the prebuilt
+    // deps/sm-obj-zig/dist/libspidermonkey.a) were compiled without -fPIC, so
+    // wasm-ld rejects their absolute-address relocations when linking a PIC
+    // dylib ("relocation R_WASM_MEMORY_ADDR_SLEB ... recompile with -fPIC").
+    // Run with: zig build engine-dylib-experiment -Dengine-dylib-experiment=true
+    // Kept as a reproducible, buildable artifact of the blocker rather than only
+    // a prose description.
+    if (b.option(bool, "engine-dylib-experiment", "world-shell-spike: build the engine as a PIC dylib") orelse false) {
+        const engine_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            .pic = true,
+        });
+        const engine_lib = b.addLibrary(.{ .name = "starling-engine", .root_module = engine_mod, .linkage = .dynamic });
+        addStarlingSources(ctx, engine_mod);
+        engine_mod.addObjectFile(b.path(b.pathJoin(&.{ ctx.host_api_dir, "bindings/bindings_component_type.o" })));
+        engine_mod.addObjectFile(b.path("deps/openssl-zig/libx32/libcrypto.a"));
+        engine_mod.addObjectFile(b.path("target/wasm32-wasip1/release/librust_staticlib.a"));
+        engine_mod.addObjectFile(b.path(sm_lib));
+        const engine_step = b.step("engine-dylib-experiment", "world-shell-spike: link the engine as a PIC dylib");
+        const inst_engine = b.addInstallBinFile(engine_lib.getEmittedBin(), "starling-engine.wasm");
+        inst_engine.step.dependOn(&engine_lib.step);
+        engine_step.dependOn(&inst_engine.step);
+    }
+
+    // ---- EXPERIMENT (world-shell-integration): thin, WIT-specific "shell" PIC
+    // dylib -- only the generated component bindings + the typed js_dispatch
+    // bridge (Zig side), *not* any StarlingMonkey C++/SpiderMonkey/OpenSSL/Rust
+    // sources. `starling_js_dispatch`/`starling_js_dispatch_native`/
+    // `starling_js_dispatch_native_free`/`cabi_realloc` are left as unresolved
+    // externs, to be satisfied at composition time (`wasm-tools component link`)
+    // by the engine dylib's own exports of those same symbols. Requires
+    // -Ddispatch-wit/-Ddispatch-world (same flags the monolithic path already
+    // uses to select a WIT world). Gated behind -Dshell-dylib-experiment so it
+    // never runs by default.
+    if (b.option(bool, "shell-dylib-experiment", "world-shell-integration: build a thin WIT shell as a PIC dylib") orelse false) {
+        if (wasip3_dep == null) @panic("-Dshell-dylib-experiment requires -Ddispatch-wit/-Ddispatch-world");
+        const dep = wasip3_dep.?;
+        // link_libc intentionally omitted: linking wasi-libc into *both* the
+        // engine and this shell dylib makes each pull in its own copy of
+        // libc's internal weak helper symbols (e.g.
+        // `__wasilibc_find_relpath_alloc`), which `wasm-tools component link`
+        // rejects as a duplicate export across side modules (composing two
+        // -dynamic -fPIC modules that both statically link libc is not
+        // supported by the installed wasm-tools 1.250.0 -- see
+        // docs/world-shell-integration/README.md). The shell has no need for
+        // its own libc: all allocation goes through the engine's exported
+        // `cabi_realloc`, and `free`/`malloc`, if referenced, resolve as
+        // cross-module imports against the engine's own libc instead.
+        const shell_mod = b.createModule(.{
+            .root_source_file = generated_bindings,
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        });
+        const wit_types = b.createModule(.{
+            .root_source_file = dep.path("src/wit_types.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const js_dispatch = b.createModule(.{
+            .root_source_file = b.path("runtime/js_dispatch.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        shell_mod.addImport("wit_types", wit_types);
+        shell_mod.addImport("js_dispatch", js_dispatch);
+        const shell_lib = b.addLibrary(.{ .name = "starling-shell", .root_module = shell_mod, .linkage = .dynamic });
+        const shell_step = b.step("shell-dylib-experiment", "world-shell-integration: link a thin WIT shell as a PIC dylib");
+        const inst_shell = b.addInstallBinFile(shell_lib.getEmittedBin(), "starling-shell.wasm");
+        inst_shell.step.dependOn(&shell_lib.step);
+        shell_step.dependOn(&inst_shell.step);
+    }
 }
 
 // Render componentize.sh from componentize.sh.in, pointing the tool paths at the
