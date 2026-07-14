@@ -28,15 +28,15 @@ artifacts -- see `deps/build-deps.sh` and the `docs/pic-*/verify` scripts).
 - **Engine** (`-Dengine-dylib-experiment=true`): the full StarlingMonkey C++
   runtime + SpiderMonkey + OpenSSL + Rust crates, linked as a `wasm32-wasi
   -dynamic -fPIC` dylib with **no** component/dispatch WIT compiled in at
-  all. It exports `cabi_realloc` and the three `js_dispatch` bridge
-  functions (`starling_js_dispatch`, `starling_js_dispatch_native`,
-  `starling_js_dispatch_native_free`); everything else needed by a shell is
-  reached transitively once composed.
+  all. It exports `cabi_realloc` and the four `js_dispatch` bridge
+  functions (`starling_js_dispatch`, `starling_dispatch_result_free`,
+  `starling_js_dispatch_native`, `starling_js_dispatch_native_free`);
+  everything else needed by a shell is reached transitively once composed.
 - **Shell** (`-Dshell-dylib-experiment=true -Ddispatch-wit=... -Ddispatch-world=...`):
   a thin `wasm32-wasi -dynamic -fPIC` dylib containing *only* the
   `wasip3-bindgen`-generated `component_bindings.zig` for one WIT world, plus
   `wit_types.zig` and `runtime/js_dispatch.zig` (the Zig half of the typed
-  bridge). It imports the three dispatch functions from `env` and contains
+  bridge). It imports the four dispatch functions from `env` and contains
   none of the engine's C++/SpiderMonkey/OpenSSL/Rust code.
 - **Composition**: `wasm-tools component embed --world <world> <wit-dir>
   shell.wasm` attaches the WIT world's `component-type` custom section to the
@@ -59,7 +59,7 @@ warm-cached end-to-end) and were independently verified during this session:
    errors from non-PIC OpenSSL/Rust archives); those are now real PIC
    archives (see `docs/pic-rust/`, `deps/verify-openssl-pic.sh`,
    `docs/pic-spidermonkey/`).
-   - The engine dylib does **not** naturally export the three dispatch
+   - The engine dylib does **not** naturally export the four dispatch
      bridge functions: in the monolithic build they stay alive because
      `runtime/js_dispatch.zig`'s `extern fn` declarations are real call
      sites; in a standalone engine dylib with no Zig caller in-module,
@@ -112,15 +112,22 @@ warm-cached end-to-end) and were independently verified during this session:
      explainer](https://github.com/WebAssembly/component-model/blob/main/design/mvp/examples/SharedEverythingDynamicLinking.md)
      is an idealized illustration; the actual lld/wasm-ld implementation
      unconditionally makes every `-shared` output import memory.
-   - `wasm-tools component link engine=<starling-raw.wasm> shell=...` (using
-     the existing, already-Wizer-compatible, memory-*owning* monolithic
-     build as the "engine") &rarr; `error: failed to encode a component
-     from modules: failed to extract linking metadata from engine:
-     unsupported export kind for memory: Memory`. `component link` requires
-     every input to carry a `dylink.0` section; a plain memory-owning
-     module (no `dylink.0`) is rejected outright, so simply swapping in the
-     existing Wizer-friendly executable as one of the linked inputs does not
-     work either.
+   - `wasm-tools component link engine=<memory-owner>.wasm shell=...`, where
+     `<memory-owner>.wasm` is a small, deterministic fixture module built by
+     the verify script itself (`zig build-exe` of a one-function `.zig`
+     file, plain `wasm32-wasi` target, **not** `-dynamic`) that owns/exports
+     its memory and carries no `dylink.0` section -- the same shape as the
+     existing Wizer-compatible monolithic `starling-raw.wasm` build, just
+     far smaller and reproducible without a full engine build &rarr; `error:
+     failed to encode a component from modules: failed to extract linking
+     metadata from engine: unsupported export kind for memory: Memory`.
+     `component link` requires every input to carry a `dylink.0` section; a
+     plain memory-owning module (no `dylink.0`) is rejected outright
+     regardless of its size or contents, so simply swapping in the existing
+     Wizer-friendly executable as one of the linked inputs does not work
+     either -- confirmed manually against the real monolithic
+     `starling-raw.wasm` build during this work, which fails with the
+     identical diagnostic.
    - Composing first and Wizer-ing the resulting *component* afterwards is
      also not viable: `wasmtime wizer <component>.wasm` &rarr; `No exported
      func named 'wizer-initialize' in component` -- Wizer operates only on

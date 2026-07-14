@@ -13,9 +13,9 @@
 # with the currently pinned toolchain (see ../README.md for the narrative):
 #   1. `wasmtime wizer` refuses a PIC engine dylib (imports memory).
 #   2. `wasm-ld`/zig refuses `--export-memory` together with `-shared`.
-#   3. `wasm-tools component link` refuses a plain memory-owning module
-#      (e.g. the existing Wizer-compatible `starling-raw.wasm`) as an input,
-#      because it lacks a `dylink.0` section.
+#   3. `wasm-tools component link` refuses a memory-owning module that lacks
+#      a `dylink.0` section, using a small, deterministically generated
+#      fixture module (not the huge monolithic build) as the negative input.
 #
 # Usage (from repo root):
 #   unset ZIG_LOCAL_CACHE_DIR
@@ -39,18 +39,18 @@ ADAPTER="${ADAPTER:-$ROOT/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_sna
 work="$(mktemp -d "$ROOT/.verify-work-XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-echo "== [1/6] Building the world-independent engine dylib (no component/dispatch WIT) =="
+echo "== [1/7] Building the world-independent engine dylib (no component/dispatch WIT) =="
 "$ZIG" build engine-dylib-experiment -Dengine-dylib-experiment=true -Doptimize=ReleaseSmall \
   --prefix "$work/engine-out" --summary all
 ENGINE="$work/engine-out/bin/starling-engine.wasm"
 "$WASM_TOOLS" validate "$ENGINE"
 "$WASM_TOOLS" print "$ENGINE" > "$work/engine.wat"
 grep -q '(@dylink.0' "$work/engine.wat" || { echo "FAIL: engine is not a PIC dylib"; exit 1; }
-for sym in starling_js_dispatch starling_js_dispatch_native starling_js_dispatch_native_free; do
+for sym in starling_js_dispatch starling_dispatch_result_free starling_js_dispatch_native starling_js_dispatch_native_free; do
   grep -q "(export \"$sym\"" "$work/engine.wat" \
     || { echo "FAIL: engine does not export $sym"; exit 1; }
 done
-echo "OK: engine is a valid PIC dylib exporting all three dispatch bridge functions"
+echo "OK: engine is a valid PIC dylib exporting all four dispatch bridge functions"
 ENGINE_HASH_BEFORE="$(sha256sum "$ENGINE" | cut -d' ' -f1)"
 
 build_and_compose_shell() {
@@ -69,12 +69,12 @@ build_and_compose_shell() {
 }
 
 echo
-echo "== [2/6] Building + composing thin shell A (host-apis/wasi-0.2.10/wit/deps/starling-js) =="
+echo "== [2/7] Building + composing thin shell A (host-apis/wasi-0.2.10/wit/deps/starling-js) =="
 time build_and_compose_shell \
   host-apis/wasi-0.2.10/wit/deps/starling-js js-exports "$work/shellA" "shell A"
 
 echo
-echo "== [3/6] Building + composing thin shell B (.../starling-js-v2, a distinct world) =="
+echo "== [3/7] Building + composing thin shell B (.../starling-js-v2, a distinct world) =="
 time build_and_compose_shell \
   host-apis/wasi-0.2.10/wit/deps/starling-js-v2 js-exports "$work/shellB" "shell B"
 
@@ -84,7 +84,7 @@ ENGINE_HASH_AFTER="$(sha256sum "$ENGINE" | cut -d' ' -f1)"
 echo "OK: engine.wasm byte-identical (sha256 $ENGINE_HASH_AFTER) across both distinct worlds"
 
 echo
-echo "== [4/6] Invoking the composed (uninitialized) component through wasmtime =="
+echo "== [4/7] Invoking the composed (uninitialized) component through wasmtime =="
 echo "   (expected: reaches starling_js_dispatch -> resolve_export_function -> panics because"
 echo "    no JS module/context has been initialized -- this proves the composed call chain"
 echo "    engine<->shell is wired correctly end-to-end; only JS-engine initialization is missing)"
@@ -97,7 +97,7 @@ grep -q "JavaScript export dispatch failed" "$work/invoke.log" \
 echo "OK: composed component runs end-to-end up to the (expected) uninitialized-engine panic"
 
 echo
-echo "== [5/6] Negative probe: wasmtime wizer rejects the PIC engine dylib =="
+echo "== [5/7] Negative probe: wasmtime wizer rejects the PIC engine dylib =="
 if "$WASMTIME" wizer "$ENGINE" -o "$work/wizer-out.wasm" > "$work/wizer.log" 2>&1; then
   echo "UNEXPECTED: wizer succeeded on a PIC dylib"; cat "$work/wizer.log"; exit 1
 fi
@@ -106,7 +106,7 @@ grep -qi "imported memories are not supported" "$work/wizer.log" \
 echo "OK: $(grep -i 'error' "$work/wizer.log" | head -1)"
 
 echo
-echo "== [6/6] Negative probe: -shared + --export-memory is rejected by the linker =="
+echo "== [6/7] Negative probe: -shared + --export-memory is rejected by the linker =="
 cat > "$work/probe.zig" <<'EOF'
 export fn probe(x: i32) i32 {
     return x + 1;
@@ -119,6 +119,32 @@ fi
 grep -qi "exporting memory is incompatible with dynamic linking" "$work/probe.log" \
   || { echo "FAIL: expected the dynamic-linking/export-memory conflict"; cat "$work/probe.log"; exit 1; }
 echo "OK: $(grep -i 'error' "$work/probe.log" | head -1)"
+
+echo
+echo "== [7/7] Negative probe: component link rejects a memory-owning, non-dylink.0 module =="
+cat > "$work/memory-owner.zig" <<'EOF'
+export fn probe(x: i32) i32 {
+    return x + 1;
+}
+pub fn main() void {}
+EOF
+"$ZIG" build-exe "$work/memory-owner.zig" -target wasm32-wasi -OReleaseSmall \
+  -femit-bin="$work/memory-owner.wasm" > "$work/memory-owner-build.log" 2>&1
+"$WASM_TOOLS" print "$work/memory-owner.wasm" > "$work/memory-owner.wat"
+grep -q '(@dylink.0' "$work/memory-owner.wat" \
+  && { echo "FAIL: fixture unexpectedly carries a dylink.0 section"; exit 1; }
+grep -q '(export "memory"' "$work/memory-owner.wat" \
+  || { echo "FAIL: fixture does not own/export memory"; exit 1; }
+if "$WASM_TOOLS" component link \
+     engine="$work/memory-owner.wasm" shell="$work/shellA/shell-embedded.wasm" \
+     --adapt wasi_snapshot_preview1="$ADAPTER" \
+     -o "$work/composed-bad.wasm" > "$work/component-link-reject.log" 2>&1; then
+  echo "UNEXPECTED: component link succeeded with a memory-owning, non-dylink.0 input"
+  cat "$work/component-link-reject.log"; exit 1
+fi
+grep -qi "unsupported export kind for memory" "$work/component-link-reject.log" \
+  || { echo "FAIL: expected the dylink.0-less memory-owning-module rejection"; cat "$work/component-link-reject.log"; exit 1; }
+echo "OK: $(grep -i 'unsupported export kind for memory' "$work/component-link-reject.log" | sed 's/^ *//')"
 
 echo
 echo "All checks passed. See docs/world-shell-integration/README.md for the full write-up,"

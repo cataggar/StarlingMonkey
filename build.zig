@@ -350,15 +350,28 @@ pub fn build(b: *std.Build) void {
     // monolithic relink? Gated behind -Dengine-dylib-experiment so it never runs
     // by default (default build/test behavior is unaffected either way).
     //
-    // Status: this step is EXPECTED TO FAIL today. It reproduces the exact
-    // blocker documented in docs/world-shell-spike.md: the prebuilt
-    // deps/openssl-zig/libx32/libcrypto.a (and, transitively, the prebuilt
-    // deps/sm-obj-zig/dist/libspidermonkey.a) were compiled without -fPIC, so
-    // wasm-ld rejects their absolute-address relocations when linking a PIC
-    // dylib ("relocation R_WASM_MEMORY_ADDR_SLEB ... recompile with -fPIC").
+    // Status: this step builds successfully. deps/openssl-zig/libx32/libcrypto.a,
+    // target/wasm32-wasip1/release/librust_staticlib.a, and the SpiderMonkey
+    // object archive are now all real, PIC (-fPIC) artifacts (see
+    // docs/pic-rust/, deps/verify-openssl-pic.sh, docs/pic-spidermonkey/), so
+    // this closes the original blocker documented in docs/world-shell-spike.md
+    // (17253 link errors from non-PIC OpenSSL/Rust archives). The engine links
+    // as a valid `dylink.0`-tagged PIC dylib, world-independent (no
+    // component/dispatch WIT compiled in), and composes cleanly with a thin
+    // per-world shell via `wasm-tools component link` -- see
+    // docs/world-shell-integration/README.md.
+    //
+    // What remains blocked is initializing that composed engine+shell as a
+    // reusable JS-engine snapshot: Wizer refuses any module that imports
+    // memory ("imported memories are not supported"), and every
+    // `-dynamic -fPIC` wasm32-wasi dylib produced by this wasm-ld imports its
+    // memory rather than owning/exporting it (there is no flag combination
+    // that produces a `-shared`/`dylink.0` module which owns memory instead).
+    // This is a structural Wizer/imported-memory constraint of the pinned
+    // toolchain, not a StarlingMonkey PIC-linkage problem -- see
+    // docs/world-shell-integration/README.md for the exact reproducible
+    // probes.
     // Run with: zig build engine-dylib-experiment -Dengine-dylib-experiment=true
-    // Kept as a reproducible, buildable artifact of the blocker rather than only
-    // a prose description.
     if (b.option(bool, "engine-dylib-experiment", "world-shell-spike: build the engine as a PIC dylib") orelse false) {
         const engine_mod = b.createModule(.{
             .target = target,
