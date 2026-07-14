@@ -160,6 +160,25 @@ interface host {
     validate-non-negative: func(n: s32) -> result<_, string>;
 }
 
+// A world-level `use` imports these named types into `js-exports`. `alias`
+// reaches the variant and then record in this source interface's scope; `point`
+// deliberately has the same local WIT name as host's distinct `point`.
+interface root-types {
+    record point {
+        x: u32,
+        y: u32,
+    }
+    record inner {
+        x: u32,
+        y: u32,
+    }
+    variant outer {
+        empty,
+        item(inner),
+    }
+    type alias = outer;
+}
+
 interface api {
     record point {
         x: u32,
@@ -203,6 +222,15 @@ interface api {
         rejected,
     }
     run-root-transform: func(value: root-message) -> root-response;
+    record root-chain-inner {
+        x: u32,
+        y: u32,
+    }
+    variant root-chain-outer {
+        empty,
+        item(root-chain-inner),
+    }
+    run-root-chain: func(value: root-chain-outer) -> root-chain-outer;
 
     run-sum-nested-lists: func(rows: list<list<u32>>) -> u32;
 
@@ -271,11 +299,16 @@ world js-exports {
     }
     type root-response-alias = root-response;
 
+    // `alias -> outer -> inner` must resolve and emit from root-types's
+    // source scope. `point` also collides with host's independent type.
+    use root-types.{alias, point};
+
     import add-one: func(value: u32) -> u32;
     import root-note: func();
     import root-note-count: func() -> u32;
     import root-boom: func() -> u32;
     import root-transform: func(value: root-message) -> root-response-alias;
+    import root-chain: func(value: alias) -> alias;
 
     import host;
     export api;

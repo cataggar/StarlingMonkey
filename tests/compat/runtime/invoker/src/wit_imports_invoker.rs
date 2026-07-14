@@ -444,6 +444,35 @@ fn add_root_imports(linker: &mut Linker<Host>, include_root_boom: bool) -> Resul
         },
     )?;
 
+    root.func_new(
+        "root-chain",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Variant(tag, payload) = &args[0] else {
+                return Err(wasm_err("root-chain: expected outer variant"));
+            };
+            let ("item", Some(inner)) = (tag.as_str(), payload.as_deref()) else {
+                return Err(wasm_err("root-chain: expected item(inner)"));
+            };
+            let Val::Record(fields) = inner else {
+                return Err(wasm_err("root-chain: expected inner record"));
+            };
+            let Some((_, Val::U32(x))) = fields.iter().find(|(name, _)| name == "x") else {
+                return Err(wasm_err("root-chain: inner.x must be u32"));
+            };
+            let Some((_, Val::U32(y))) = fields.iter().find(|(name, _)| name == "y") else {
+                return Err(wasm_err("root-chain: inner.y must be u32"));
+            };
+            results[0] = Val::Variant(
+                "item".to_string(),
+                Some(Box::new(Val::Record(vec![
+                    ("x".to_string(), Val::U32(x.wrapping_add(3))),
+                    ("y".to_string(), Val::U32(y.wrapping_add(4))),
+                ]))),
+            );
+            Ok(())
+        },
+    )?;
+
     Ok(())
 }
 

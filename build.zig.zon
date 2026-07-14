@@ -35,8 +35,8 @@
         // a local sibling-worktree `.path`), so a clean clone builds without
         // any `/work` sibling directories present.
         .wasip3 = .{
-            .url = "git+https://github.com/cataggar/wabt#be6c22ba4d4804e0624aeb6638e9afbd38940c23",
-            .hash = "wasip3-0.3.0-Kmwy2p8zBwCwSKRvztpLccp-WAd7ih8CtdyJal4knFG7",
+            .url = "git+https://github.com/cataggar/wabt#77c8b067c292c8f965419a40d12228750ee33a88",
+            .hash = "wasip3-0.3.0-Kmwy2idRBwDbcvZLNPEoz0_ol-eiIIZaqxPWNImzpgH7",
         },
     },
 

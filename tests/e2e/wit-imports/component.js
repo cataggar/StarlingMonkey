@@ -69,6 +69,7 @@ import rootNote from "root-note";
 import rootNoteCount from "root-note-count";
 import rootBoom from "root-boom";
 import rootTransform from "root-transform";
+import rootChain from "root-chain";
 
 export function runAdd(a, b) {
   return add(a, b);
@@ -166,6 +167,11 @@ function runRootTransform(value) {
   return rootTransform(value);
 }
 export { runRootTransform as "run-root-transform" };
+
+function runRootChain(value) {
+  return rootChain(value);
+}
+export { runRootChain as "run-root-chain" };
 
 function runSumNestedLists(rows) {
   return sumNestedLists(rows);
