@@ -6,11 +6,26 @@ interface api {
     y: s32,
   }
 
+  // A nested aggregate: a record embedding another record plus an exact
+  // 64-bit field, used to prove the native typed dispatch path handles
+  // aggregates without JSON and without losing precision above 2^53.
+  record big-point {
+    p: point,
+    id: u64,
+  }
+
   add: func(a: u32, b: u32) -> u32;
   greet: func(name: string) -> string;
   notify: func(message: string);
   move: func(point: point, dx: s32, dy: s32) -> point;
   maybe: func(value: option<u32>) -> option<u32>;
+
+  // Exact 64-bit round trips beyond 2^53 (JSON numbers lose precision here;
+  // the native typed dispatch path carries them as JavaScript BigInt).
+  big-add: func(a: u64, b: u64) -> u64;
+  big-sub: func(a: s64, b: s64) -> s64;
+  // Nested aggregate carrying an exact u64 field alongside a nested record.
+  tag-point: func(p: point, id: u64) -> big-point;
 }
 
 world js-exports {
