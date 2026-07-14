@@ -8,8 +8,7 @@
     "node": ">=22.12.0"
   },
   "devDependencies": {
-    "@bytecodealliance/componentize-js": "0.21.0",
-    "@bytecodealliance/jco": "1.25.2"
+    "@bytecodealliance/componentize-js": "0.21.0"
   },
   "scripts": {
     "run": "node run-reference.mjs"

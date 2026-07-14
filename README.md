@@ -125,10 +125,13 @@ The JavaScript bridge currently supports synchronous JSON-representable
 primitives, strings, lists, records, options, and functions without a result.
 Promise results are rejected.
 
-See `tests/compat/README.md` for a data-driven manifest and Node-free test
-harness tracking this bridge's compatibility with a pinned ComponentizeJS
+See `tests/compat/README.md` for a data-driven manifest and two Node-free test
+harness modes tracking this bridge's compatibility with a pinned ComponentizeJS
 release (`tests/compat/manifest.json`), including known deviations between
-the two and original WIT/JavaScript fixtures for the surface described above.
+the two and original WIT/JavaScript fixtures for the surface described above:
+a fast structural mode, and a slower runtime mode that builds and exercises
+the real Zig/WABT bridge and (optionally) the pinned ComponentizeJS reference
+itself through Wasmtime.
 
 Notes:
 - SpiderMonkey must be built from source with Zig because the upstream prebuilt
@@ -146,14 +149,34 @@ zig build test
 ```
 
 This runs the e2e and integration suites (`tests/run-suite.sh`) against the
-runtime in `zig-out/bin`, plus the Node-free ComponentizeJS compatibility
-harness (`tests/compat/run-compat-tests.sh`; see `tests/compat/README.md`).
-Run the compatibility harness alone, without needing the wasm build above,
-with:
+runtime in `zig-out/bin`, plus the Node-free, structural-only ComponentizeJS
+compatibility harness (`tests/compat/run-compat-tests.sh`; see
+`tests/compat/README.md`). Run the structural compatibility harness alone,
+without needing the wasm build above, with:
 
 ```console
 zig build compat-test
 ```
+
+The structural harness above only checks the compatibility manifest,
+fixtures, and expected-output files for self-consistency; it does not build
+or execute anything through the real Zig/WABT bridge or ComponentizeJS. For
+that, run the separate, required/full runtime bridge suite — which builds
+the actual WIT dispatch reactor for every fixture, componentizes it with the
+real Wizer+WABT pipeline, and invokes it through Wasmtime — with:
+
+```console
+zig build compat-bridge-test
+```
+
+This is not part of `zig build test`/`compat-test` because a full run takes
+on the order of 15-20 minutes and requires a Rust toolchain and `wasm-tools`
+in addition to the wasm build's own prerequisites; see
+`tests/compat/runtime/README.md` for exact requirements. The opt-in
+ComponentizeJS reference mode (`tests/compat/reference/`) is a separate,
+Node-only, one-command script not wired into either Zig build step; see
+`tests/compat/reference/README.md`.
+
 
 ## Using StarlingMonkey with dynamically loaded JS code
 

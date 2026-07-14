@@ -303,16 +303,37 @@ pub fn build(b: *std.Build) void {
     dispatch_e2e.addArg(b.graph.zig_exe);
     test_step.dependOn(&dispatch_e2e.step);
 
-    // `zig build compat-test`: Node-free ComponentizeJS compatibility
-    // harness (tests/compat, cataggar/StarlingMonkey#6 Phase 0). Unlike
-    // `test` above, this does not require the full wasm build/install step:
-    // it validates tests/compat/manifest.json's fixtures/WIT/expected
-    // outputs structurally (plus a best-effort optional Node self-check,
-    // skipped cleanly when Node is absent). See tests/compat/README.md.
-    const compat_test_step = b.step("compat-test", "Run the Node-free ComponentizeJS compatibility harness (tests/compat)");
+    // `zig build compat-test`: Node-free, STRUCTURAL-ONLY ComponentizeJS
+    // compatibility harness (tests/compat, cataggar/StarlingMonkey#6 Phase
+    // 0). Unlike `test` above, this does not require the full wasm
+    // build/install step: it validates tests/compat/manifest.json's
+    // fixtures/WIT/expected outputs and schema structurally (plus a
+    // best-effort optional Node self-check, skipped cleanly when Node is
+    // absent). It does NOT build or run the real Zig/WABT bridge, and does
+    // NOT execute anything through ComponentizeJS -- see
+    // `compat-bridge-test` below for that, and tests/compat/README.md's
+    // "Two harness modes" section for why these are kept distinct.
+    const compat_test_step = b.step("compat-test", "Run the Node-free, structural-only ComponentizeJS compatibility harness (tests/compat)");
     const compat_run = b.addSystemCommand(&.{ "bash", "tests/compat/run-compat-tests.sh" });
     compat_test_step.dependOn(&compat_run.step);
     test_step.dependOn(compat_test_step);
+
+    // `zig build compat-bridge-test`: the REQUIRED/FULL runtime
+    // compatibility suite (tests/compat/runtime). Unlike `compat-test`
+    // above, this actually builds the StarlingMonkey WIT dispatch reactor
+    // for every tests/compat fixture, componentizes each with the real
+    // Wizer+WABT pipeline, and invokes every export through Wasmtime,
+    // comparing against tests/compat/manifest.json's checked-in
+    // expectations -- see tests/compat/runtime/README.md. This is
+    // deliberately NOT a dependency of `test`/`compat-test`: a full run
+    // takes on the order of 15-20 minutes (a from-scratch Zig build per
+    // fixture), and missing tools/artifacts (wasm-tools, a Rust toolchain,
+    // the prebuilt SpiderMonkey/OpenSSL/Rust-staticlib artifacts this
+    // build needs) make it fail outright rather than skip, so it must be
+    // invoked explicitly as its own step.
+    const compat_bridge_test_step = b.step("compat-bridge-test", "Run the real Zig/WABT/Wasmtime bridge compatibility suite (tests/compat/runtime; required/full, ~15-20 min, not part of `test`)");
+    const compat_bridge_run = b.addSystemCommand(&.{ "bash", "tests/compat/runtime/run-bridge-tests.sh" });
+    compat_bridge_test_step.dependOn(&compat_bridge_run.step);
 
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the

@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compat_lib  # noqa: E402
+import json_schema_lite  # noqa: E402
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -68,11 +69,22 @@ class Reporter:
 
 
 def check_manifest_schema_shape(manifest: dict, reporter: Reporter) -> None:
-    label = "manifest/required-keys"
-    required = ["manifest_version", "phase", "provenance", "bridge", "feature_matrix", "fixtures"]
-    missing = [key for key in required if key not in manifest]
-    if missing:
-        reporter.report(FAIL, label, f"missing top-level keys: {missing}")
+    """Actually enforces tests/compat/schema/manifest.schema.json against
+    manifest.json, using the stdlib-only draft-07-subset validator in
+    lib/json_schema_lite.py (see that module's docstring for why this
+    doesn't pull in the `jsonschema` PyPI package). Previously,
+    manifest.schema.json's `$schema` reference was purely informational --
+    nothing checked manifest.json against it."""
+    label = "manifest/schema-valid"
+    schema_path = compat_lib.COMPAT_DIR / "schema" / "manifest.schema.json"
+    try:
+        with open(schema_path, encoding="utf-8") as fh:
+            schema = json.load(fh)
+        json_schema_lite.validate(manifest, schema)
+    except json_schema_lite.UnsupportedKeyword as exc:
+        reporter.report(FAIL, label, f"schema uses an unsupported keyword: {exc}")
+    except json_schema_lite.SchemaValidationError as exc:
+        reporter.report(FAIL, label, str(exc))
     else:
         reporter.report(PASS, label)
 

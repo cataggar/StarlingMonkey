@@ -2,46 +2,77 @@
 // Opt-in reference-mode runner for tests/compat (cataggar/StarlingMonkey#6,
 // Phase 0). Not part of the normal build or test suite -- see README.md in
 // this directory for setup and requirements (Node >= 22.12, `npm install`
-// run manually here first).
+// run manually here first, plus `cargo`/`rustc` for the compat-invoker
+// helper described below).
 //
 // For every non-negative fixture declared in ../manifest.json, this script:
 //   1. componentizes fixtures/<id>/component.js against fixtures/<id>/wit
 //      using the pinned @bytecodealliance/componentize-js release,
-//   2. transpiles the resulting component with jco so it can be imported
-//      directly as a plain JS module (avoiding any CLI string-argument
-//      ambiguity -- see manifest.json provenance notes on the u32 CLI
-//      quirk that was ruled out this way),
-//   3. calls each declared case/sequence and compares the observed value
-//      against manifest.json's reference_result (falling back to result)
-//      field, reporting PASS/FAIL/SKIP the same way run-compat-tests.sh
-//      does.
+//   2. writes the produced component to .component-cache/<id>.wasm and
+//      invokes it with ../runtime/invoker (compat-invoker), a small Rust
+//      host built on the official `wasmtime` crate, which instantiates the
+//      component once and calls each declared case/sequence against that
+//      single instance via the component model's dynamic API (Wasmtime's
+//      canonical-ABI value marshalling, not a hand-rolled CLI string
+//      parser and not another component transpiler). This keeps the
+//      *execution* half of the comparison attributable to Wasmtime + the
+//      real componentize-js output, per cataggar/StarlingMonkey#6's
+//      requirement that defects observed here be attributable to
+//      ComponentizeJS itself rather than to a second adapter's own bugs.
+//      (`@bytecodealliance/jco` is no longer a dependency of this script
+//      or this directory's package.json; it remains only as
+//      componentize-js's own internal transitive dependency -- see
+//      README.md "Why jco still appears in package-lock.json".)
+//   3. compares the observed value against manifest.json's result field,
+//      reporting PASS/FAIL the same way run-compat-tests.sh does.
 //
 // For negative fixtures (missing/invalid export), this script instead
 // confirms that componentize() itself rejects with the manifest's declared
-// reference_class/reference_message_contains.
+// reference_class/reference_message_contains -- a componentize-js build-time
+// behavior with no wasm execution involved, so it is unaffected by the jco
+// question above.
 //
 // Usage (from this directory, after `npm install`):
 //   node run-reference.mjs
 
 import { componentize } from "@bytecodealliance/componentize-js";
-import { transpile } from "@bytecodealliance/jco";
-import { readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const COMPAT_DIR = join(HERE, "..");
+const CACHE_DIR = join(HERE, ".component-cache");
+const INVOKER_DIR = join(COMPAT_DIR, "runtime", "invoker");
+const INVOKER_BIN = join(INVOKER_DIR, "target", "release", "compat-invoker");
 
 const manifest = JSON.parse(await readFile(join(COMPAT_DIR, "manifest.json"), "utf8"));
 
-let pass = 0, fail = 0, skip = 0;
+let pass = 0, fail = 0;
 const failures = [];
 
 function report(status, label, detail) {
   if (status === "PASS") pass++;
-  else if (status === "SKIP") skip++;
   else { fail++; failures.push(label); }
   console.log(detail ? `${status} ${label} -- ${detail}` : `${status} ${label}`);
+}
+
+async function ensureInvokerBuilt() {
+  try {
+    await execFileAsync("cargo", ["--version"]);
+  } catch {
+    throw new Error(
+      "`cargo` not found on PATH -- required to build tests/compat/runtime/invoker " +
+      "(compat-invoker), which this script uses to run componentize-js output through " +
+      "Wasmtime. Install a Rust toolchain (https://rustup.rs) to run the reference mode."
+    );
+  }
+  console.log("building compat-invoker (cargo build --release)...");
+  await execFileAsync("cargo", ["build", "--release", "--quiet"], { cwd: INVOKER_DIR });
 }
 
 async function componentizeFixture(fixture) {
@@ -55,31 +86,45 @@ async function componentizeFixture(fixture) {
   return component;
 }
 
-async function loadTranspiled(component, name) {
-  const workdir = join(HERE, ".jco-out", name);
-  await rm(workdir, { recursive: true, force: true });
-  const { mkdir, writeFile } = await import("node:fs/promises");
-  await mkdir(workdir, { recursive: true });
-  const { files } = await transpile(component, { name, noTypescript: true });
-  let entry;
-  for (const [relPath, contents] of Object.entries(files)) {
-    const full = join(workdir, relPath);
-    await mkdir(dirname(full), { recursive: true });
-    await writeFile(full, contents);
-    if (relPath === `${name}.js`) entry = full;
+function callsFor(fixture) {
+  const calls = [];
+  for (const c of fixture.cases ?? []) {
+    calls.push({ function: c.function, args: c.args, __case: c });
   }
-  return await import(pathToFileURL(entry).href);
+  for (const seq of fixture.sequences ?? []) {
+    for (const [index, call] of seq.calls.entries()) {
+      calls.push({
+        function: seq.function,
+        args: call.args,
+        __case: { id: `${seq.id}#${index}`, void: false, result: call.result },
+      });
+    }
+  }
+  return calls;
 }
 
+async function invoke(wasmPath, calls) {
+  const callsPath = `${wasmPath}.calls.json`;
+  await writeFile(callsPath, JSON.stringify(calls.map(({ function: fn, args }) => ({ function: fn, args }))));
+  const { stdout } = await execFileAsync(INVOKER_BIN, [wasmPath, callsPath], { maxBuffer: 64 * 1024 * 1024 });
+  return JSON.parse(stdout);
+}
+
+await mkdir(CACHE_DIR, { recursive: true });
+await ensureInvokerBuilt();
+
 for (const fixture of manifest.fixtures) {
+  const label = `reference/${fixture.id}`;
+
   if (fixture.negative) {
-    const label = `reference/${fixture.id}`;
     try {
       await componentizeFixture(fixture);
       report("FAIL", label, "componentize() unexpectedly succeeded for a negative fixture");
     } catch (err) {
-      const expectClasses = (fixture.cases ?? []).map((c) => c.expect_error?.reference_message_contains).filter(Boolean);
-      const message = String(err && err.message || err);
+      const expectClasses = (fixture.cases ?? [])
+        .map((c) => c.expect_error?.reference_message_contains)
+        .filter(Boolean);
+      const message = String((err && err.message) || err);
       const matched = expectClasses.some((needle) => message.includes(needle));
       if (matched) report("PASS", label);
       else report("FAIL", label, `error message did not match any expected substring; got: ${message}`);
@@ -87,44 +132,37 @@ for (const fixture of manifest.fixtures) {
     continue;
   }
 
-  const label = `reference/${fixture.id}`;
-  let mod;
+  let wasmPath;
   try {
     const component = await componentizeFixture(fixture);
-    mod = await loadTranspiled(component, fixture.id);
+    wasmPath = join(CACHE_DIR, `${fixture.id}.wasm`);
+    await writeFile(wasmPath, component);
   } catch (err) {
-    report("FAIL", label, `componentize/transpile failed: ${err && err.message || err}`);
+    report("FAIL", label, `componentize failed: ${(err && err.message) || err}`);
+    continue;
+  }
+
+  const calls = callsFor(fixture);
+  let results;
+  try {
+    results = await invoke(wasmPath, calls);
+  } catch (err) {
+    report("FAIL", label, `compat-invoker failed: ${(err && err.message) || err}`);
     continue;
   }
 
   const mismatches = [];
-  for (const c of fixture.cases ?? []) {
-    let got;
-    try {
-      got = await mod[c.function](...c.args);
-    } catch (err) {
-      mismatches.push(`${c.id}: threw ${err && err.message || err}`);
+  for (const [i, call] of calls.entries()) {
+    const c = call.__case;
+    const observed = results[i];
+    if (!observed.ok) {
+      mismatches.push(`${c.id}: trapped: ${observed.trap}`);
       continue;
     }
     if (c.void) continue;
     const want = "reference_result" in c ? c.reference_result : c.result;
-    const normalizedGot = got === undefined ? null : got;
-    if (JSON.stringify(normalizedGot) !== JSON.stringify(want)) {
-      mismatches.push(`${c.id}: want ${JSON.stringify(want)}, got ${JSON.stringify(normalizedGot)}`);
-    }
-  }
-  for (const seq of fixture.sequences ?? []) {
-    for (const [index, call] of seq.calls.entries()) {
-      let got;
-      try {
-        got = await mod[seq.function](...call.args);
-      } catch (err) {
-        mismatches.push(`${seq.id}#${index}: threw ${err && err.message || err}`);
-        continue;
-      }
-      if (JSON.stringify(got) !== JSON.stringify(call.result)) {
-        mismatches.push(`${seq.id}#${index}: want ${JSON.stringify(call.result)}, got ${JSON.stringify(got)}`);
-      }
+    if (JSON.stringify(observed.value) !== JSON.stringify(want)) {
+      mismatches.push(`${c.id}: want ${JSON.stringify(want)}, got ${JSON.stringify(observed.value)}`);
     }
   }
 
@@ -133,7 +171,7 @@ for (const fixture of manifest.fixtures) {
 }
 
 console.log();
-console.log(`== reference summary: ${pass} passed, ${fail} failed, ${skip} skipped ==`);
+console.log(`== reference summary: ${pass} passed, ${fail} failed ==`);
 if (failures.length) {
   console.log("  failed: " + failures.join(", "));
   process.exit(1);

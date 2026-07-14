@@ -53,4 +53,14 @@
 __pycache__/
 tests/compat/reference/node_modules/
 tests/compat/reference/.jco-out/
+tests/compat/reference/.node-cache/
+tests/compat/reference/.component-cache/
+
+# Compatibility harness runtime bridge mode (tests/compat/runtime): the
+# patched wabt build, per-fixture build/componentize cache, and the
+# compat-invoker Rust crate's build output. Cargo.lock IS committed (not
+# ignored) for compat-invoker's own build reproducibility.
+tests/compat/runtime/.wabt-cache/
+tests/compat/runtime/.cache/
+tests/compat/runtime/invoker/target/
 
