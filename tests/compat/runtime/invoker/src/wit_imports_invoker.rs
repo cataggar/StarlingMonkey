@@ -401,6 +401,49 @@ fn add_root_imports(linker: &mut Linker<Host>, include_root_boom: bool) -> Resul
         )?;
     }
 
+    root.func_new(
+        "root-transform",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::Record(message) = &args[0] else {
+                return Err(wasm_err("root-transform: expected root-message record"));
+            };
+            let Some((_, Val::Record(coordinate))) = message.iter().find(|(name, _)| name == "coordinate") else {
+                return Err(wasm_err("root-transform: missing coordinate record"));
+            };
+            let Some((_, Val::U32(x))) = coordinate.iter().find(|(name, _)| name == "x") else {
+                return Err(wasm_err("root-transform: coordinate.x must be u32"));
+            };
+            let Some((_, Val::U32(y))) = coordinate.iter().find(|(name, _)| name == "y") else {
+                return Err(wasm_err("root-transform: coordinate.y must be u32"));
+            };
+            let Some((_, Val::List(labels))) = message.iter().find(|(name, _)| name == "labels") else {
+                return Err(wasm_err("root-transform: labels must be list<string>"));
+            };
+            let mut transformed_labels = Vec::with_capacity(labels.len() + 1);
+            for label in labels.iter().rev() {
+                let Val::String(label) = label else {
+                    return Err(wasm_err("root-transform: labels must be list<string>"));
+                };
+                transformed_labels.push(Val::String(label.clone()));
+            }
+            transformed_labels.push(Val::String("host".to_string()));
+            results[0] = Val::Variant(
+                "accepted".to_string(),
+                Some(Box::new(Val::Record(vec![
+                    (
+                        "coordinate".to_string(),
+                        Val::Record(vec![
+                            ("x".to_string(), Val::U32(x.wrapping_add(1))),
+                            ("y".to_string(), Val::U32(y.wrapping_add(2))),
+                        ]),
+                    ),
+                    ("labels".to_string(), Val::List(transformed_labels)),
+                ]))),
+            );
+            Ok(())
+        },
+    )?;
+
     Ok(())
 }
 

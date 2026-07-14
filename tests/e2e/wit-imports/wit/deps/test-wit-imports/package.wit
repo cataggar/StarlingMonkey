@@ -190,6 +190,19 @@ interface api {
     run-root-note: func() -> bool;
     run-root-note-count: func() -> u32;
     run-root-boom: func() -> u32;
+    record root-coordinates {
+        x: u32,
+        y: u32,
+    }
+    record root-message {
+        coordinate: root-coordinates,
+        labels: list<string>,
+    }
+    variant root-response {
+        accepted(root-message),
+        rejected,
+    }
+    run-root-transform: func(value: root-message) -> root-response;
 
     run-sum-nested-lists: func(rows: list<list<u32>>) -> u32;
 
@@ -242,10 +255,27 @@ world js-exports {
     //   import addOne from "add-one";
     // Each function becomes a distinct ESM module with a default export,
     // while the generated core wasm imports `$root` / the verbatim WIT name.
+    // Named world-local root types exercise recursive lowering/lifting of a
+    // record containing another record and a list, plus a variant alias.
+    record root-coordinates {
+        x: u32,
+        y: u32,
+    }
+    record root-message {
+        coordinate: root-coordinates,
+        labels: list<string>,
+    }
+    variant root-response {
+        accepted(root-message),
+        rejected,
+    }
+    type root-response-alias = root-response;
+
     import add-one: func(value: u32) -> u32;
     import root-note: func();
     import root-note-count: func() -> u32;
     import root-boom: func() -> u32;
+    import root-transform: func(value: root-message) -> root-response-alias;
 
     import host;
     export api;
