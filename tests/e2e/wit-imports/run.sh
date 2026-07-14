@@ -32,6 +32,8 @@
 #   * requirement 5 (versioned interface names): the fixture's import/export
 #     both use the versioned identifier `test:wit-imports/{host,api}@1.2.3`
 #     throughout.
+#   * root-function preservation: `root-add` remains a callable top-level
+#     export beside the versioned named `api` interface.
 #   * void import result contract: `note` (a WIT import with no result)
 #     surfaces to JavaScript as exactly `undefined`, and its host-side
 #     implementation's observable side effect (an incrementing counter,
@@ -175,7 +177,7 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-root-note-count", "args": []},
   {"function": "run-root-transform", "args": [{"coordinate": {"x": 5, "y": 8}, "labels": ["alpha", "beta"]}]},
   {"function": "run-root-chain", "args": [{"tag": "item", "val": {"x": 5, "y": 8}}]},
-
+  {"function": "root-add", "args": [20, 22]},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -304,9 +306,10 @@ assert_field "root named aggregate recursively lowers and lifts" 45 \
   "rec['value']" "{'tag': 'accepted', 'val': {'coordinate': {'x': 6, 'y': 10}, 'labels': ['beta', 'alpha', 'host']}}"
 assert_field "root use alias chain lowers and lifts through its source interface" 46 \
   "rec['value']" "{'tag': 'item', 'val': {'x': 8, 'y': 12}}"
+assert_field "root function export remains callable beside the api namespace" 47 "rec['value']" "42"
 
-assert_field "run-boom host trap propagates" 47 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 47 \
+assert_field "run-boom host trap propagates" 48 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 48 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] invoking root-boom in a fresh instance"

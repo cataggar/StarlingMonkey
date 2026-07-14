@@ -1,10 +1,14 @@
-package compat:repeated-calls;
+package starling:js;
 
 // Phase 0 compatibility fixture: repeated calls against exports that hold
 // module-level state across invocations, verifying that the Wizer-snapshotted
 // module instance persists state between dispatches within one component
 // instance (rather than each call re-evaluating the module from scratch).
+interface api {
+   increment: func() -> u32;
+   accumulate: func(amount: s32) -> s32;
+}
+
 world js-exports {
-  export increment: func() -> u32;
-  export accumulate: func(amount: s32) -> s32;
+  export api;
 }

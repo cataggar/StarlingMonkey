@@ -5,14 +5,16 @@
 // WIT `none` to JavaScript `undefined`, matching ComponentizeJS 0.21.
 //
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0).
-export function maybenumber(value) {
+function maybenumber(value) {
   return value == null ? null : value + 1;
 }
 
-export function maybestring(value) {
+function maybestring(value) {
   return value == null ? null : value.toUpperCase();
 }
 
-export function maybepoint(value) {
+function maybepoint(value) {
   return value == null ? null : { x: value.x, y: value.y };
 }
+
+export const api = { maybenumber, maybestring, maybepoint };

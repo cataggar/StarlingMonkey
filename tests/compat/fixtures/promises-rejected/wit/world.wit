@@ -1,4 +1,4 @@
-package compat:promises-rejected;
+package starling:js;
 
 // Phase 0 (promise-sync roadmap phase) compatibility fixture: a Promise
 // export that rejects. Kept as its own single-case fixture (rather than
@@ -9,6 +9,10 @@ package compat:promises-rejected;
 // "missing-export-detection-timing" and the two existing single-case
 // negative-missing-export/negative-invalid-export fixtures for the same
 // established convention.
+interface api {
+   reject: func() -> u32;
+}
+
 world js-exports {
-  export reject: func() -> u32;
+  export api;
 }

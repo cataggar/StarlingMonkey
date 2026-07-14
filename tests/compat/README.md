@@ -161,11 +161,11 @@ compared.
 See `manifest.json`'s `bridge.known_deviations` for the full list with
 evidence and confidence levels. Summary, as of this manifest:
 
-- **Interface export flattening**: the bridge always looks up a flat
-  top-level function by name; ComponentizeJS requires a JS namespace object
-  export when the WIT world exports a named `interface`. All Phase 0
-  fixtures declare exports directly on the `world` to sidestep this (a
-  single JS source is valid input to both pipelines).
+- **Named-interface exports**: resolved. Both pipelines now consume each
+  fixture's exact `interface api { ... } world js-exports { export api; }`
+  WIT and `export const api = { ... }` JavaScript topology. The shared
+  invoker requires the exact `starling:js/api` component interface instead
+  of normalizing flat and nested surfaces.
 - **`u32` values >= 2^31**: do not round-trip correctly through the pinned
   ComponentizeJS reference (reference-verified); the bridge is expected,
   by static reasoning about its JSON-based dispatch, to be unaffected,

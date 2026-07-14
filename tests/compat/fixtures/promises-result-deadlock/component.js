@@ -11,6 +11,8 @@
 // and remains a hard trap regardless).
 //
 // Written for cataggar/StarlingMonkey feat/js-bridge-parity-integration.
-export function divideAsync(a, b) {
+function divideAsync(a, b) {
   return new Promise(() => {});
 }
+
+export const api = { divideAsync };

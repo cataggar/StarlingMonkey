@@ -5,12 +5,12 @@ Node-free by design (see compat_lib.py). Validates that:
 
   1. manifest.json is well-formed and every fixture/case it declares is
      backed by real files on disk.
-  2. Each fixture's WIT actually parses (via the already-pinned `wasm-tools`
-     binary) and declares exactly the exported functions the manifest's
-     cases/sequences reference, directly on the named world (see
-     known_deviations "interface-export-flattening").
-  3. Each fixture's component.js statically defines (or, for the two
-     negative fixtures, intentionally omits/misdefines) those exports.
+  2. Each fixture's WIT parses and exports exactly one named `api`
+     interface containing the manifest's functions (never flat world
+     functions).
+  3. Each fixture's component.js exports an `api` namespace object whose
+     members are functions (or intentionally missing/non-callable for the
+     two negative fixtures).
   4. The checked-in tests/compat/expected/<fixture>.json files have not
      drifted out of sync with manifest.json.
   5. (Best-effort, skipped without failing if `node` is not on PATH) the
@@ -171,6 +171,14 @@ def check_wit_and_js(manifest: dict, reporter: Reporter, wasm_tools: str | None)
             reporter.report(FAIL, f"js-file-exists/{fid}", f"missing {js_path}")
             continue
         js_source = js_path.read_text(encoding="utf-8")
+        namespace_label = f"js-exports-api-namespace/{fid}"
+        if compat_lib.js_exports_api_namespace(js_source):
+            reporter.report(PASS, namespace_label)
+        else:
+            reporter.report(
+                FAIL, namespace_label,
+                f"{fixture['js_file']} must contain `export const api = {{ ... }};`",
+            )
 
         if wit_json is not None:
             label = f"wit-exports-match-manifest/{fid}"
@@ -222,7 +230,10 @@ def check_wit_and_js(manifest: dict, reporter: Reporter, wasm_tools: str | None)
                 reporter.report(PASS, label)
             else:
                 camel = compat_lib.camel_case(fn)
-                reporter.report(FAIL, label, f"no 'export function {fn}(' or 'export function {camel}(' found in {fixture['js_file']}")
+                reporter.report(
+                    FAIL, label,
+                    f"api.{camel} is not backed by a function in {fixture['js_file']}",
+                )
 
 
 NODE_ESCAPE_MAP = {"'": "\\'", "\\": "\\\\"}
@@ -311,7 +322,7 @@ def node_selfcheck_fixture(node: str, fixture: dict, reporter: Reporter, top_lev
     # context, so it takes the same err-reshaping path as a synchronous
     # throw.
     def push_call(id_json: str, fn: str, args_json: str) -> str:
-        call_expr = f"await mod.{compat_lib.camel_case(fn)}(...({args_json}))"
+        call_expr = f"await mod.api.{compat_lib.camel_case(fn)}(...({args_json}))"
         if fn in top_level_result_fns:
             return (
                 f"try {{ const v = {call_expr}; "

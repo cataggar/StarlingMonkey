@@ -1,15 +1,19 @@
-package compat:options;
+package starling:js;
 
 // Phase 0 compatibility fixture: option<T> arguments/results for a numeric,
 // string and record payload. WIT `none` is lifted as JavaScript `undefined`,
 // while both JavaScript `null` and `undefined` lower to WIT `none`.
-world js-exports {
+interface api {
   record point {
     x: s32,
     y: s32,
   }
 
-  export maybenumber: func(value: option<u32>) -> option<u32>;
-  export maybestring: func(value: option<string>) -> option<string>;
-  export maybepoint: func(value: option<point>) -> option<point>;
+   maybenumber: func(value: option<u32>) -> option<u32>;
+   maybestring: func(value: option<string>) -> option<string>;
+   maybepoint: func(value: option<point>) -> option<point>;
+}
+
+world js-exports {
+  export api;
 }

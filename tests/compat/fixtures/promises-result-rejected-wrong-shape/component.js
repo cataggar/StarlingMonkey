@@ -9,9 +9,11 @@
 // matches-throw" known_deviation).
 //
 // Written for cataggar/StarlingMonkey feat/js-bridge-parity-integration.
-export async function divideAsync(a, b) {
+async function divideAsync(a, b) {
   if (b === 0) {
     return Promise.reject(new Error("division by zero"));
   }
   return Math.trunc(a / b);
 }
+
+export const api = { divideAsync };

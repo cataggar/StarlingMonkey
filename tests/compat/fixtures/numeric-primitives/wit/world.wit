@@ -1,16 +1,20 @@
-package compat:numeric-primitives;
+package starling:js;
 
 // Phase 0 compatibility fixture: integer widths u8/u16/u32/s8/s16/s32 and
 // float32/float64, at their boundary values. u64/s64 are intentionally excluded
 // (see manifest.json known_deviations "integer-64-bit-precision").
+interface api {
+   echou8: func(value: u8) -> u8;
+   echou16: func(value: u16) -> u16;
+   echou32: func(value: u32) -> u32;
+   echos8: func(value: s8) -> s8;
+   echos16: func(value: s16) -> s16;
+   echos32: func(value: s32) -> s32;
+   echof32: func(value: f32) -> f32;
+   echof64: func(value: f64) -> f64;
+   sum: func(a: u32, b: u32) -> u32;
+}
+
 world js-exports {
-  export echou8: func(value: u8) -> u8;
-  export echou16: func(value: u16) -> u16;
-  export echou32: func(value: u32) -> u32;
-  export echos8: func(value: s8) -> s8;
-  export echos16: func(value: s16) -> s16;
-  export echos32: func(value: s32) -> s32;
-  export echof32: func(value: f32) -> f32;
-  export echof64: func(value: f64) -> f64;
-  export sum: func(a: u32, b: u32) -> u32;
+  export api;
 }

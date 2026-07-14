@@ -302,3 +302,42 @@ function runValidateNonNegative(n) {
   }
 }
 export { runValidateNonNegative as "run-validate-non-negative" };
+
+export function rootAdd(a, b) {
+  return a + b;
+}
+
+export const api = {
+  "run-add": runAdd,
+  "run-sum-list": runSumList,
+  "run-greet": runGreet,
+  "run-scale": runScale,
+  "run-repeated-add": runRepeatedAdd,
+  "run-boom": runBoom,
+  "run-note": runNote,
+  "run-note-count": runNoteCount,
+  "run-root-add": runRootAdd,
+  "run-root-repeated": runRootRepeated,
+  "run-root-note": runRootNote,
+  "run-root-note-count": runRootNoteCount,
+  "run-root-boom": runRootBoom,
+  "run-root-transform": runRootTransform,
+  "run-root-chain": runRootChain,
+  "run-sum-nested-lists": runSumNestedLists,
+  "run-char": runChar,
+  "run-option-char": runOptionChar,
+  "run-bytes-is-uint8array": runBytesIsUint8Array,
+  "run-sum-bytes": runSumBytes,
+  "run-xor-bytes": runXorBytes,
+  "run-optional-bytes": runOptionalBytes,
+  "run-describe-nested-option": runDescribeNestedOption,
+  "run-identity-nested-option": runIdentityNestedOption,
+  "run-swap-tuple": runSwapTuple,
+  "run-color": runColor,
+  "run-option-color": runOptionColor,
+  "run-permissions": runPermissions,
+  "run-option-permissions": runOptionPermissions,
+  "run-shape": runShape,
+  "run-checked-div": runCheckedDiv,
+  "run-validate-non-negative": runValidateNonNegative,
+};

@@ -199,7 +199,11 @@ struct StarlingJsValue {
 // `STARLING_JS_STRING` values are how those two wrappers cross this
 // boundary; see js_dispatch.zig for the comptime dispatch on `T`.
 //
-// Calls the named export with `args`, encoding each to a JS value (records ->
+// Calls the named export with `args`. A bare dispatch name resolves a root
+// module function; `<package>/<interface>[@version]#<function>` resolves the
+// function inside the module's same-named interface namespace object.
+// Interface-qualified names never fall back to flat module functions.
+// Arguments are encoded to JS values (records ->
 // plain objects by field name, i64/u64 -> exact BigInt, lists -> JS Arrays,
 // `wit_types.ByteList` -> a genuine `Uint8Array`, `wit_types.Char` -> a
 // single-codepoint string, variant/result -> `{tag, val}` objects, flags ->

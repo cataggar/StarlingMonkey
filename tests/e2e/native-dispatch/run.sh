@@ -32,6 +32,9 @@
 #     (camelCased on the JS side) vs. multi-word enum/variant case labels
 #     (kept in their original kebab-case spelling), and a kebab-case export
 #     name resolved only via the camelCase JS export-name fallback
+#   * named-interface topology: `api` is required to be an object containing
+#     callable members; flat, missing, non-object, and non-callable shapes
+#     all trap instead of being flattened
 #   * a battery of wrong-type/invalid-discriminant negative cases for every
 #     new value class above, asserting each traps instead of silently
 #     decoding to a plausible-looking but wrong value
@@ -112,6 +115,23 @@ expect_trap() {
   timeout "$TIMEOUT_SECS" "$WASMTIME" run -S http --invoke "$expr" "$COMPONENT" >/dev/null 2>&1 && status=0 || status=$?
   if [ "$status" -eq 124 ]; then
     echo "FAIL $name: invoking '$expr' timed out after ${TIMEOUT_SECS}s (hung instead of trapping)"
+    fail=1
+    return
+  fi
+  if [ "$status" -eq 0 ]; then
+    echo "FAIL $name: invoking '$expr' expected a trap, but it exited 0"
+    fail=1
+    return
+  fi
+  echo "PASS $name (trapped with exit $status)"
+}
+
+# expect_component_trap NAME COMPONENT INVOKE_EXPR
+expect_component_trap() {
+  local name="$1" component="$2" expr="$3" status
+  timeout "$TIMEOUT_SECS" "$WASMTIME" run -S http --invoke "$expr" "$component" >/dev/null 2>&1 && status=0 || status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "FAIL $name: invoking '$expr' timed out after ${TIMEOUT_SECS}s"
     fail=1
     return
   fi
@@ -284,6 +304,20 @@ expect_eq "echo-multi-word-variant keeps kebab-case discriminants" \
   "echo-multi-word-variant(left-turn(3))" "left-turn(3)"
 expect_eq "multi-word-echo resolves via the camelCase export-name fallback" \
   "multi-word-echo(5)" "6"
+
+# --- Named-interface topology ---------------------------------------------
+# Missing-export validation intentionally remains call-time behavior here,
+# but interface-qualified dispatch must reject every invalid namespace
+# shape. A flat `add` must not stand in for `api.add`.
+for shape in flat missing-namespace nonobject-namespace noncallable-member; do
+  shape_component="$PREFIX/js-dispatch-$shape.wasm"
+  echo "[native-dispatch e2e] componentizing namespace-shape fixture: $shape"
+  WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+  WASM_TOOLS_BIN="$BIN/wasm-tools" \
+    "$BIN/componentize.sh" "tests/fixtures/js-dispatch-$shape.js" -o "$shape_component"
+  "$BIN/wasm-tools" validate --features all "$shape_component"
+  expect_component_trap "interface namespace rejects $shape shape" "$shape_component" "add(2, 3)"
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "[native-dispatch e2e] FAILED"

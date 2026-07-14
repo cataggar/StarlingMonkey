@@ -278,23 +278,11 @@ struct Call {
     args: Vec<serde_json::Value>,
 }
 
-/// Resolves an export function by its bare name (e.g. "negate"), searching
-/// both the component's top-level exports (the "interface-export-flattening"
-/// shape used by some fixtures/examples) and one level of nested interface
-/// instances (the `interface api { ... } world js-exports { export api; }`
-/// shape produced by `gen_bridge_wit.py` for the compat fixtures). This
-/// mirrors what `wasmtime run --invoke <name>(...)` does internally, since
-/// fixture manifests only record bare function names.
-///
-/// NOTE: this dual lookup is a harness convenience, not evidence that the
-/// bridge and reference componentized artifacts expose the same WIT
-/// surface for a given fixture -- they don't. See manifest.json's
-/// known_deviations "bridge-harness-starling-js-api-wrapping": the bridge
-/// pipeline's output nests fixture functions one level down, under a
-/// `starling:js/api` interface instance, while the reference pipeline's
-/// output exports the same functions flat at the top level. This function
-/// resolving both shapes uniformly must not be read as validating
-/// interface-shape parity between the two pipelines.
+/// Resolves a function only through the exact `starling:js/api` interface
+/// exported by every compat fixture. There is deliberately no top-level or
+/// "first nested interface containing this name" fallback: either pipeline
+/// changing topology must fail the same harness instead of being normalized
+/// away by its invoker.
 fn resolve_func(
     instance: &wasmtime::component::Instance,
     store: &mut Store<Host>,
@@ -302,29 +290,30 @@ fn resolve_func(
     engine: &Engine,
     name: &str,
 ) -> Result<wasmtime::component::Func> {
-    if let Some(f) = instance.get_func(&mut *store, name) {
-        return Ok(f);
+    const INTERFACE: &str = "starling:js/api";
+    let interface_ty = component
+        .component_type()
+        .exports(engine)
+        .find_map(|(export_name, item)| (export_name == INTERFACE).then_some(item))
+        .with_context(|| format!("component does not export exact interface '{INTERFACE}'"))?;
+    let wasmtime::component::types::ComponentItem::ComponentInstance(iface) = interface_ty else {
+        anyhow::bail!("component export '{INTERFACE}' is not an interface instance");
+    };
+    if !iface
+        .exports(engine)
+        .any(|(function_name, _)| function_name == name)
+    {
+        anyhow::bail!("interface '{INTERFACE}' does not export function '{name}'");
     }
-    for (export_name, item) in component.component_type().exports(engine) {
-        if let wasmtime::component::types::ComponentItem::ComponentInstance(iface) = item {
-            if iface.exports(engine).any(|(fname, _)| fname == name) {
-                // Wasmtime >= 42's `Instance::get_export` returns
-                // `(ComponentItem, ComponentExportIndex)` (previously just
-                // the index) so callers can also inspect the item's type
-                // without a second lookup; only the index is needed here.
-                let (_, iface_idx) = instance
-                    .get_export(&mut *store, None, export_name)
-                    .with_context(|| format!("resolving interface export '{export_name}'"))?;
-                let (_, func_idx) = instance
-                    .get_export(&mut *store, Some(&iface_idx), name)
-                    .with_context(|| format!("resolving function '{name}' in '{export_name}'"))?;
-                return instance
-                    .get_func(&mut *store, &func_idx)
-                    .with_context(|| format!("export '{export_name}#{name}' is not a function"));
-            }
-        }
-    }
-    anyhow::bail!("export '{}' not found (checked top-level and nested interfaces)", name)
+    let (_, iface_idx) = instance
+        .get_export(&mut *store, None, INTERFACE)
+        .with_context(|| format!("resolving interface export '{INTERFACE}'"))?;
+    let (_, func_idx) = instance
+        .get_export(&mut *store, Some(&iface_idx), name)
+        .with_context(|| format!("resolving function '{name}' in '{INTERFACE}'"))?;
+    instance
+        .get_func(&mut *store, &func_idx)
+        .with_context(|| format!("export '{INTERFACE}#{name}' is not a function"))
 }
 
 /// Calls `func` with `params`/`results`. Returns the JSON record for this

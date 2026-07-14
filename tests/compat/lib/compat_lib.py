@@ -67,22 +67,39 @@ def component_wit_json(wasm_tools: str, wit_dir: Path) -> dict[str, Any]:
 
 
 def world_export_functions(wit_json: dict[str, Any], world_name: str) -> dict[str, dict[str, Any]]:
-    """Return {function_name: function_json} for functions exported directly
-    on the given world (Phase 0 fixtures declare exports directly on the
-    world; see manifest.json known_deviations "interface-export-flattening")."""
+    """Return functions from the world's single named `api` interface."""
     worlds = {w["name"]: w for w in wit_json.get("worlds", [])}
     world = worlds.get(world_name)
     if world is None:
         raise ValueError(f"world '{world_name}' not found (have: {sorted(worlds)})")
-    functions: dict[str, dict[str, Any]] = {}
-    for name, export in world.get("exports", {}).items():
-        if "function" in export:
-            functions[name] = export["function"]
-    return functions
+    root_functions = [
+        name for name, export in world.get("exports", {}).items()
+        if "function" in export
+    ]
+    interface_ids = [
+        export["interface"]["id"]
+        for export in world.get("exports", {}).values()
+        if "interface" in export
+    ]
+    if root_functions:
+        raise ValueError(
+            f"world '{world_name}' unexpectedly has flat function export(s): {root_functions}"
+        )
+    if len(interface_ids) != 1:
+        raise ValueError(
+            f"world '{world_name}' must export exactly one named interface, got {len(interface_ids)}"
+        )
+    interface = wit_json.get("interfaces", [])[interface_ids[0]]
+    if interface.get("name") != "api":
+        raise ValueError(
+            f"world '{world_name}' exports interface {interface.get('name')!r}, expected 'api'"
+        )
+    return interface.get("functions", {})
 
 
-_EXPORT_FUNCTION_RE_TEMPLATE = r"export\s+(?:async\s+)?function\s+{name}\s*\("
-_EXPORT_NONFUNCTION_RE_TEMPLATE = r"export\s+(?:const|let|var)\s+{name}\b"
+_FUNCTION_RE_TEMPLATE = r"(?:^|\n)\s*(?:async\s+)?function\s+{name}\s*\("
+_NONFUNCTION_RE_TEMPLATE = r"(?:^|\n)\s*(?:const|let|var)\s+{name}\b"
+_API_EXPORT_RE = re.compile(r"export\s+const\s+api\s*=\s*\{(?P<body>[^}]*)\}\s*;", re.S)
 
 
 def camel_case(kebab_name: str) -> str:
@@ -98,20 +115,41 @@ def camel_case(kebab_name: str) -> str:
     return head + "".join(word[:1].upper() + word[1:] for word in rest if word)
 
 
+def _api_exports_name(js_source: str, name: str) -> bool:
+    match = _API_EXPORT_RE.search(js_source)
+    if match is None:
+        return False
+    members = {
+        member.strip().split(":", 1)[0].strip()
+        for member in match.group("body").split(",")
+        if member.strip()
+    }
+    return name in members
+
+
 def js_defines_function_export(js_source: str, name: str) -> bool:
     """`name` is the WIT (kebab-case) export name; both pipelines resolve
     it as a same-named export tried first, then a camelCase fallback (see
-    known_deviations "kebab-case-and-naming" / js_dispatch.cpp), so a
-    multi-word fixture's component.js is only required to define the
-    camelCase spelling."""
+    js_dispatch.cpp), so a multi-word fixture's `api` object is only
+    required to expose the camelCase spelling."""
     for candidate in {name, camel_case(name)}:
-        if re.search(_EXPORT_FUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source):
+        if (
+            _api_exports_name(js_source, candidate)
+            and re.search(_FUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source)
+        ):
             return True
     return False
 
 
 def js_defines_nonfunction_export(js_source: str, name: str) -> bool:
     for candidate in {name, camel_case(name)}:
-        if re.search(_EXPORT_NONFUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source):
+        if (
+            _api_exports_name(js_source, candidate)
+            and re.search(_NONFUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source)
+        ):
             return True
     return False
+
+
+def js_exports_api_namespace(js_source: str) -> bool:
+    return _API_EXPORT_RE.search(js_source) is not None

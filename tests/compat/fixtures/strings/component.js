@@ -6,14 +6,16 @@
 // values with astral characters (e.g. emoji) that span two code units.
 //
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0).
-export function identity(value) {
+function identity(value) {
   return value;
 }
 
-export function concat(a, b) {
+function concat(a, b) {
   return a + b;
 }
 
-export function length(value) {
+function length(value) {
   return value.length;
 }
+
+export const api = { identity, concat, length };
