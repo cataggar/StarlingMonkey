@@ -10,6 +10,22 @@
 // custom imports"). Everything else here is identical to the shared file.
 package local:bindings;
 
+interface root-types {
+  record point {
+    x: u32,
+    y: u32,
+  }
+  record inner {
+    x: u32,
+    y: u32,
+  }
+  variant outer {
+    empty,
+    item(inner),
+  }
+  type alias = outer;
+}
+
 world js-dispatch {
   import wasi:cli/environment@0.2.10;
   import wasi:cli/exit@0.2.10;
@@ -64,11 +80,14 @@ world js-dispatch {
   }
   type root-response-alias = root-response;
 
+  use root-types.{alias, point};
+
   import add-one: func(value: u32) -> u32;
   import root-note: func();
   import root-note-count: func() -> u32;
   import root-boom: func() -> u32;
   import root-transform: func(value: root-message) -> root-response-alias;
+  import root-chain: func(value: alias) -> alias;
 
   export wasi:cli/run@0.2.10;
   export wasi:http/incoming-handler@0.2.10;

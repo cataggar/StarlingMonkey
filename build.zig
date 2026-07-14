@@ -583,7 +583,7 @@ pub fn build(b: *std.Build) void {
     // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
     // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
     // reactor against a fixture-specific WIT world that additionally
-    // *imports* a custom `test:wit-imports/host@1.2.3` interface and four
+    // *imports* a custom `test:wit-imports/host@1.2.3` interface and
     // world-level functions (not just the usual export-only js-dispatch world),
     // componentizes
     // tests/e2e/wit-imports/component.js against it (a JS module that
@@ -605,7 +605,8 @@ pub fn build(b: *std.Build) void {
     // build.zig.zon's `.wasip3` pin) fixed the reverse (`--js-imports`)
     // bridge's type gate and lowering for all of them. Root-function coverage
     // verifies the default-import convention, arguments/results,
-    // void=>undefined, repeated calls, traps, and missing-import diagnostics.
+    // void=>undefined, repeated calls, traps, missing-import diagnostics, and
+    // a recursive alias/variant/record chain reached through a root `use`.
     // Like `compat-bridge-test`, this is deliberately NOT part of `test`: it
     // requires a Rust toolchain and takes several minutes end to end (fresh Zig build +
     // Cranelift compilation under load), so it must be invoked explicitly.
