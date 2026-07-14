@@ -13,9 +13,9 @@
         "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
         "reference_confidence": "reference-verified",
         "bridge_class": "call-time-trap",
-        "bridge_message_contains": "is not a function",
+        "bridge_message_contains": "does not export 'phantom'",
         "bridge_confidence": "build-verified",
-        "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call; the \"is not a function\" text is emitted by the JS engine's own panic diagnostic on stderr, not the wasm trap message itself -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
+        "bridge_source": "runtime/js_dispatch.cpp: resolve_property_lookup checks literal and camelCase spellings, then emits an explicit missing-export diagnostic before JS_GetProperty; non-callable properties retain the distinct \"is not a function\" diagnostic -- see tests/compat/runtime (bridge/negative-missing-export, bridge/negative-invalid-export)"
       }
     }
   ],

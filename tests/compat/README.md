@@ -171,17 +171,15 @@ evidence and confidence levels. Summary, as of this manifest:
   by static reasoning about its JSON-based dispatch, to be unaffected,
   but this has not been build-verified. See the `numeric-primitives`
   fixture's `echou32-max` case.
-- **`option::none` representation**: arrives as JS `undefined` under
-  ComponentizeJS but as JS `null` under the bridge's JSON round-trip
-  (bridge behavior reasoned from `std.json` null serialization, not
-  build-verified). All Phase 0 fixtures use the portable `value == null`
-  idiom and always return `null` for `none`, so one JS source works under
-  both.
+- **`option::none` representation**: resolved. Signatures containing an
+  option at any depth use native dispatch, which lifts `none` as JavaScript
+  `undefined` and preserves all three nested-option states exactly like
+  ComponentizeJS 0.21.
 - **Missing/invalid export detection timing**: ComponentizeJS detects a
   missing or non-function WIT export at componentization (build) time
-  (reference-verified); the bridge only detects this lazily, at call time
-  (reasoned from `js_dispatch.cpp`'s `JS_GetProperty`/`JS::IsCallable`
-  check, not build-verified). See the two `negative-*` fixtures.
+  (reference-verified); the bridge detects this lazily at call time, with
+  distinct missing-member and non-callable diagnostics (build-verified).
+  See the two `negative-*` fixtures.
 
 ## Provenance
 
