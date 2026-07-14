@@ -1,0 +1,11 @@
+# Copied verbatim into the generated Rust staticlib build directory's
+# `.cargo/config.toml` by deps/build-deps.sh, so that every crate in the
+# bundle (the staticlib crate itself and every path/registry dependency it
+# pulls in for wasm32-wasip1) is compiled with `-C relocation-model=pic`.
+#
+# This is scoped to the wasm32-wasip1 target only, so host-side build
+# scripts/proc-macros (compiled for the host target) are unaffected, and it
+# is tracked/reproducible rather than relying on an ambient user-level
+# ~/.cargo/config.toml or a shell-exported RUSTFLAGS.
+[target.wasm32-wasip1]
+rustflags = ["-C", "relocation-model=pic"]

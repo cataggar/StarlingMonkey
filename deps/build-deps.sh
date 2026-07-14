@@ -141,7 +141,15 @@ RUST_LIB="$ROOT/target/wasm32-wasip1/release/librust_staticlib.a"
 if [[ "$FORCE" == "--force" || ! -f "$RUST_LIB" ]]; then
   echo ">>> Building Rust crate bundle"
   BD="$DEPS/rust-staticlib-build"
-  rm -rf "$BD" && mkdir -p "$BD"
+  rm -rf "$BD" && mkdir -p "$BD/.cargo"
+  # Build every unit (the bundle crate and all its path/registry
+  # dependencies) as position-independent code, so the resulting
+  # librust_staticlib.a can later be linked into a wasm32-wasi PIC dylib
+  # (e.g. `wasm-ld -shared`/`zig build-lib -dynamic -fPIC`) instead of only
+  # a plain static executable. Scoped via a tracked config.toml (not
+  # RUSTFLAGS or the user's ambient ~/.cargo/config.toml) so it is
+  # reproducible and target-specific.
+  cp "$ROOT/runtime/crates/staticlib-template/cargo-config.toml.in" "$BD/.cargo/config.toml"
   cp "$ROOT/runtime/crates/staticlib-template/Cargo.toml.in" "$BD/Cargo.toml"
   cat >> "$BD/Cargo.toml" <<EOF
 rust-encoding = { path = "$ROOT/crates/rust-encoding", features = [] }

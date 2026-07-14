@@ -1,0 +1,9 @@
+package pic-rust:verify;
+
+// Thin world used only to prove that the "engine" module built by linking
+// the PIC-rebuilt librust_staticlib.a can be composed (via `wasm-tools
+// component link`, the Shared-Everything Dynamic Linking mechanism) with
+// an independently built "shell" module and executed end-to-end.
+world demo {
+  export shell-call: func(a: s32, b: s32) -> s32;
+}
