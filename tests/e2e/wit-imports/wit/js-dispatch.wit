@@ -50,10 +50,25 @@ world js-dispatch {
   // World-level function imports. The generated core wasm imports these from
   // `$root`; ComponentizeJS-compatible JavaScript sees one default-export
   // module per function (`import addOne from "add-one"`, etc.).
+  record root-coordinates {
+    x: u32,
+    y: u32,
+  }
+  record root-message {
+    coordinate: root-coordinates,
+    labels: list<string>,
+  }
+  variant root-response {
+    accepted(root-message),
+    rejected,
+  }
+  type root-response-alias = root-response;
+
   import add-one: func(value: u32) -> u32;
   import root-note: func();
   import root-note-count: func() -> u32;
   import root-boom: func() -> u32;
+  import root-transform: func(value: root-message) -> root-response-alias;
 
   export wasi:cli/run@0.2.10;
   export wasi:http/incoming-handler@0.2.10;

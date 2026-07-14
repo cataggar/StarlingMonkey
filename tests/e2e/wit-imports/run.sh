@@ -104,7 +104,7 @@ echo "[wit-imports e2e] confirming test:wit-imports/host@1.2.3 is a real compone
   exit 1
 }
 echo "PASS component declares versioned import/export interface names"
-for root_import in add-one root-note root-note-count root-boom; do
+for root_import in add-one root-note root-note-count root-boom root-transform; do
   "$BIN/wasm-tools" component wit "$COMPONENT" | grep -q "import ${root_import}: func" || {
     echo "FAIL: componentized output does not declare root function import ${root_import}"
     exit 1
@@ -173,6 +173,7 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-root-note-count", "args": []},
   {"function": "run-root-note", "args": []},
   {"function": "run-root-note-count", "args": []},
+  {"function": "run-root-transform", "args": [{"coordinate": {"x": 5, "y": 8}, "labels": ["alpha", "beta"]}]},
 
   {"function": "run-boom", "args": []}
 ]
@@ -298,9 +299,11 @@ assert_field "root void result is exactly undefined" 41 "rec['value']" "True"
 assert_field "root-note side effect ran once" 42 "rec['value']" "1"
 assert_field "root void result stays undefined on repeat" 43 "rec['value']" "True"
 assert_field "root-note side effect ran twice" 44 "rec['value']" "2"
+assert_field "root named aggregate recursively lowers and lifts" 45 \
+  "rec['value']" "{'tag': 'accepted', 'val': {'coordinate': {'x': 6, 'y': 10}, 'labels': ['beta', 'alpha', 'host']}}"
 
-assert_field "run-boom host trap propagates" 45 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 45 \
+assert_field "run-boom host trap propagates" 46 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 46 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] invoking root-boom in a fresh instance"
