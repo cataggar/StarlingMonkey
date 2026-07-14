@@ -1,0 +1,86 @@
+{
+  "fixture": "integers-64bit",
+  "world": "js-exports",
+  "wit_dir": "fixtures/integers-64bit/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "big-add-u64-max",
+      "function": "big-add",
+      "args": [
+        18446744073709551615,
+        0
+      ],
+      "result": 18446744073709551615,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "big-add-basic",
+      "function": "big-add",
+      "args": [
+        1000000000000,
+        2000000000000
+      ],
+      "result": 3000000000000,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "big-sub-near-i64-max",
+      "function": "big-sub",
+      "args": [
+        9223372036854775807,
+        1
+      ],
+      "result": 9223372036854775806,
+      "confidence": "reference-verified",
+      "notes": "Exercises the s64 upper boundary (i64::MAX) with a full-domain (> Number.MAX_SAFE_INTEGER) value on both sides. Deliberately avoids any negative s64 value: see known_deviations componentizejs-s64-negative-value-defect -- the pinned ComponentizeJS 0.21.0 reference traps unconditionally on *any* negative s64 argument or return value, so a near-i64::MIN case cannot be expressed as a normal passing fixture case here (a trap also poisons the shared Wasmtime component instance for every later call in the same invocation, so it can't safely coexist with this fixture's other cases either); the current Zig/WABT native bridge itself is unaffected (build-verified: tests/e2e/native-dispatch/run.sh 'big-sub near i64::MIN' case)."
+    },
+    {
+      "id": "label-id-basic",
+      "function": "label-id",
+      "args": [
+        "widget",
+        18446744073709551615
+      ],
+      "result": {
+        "label": "widget",
+        "id": 18446744073709551615
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "maybe-big-some",
+      "function": "maybe-big",
+      "args": [
+        18446744073709551614
+      ],
+      "result": 18446744073709551615,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "maybe-big-none",
+      "function": "maybe-big",
+      "args": [
+        null
+      ],
+      "result": null,
+      "confidence": "reference-verified",
+      "notes": "Same option<T> none-representation deviation as known_deviations option-none-representation; both null and undefined lower back to none, so this case's own args/result round-trip is unaffected.",
+      "bridge_none_representation": "null",
+      "reference_none_representation": "undefined"
+    },
+    {
+      "id": "sum-list-basic",
+      "function": "sum-list",
+      "args": [
+        [
+          18446744073709551615,
+          1
+        ]
+      ],
+      "result": 0,
+      "confidence": "reference-verified",
+      "notes": "Deliberately wraps past u64::MAX (mod 2**64) to also exercise BigInt wraparound arithmetic identically in both pipelines, not just round-tripping."
+    }
+  ]
+}

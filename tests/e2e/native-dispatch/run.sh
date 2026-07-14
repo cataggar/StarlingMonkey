@@ -17,8 +17,24 @@
 #   * list<u64> (sum-list, echo-list), exercising the LIST tag end to end
 #   * a deliberately wrong-typed JS export (wrong-type), asserting it traps
 #     instead of silently decoding to 0/false
+#   * numeric wraparound (wrap-numbers, sum-list overflow): an out-of-range/
+#     negative/fractional Number or BigInt of the *correct* kind wraps
+#     modulo 2**bitwidth (ToInt32/ToUint32-family, ToBigInt64/ToBigUint64),
+#     matching the pinned ComponentizeJS reference exactly -- this is
+#     deliberately NOT a trap, unlike a wrong-*kind* result
 #   * existing JSON-path exports (add/greet/notify/move/maybe), as a
 #     regression check that non-migrated types still work unchanged
+#   * char, list<u8> (vs. string), tuple, enum, flags, variant, and
+#     result<T, E> (both nested and as an export's own top-level return
+#     type, which uses ComponentizeJS's "return means Ok, throw means Err"
+#     calling convention instead of a {tag, val} object)
+#   * naming/version edge cases: multi-word record fields/flags labels
+#     (camelCased on the JS side) vs. multi-word enum/variant case labels
+#     (kept in their original kebab-case spelling), and a kebab-case export
+#     name resolved only via the camelCase JS export-name fallback
+#   * a battery of wrong-type/invalid-discriminant negative cases for every
+#     new value class above, asserting each traps instead of silently
+#     decoding to a plausible-looking but wrong value
 #
 # Usage: run.sh [zig-binary] [install-prefix]
 #   zig-binary defaults to `zig` on PATH; install-prefix defaults to
@@ -174,6 +190,78 @@ expect_eq "promise-big-add: async function awaiting BigInt values" \
   "promise-big-add(18446744073709551614, 1)" "18446744073709551615"
 expect_trap "promise-reject-big: rejection traps on the native dispatch path too" \
   "promise-reject-big()"
+# --- Numeric wraparound (ComponentizeJS/ECMAScript modular semantics, not a
+# trap) for out-of-range/negative/fractional Numbers and BigInts of the
+# correct kind -- re-verified against the pinned reference itself (see
+# tests/compat/fixtures/integers-64bit "sum-list-basic").
+expect_eq "wrap-numbers wraps out-of-range/negative/fractional numeric results instead of trapping" \
+  "wrap-numbers()" \
+  "{overflow-u8: 44, negative-u8: 251, fractional-u8: 3, overflow-s32: -2147483648, negative-u64: 18446744073709551611, overflow-s64: 0}"
+expect_eq "sum-list wraps past u64::MAX instead of trapping" \
+  "sum-list([18446744073709551615, 1])" "0"
+
+# --- char -------------------------------------------------------------
+expect_eq "echo-char ascii" "echo-char('e')" "'e'"
+expect_eq "echo-char multi-byte scalar value" "echo-char('é')" "'é'"
+expect_trap "wrong-type-char traps on a non-string result" "wrong-type-char()"
+expect_trap "invalid-char-multi-codepoint traps on more than one scalar value" \
+  "invalid-char-multi-codepoint()"
+
+# --- list<u8> vs string -------------------------------------------------
+expect_eq "echo-bytes round-trips a Uint8Array" "echo-bytes([1, 2, 3])" "[1, 2, 3]"
+expect_eq "bytes-len counts bytes, not codepoints" "bytes-len([1, 2, 3])" "3"
+expect_trap "wrong-type-bytes traps on neither Uint8Array nor Array" "wrong-type-bytes()"
+
+# --- tuple ---------------------------------------------------------------
+expect_eq "swap-pair round-trips as a positional array" \
+  'swap-pair((5, "hi"))' '("hi", 5)'
+expect_trap "wrong-type-tuple traps on a non-array result" "wrong-type-tuple()"
+
+# --- enum ------------------------------------------------------------
+expect_eq "echo-direction single-word case" "echo-direction(north)" "north"
+expect_eq "echo-direction kebab-case multi-word case" "echo-direction(north-east)" "north-east"
+expect_trap "invalid-enum-case traps on an unrecognized case string" "invalid-enum-case()"
+expect_trap "wrong-type-enum traps on a non-string result" "wrong-type-enum()"
+
+# --- flags -----------------------------------------------------------
+expect_eq "echo-perms round-trips a partial flag set" \
+  "echo-perms({can-read, can-execute})" "{can-read, can-execute}"
+expect_eq "echo-perms round-trips the empty flag set" "echo-perms({})" "{}"
+expect_trap "missing-flags-property traps on a missing required label" \
+  "missing-flags-property()"
+expect_trap "wrong-type-flags traps on a non-object result" "wrong-type-flags()"
+
+# --- variant -----------------------------------------------------------
+expect_eq "echo-shape payload case" "echo-shape(circle(5))" "circle(5)"
+expect_eq "echo-shape void-payload case" "echo-shape(point)" "point"
+expect_trap "invalid-variant-tag traps on an unrecognized discriminant" \
+  "invalid-variant-tag()"
+expect_trap "wrong-type-variant traps on a non-object result" "wrong-type-variant()"
+
+# --- result<T, E> --------------------------------------------------------
+expect_eq "echo-wrapped-result nested ok case" \
+  "echo-wrapped-result({r: ok(5)})" "{r: ok(5)}"
+expect_eq "echo-wrapped-result nested err case" \
+  'echo-wrapped-result({r: err("bad")})' '{r: err("bad")}'
+expect_eq "divide ok (top-level result, return-means-ok convention)" "divide(10, 2)" "ok(5)"
+expect_eq "divide err (top-level result, throw-means-err convention)" \
+  "divide(10, 0)" 'err("division by zero")'
+expect_eq "checked-negate ok (void-E result on success)" "checked-negate(5)" "ok(-5)"
+expect_eq "checked-negate err (void-E result, throwing anything signals err)" \
+  "checked-negate(-2147483648)" "err"
+
+# --- naming/version edge cases -------------------------------------------
+expect_eq "echo-multi-word-record camelCases field names on the JS side" \
+  'echo-multi-word-record({first-value: 1, second-value: "x"})' \
+  '{first-value: 1, second-value: "x"}'
+expect_eq "echo-multi-word-flags camelCases label names on the JS side" \
+  "echo-multi-word-flags({can-read-write})" "{can-read-write}"
+expect_eq "echo-multi-word-enum keeps kebab-case case labels" \
+  "echo-multi-word-enum(south-west)" "south-west"
+expect_eq "echo-multi-word-variant keeps kebab-case discriminants" \
+  "echo-multi-word-variant(left-turn(3))" "left-turn(3)"
+expect_eq "multi-word-echo resolves via the camelCase export-name fallback" \
+  "multi-word-echo(5)" "6"
 
 if [ "$fail" -ne 0 ]; then
   echo "[native-dispatch e2e] FAILED"

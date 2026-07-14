@@ -1,0 +1,6 @@
+package probe:scalars;
+world js-exports {
+  export id-s64: func(v: s64) -> s64;
+  export sub2: func(a: s64, b: s64) -> s64;
+  export neg-s64: func(v: s64) -> s64;
+}

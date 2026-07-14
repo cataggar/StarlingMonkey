@@ -94,6 +94,140 @@ interface api {
   promise-resolve-big-add: func(a: u64, b: u64) -> u64;
   promise-big-add: func(a: u64, b: u64) -> u64;
   promise-reject-big: func() -> u64;
+  // --- numeric wraparound (matches ComponentizeJS/ECMAScript, not a trap) --
+  // A JS export's own return value that is a Number/BigInt of the *correct
+  // kind* but out of range, negative, fractional, or non-finite for the
+  // declared WIT integer type wraps modulo 2**bitwidth (ToInt32/ToUint32-
+  // family for narrower widths, ToBigInt64/ToBigUint64 for u64/s64) -- it is
+  // not a trap -- empirically re-verified against the pinned ComponentizeJS
+  // 0.21.0 reference itself, not assumed from the spec (see
+  // tests/compat/fixtures/integers-64bit's "sum-list-basic" case and
+  // tests/compat/reference). Only a genuinely wrong *kind* (e.g. a string
+  // where a number/BigInt is required) still traps -- see `wrong-type`
+  // above. `wrap-check` bundles several narrow-width fields alongside a
+  // u64/s64 field so the whole record is forced through the native
+  // (non-JSON) dispatch path, the same way `tag-point`/`labeled-id` are.
+  record wrap-check {
+    overflow-u8: u8,
+    negative-u8: u8,
+    fractional-u8: u8,
+    overflow-s32: s32,
+    negative-u64: u64,
+    overflow-s64: s64,
+  }
+  wrap-numbers: func() -> wrap-check;
+
+  // --- char --------------------------------------------------------------
+  // `char` and `u32` both lower, under the default bindgen, to a bare Zig
+  // `u32`; the `--dispatch`-mode `wit_types.Char` wrapper (see
+  // component_bindgen.zig) is what lets js_dispatch.zig tell them apart and
+  // encode/decode `char` as a single-codepoint JS string instead of a
+  // Number.
+  echo-char: func(c: char) -> char;
+  // JS returns a multi-codepoint string, or a non-string, where exactly one
+  // Unicode scalar value is required.
+  wrong-type-char: func() -> char;
+  invalid-char-multi-codepoint: func() -> char;
+
+  // --- list<u8> vs string --------------------------------------------------
+  // `list<u8>` and `string` both lower, under the default bindgen, to a
+  // bare Zig `[]const u8`; the `--dispatch`-mode `wit_types.ByteList`
+  // wrapper is what lets js_dispatch.zig encode/decode `list<u8>` as a
+  // genuine JS `Uint8Array` instead of `string`'s UTF-8 text convention.
+  echo-bytes: func(data: list<u8>) -> list<u8>;
+  bytes-len: func(data: list<u8>) -> u32;
+  // JS returns neither a Uint8Array nor a plain Array.
+  wrong-type-bytes: func() -> list<u8>;
+
+  // --- tuple ---------------------------------------------------------------
+  swap-pair: func(pair: tuple<u32, string>) -> tuple<string, u32>;
+  wrong-type-tuple: func() -> tuple<u32, u32>;
+
+  // --- enum ------------------------------------------------------------
+  enum direction {
+    north,
+    south,
+    north-east,
+  }
+  echo-direction: func(d: direction) -> direction;
+  // JS returns a string that isn't one of the enum's case labels.
+  invalid-enum-case: func() -> direction;
+  // JS returns a non-string where the enum's string encoding is expected.
+  wrong-type-enum: func() -> direction;
+
+  // --- flags -----------------------------------------------------------
+  flags perms {
+    can-read,
+    can-write,
+    can-execute,
+  }
+  echo-perms: func(p: perms) -> perms;
+  // JS returns an object missing one of the three required boolean labels.
+  missing-flags-property: func() -> perms;
+  // JS returns a non-object where the flags object is expected.
+  wrong-type-flags: func() -> perms;
+
+  // --- variant -----------------------------------------------------------
+  variant shape {
+    circle(u32),
+    square(u32),
+    point,
+  }
+  echo-shape: func(s: shape) -> shape;
+  // JS returns a `{tag, val}` object whose `tag` doesn't name any case.
+  invalid-variant-tag: func() -> shape;
+  // JS returns a non-object where the `{tag, val}` shape is expected.
+  wrong-type-variant: func() -> shape;
+
+  // --- result<T, E> --------------------------------------------------------
+  // Nested (argument/field) position: JS-visible as the same `{tag, val}`
+  // object every other variant uses.
+  record wrapped-result {
+    r: result<u32, string>,
+  }
+  echo-wrapped-result: func(w: wrapped-result) -> wrapped-result;
+
+  // Top-level export return-type position: ComponentizeJS's "return means
+  // Ok, throw means Err" calling convention applies only here, not to the
+  // nested `wrapped-result.r` field above.
+  divide: func(a: u32, b: u32) -> result<u32, string>;
+  // `err` case where E is `void`: JS signals failure by throwing anything.
+  checked-negate: func(value: s32) -> result<s32>;
+
+  // --- naming/version edge cases -------------------------------------------
+  // Multi-word WIT identifiers: record fields/flags labels/export names
+  // become camelCase JS identifiers; enum case labels/variant tags stay
+  // their original kebab-case spelling as a string *value*.
+  record multi-word-record {
+    first-value: u32,
+    second-value: string,
+  }
+  echo-multi-word-record: func(r: multi-word-record) -> multi-word-record;
+
+  flags multi-word-flags {
+    can-read-write,
+    can-execute-only,
+  }
+  echo-multi-word-flags: func(f: multi-word-flags) -> multi-word-flags;
+
+  enum multi-word-enum {
+    north-east,
+    south-west,
+  }
+  echo-multi-word-enum: func(e: multi-word-enum) -> multi-word-enum;
+
+  variant multi-word-variant {
+    left-turn(u32),
+    right-turn(u32),
+  }
+  echo-multi-word-variant: func(v: multi-word-variant) -> multi-word-variant;
+
+  // A kebab-case export name whose JS implementation is *only* defined
+  // under its camelCase spelling (not the literal kebab string) -- proves
+  // `resolve_export_function`'s camelCase fallback actually engages, not
+  // just that the literal kebab lookup still works (every other export
+  // above is implemented under its literal kebab name).
+  multi-word-echo: func(value: u32) -> u32;
 }
 
 world js-exports {

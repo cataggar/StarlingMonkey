@@ -9,10 +9,13 @@
 #include "js/BigInt.h"
 #include "js/CallAndConstruct.h"
 #include "js/CharacterEncoding.h"
+#include "js/GCAPI.h"
 #include "js/JSON.h"
 #include "js/Promise.h"
 #include "js/PropertyAndElement.h"
+#include "js/experimental/TypedData.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -50,12 +53,37 @@ uint32_t dispatch_error(JSContext *cx, const char *context) {
   return 1;
 }
 
+// ComponentizeJS/jco's generated glue looks up export functions by camelCase
+// identifier (a kebab-case WIT name like "echo-color" becomes "echoColor"),
+// not by the literal kebab-case string. `resolve_export_function` below
+// tries the literal name first (preserving this bridge's original,
+// already-tested convention -- a module can still expose a non-identifier
+// name via `export { impl as "big-add" }`), and only falls back to the
+// camelCase spelling if the literal property doesn't exist, so JS written
+// against either convention resolves correctly.
+std::string kebab_to_camel_case(std::string_view kebab) {
+  std::string out;
+  out.reserve(kebab.size());
+  bool upper_next = false;
+  for (char c : kebab) {
+    if (c == '-') {
+      upper_next = true;
+      continue;
+    }
+    out.push_back(upper_next ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c);
+    upper_next = false;
+  }
+  return out;
+}
+
 // Shared by both the JSON and the typed-native bridge: looks up
 // `<top-level module>[function_name]` (the bare WIT function name, taken
 // verbatim from after the last '#' of the qualified export name -- e.g.
 // "starling:js/api#big-add" -> "big-add"; a module can expose that literal
-// (non-identifier) name via `export { impl as "big-add" }`). Assumes `cx` is
-// valid and its realm has already been entered by the caller.
+// (non-identifier) name via `export { impl as "big-add" }`, or, matching
+// ComponentizeJS, a camelCase identifier export like `export function
+// bigAdd(...)`). Assumes `cx` is valid and its realm has already been
+// entered by the caller.
 bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
                              const uint8_t *export_name_ptr, size_t export_name_len,
                              const char **error_context, std::string *out_function_name) {
@@ -72,13 +100,26 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
       separator == std::string_view::npos ? export_name : export_name.substr(separator + 1));
 
   JS::RootedObject namespace_object(cx, &module_namespace.toObject());
-  if (!JS_GetProperty(cx, namespace_object, function_name.c_str(), out_function)) {
+  std::string lookup_name = function_name;
+  std::string camel_name = kebab_to_camel_case(function_name);
+  if (camel_name != function_name) {
+    bool has_literal = false;
+    if (!JS_HasProperty(cx, namespace_object, function_name.c_str(), &has_literal)) {
+      *error_context = "resolving a JavaScript module export";
+      return false;
+    }
+    if (!has_literal) {
+      lookup_name = camel_name;
+    }
+  }
+
+  if (!JS_GetProperty(cx, namespace_object, lookup_name.c_str(), out_function)) {
     *error_context = "resolving a JavaScript module export";
     return false;
   }
   if (!out_function.isObject() || !JS::IsCallable(&out_function.toObject())) {
     JS_ReportErrorUTF8(cx, "JavaScript module export '%s' is not a function",
-                       function_name.c_str());
+                       lookup_name.c_str());
     *error_context = "resolving a JavaScript module export";
     return false;
   }
@@ -353,6 +394,20 @@ bool encode_to_js(JSContext *cx, const StarlingJsValue &v, JS::MutableHandleValu
     out.setString(str);
     return true;
   }
+  case STARLING_JS_BYTES: {
+    JS::RootedObject array(cx, JS_NewUint8Array(cx, v.str_len));
+    if (!array) {
+      return false;
+    }
+    if (v.str_len > 0) {
+      bool is_shared = false;
+      JS::AutoCheckCannotGC nogc(cx);
+      uint8_t *data = JS_GetUint8ArrayData(array, &is_shared, nogc);
+      std::memcpy(data, v.str_ptr, v.str_len);
+    }
+    out.setObject(*array);
+    return true;
+  }
   case STARLING_JS_OPTION_NONE:
     out.setNull();
     return true;
@@ -424,17 +479,29 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
     return true;
   }
   if (v.isBigInt()) {
-    // `ToBigInt64`/`ToBigUint64` only reinterpret bits (they don't report
-    // whether the BigInt actually fits the target domain), so use the
-    // exact-fit queries instead: they report both the precise value and
-    // whether the BigInt's true mathematical value fits, letting the Zig
-    // side validate the full s64/u64 domains without being fooled by two's
-    // complement wraparound (see the field comments in js_dispatch.h).
+    // A JS export's own return value is lowered into the wasm ABI the same
+    // way the real ComponentizeJS/Wasmtime canonical-ABI JS embedding does:
+    // per the ECMAScript `ToBigInt64`/`ToBigUint64` abstract operations, an
+    // out-of-domain (too large, or negative for u64) BigInt result *wraps*
+    // modulo 2**64, it does not throw/trap (empirically re-verified against
+    // the pinned ComponentizeJS 0.21.0 reference itself for this exact
+    // shape -- see tests/compat/manifest.json known_deviations
+    // integer-64-bit-precision and tests/compat/fixtures/integers-64bit's
+    // "sum-list-basic" case, which deliberately sums past u64::MAX and
+    // expects the wrapped result, matching both pipelines). `ToBigInt64`/
+    // `ToBigUint64` compute exactly that modulo-2**64 reinterpretation, so
+    // both fields are always populated unconditionally; there is no
+    // "doesn't fit" case to reject here. `bigint_fits_i64`/`bigint_fits_u64`
+    // /`bigint_is_negative` are kept only as diagnostic metadata (unused by
+    // the current Zig-side decode, which now always accepts any BigInt of
+    // the correct sign-domain kind), not as a trap gate.
     JS::BigInt *bi = v.toBigInt();
-    int64_t i64_out = 0;
-    uint64_t u64_out = 0;
-    bool fits_i64 = JS::BigIntFits<int64_t>(bi, &i64_out);
-    bool fits_u64 = JS::BigIntFits<uint64_t>(bi, &u64_out);
+    int64_t i64_out = JS::ToBigInt64(bi);
+    uint64_t u64_out = JS::ToBigUint64(bi);
+    int64_t fit_probe = 0;
+    uint64_t fit_probe_u = 0;
+    bool fits_i64 = JS::BigIntFits<int64_t>(bi, &fit_probe);
+    bool fits_u64 = JS::BigIntFits<uint64_t>(bi, &fit_probe_u);
     *out = {.tag = STARLING_JS_U64,
             .i64_val = i64_out,
             .u64_val = u64_out,
@@ -467,6 +534,27 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
   }
   if (v.isObject()) {
     JS::RootedObject obj(cx, &v.toObject());
+
+    // A `Uint8Array` must be detected before both the Array check and the
+    // generic own-property-keys walk below: it is not itself a JS Array
+    // (`JS::IsArrayObject` is false for it), so it would otherwise fall
+    // through to the generic object walk, which would enumerate its integer
+    // indices as string-ish own properties. ComponentizeJS always lifts a
+    // WIT `list<u8>` argument to a real `Uint8Array` (never a plain Array),
+    // so recognizing one here lets `decodeNative`'s `wit_types.ByteList`
+    // path distinguish an actual byte-list result from any other JS array.
+    if (JS_IsUint8Array(obj)) {
+      uint8_t *data = nullptr;
+      bool is_shared = false;
+      size_t len = 0;
+      if (!JS_GetObjectAsUint8Array(obj, &len, &is_shared, &data)) {
+        JS_ReportErrorASCII(cx, "native dispatch: could not read a Uint8Array return value");
+        return false;
+      }
+      const uint8_t *bytes = arena.copy_bytes(reinterpret_cast<const char *>(data), len);
+      *out = {.tag = STARLING_JS_BYTES, .str_ptr = bytes, .str_len = len};
+      return true;
+    }
 
     // Arrays must be detected *before* the generic own-property-keys walk
     // below: `js::GetPropertyKeys` would enumerate a dense array's elements
@@ -538,6 +626,7 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
 extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 size_t export_name_len,
                                                 const StarlingJsValue *args_ptr, size_t args_len,
+                                                uint8_t result_is_wit_result,
                                                 StarlingJsValue *out_result, void **out_arena) {
   *out_result = {};
   *out_arena = nullptr;
@@ -570,6 +659,26 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
 
   JS::RootedValue return_value(cx);
   if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
+    // ComponentizeJS convention for an export whose own result type is a WIT
+    // `result<T, E>`: a thrown value signals `err` (see js_dispatch.h). Only
+    // take this path for a plain, still-pending JS exception -- not for the
+    // (different, and rarer) cases where `JS::Call` fails without one, e.g.
+    // an uncatchable OOM.
+    if (result_is_wit_result != 0 && JS_IsExceptionPending(cx)) {
+      JS::RootedValue thrown(cx);
+      if (!JS_GetPendingException(cx, &thrown)) {
+        return dispatch_error(cx, "calling a JavaScript module export");
+      }
+      JS_ClearPendingException(cx);
+      auto *arena = new NativeArena();
+      if (!decode_from_js(cx, thrown, *arena, out_result)) {
+        delete arena;
+        *out_arena = nullptr;
+        return dispatch_error(cx, "decoding a thrown JavaScript error value");
+      }
+      *out_arena = arena;
+      return 2;
+    }
     return dispatch_error(cx, "calling a JavaScript module export");
   }
   if (!resolve_promise_like(cx, function_name.c_str(), &return_value)) {

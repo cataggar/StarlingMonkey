@@ -114,6 +114,41 @@ def declared_function_names(fixture: dict) -> set[str]:
     return names
 
 
+def top_level_result_functions(wasm_tools: str | None, fixture: dict) -> set[str]:
+    """Names of this fixture's declared functions whose *own* WIT return
+    type resolves (possibly through a named type alias) to `result<T, E>`
+    -- i.e. functions using ComponentizeJS's "return means Ok, throw means
+    Err" calling convention at the top level, as opposed to a `result<T,E>`
+    nested inside a record/list/option field (which is instead observed as
+    a plain `{tag, val}`-shaped JS value, never a throw). Returns an empty
+    set (rather than raising) if wasm-tools is unavailable, degrading the
+    node-selfcheck below to its pre-existing plain-return-value comparison
+    for every case in that fixture."""
+    if wasm_tools is None:
+        return set()
+    wit_dir = compat_lib.COMPAT_DIR / fixture["wit_dir"]
+    try:
+        wit_json = compat_lib.component_wit_json(wasm_tools, wit_dir)
+    except subprocess.CalledProcessError:
+        return set()
+    try:
+        functions = compat_lib.world_export_functions(wit_json, fixture["world"])
+    except ValueError:
+        return set()
+    types = wit_json.get("types", [])
+
+    def resolves_to_result(type_ref) -> bool:
+        if not isinstance(type_ref, int):
+            return False  # a builtin scalar type name (e.g. "u32"), never a result
+        kind = types[type_ref].get("kind")
+        return isinstance(kind, dict) and "result" in kind
+
+    return {
+        name for name, fn in functions.items()
+        if name in declared_function_names(fixture) and resolves_to_result(fn.get("result"))
+    }
+
+
 def check_wit_and_js(manifest: dict, reporter: Reporter, wasm_tools: str | None) -> None:
     for fixture in manifest["fixtures"]:
         fid = fixture["id"]
@@ -186,24 +221,78 @@ def check_wit_and_js(manifest: dict, reporter: Reporter, wasm_tools: str | None)
             if compat_lib.js_defines_function_export(js_source, fn):
                 reporter.report(PASS, label)
             else:
-                reporter.report(FAIL, label, f"no 'export function {fn}(' found in {fixture['js_file']}")
+                camel = compat_lib.camel_case(fn)
+                reporter.report(FAIL, label, f"no 'export function {fn}(' or 'export function {camel}(' found in {fixture['js_file']}")
 
 
 NODE_ESCAPE_MAP = {"'": "\\'", "\\": "\\\\"}
+
+_JS_SAFE_INT_MAX = 2**53 - 1
+
+
+def _fixture_needs_bigint(fixture: dict) -> bool:
+    """True if any declared arg/result in `fixture` falls outside
+    Number.MAX_SAFE_INTEGER, i.e. this fixture is meant to exchange real JS
+    BigInt (u64/s64) values at the actual WIT/canonical-ABI boundary. The
+    plain-JSON-literal self-check below cannot represent those without
+    precision loss (a bare `18446744073709551615` numeric literal rounds
+    to the nearest float64 the moment V8 parses it, and `JSON.stringify`
+    cannot serialize a real `BigInt` value at all without a lossy custom
+    replacer) -- see node_selfcheck_fixture's early-SKIP for this case."""
+    def walk(value) -> bool:
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value > _JS_SAFE_INT_MAX or value < -_JS_SAFE_INT_MAX
+        if isinstance(value, list):
+            return any(walk(v) for v in value)
+        if isinstance(value, dict):
+            return any(walk(v) for v in value.values())
+        return False
+
+    for case in fixture.get("cases", []):
+        if walk(case.get("args", [])) or walk(case.get("result")):
+            return True
+    for seq in fixture.get("sequences", []):
+        for call in seq.get("calls", []):
+            if walk(call.get("args", [])) or walk(call.get("result")):
+                return True
+    return False
 
 
 def node_available() -> str | None:
     return shutil.which("node")
 
 
-def node_selfcheck_fixture(node: str, fixture: dict, reporter: Reporter) -> None:
+def node_selfcheck_fixture(node: str, fixture: dict, reporter: Reporter, top_level_result_fns: set[str]) -> None:
     """Best-effort: actually evaluate the fixture's plain JavaScript with a
     system Node.js (if present) and compare against the manifest's declared
     results. This exercises only the JS semantics directly (no WIT, no
     canonical ABI, no ComponentizeJS, no wasm) -- it catches authoring
     mistakes in the fixture/manifest pair, and is skipped (not failed) when
-    Node is unavailable, since this repository does not depend on Node."""
+    Node is unavailable, since this repository does not depend on Node.
+
+    `top_level_result_fns` names this fixture's functions whose own return
+    type is `result<T,E>` (see top_level_result_functions): for those, the
+    manifest's expected `result` is the canonical-ABI-level `{tag, val}`
+    shape (matching what tests/compat/runtime/invoker observes through
+    Wasmtime), not the plain value the JS function itself returns/throws
+    (ComponentizeJS's "return means Ok, throw means Err" convention), so
+    each call is wrapped in try/catch and re-shaped into that convention
+    before comparison."""
     fid = fixture["id"]
+
+    if _fixture_needs_bigint(fixture):
+        reporter.report(
+            SKIP, f"node-selfcheck/{fid}",
+            "fixture exchanges full-domain u64/s64 (BigInt) values; this "
+            "plain-JSON-literal self-check cannot represent them without "
+            "precision loss, unlike the real bridge/reference (see "
+            "tests/compat/runtime and tests/compat/reference, which "
+            "actually exercise BigInt through the canonical ABI)."
+        )
+        return
+
     js_path = compat_lib.COMPAT_DIR / fixture["dir"] / fixture["js_file"]
 
     # `await` unconditionally: a no-op for a plain synchronously-returned
@@ -212,24 +301,37 @@ def node_selfcheck_fixture(node: str, fixture: dict, reporter: Reporter) -> None
     # actually driven to its fulfilled value here too, instead of pushing
     # the Promise object itself (which would not match the manifest's
     # declared fulfilled-value `result`). Fixtures whose promises never
-    # settle (tests/compat/fixtures/promises-negative) are always
-    # `negative: true` and therefore already excluded from this self-check
-    # by main()'s `if fixture.get("negative"): continue`.
+    # settle or reject without a top-level `result<T,E>` return type
+    # (tests/compat/fixtures/promises-rejected, promises-deadlock) are
+    # always `negative: true` and therefore already excluded from this
+    # self-check by main()'s `if fixture.get("negative"): continue`. A
+    # rejected Promise from a `result_is_wit_result` export *is* exercised
+    # here (when not `negative`): `await` inside the `try` below re-throws
+    # the rejection reason as a synchronous exception in this async
+    # context, so it takes the same err-reshaping path as a synchronous
+    # throw.
+    def push_call(id_json: str, fn: str, args_json: str) -> str:
+        call_expr = f"await mod.{compat_lib.camel_case(fn)}(...({args_json}))"
+        if fn in top_level_result_fns:
+            return (
+                f"try {{ const v = {call_expr}; "
+                f"out.push({{id: {id_json}, value: {{tag: 'ok', val: v}}}}); "
+                f"}} catch (e) {{ const errVal = {{tag: 'err'}}; "
+                "if (typeof e === 'string' || typeof e === 'number' || typeof e === 'boolean') { errVal.val = e; } "
+                f"out.push({{id: {id_json}, value: errVal}}); }}"
+            )
+        return f"out.push({{id: {id_json}, value: {call_expr}}});"
+
     script_lines = [f"const mod = await import({json.dumps(js_path.as_posix())});", "const out = [];"]
     cases = list(fixture.get("cases", []))
     for case in cases:
         args_json = json.dumps(case["args"])
-        script_lines.append(
-            f"out.push({{id: {json.dumps(case['id'])}, "
-            f"value: await mod.{case['function']}(...({args_json}))}});"
-        )
+        script_lines.append(push_call(json.dumps(case["id"]), case["function"], args_json))
     for seq in fixture.get("sequences", []):
         for index, call in enumerate(seq["calls"]):
             args_json = json.dumps(call["args"])
-            script_lines.append(
-                f"out.push({{id: {json.dumps(seq['id'] + '#' + str(index))}, "
-                f"value: await mod.{seq['function']}(...({args_json}))}});"
-            )
+            seq_id_json = json.dumps(seq["id"] + "#" + str(index))
+            script_lines.append(push_call(seq_id_json, seq["function"], args_json))
     script_lines.append("console.log(JSON.stringify(out.map(o => o.value === undefined ? {...o, value: null, __void: true} : o)));")
     script = "\n".join(script_lines)
 
@@ -304,7 +406,7 @@ def main() -> None:
         for fixture in manifest["fixtures"]:
             if fixture.get("negative"):
                 continue
-            node_selfcheck_fixture(node, fixture, reporter)
+            node_selfcheck_fixture(node, fixture, reporter, top_level_result_functions(wasm_tools, fixture))
 
     reporter.summary_and_exit()
 

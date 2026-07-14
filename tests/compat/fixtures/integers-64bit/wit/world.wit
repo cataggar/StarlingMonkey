@@ -1,0 +1,22 @@
+package compat:integers-64bit;
+
+// Phase 1a compatibility fixture: full-domain u64/s64 (values that do not
+// fit exactly in an IEEE-754 double, i.e. >= 2^53). ComponentizeJS lifts
+// these as JS BigInt (see manifest.json known_deviations
+// "integer-64-bit-precision", now closed by this fixture: the current
+// Zig/WABT bridge's native tagged-value path -- runtime/js_dispatch.zig,
+// active whenever a signature contains i64/u64 -- also exchanges exact
+// BigInt values, not lossy JSON-Number round-tripped text).
+world js-exports {
+  export big-add: func(a: u64, b: u64) -> u64;
+  export big-sub: func(a: s64, b: s64) -> s64;
+
+  record labeled-id {
+    label: string,
+    id: u64,
+  }
+  export label-id: func(label: string, id: u64) -> labeled-id;
+
+  export maybe-big: func(value: option<u64>) -> option<u64>;
+  export sum-list: func(values: list<u64>) -> u64;
+}

@@ -181,3 +181,172 @@ async function promiseRejectBigImpl() {
   throw new Error("promise-reject-big: deliberate rejection");
 }
 export { promiseRejectBigImpl as "promise-reject-big" };
+// Numeric wraparound (matches ComponentizeJS/ECMAScript, not a trap): each
+// field here is a deliberately out-of-range/negative/fractional Number or
+// BigInt of the *correct kind*, which must lower via modular wraparound
+// (ToInt32/ToUint32-family, ToBigInt64/ToBigUint64), not a trap. See
+// tests/compat/fixtures/integers-64bit's "sum-list-basic" case for the same
+// behavior verified against the pinned ComponentizeJS reference itself.
+function wrapNumbersImpl() {
+  return {
+    overflowU8: 300, // 300 mod 256 = 44
+    negativeU8: -5, // 256 - 5 = 251
+    fractionalU8: 3.5, // truncates toward zero first, then wraps: 3
+    overflowS32: 2147483648, // i32::MAX + 1 wraps to i32::MIN
+    negativeU64: -5n, // 2**64 - 5
+    overflowS64: 18446744073709551616n, // 2**64 wraps to 0
+  };
+}
+export { wrapNumbersImpl as "wrap-numbers" };
+
+// --- char --------------------------------------------------------------
+function echoCharImpl(c) {
+  return c;
+}
+export { echoCharImpl as "echo-char" };
+
+function wrongTypeCharImpl() {
+  return 42; // not a string at all
+}
+export { wrongTypeCharImpl as "wrong-type-char" };
+
+function invalidCharMultiCodepointImpl() {
+  return "ab"; // two codepoints, not exactly one Unicode scalar value
+}
+export { invalidCharMultiCodepointImpl as "invalid-char-multi-codepoint" };
+
+// --- list<u8> vs string --------------------------------------------------
+function echoBytesImpl(data) {
+  // `data` must be a genuine Uint8Array (see js_dispatch.h); returning it
+  // unchanged also exercises the lenient decode (a plain Array would be
+  // equally acceptable coming back, but a real Uint8Array is what a
+  // faithful JS implementation would naturally produce here).
+  return data;
+}
+export { echoBytesImpl as "echo-bytes" };
+
+function bytesLenImpl(data) {
+  return data.length;
+}
+export { bytesLenImpl as "bytes-len" };
+
+function wrongTypeBytesImpl() {
+  return "not-bytes"; // neither a Uint8Array nor a plain Array
+}
+export { wrongTypeBytesImpl as "wrong-type-bytes" };
+
+// --- tuple ---------------------------------------------------------------
+function swapPairImpl(pair) {
+  return [pair[1], pair[0]];
+}
+export { swapPairImpl as "swap-pair" };
+
+function wrongTypeTupleImpl() {
+  return { 0: 1, 1: 2 }; // a plain object, not a real JS Array
+}
+export { wrongTypeTupleImpl as "wrong-type-tuple" };
+
+// --- enum ------------------------------------------------------------
+function echoDirectionImpl(d) {
+  return d;
+}
+export { echoDirectionImpl as "echo-direction" };
+
+function invalidEnumCaseImpl() {
+  return "north-west"; // not one of direction's declared case labels
+}
+export { invalidEnumCaseImpl as "invalid-enum-case" };
+
+function wrongTypeEnumImpl() {
+  return 0; // not a string
+}
+export { wrongTypeEnumImpl as "wrong-type-enum" };
+
+// --- flags -----------------------------------------------------------
+function echoPermsImpl(p) {
+  return p;
+}
+export { echoPermsImpl as "echo-perms" };
+
+function missingFlagsPropertyImpl() {
+  return { canRead: true, canWrite: false }; // missing required canExecute
+}
+export { missingFlagsPropertyImpl as "missing-flags-property" };
+
+function wrongTypeFlagsImpl() {
+  return "not-an-object";
+}
+export { wrongTypeFlagsImpl as "wrong-type-flags" };
+
+// --- variant -----------------------------------------------------------
+function echoShapeImpl(s) {
+  return s;
+}
+export { echoShapeImpl as "echo-shape" };
+
+function invalidVariantTagImpl() {
+  return { tag: "triangle" }; // not one of shape's declared case names
+}
+export { invalidVariantTagImpl as "invalid-variant-tag" };
+
+function wrongTypeVariantImpl() {
+  return 42; // not a {tag, val} object
+}
+export { wrongTypeVariantImpl as "wrong-type-variant" };
+
+// --- result<T, E> --------------------------------------------------------
+function echoWrappedResultImpl(w) {
+  return w;
+}
+export { echoWrappedResultImpl as "echo-wrapped-result" };
+
+// The export's own top-level return type is `result<u32, string>`:
+// ComponentizeJS's calling convention returns the Ok payload directly and
+// signals Err by throwing (see js_dispatch.h).
+function divideImpl(a, b) {
+  if (b === 0) {
+    throw "division by zero";
+  }
+  return Math.trunc(a / b);
+}
+export { divideImpl as "divide" };
+
+// `result<s32>` (E is void, per WIT's err-omitted shorthand): failure is
+// signaled by throwing anything at all, since there's no err payload to
+// carry.
+function checkedNegateImpl(value) {
+  if (value === -2147483648) {
+    throw new Error("negating i32::MIN would overflow");
+  }
+  return -value;
+}
+export { checkedNegateImpl as "checked-negate" };
+
+// --- naming/version edge cases -------------------------------------------
+function echoMultiWordRecordImpl(r) {
+  return r;
+}
+export { echoMultiWordRecordImpl as "echo-multi-word-record" };
+
+function echoMultiWordFlagsImpl(f) {
+  return f;
+}
+export { echoMultiWordFlagsImpl as "echo-multi-word-flags" };
+
+function echoMultiWordEnumImpl(e) {
+  return e;
+}
+export { echoMultiWordEnumImpl as "echo-multi-word-enum" };
+
+function echoMultiWordVariantImpl(v) {
+  return v;
+}
+export { echoMultiWordVariantImpl as "echo-multi-word-variant" };
+
+// Exported ONLY under its camelCase spelling (never the literal kebab
+// string "multi-word-echo") -- proves resolve_export_function's camelCase
+// fallback lookup actually engages, not just that every other export's
+// literal-kebab lookup still works.
+export function multiWordEcho(value) {
+  return value + 1;
+}

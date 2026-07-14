@@ -45,7 +45,57 @@ const CACHE_DIR = join(HERE, ".component-cache");
 const INVOKER_DIR = join(COMPAT_DIR, "runtime", "invoker");
 const INVOKER_BIN = join(INVOKER_DIR, "target", "release", "compat-invoker");
 
-const manifest = JSON.parse(await readFile(join(COMPAT_DIR, "manifest.json"), "utf8"));
+// manifest.json/compat-invoker's stdout can both contain full-domain u64/s64
+// integer literals (>= 2**63, or simply outside Number.MAX_SAFE_INTEGER)
+// that a plain `JSON.parse` would silently round to the nearest float64 --
+// e.g. `18446744073709551615` (u64::MAX) becomes `18446744073709552000`.
+// `jsonParseBigInt` uses V8's JSON.parse reviver "source text access"
+// (`context.source`, Node >= 21) to detect exactly this case and upgrade
+// only those specific literals to a real BigInt, leaving every other
+// number as a plain JS Number; `jsonStringifyBigInt`/`jsonEqualBigInt`
+// are the matching serializer/comparator for values that may now contain
+// BigInt. See manifest.json known_deviations integer-64-bit-precision and
+// tests/compat/fixtures/integers-64bit, which specifically needs this.
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
+
+function jsonParseBigInt(text) {
+  return JSON.parse(text, (_key, value, context) => {
+    if (typeof value !== "number" || !context?.source) return value;
+    if (!/^-?\d+$/.test(context.source)) return value; // not a bare integer literal
+    const big = BigInt(context.source);
+    return big >= MIN_SAFE && big <= MAX_SAFE ? value : big;
+  });
+}
+
+function jsonStringifyBigInt(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(jsonStringifyBigInt).join(",")}]`;
+  return `{${Object.entries(value)
+    .map(([k, v]) => `${JSON.stringify(k)}:${jsonStringifyBigInt(v)}`)
+    .join(",")}}`;
+}
+
+function jsonEqualBigInt(a, b) {
+  if (typeof a === "bigint" || typeof b === "bigint") {
+    return (typeof a === "bigint" ? a : typeof a === "number" ? BigInt(a) : null) ===
+      (typeof b === "bigint" ? b : typeof b === "number" ? BigInt(b) : null);
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => jsonEqualBigInt(v, b[i]));
+  }
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const aKeys = Object.keys(a).sort();
+    const bKeys = Object.keys(b).sort();
+    if (aKeys.length !== bKeys.length || aKeys.some((k, i) => k !== bKeys[i])) return false;
+    return aKeys.every((k) => jsonEqualBigInt(a[k], b[k]));
+  }
+  return a === b;
+}
+
+const manifest = jsonParseBigInt(await readFile(join(COMPAT_DIR, "manifest.json"), "utf8"));
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -100,9 +150,9 @@ function callsFor(fixture) {
 
 async function invoke(wasmPath, calls) {
   const callsPath = `${wasmPath}.calls.json`;
-  await writeFile(callsPath, JSON.stringify(calls.map(({ function: fn, args }) => ({ function: fn, args }))));
+  await writeFile(callsPath, jsonStringifyBigInt(calls.map(({ function: fn, args }) => ({ function: fn, args }))));
   const { stdout } = await execFileAsync(INVOKER_BIN, [wasmPath, callsPath], { maxBuffer: 64 * 1024 * 1024 });
-  return JSON.parse(stdout);
+  return jsonParseBigInt(stdout);
 }
 
 await mkdir(CACHE_DIR, { recursive: true });
@@ -198,8 +248,8 @@ for (const fixture of manifest.fixtures) {
     }
     if (c.void) continue;
     const want = "reference_result" in c ? c.reference_result : c.result;
-    if (JSON.stringify(observed.value) !== JSON.stringify(want)) {
-      mismatches.push(`${c.id}: want ${JSON.stringify(want)}, got ${JSON.stringify(observed.value)}`);
+    if (!jsonEqualBigInt(observed.value, want)) {
+      mismatches.push(`${c.id}: want ${jsonStringifyBigInt(want)}, got ${jsonStringifyBigInt(observed.value)}`);
     }
   }
 

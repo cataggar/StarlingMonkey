@@ -1,4 +1,5 @@
 const std = @import("std");
+const wit_types = @import("wit_types");
 
 const DispatchResult = extern struct {
     ptr: ?[*]u8,
@@ -39,6 +40,10 @@ const NativeTag = enum(u32) {
     option_some = 6,
     record = 7,
     list_ = 8,
+    // WIT `list<u8>` (`wit_types.ByteList`): a genuine JS `Uint8Array`, never
+    // a plain Array (matches ComponentizeJS 0.21.0). Reuses `str_ptr`/
+    // `str_len` (see js_dispatch.h).
+    bytes = 9,
 };
 
 // Mirrors `struct StarlingJsValue` in js_dispatch.h field-for-field. Both
@@ -84,23 +89,119 @@ extern fn starling_js_dispatch_native(
     export_name_len: usize,
     args_ptr: [*]const NativeValue,
     args_len: usize,
+    result_is_wit_result: u8,
     out_result: *NativeValue,
     out_arena: *?*anyopaque,
 ) u32;
 
 extern fn starling_js_dispatch_native_free(arena: ?*anyopaque) void;
 
+// ---------------------------------------------------------------------------
+// Naming-convention helpers.
+//
+// The WABT bindgen's `snake()` helper (component_bindgen.zig) turns every WIT
+// kebab-case identifier into a Zig field/tag name by replacing `-` with `_`
+// (WIT identifiers never contain `_`, so this is exactly reversible).
+// ComponentizeJS 0.21.0's JS-visible naming conventions were determined
+// empirically against the pinned reference (0.21.0,
+// 12c2b4a25033f65047f8ec5c5fb9e3013bfc4950) through the same Wasmtime 42
+// differential host used by tests/compat, not guessed:
+//   * record fields and flags labels become JS camelCase *property names*
+//     (e.g. WIT `first-value` / Zig `first_value` -> JS `firstValue`).
+//   * enum case labels and variant/result case tags stay their *original
+//     kebab-case spelling*, carried as plain string *values* (not
+//     identifiers), e.g. WIT `north-east` -> the JS string `"north-east"`
+//     (not camelCased -- string content isn't an identifier).
+//   * a kebab-case WIT function name is looked up as a camelCase JS export
+//     identifier (see `kebab_to_camel_case` in js_dispatch.cpp).
+
+fn CamelCase(comptime snake: []const u8) []const u8 {
+    return comptime blk: {
+        var buf: [snake.len]u8 = undefined;
+        var len: usize = 0;
+        var upper_next = false;
+        for (snake) |c| {
+            if (c == '_') {
+                upper_next = true;
+                continue;
+            }
+            buf[len] = if (upper_next) std.ascii.toUpper(c) else c;
+            upper_next = false;
+            len += 1;
+        }
+        const final = buf[0..len].*;
+        break :blk &final;
+    };
+}
+
+fn KebabCase(comptime snake: []const u8) []const u8 {
+    return comptime blk: {
+        var buf: [snake.len]u8 = snake[0..snake.len].*;
+        for (&buf) |*c| {
+            if (c.* == '_') c.* = '-';
+        }
+        const final = buf;
+        break :blk &final;
+    };
+}
+
+// Converts a runtime (JS-sourced) kebab-case string back to the Zig
+// snake_case spelling used by `@tagName`/`std.meta.stringToEnum`, into
+// `buf`. Returns `null` if `s` doesn't fit `buf` -- which, for any string
+// that could possibly match a real (bounded-length, comptime-known) case
+// name, means it can't match and the caller should trap.
+fn kebabToSnakeBuf(buf: []u8, s: []const u8) ?[]u8 {
+    if (s.len > buf.len) return null;
+    for (s, 0..) |c, i| buf[i] = if (c == '-') '_' else c;
+    return buf[0..s.len];
+}
+
+// A WIT `result<T, E>` (`wit_types.Result(T, E)`) is, at the Zig level,
+// indistinguishable from an ordinary two-case `variant` also named `ok`/
+// `err` -- both are `union(enum) { ok: T, err: E }`. This structural check
+// is what `callNative` uses to decide whether the export's own top-level
+// return type gets ComponentizeJS's "return means Ok, throw means Err"
+// calling convention (see js_dispatch.h); any *nested* `result<T, E>` (e.g.
+// inside a record/list/option) is unaffected and keeps decoding via the
+// ordinary `{tag, val}` object shape below.
+fn isWitResultType(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"union" => |u| u.field_names.len == 2 and
+            std.mem.eql(u8, u.field_names[0], "ok") and
+            std.mem.eql(u8, u.field_names[1], "err"),
+        else => false,
+    };
+}
+
 // Recursively checks whether `T`'s type graph (struct fields, optional
 // children) contains an exact `i64`/`u64` anywhere -- the only types JSON
-// cannot carry losslessly. Used at comptime to decide, per export, whether
-// `call` should route through the native bridge or the JSON one; this is the
-// "bounded fallback" that keeps every JSON-representable export working
-// exactly as before.
+// cannot carry losslessly -- or any of the shapes JSON can't represent in
+// ComponentizeJS's exact JS shape at all (`char`/`list<u8>`'s nominal
+// wrapper types, `enum`, `flags` (a packed struct, which JSON would instead
+// serialize field-for-field including the padding field), or `variant`/
+// `result` (a tagged union, which `std.json` serializes as a single-key
+// `{"active_field": value}` object rather than ComponentizeJS's `{tag,
+// val}`)). Used at comptime to decide, per export, whether `call` should
+// route through the native bridge or the JSON one; this is the "bounded
+// fallback" that keeps every JSON-representable export working exactly as
+// before.
 fn typeNeedsNative(comptime T: type) bool {
     if (T == i64 or T == u64) return true;
+    if (T == wit_types.Char or T == wit_types.ByteList) return true;
     return switch (@typeInfo(T)) {
         .optional => |o| typeNeedsNative(o.child),
+        .@"enum", .@"union" => true,
         .@"struct" => |s| comptime blk: {
+            // A `flags` type: a packed struct backing integer. Always needs
+            // native routing (JSON would otherwise leak the `_padding` field
+            // and not camelCase the label names).
+            if (s.layout == .@"packed") break :blk true;
+            // A `tuple<...>` (`wit_types.Tuple`, a real Zig tuple struct):
+            // `std.json` happens to already round-trip this correctly as a
+            // JSON array, but it's routed through native unconditionally
+            // anyway for a single consistent code path across every new
+            // value shape (no existing fixture depends on tuple-via-JSON).
+            if (s.is_tuple) break :blk true;
             for (s.field_types) |field_type| {
                 if (typeNeedsNative(field_type)) break :blk true;
             }
@@ -120,7 +221,19 @@ fn typeNeedsNative(comptime T: type) bool {
 }
 
 fn needsNative(comptime Result: type, comptime Args: type) bool {
-    return typeNeedsNative(Result) or typeNeedsNative(Args);
+    if (typeNeedsNative(Result)) return true;
+    // `Args` here is the compiler-synthesized anonymous tuple struct built
+    // from `callNative`'s `args: anytype` parameter pack, not a genuine WIT
+    // `tuple<...>` value -- both are `is_tuple == true` structurally, so
+    // `typeNeedsNative` can't be called on `Args` itself (its "a WIT tuple
+    // always needs native" rule would then force every export through the
+    // native bridge, regardless of whether any of its arguments actually
+    // need it). Check each argument's own type instead.
+    const info = @typeInfo(Args).@"struct";
+    inline for (info.field_types) |field_type| {
+        if (typeNeedsNative(field_type)) return true;
+    }
+    return false;
 }
 
 // Builds a `NativeValue` tree for one Zig argument value. Nested allocations
@@ -129,6 +242,22 @@ fn needsNative(comptime Result: type, comptime Args: type) bool {
 // dispatch call returns; string payloads are referenced directly (no copy)
 // since the source value already outlives the call.
 fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) NativeValue {
+    // `wit_types.Char`/`wit_types.ByteList` are plain single-field structs
+    // (see wit_types.zig), so they'd otherwise fall into the generic
+    // `.@"struct"` record arm below and encode as `{"codepoint": N}` /
+    // `{"bytes": [...]}` -- checked by type identity first to instead
+    // produce the exact JS shapes ComponentizeJS uses (a one-codepoint
+    // string, a `Uint8Array`).
+    if (T == wit_types.Char) {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(value.codepoint), &buf) catch
+            @panic("native dispatch: char argument is not a valid Unicode scalar value");
+        const bytes = allocator.dupe(u8, buf[0..n]) catch @panic("OOM");
+        return .{ .tag = .string_, .str_ptr = bytes.ptr, .str_len = bytes.len };
+    }
+    if (T == wit_types.ByteList) {
+        return .{ .tag = .bytes, .str_ptr = value.bytes.ptr, .str_len = value.bytes.len };
+    }
     return switch (@typeInfo(T)) {
         .bool => .{ .tag = .bool_, .bool_val = @intFromBool(value) },
         .int => blk: {
@@ -185,12 +314,114 @@ fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) Native
             }
             break :blk .{ .tag = .option_none };
         },
+        // A WIT `enum`: a bare tag, JS-visible as its original kebab-case
+        // spelling (a plain string *value*, not an identifier -- unlike
+        // record fields/flags labels, so no camelCasing here; see the
+        // naming-convention note above `CamelCase`/`KebabCase`).
+        .@"enum" => |e| blk: {
+            const kebab_names = comptime names: {
+                var names: [e.field_names.len][]const u8 = undefined;
+                for (e.field_names, 0..) |name, i| names[i] = KebabCase(name);
+                const final = names;
+                break :names &final;
+            };
+            const name = kebab_names[@intFromEnum(value)];
+            break :blk .{ .tag = .string_, .str_ptr = name.ptr, .str_len = name.len };
+        },
+        // A WIT `variant`/`result` (`wit_types.Result(T, E)` included --
+        // ComponentizeJS's return-position throw-sugar is an export-level
+        // *calling convention*, not a different argument shape: as an
+        // argument, `result<T, E>` is JS-visible as the same `{tag, val}`
+        // object every other variant/result uses, confirmed empirically
+        // against the pinned reference). `val` is omitted entirely for a
+        // void-payload case, matching the observed shape exactly (not
+        // present-with-`null`/`undefined`).
+        //
+        // `active`'s ordinal (`@intFromEnum`, not its runtime `@tagName`) is
+        // what selects the kebab-case name and payload field at runtime --
+        // `KebabCase`/`@field` need a *comptime-known* field name, and a
+        // union's actual active case is only known at runtime, so this
+        // (like the `enum` arm above) precomputes a name table indexed by
+        // ordinal at comptime instead of trying to feed a runtime tag name
+        // through a comptime-parameter helper.
+        .@"union" => |u| blk: {
+            const active = std.meta.activeTag(value);
+            const kebab_names = comptime names: {
+                var names: [u.field_names.len][]const u8 = undefined;
+                for (u.field_names, 0..) |name, i| names[i] = KebabCase(name);
+                const final = names;
+                break :names &final;
+            };
+            const tag_name = kebab_names[@intFromEnum(active)];
+            const tag_bytes = allocator.dupe(u8, tag_name) catch @panic("OOM");
+            const tag_boxed = allocator.create(NativeValue) catch @panic("OOM");
+            tag_boxed.* = .{ .tag = .string_, .str_ptr = tag_bytes.ptr, .str_len = tag_bytes.len };
+            const tag_field_name: []const u8 = "tag";
+            const val_field_name: []const u8 = "val";
+
+            var val_boxed: ?*NativeValue = null;
+            inline for (u.field_names, u.field_types, 0..) |name, field_type, i| {
+                if (field_type != void and @intFromEnum(active) == i) {
+                    const boxed = allocator.create(NativeValue) catch @panic("OOM");
+                    boxed.* = encodeNative(field_type, @field(value, name), allocator);
+                    val_boxed = boxed;
+                }
+            }
+
+            const field_count: usize = if (val_boxed != null) 2 else 1;
+            const fields = allocator.alloc(NativeField, field_count) catch @panic("OOM");
+            fields[0] = .{ .name_ptr = tag_field_name.ptr, .name_len = tag_field_name.len, .value = tag_boxed };
+            if (val_boxed) |vb| {
+                fields[1] = .{ .name_ptr = val_field_name.ptr, .name_len = val_field_name.len, .value = vb };
+            }
+            break :blk .{ .tag = .record, .fields_ptr = fields.ptr, .fields_len = fields.len };
+        },
         .@"struct" => |s| blk: {
+            // A WIT `flags`: a packed struct of `bool` labels plus, unless
+            // the label count exactly fills the backing integer, a trailing
+            // non-bool `_padding` field (see component_bindgen.zig's
+            // `.flags` emission) that must never be treated as a label.
+            // ComponentizeJS represents flags as a plain JS object with
+            // *every* label present as a `true`/`false` camelCase property
+            // (confirmed empirically -- not just the "set" ones).
+            if (s.layout == .@"packed") {
+                var field_count: usize = 0;
+                inline for (s.field_types) |field_type| {
+                    if (field_type == bool) field_count += 1;
+                }
+                const fields = allocator.alloc(NativeField, field_count) catch @panic("OOM");
+                var i: usize = 0;
+                inline for (s.field_names, s.field_types) |name, field_type| {
+                    if (field_type == bool) {
+                        const camel = CamelCase(name);
+                        const boxed = allocator.create(NativeValue) catch @panic("OOM");
+                        boxed.* = .{ .tag = .bool_, .bool_val = @intFromBool(@field(value, name)) };
+                        fields[i] = .{ .name_ptr = camel.ptr, .name_len = camel.len, .value = boxed };
+                        i += 1;
+                    }
+                }
+                break :blk .{ .tag = .record, .fields_ptr = fields.ptr, .fields_len = fields.len };
+            }
+            // A WIT `tuple<...>` (`wit_types.Tuple(...)`, a real Zig tuple
+            // struct): JS-visible as a plain positional Array, not a
+            // `{"0": ..., "1": ...}` object.
+            if (s.is_tuple) {
+                const items = allocator.alloc(NativeValue, s.field_names.len) catch @panic("OOM");
+                inline for (s.field_names, s.field_types, 0..) |name, field_type, i| {
+                    items[i] = encodeNative(field_type, @field(value, name), allocator);
+                }
+                break :blk .{ .tag = .list_, .list_ptr = items.ptr, .list_len = items.len };
+            }
+            // A plain WIT `record`: field names are camelCased for the JS
+            // property key (matches ComponentizeJS for multi-word field
+            // names; a no-op for the already-single-word names every
+            // existing fixture uses).
             const fields = allocator.alloc(NativeField, s.field_names.len) catch @panic("OOM");
             inline for (s.field_names, s.field_types, 0..) |name, field_type, i| {
+                const camel = CamelCase(name);
                 const boxed = allocator.create(NativeValue) catch @panic("OOM");
                 boxed.* = encodeNative(field_type, @field(value, name), allocator);
-                fields[i] = .{ .name_ptr = name.ptr, .name_len = name.len, .value = boxed };
+                fields[i] = .{ .name_ptr = camel.ptr, .name_len = camel.len, .value = boxed };
             }
             break :blk .{ .tag = .record, .fields_ptr = fields.ptr, .fields_len = fields.len };
         },
@@ -209,25 +440,32 @@ fn findNativeField(value: *const NativeValue, comptime name: []const u8) ?*const
 }
 
 // Decodes the integer leaf of a `NativeValue` onto a concrete Zig integer
-// type, validating both the JS value's *kind* (BigInt vs. Number) and its
-// numeric range/integrality -- a JS export returning the wrong shape (e.g. a
-// plain `Number` where a `u64`/`s64` BigInt is required, or a fractional or
-// out-of-range `Number` for a narrower int) traps with a diagnostic instead
-// of silently truncating/wrapping to a plausible-looking but wrong value.
+// type, validating the JS value's *kind* (BigInt vs. Number) but -- for a
+// value of the correct kind -- *wrapping* an out-of-range/negative/
+// fractional/non-finite result modulo 2**bitSizeOf(T), exactly like the
+// real ComponentizeJS/Wasmtime canonical-ABI JS embedding's own
+// `ToInt32`/`ToUint32`-family (narrower widths) and `ToBigInt64`/
+// `ToBigUint64` (64-bit) abstract operations do when lowering a JS export's
+// return value -- neither of which throws/traps on magnitude alone. This
+// was re-verified directly against the pinned ComponentizeJS 0.21.0
+// reference (not assumed from the spec): e.g. a JS export returning
+// `-1` for a `u32` result lowers to `4294967295`, `300` for a `u8` result
+// lowers to `44` (`300 mod 256`), and `values.reduce(.... 0n)` summing a
+// `list<u64>` past `u64::MAX` lowers the wrapped low-64-bits result, not a
+// trap (see tests/compat/fixtures/integers-64bit's "sum-list-basic" case).
+// A *wrong-kind* result (e.g. a plain `Number` where a `u64`/`s64` BigInt is
+// required, or vice versa, or any non-numeric JS value) is a different,
+// genuine implementation bug and still traps -- that direction has no
+// coercion to fall back on (mirroring `ToBigInt`'s own `TypeError` on a
+// `Number` argument).
 fn decodeNativeInt(comptime T: type, value: *const NativeValue) T {
     if (T == i64) {
         return switch (value.tag) {
-            // `bigint_fits_i64` (computed via `JS::BigIntIsInt64` on the C++
-            // side) is the authoritative fit check -- unlike `i64_val`
-            // itself, it can't be fooled by two's-complement wraparound for
-            // values outside the s64 domain.
-            .i64_, .u64_ => if (value.bigint_fits_i64 != 0)
-                value.i64_val
-            else
-                std.debug.panic(
-                    "native dispatch: BigInt result does not fit in s64 (out of range)",
-                    .{},
-                ),
+            // `i64_val` is always the exact `ToBigInt64`-style modulo-2**64
+            // reinterpretation (see js_dispatch.cpp/.h), valid for every
+            // BigInt regardless of whether it fits the s64 domain -- no
+            // further range check is needed or correct here.
+            .i64_, .u64_ => value.i64_val,
             else => std.debug.panic(
                 "native dispatch: expected a BigInt result for an s64, got a JavaScript value of kind {t}",
                 .{value.tag},
@@ -236,21 +474,10 @@ fn decodeNativeInt(comptime T: type, value: *const NativeValue) T {
     }
     if (T == u64) {
         return switch (value.tag) {
-            .i64_, .u64_ => blk: {
-                if (value.bigint_is_negative != 0) {
-                    std.debug.panic(
-                        "native dispatch: expected a non-negative BigInt result for a u64, got a negative BigInt",
-                        .{},
-                    );
-                }
-                if (value.bigint_fits_u64 == 0) {
-                    std.debug.panic(
-                        "native dispatch: BigInt result does not fit in u64 (out of range)",
-                        .{},
-                    );
-                }
-                break :blk value.u64_val;
-            },
+            // Likewise `u64_val` is always the exact `ToBigUint64`-style
+            // modulo-2**64 reinterpretation, valid (and already
+            // non-negative) for every BigInt.
+            .i64_, .u64_ => value.u64_val,
             else => std.debug.panic(
                 "native dispatch: expected a BigInt result for a u64, got a JavaScript value of kind {t}",
                 .{value.tag},
@@ -259,9 +486,11 @@ fn decodeNativeInt(comptime T: type, value: *const NativeValue) T {
     }
     // Every other integer width (i8/u8/i16/u16/i32/u32/...) is represented
     // as a plain JS `Number` (tag `.f64_`) -- only 64-bit integers require
-    // BigInt. Validate finiteness, integrality, and range against `T` before
-    // truncating; each of these is a genuine wrong-JS-return-value case that
-    // must trap, not decode to a truncated/wrapped 0-ish value.
+    // BigInt. A wrong *kind* (BigInt, string, bool, object, ...) still traps;
+    // a `Number` of the right kind is wrapped, not rejected, matching
+    // ECMAScript `ToInt32`/`ToUint32`/`ToInt8`/... semantics: NaN/+-Infinity
+    // become 0, the value truncates toward zero, and the result reduces
+    // modulo 2**bitSizeOf(T) (two's complement for a signed `T`).
     if (value.tag != .f64_) {
         std.debug.panic(
             "native dispatch: expected a number result for " ++ @typeName(T) ++
@@ -269,29 +498,34 @@ fn decodeNativeInt(comptime T: type, value: *const NativeValue) T {
             .{value.tag},
         );
     }
-    const d = value.f64_val;
-    if (!std.math.isFinite(d)) {
-        std.debug.panic(
-            "native dispatch: expected a finite number result for " ++ @typeName(T) ++ ", got {d}",
-            .{d},
-        );
+    return wrapFloatToInt(T, value.f64_val);
+}
+
+// Implements the ECMAScript `ToInt32`/`ToUint32`-family abstract operation,
+// generalized to any integer width `T` up to 32 bits (the only widths that
+// reach here -- 64-bit ints are BigInt and handled separately above).
+fn wrapFloatToInt(comptime T: type, d: f64) T {
+    const bits = @bitSizeOf(T);
+    comptime std.debug.assert(bits < 64); // 64-bit widths are BigInt, handled above.
+    if (!std.math.isFinite(d)) return 0; // NaN/+-Infinity -> +0, per spec.
+    const modulus_pow: u64 = @as(u64, 1) << bits;
+    const modulus_f: f64 = @floatFromInt(modulus_pow);
+    // `@mod` on floats is floored (result takes the divisor's sign), giving
+    // the spec's non-negative "modulo" directly once the fractional part is
+    // truncated toward zero first (matching, e.g., a `u8` export returning
+    // `3.5` lowering to `3`, not `3.5 mod 256`).
+    const wrapped_f = @mod(@trunc(d), modulus_f); // in [0, modulus_f)
+    // Safe: `wrapped_f` is in [0, 2**bits) with bits <= 32, well within u64.
+    const wrapped_u64: u64 = @intFromFloat(wrapped_f);
+    if (@typeInfo(T).int.signedness == .unsigned) {
+        return @intCast(wrapped_u64);
     }
-    if (@trunc(d) != d) {
-        std.debug.panic(
-            "native dispatch: expected an integer-valued number result for " ++ @typeName(T) ++
-                ", got {d}",
-            .{d},
-        );
-    }
-    const min_f: f64 = @floatFromInt(std.math.minInt(T));
-    const max_f: f64 = @floatFromInt(std.math.maxInt(T));
-    if (d < min_f or d > max_f) {
-        std.debug.panic(
-            "native dispatch: number result {d} is out of range for " ++ @typeName(T),
-            .{d},
-        );
-    }
-    return @intFromFloat(d);
+    const half: u64 = modulus_pow / 2;
+    const signed: i64 = if (wrapped_u64 >= half)
+        @as(i64, @intCast(wrapped_u64)) - @as(i64, @intCast(modulus_pow))
+    else
+        @intCast(wrapped_u64);
+    return @intCast(signed);
 }
 
 // Decodes a generic `NativeValue` tree (reflecting the JS return value's
@@ -305,6 +539,59 @@ fn decodeNativeInt(comptime T: type, value: *const NativeValue) T {
 // this returns -- see the ownership contract in js_dispatch.h and the
 // `defer`-ordering note in `callNative` below.
 fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.Allocator) T {
+    // See the matching note in `encodeNative`: `wit_types.Char`/
+    // `wit_types.ByteList` must be special-cased by type identity before the
+    // generic `.@"struct"` arm, or they'd expect a `{"codepoint": ...}` /
+    // `{"bytes": ...}` record instead of the actual JS shapes ComponentizeJS
+    // produces (a one-codepoint string, a `Uint8Array`).
+    if (T == wit_types.Char) {
+        if (value.tag != .string_) {
+            std.debug.panic(
+                "native dispatch: expected a one-character string result for char, got a JavaScript value of kind {t}",
+                .{value.tag},
+            );
+        }
+        const ptr = value.str_ptr orelse
+            @panic("native dispatch: char result is missing its byte pointer");
+        const bytes = ptr[0..value.str_len];
+        const len = std.unicode.utf8ByteSequenceLength(if (bytes.len > 0) bytes[0] else 0) catch
+            std.debug.panic(
+                "native dispatch: char result is not exactly one Unicode scalar value, got {d} bytes",
+                .{bytes.len},
+            );
+        if (len != bytes.len) {
+            std.debug.panic(
+                "native dispatch: char result is not exactly one Unicode scalar value, got {d} bytes",
+                .{bytes.len},
+            );
+        }
+        const codepoint = std.unicode.utf8Decode(bytes) catch
+            @panic("native dispatch: char result is not valid UTF-8");
+        return .{ .codepoint = codepoint };
+    }
+    if (T == wit_types.ByteList) {
+        if (value.tag == .bytes) {
+            const ptr = value.str_ptr orelse
+                @panic("native dispatch: list<u8> result is missing its byte pointer");
+            return .{ .bytes = allocator.dupe(u8, ptr[0..value.str_len]) catch @panic("OOM") };
+        }
+        // ComponentizeJS's own `list<u8>` lowering leniently accepts a
+        // plain JS Array of small integers, not just a `Uint8Array`
+        // (confirmed empirically), so this bridge does too.
+        if (value.tag == .list_) {
+            const items = value.list_ptr orelse
+                @panic("native dispatch: list<u8> result is missing its item pointer");
+            const bytes = allocator.alloc(u8, value.list_len) catch @panic("OOM");
+            for (items[0..value.list_len], bytes) |*item, *out| {
+                out.* = decodeNativeInt(u8, item);
+            }
+            return .{ .bytes = bytes };
+        }
+        std.debug.panic(
+            "native dispatch: expected a Uint8Array or Array result for list<u8>, got a JavaScript value of kind {t}",
+            .{value.tag},
+        );
+    }
     return switch (@typeInfo(T)) {
         .bool => blk: {
             if (value.tag != .bool_) {
@@ -371,7 +658,134 @@ fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.
             }
             break :blk decodeNative(o.child, value, allocator);
         },
+        // A WIT `enum`: the JS side is a plain string of the case's
+        // original kebab-case spelling (see the naming-convention note
+        // above `CamelCase`/`KebabCase`). An unrecognized string is an
+        // invalid discriminant and must trap, not silently decode to
+        // whatever `@enumFromInt(0)` happens to be.
+        .@"enum" => blk: {
+            if (value.tag != .string_) {
+                std.debug.panic(
+                    "native dispatch: expected a string result for an enum, got a JavaScript value of kind {t}",
+                    .{value.tag},
+                );
+            }
+            const ptr = value.str_ptr orelse
+                @panic("native dispatch: enum result is missing its byte pointer");
+            const kebab = ptr[0..value.str_len];
+            var snake_buf: [128]u8 = undefined;
+            const snake = kebabToSnakeBuf(&snake_buf, kebab) orelse
+                std.debug.panic("native dispatch: invalid enum case '{s}'", .{kebab});
+            break :blk std.meta.stringToEnum(T, snake) orelse
+                std.debug.panic("native dispatch: invalid enum case '{s}'", .{kebab});
+        },
+        // A WIT `variant`/`result`: the JS side is a `{tag, val}` object
+        // (see the naming-convention note above `CamelCase`/`KebabCase`;
+        // this is the *nested*-position shape -- an export's own top-level
+        // `result<T, E>` return value instead uses the throw-means-err
+        // convention special-cased in `callNative`, never reaching this
+        // arm for that position). An unmatched `tag` string is an invalid
+        // discriminant and must trap.
+        .@"union" => |u| blk: {
+            if (value.tag != .record) {
+                std.debug.panic(
+                    "native dispatch: expected a {{tag, val}} object result for a variant/result, got a JavaScript value of kind {t}",
+                    .{value.tag},
+                );
+            }
+            const tag_value = findNativeField(value, "tag") orelse
+                @panic("native dispatch: variant/result result is missing its 'tag' field");
+            if (tag_value.tag != .string_) {
+                std.debug.panic(
+                    "native dispatch: variant/result 'tag' must be a string, got a JavaScript value of kind {t}",
+                    .{tag_value.tag},
+                );
+            }
+            const tag_ptr = tag_value.str_ptr orelse
+                @panic("native dispatch: variant/result 'tag' is missing its byte pointer");
+            const kebab = tag_ptr[0..tag_value.str_len];
+            var snake_buf: [128]u8 = undefined;
+            const snake = kebabToSnakeBuf(&snake_buf, kebab) orelse
+                std.debug.panic("native dispatch: invalid variant/result discriminant '{s}'", .{kebab});
+
+            var result: ?T = null;
+            inline for (u.field_names, u.field_types) |name, field_type| {
+                if (result == null and std.mem.eql(u8, snake, name)) {
+                    if (field_type == void) {
+                        result = @unionInit(T, name, {});
+                    } else {
+                        const val_value = findNativeField(value, "val") orelse
+                            @panic("native dispatch: variant/result result is missing its 'val' field");
+                        result = @unionInit(T, name, decodeNative(field_type, val_value, allocator));
+                    }
+                }
+            }
+            break :blk result orelse
+                std.debug.panic("native dispatch: invalid variant/result discriminant '{s}'", .{kebab});
+        },
         .@"struct" => |s| blk: {
+            // A WIT `flags`: JS-visible as a plain object with every label
+            // present as a camelCase boolean property (see `encodeNative`).
+            // A missing or non-boolean expected property is a genuine
+            // wrong-shape result and must trap.
+            if (s.layout == .@"packed") {
+                if (value.tag != .record) {
+                    std.debug.panic(
+                        "native dispatch: expected an object result for flags, got a JavaScript value of kind {t}",
+                        .{value.tag},
+                    );
+                }
+                // Field default values aren't guaranteed (the generated
+                // `_padding` field has one, but the `bool` label fields
+                // don't -- see component_bindgen.zig's `.flags` emission),
+                // so every field must be explicitly assigned, including the
+                // padding bits (always zeroed; it carries no JS-visible
+                // meaning).
+                var result: T = undefined;
+                inline for (s.field_names, s.field_types) |name, field_type| {
+                    if (field_type != bool) {
+                        @field(result, name) = 0;
+                    }
+                }
+                inline for (s.field_names, s.field_types) |name, field_type| {
+                    if (field_type == bool) {
+                        const camel = comptime CamelCase(name);
+                        const field_value = findNativeField(value, camel) orelse
+                            @panic("native dispatch: missing flags property '" ++ camel ++ "'");
+                        if (field_value.tag != .bool_) {
+                            std.debug.panic(
+                                "native dispatch: flags property '" ++ camel ++
+                                    "' must be a boolean, got a JavaScript value of kind {t}",
+                                .{field_value.tag},
+                            );
+                        }
+                        @field(result, name) = field_value.bool_val != 0;
+                    }
+                }
+                break :blk result;
+            }
+            // A WIT `tuple<...>`: JS-visible as a plain positional Array.
+            if (s.is_tuple) {
+                if (value.tag != .list_) {
+                    std.debug.panic(
+                        "native dispatch: expected an array result for a tuple, got a JavaScript value of kind {t}",
+                        .{value.tag},
+                    );
+                }
+                if (value.list_len != s.field_names.len) {
+                    std.debug.panic(
+                        "native dispatch: tuple result has {d} elements, expected {d}",
+                        .{ value.list_len, s.field_names.len },
+                    );
+                }
+                const items = value.list_ptr orelse
+                    @panic("native dispatch: tuple result is missing its item pointer");
+                var result: T = undefined;
+                inline for (s.field_names, s.field_types, 0..) |name, field_type, i| {
+                    @field(result, name) = decodeNative(field_type, &items[i], allocator);
+                }
+                break :blk result;
+            }
             if (value.tag != .record) {
                 std.debug.panic(
                     "native dispatch: expected a record result, got a JavaScript value of kind {t}",
@@ -380,8 +794,9 @@ fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.
             }
             var result: T = undefined;
             inline for (s.field_names, s.field_types) |name, field_type| {
-                const field_value = findNativeField(value, name) orelse
-                    @panic("native dispatch: missing record field '" ++ name ++ "'");
+                const camel = comptime CamelCase(name);
+                const field_value = findNativeField(value, camel) orelse
+                    @panic("native dispatch: missing record field '" ++ camel ++ "'");
                 @field(result, name) = decodeNative(field_type, field_value, allocator);
             }
             break :blk result;
@@ -401,6 +816,13 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
         argv[i] = encodeNative(field_type, @field(args, name), arg_allocator);
     }
 
+    // See js_dispatch.h: an export whose own return type is directly
+    // `result<T, E>` gets ComponentizeJS's "return means Ok, throw means
+    // Err" calling convention instead of the ordinary `{tag, val}` object
+    // shape -- `isWitResultType` is the exact structural check for that
+    // position (never for a *nested* result, e.g. inside a record/list).
+    const is_wit_result = comptime isWitResultType(Result);
+
     var out_result: NativeValue = .{ .tag = .bool_ };
     var out_arena: ?*anyopaque = null;
     const status = starling_js_dispatch_native(
@@ -408,10 +830,14 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
         export_name.len,
         &argv,
         argv.len,
+        @intFromBool(is_wit_result),
         &out_result,
         &out_arena,
     );
-    if (status != 0) {
+    // Status 2 (thrown-value-as-err) is only ever returned when
+    // `is_wit_result` is true (see js_dispatch.h); any other non-zero status
+    // is a genuine dispatch failure.
+    if (status != 0 and !(is_wit_result and status == 2)) {
         starling_js_dispatch_native_free(out_arena);
         @panic("JavaScript export dispatch failed");
     }
@@ -430,7 +856,30 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
     // hazard entirely -- nothing in the returned `Result` value ever
     // references `out_arena`'s storage.
     _ = result_arena.reset(.retain_capacity);
-    const decoded = decodeNative(Result, &out_result, result_arena.allocator());
+    const decoded: Result = blk: {
+        if (is_wit_result) {
+            // `out_result` holds the bare Ok/Err payload (no `{tag, val}`
+            // wrapper) in this position -- decode it directly as
+            // `OkType`/`ErrType` and build the union case ourselves, rather
+            // than routing through the generic `.@"union"` arm of
+            // `decodeNative` (which expects the nested-position `{tag,
+            // val}` shape and would misinterpret this one).
+            const union_info = @typeInfo(Result).@"union";
+            const OkType = union_info.field_types[0];
+            const ErrType = union_info.field_types[1];
+            if (status == 2) {
+                break :blk if (ErrType == void)
+                    Result{ .err = {} }
+                else
+                    Result{ .err = decodeNative(ErrType, &out_result, result_arena.allocator()) };
+            }
+            break :blk if (OkType == void)
+                Result{ .ok = {} }
+            else
+                Result{ .ok = decodeNative(OkType, &out_result, result_arena.allocator()) };
+        }
+        break :blk decodeNative(Result, &out_result, result_arena.allocator());
+    };
     starling_js_dispatch_native_free(out_arena);
     return decoded;
 }
@@ -572,15 +1021,16 @@ test "u64 values with the high bit set (>= 2^63) are not misdetected as negative
     }
 }
 
-test "decodeNativeInt rejects a genuinely negative BigInt for a u64 target" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    _ = arena.allocator();
-
+test "decodeNativeInt wraps a negative BigInt for a u64 target, matching ToBigUint64" {
     // Simulate the wire shape `decode_from_js` produces for a real negative
-    // JS BigInt (e.g. `-5n`): `bigint_is_negative` set, matching what
-    // `JS::BigIntIsNegative` reports, independent of the wrapped bit
-    // pattern in `i64_val`/`u64_val`.
+    // JS BigInt (e.g. `-5n`): `i64_val`/`u64_val` are always the exact
+    // `ToBigInt64`/`ToBigUint64`-style modulo-2**64 reinterpretation (see
+    // js_dispatch.cpp), so a negative BigInt decodes to a u64 target as the
+    // wrapped two's-complement value, not a trap -- re-verified against the
+    // pinned ComponentizeJS 0.21.0 reference itself (a JS export returning
+    // `-5n` for a `u64` result lowers to `18446744073709551611`, i.e.
+    // `2**64 - 5`, it does not throw). `bigint_is_negative`/
+    // `bigint_fits_u64` remain available as diagnostic metadata only.
     const negative: NativeValue = .{
         .tag = .u64_,
         .i64_val = -5,
@@ -589,10 +1039,26 @@ test "decodeNativeInt rejects a genuinely negative BigInt for a u64 target" {
         .bigint_fits_i64 = 1,
         .bigint_fits_u64 = 0,
     };
-    try std.testing.expectEqual(@as(u8, 1), negative.bigint_is_negative);
-    // (The actual trap is exercised end-to-end via the wasmtime E2E suite,
-    // which observes a real JS `-5n` result rejected for a `u64` target;
-    // `std.debug.panic` can't be caught from a plain Zig unit test.)
+    try std.testing.expectEqual(
+        @as(u64, std.math.maxInt(u64) - 4),
+        decodeNativeInt(u64, &negative),
+    );
+}
+
+test "decodeNativeInt wraps an out-of-domain BigInt for an s64 target, matching ToBigInt64" {
+    // `2**64` (one past u64::MAX) as a BigInt result for an s64 target:
+    // modulo 2**64 is exactly 0, matching the pinned reference (a JS export
+    // returning `18446744073709551616n` for an `s64` result lowers to `0`,
+    // not a trap).
+    const huge: NativeValue = .{
+        .tag = .u64_,
+        .i64_val = 0,
+        .u64_val = 0,
+        .bigint_is_negative = 0,
+        .bigint_fits_i64 = 0,
+        .bigint_fits_u64 = 0,
+    };
+    try std.testing.expectEqual(@as(i64, 0), decodeNativeInt(i64, &huge));
 }
 
 test "round-trips a nested aggregate carrying a u64 without JSON" {
@@ -709,7 +1175,7 @@ test "decodeNative deep-copies strings so the source arena can be freed first" {
     try std.testing.expectEqualStrings("use-after-free canary", decoded);
 }
 
-test "decodeNativeInt validates numeric range and integrality for sub-64-bit widths" {
+test "decodeNativeInt decodes valid sub-64-bit widths exactly at their boundaries" {
     // Every width narrower than 64 bits is represented as a plain JS Number
     // (tag `.f64_`); valid boundary values must decode exactly.
     const max_u32: NativeValue = .{ .tag = .f64_, .f64_val = @floatFromInt(std.math.maxInt(u32)) };
@@ -717,11 +1183,172 @@ test "decodeNativeInt validates numeric range and integrality for sub-64-bit wid
 
     const min_i32: NativeValue = .{ .tag = .f64_, .f64_val = @floatFromInt(std.math.minInt(i32)) };
     try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), decodeNativeInt(i32, &min_i32));
+}
 
-    // A BigInt is also accepted for narrower widths as long as it fits --
-    // not required by any current WIT type in this bridge, but decodeNative
-    // routes both `.i64_`/`.u64_` through `decodeNativeInt`, and this pins
-    // that non-64-bit callers still only ever see `.f64_` in practice (the
-    // encode side never produces a BigInt for anything but `i64`/`u64`).
-    try std.testing.expectEqual(NativeTag.f64_, max_u32.tag);
+test "decodeNativeInt wraps out-of-range/negative/fractional/non-finite sub-64-bit Numbers, matching ToInt32/ToUint32" {
+    // Re-verified directly against the pinned ComponentizeJS 0.21.0
+    // reference (tests/compat/reference), not assumed from the ECMAScript
+    // spec alone: a JS export returning any of these values for the given
+    // WIT integer type lowers to exactly these wrapped results, never a
+    // trap.
+    const cases = .{
+        // (type, input, expected)
+        .{ u8, 300.0, @as(u8, 44) }, // 300 mod 256
+        .{ u8, -5.0, @as(u8, 251) }, // 256 - 5
+        .{ u8, 3.5, @as(u8, 3) }, // truncates toward zero before wrapping
+        .{ i8, 200.0, @as(i8, -56) }, // 200 - 256
+        .{ u32, -1.0, @as(u32, std.math.maxInt(u32)) },
+        .{ u32, 4294967296.0, @as(u32, 0) }, // 2**32 mod 2**32
+        .{ i32, std.math.inf(f64), @as(i32, 0) }, // +Infinity -> +0
+        .{ i32, -std.math.inf(f64), @as(i32, 0) }, // -Infinity -> +0
+        .{ i32, std.math.nan(f64), @as(i32, 0) }, // NaN -> +0
+    };
+    inline for (cases) |c| {
+        const T = c[0];
+        const value: NativeValue = .{ .tag = .f64_, .f64_val = c[1] };
+        try std.testing.expectEqual(c[2], decodeNativeInt(T, &value));
+    }
+}
+
+test "wit_types.Char round-trips as a single-codepoint JS string" {
+    try std.testing.expect(typeNeedsNative(wit_types.Char));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A multi-byte scalar value (U+00E9, 'e' with acute accent) exercises
+    // the UTF-8 encode/decode path, not just plain ASCII.
+    const value: wit_types.Char = .{ .codepoint = 0xE9 };
+    const encoded = encodeNative(wit_types.Char, value, arena.allocator());
+    try std.testing.expectEqual(NativeTag.string_, encoded.tag);
+    const bytes = encoded.str_ptr.?[0..encoded.str_len];
+    try std.testing.expectEqualStrings("\u{E9}", bytes);
+
+    const decoded = decodeNative(wit_types.Char, &encoded, arena.allocator());
+    try std.testing.expectEqual(@as(u32, 0xE9), decoded.codepoint);
+}
+
+test "wit_types.ByteList round-trips as a Uint8Array and accepts a lenient JS Array" {
+    try std.testing.expect(typeNeedsNative(wit_types.ByteList));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const value: wit_types.ByteList = .{ .bytes = &.{ 0, 1, 2, 255 } };
+    const encoded = encodeNative(wit_types.ByteList, value, arena.allocator());
+    // Must be a genuine Uint8Array tag (`.bytes`), not the generic list tag
+    // used for every other `list<T>` -- ComponentizeJS distinguishes these.
+    try std.testing.expectEqual(NativeTag.bytes, encoded.tag);
+    const decoded = decodeNative(wit_types.ByteList, &encoded, arena.allocator());
+    try std.testing.expectEqualSlices(u8, value.bytes, decoded.bytes);
+
+    // ComponentizeJS's own `list<u8>` lowering leniently accepts a plain
+    // Array of small integers too (confirmed empirically); decodeNative must
+    // accept that shape as well, since a JS export is free to `return
+    // [0, 1, 2, 255]` instead of constructing a real `Uint8Array`.
+    var items = [_]NativeValue{
+        .{ .tag = .f64_, .f64_val = 0 },
+        .{ .tag = .f64_, .f64_val = 1 },
+        .{ .tag = .f64_, .f64_val = 2 },
+        .{ .tag = .f64_, .f64_val = 255 },
+    };
+    const list_shaped: NativeValue = .{ .tag = .list_, .list_ptr = &items, .list_len = items.len };
+    const decoded_list = decodeNative(wit_types.ByteList, &list_shaped, arena.allocator());
+    try std.testing.expectEqualSlices(u8, value.bytes, decoded_list.bytes);
+}
+
+test "a WIT enum round-trips as a plain kebab-case JS string" {
+    const Direction = enum { north_east, south_west };
+    try std.testing.expect(typeNeedsNative(Direction));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const encoded = encodeNative(Direction, .north_east, arena.allocator());
+    try std.testing.expectEqual(NativeTag.string_, encoded.tag);
+    // Case labels stay in their original kebab-case spelling as a string
+    // *value* (not camelCased -- confirmed against the pinned
+    // ComponentizeJS reference; string content isn't an identifier).
+    try std.testing.expectEqualStrings("north-east", encoded.str_ptr.?[0..encoded.str_len]);
+
+    const decoded = decodeNative(Direction, &encoded, arena.allocator());
+    try std.testing.expectEqual(Direction.north_east, decoded);
+}
+
+test "a WIT flags type round-trips as a plain object with every label present" {
+    const Perms = packed struct(u8) { can_read: bool, can_write: bool, _padding: u6 = 0 };
+    try std.testing.expect(typeNeedsNative(Perms));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const value: Perms = .{ .can_read = true, .can_write = false };
+    const encoded = encodeNative(Perms, value, arena.allocator());
+    try std.testing.expectEqual(NativeTag.record, encoded.tag);
+    // Only the two `bool` labels are present -- the `_padding` field must
+    // never leak into the JS-visible shape.
+    try std.testing.expectEqual(@as(usize, 2), encoded.fields_len);
+    const can_read = findNativeField(&encoded, "canRead") orelse return error.MissingField;
+    try std.testing.expectEqual(@as(u8, 1), can_read.bool_val);
+    const can_write = findNativeField(&encoded, "canWrite") orelse return error.MissingField;
+    try std.testing.expectEqual(@as(u8, 0), can_write.bool_val);
+
+    const decoded = decodeNative(Perms, &encoded, arena.allocator());
+    try std.testing.expectEqual(value.can_read, decoded.can_read);
+    try std.testing.expectEqual(value.can_write, decoded.can_write);
+}
+
+test "a WIT tuple round-trips as a plain positional JS array" {
+    const T = wit_types.Tuple(.{ u32, []const u8 });
+    try std.testing.expect(typeNeedsNative(T));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const value: T = .{ 42, "hi" };
+    const encoded = encodeNative(T, value, arena.allocator());
+    try std.testing.expectEqual(NativeTag.list_, encoded.tag);
+    try std.testing.expectEqual(@as(usize, 2), encoded.list_len);
+
+    const decoded = decodeNative(T, &encoded, arena.allocator());
+    try std.testing.expectEqual(value[0], decoded[0]);
+    try std.testing.expectEqualStrings(value[1], decoded[1]);
+}
+
+test "a WIT variant round-trips as a {tag, val} object, val omitted for a void case" {
+    const Shape = union(enum) { circle: u32, point: void };
+    try std.testing.expect(typeNeedsNative(Shape));
+    try std.testing.expect(!isWitResultType(Shape));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const with_payload: Shape = .{ .circle = 5 };
+    const encoded_payload = encodeNative(Shape, with_payload, arena.allocator());
+    try std.testing.expectEqual(NativeTag.record, encoded_payload.tag);
+    try std.testing.expectEqual(@as(usize, 2), encoded_payload.fields_len);
+    const tag_field = findNativeField(&encoded_payload, "tag") orelse return error.MissingField;
+    try std.testing.expectEqualStrings("circle", tag_field.str_ptr.?[0..tag_field.str_len]);
+    const val_field = findNativeField(&encoded_payload, "val") orelse return error.MissingField;
+    try std.testing.expectEqual(@as(f64, 5), val_field.f64_val);
+
+    const decoded_payload = decodeNative(Shape, &encoded_payload, arena.allocator());
+    try std.testing.expectEqual(@as(u32, 5), decoded_payload.circle);
+
+    const void_case: Shape = .point;
+    const encoded_void = encodeNative(Shape, void_case, arena.allocator());
+    // A void-payload case omits `val` entirely (not present-with-null),
+    // matching the shape ComponentizeJS actually produces.
+    try std.testing.expectEqual(@as(usize, 1), encoded_void.fields_len);
+    try std.testing.expect(findNativeField(&encoded_void, "val") == null);
+
+    const decoded_void = decodeNative(Shape, &encoded_void, arena.allocator());
+    try std.testing.expectEqual(Shape.point, decoded_void);
+}
+
+test "isWitResultType only matches the exact ok/err two-case union shape" {
+    try std.testing.expect(isWitResultType(wit_types.Result(u32, []const u8)));
+    try std.testing.expect(isWitResultType(wit_types.Result(void, void)));
+    try std.testing.expect(!isWitResultType(union(enum) { circle: u32, point: void }));
+    try std.testing.expect(!isWitResultType(struct { ok: u32, err: []const u8 }));
 }

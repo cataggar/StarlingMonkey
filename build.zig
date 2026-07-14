@@ -328,6 +328,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        // js_dispatch.zig needs the *same* `wit_types` module instance the
+        // generated bindings use (below) so `wit_types.Char`/`ByteList`/
+        // `Result(...)`/`Tuple(...)` type identity checks (`T == wit_types.Char`)
+        // in js_dispatch.zig actually match the generated shell's types --
+        // two separately-created modules pointing at the same source file
+        // would otherwise compile as distinct, structurally-identical-but-
+        // nominally-different types.
+        js_dispatch.addImport("wit_types", wit_types);
         link_mod.addImport("wit_types", wit_types);
         link_mod.addImport("js_dispatch", js_dispatch);
     }
@@ -453,13 +461,24 @@ pub fn build(b: *std.Build) void {
     // `zig build test`: run the e2e + integration suites (tests/run-suite.sh)
     // against the installed runtime in zig-out/bin.
     const test_step = b.step("test", "Run the e2e and integration test suites");
-    const js_dispatch_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/js_dispatch.zig"),
-            .target = b.graph.host,
-            .link_libc = true,
-        }),
+    // js_dispatch.zig's own unit tests need `wit_types` (for
+    // `wit_types.Char`/`ByteList`/`Result`/`Tuple`) regardless of whether
+    // this outer `zig build test` invocation itself set -Ddispatch-wit (it
+    // normally doesn't -- see tests/e2e/native-dispatch/run.sh's own nested
+    // build for that), so fetch the dependency directly here rather than
+    // relying on the maybe-null `wasip3_dep` above.
+    const wasip3_test_dep = b.dependency("wasip3", .{});
+    const wit_types_test_mod = b.createModule(.{
+        .root_source_file = wasip3_test_dep.path("src/wit_types.zig"),
+        .target = b.graph.host,
     });
+    const js_dispatch_test_mod = b.createModule(.{
+        .root_source_file = b.path("runtime/js_dispatch.zig"),
+        .target = b.graph.host,
+        .link_libc = true,
+    });
+    js_dispatch_test_mod.addImport("wit_types", wit_types_test_mod);
+    const js_dispatch_tests = b.addTest(.{ .root_module = js_dispatch_test_mod });
     test_step.dependOn(&b.addRunArtifact(js_dispatch_tests).step);
     const heap_limit_tests = b.addSystemCommand(&.{ "bash", "tests/js-heap-limit/run.sh" });
     heap_limit_tests.addArg(b.graph.zig_exe);
@@ -659,6 +678,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         shell_mod.addImport("wit_types", wit_types);
+        js_dispatch.addImport("wit_types", wit_types);
         shell_mod.addImport("js_dispatch", js_dispatch);
         const shell_lib = b.addLibrary(.{ .name = "starling-shell", .root_module = shell_mod, .linkage = .dynamic });
         const shell_step = b.step("shell-dylib-experiment", "world-shell-integration: link a thin WIT shell as a PIC dylib");

@@ -85,9 +85,33 @@ _EXPORT_FUNCTION_RE_TEMPLATE = r"export\s+(?:async\s+)?function\s+{name}\s*\("
 _EXPORT_NONFUNCTION_RE_TEMPLATE = r"export\s+(?:const|let|var)\s+{name}\b"
 
 
+def camel_case(kebab_name: str) -> str:
+    """Convert a kebab-case WIT identifier to camelCase, matching both the
+    pinned ComponentizeJS reference's and this bridge's own JS export/
+    property-name convention (see js_dispatch.cpp's camelCase export-name
+    fallback and js_dispatch.zig's CamelCase()). A hyphenated identifier
+    like "bytes-len" is not even syntactically valid as a JS identifier, so
+    multi-word fixtures' component.js files always use the camelCase
+    spelling ("bytesLen") -- single-word names are their own camelCase
+    form, so this is a no-op for every Phase 0 fixture's names."""
+    head, *rest = kebab_name.split("-")
+    return head + "".join(word[:1].upper() + word[1:] for word in rest if word)
+
+
 def js_defines_function_export(js_source: str, name: str) -> bool:
-    return re.search(_EXPORT_FUNCTION_RE_TEMPLATE.format(name=re.escape(name)), js_source) is not None
+    """`name` is the WIT (kebab-case) export name; both pipelines resolve
+    it as a same-named export tried first, then a camelCase fallback (see
+    known_deviations "kebab-case-and-naming" / js_dispatch.cpp), so a
+    multi-word fixture's component.js is only required to define the
+    camelCase spelling."""
+    for candidate in {name, camel_case(name)}:
+        if re.search(_EXPORT_FUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source):
+            return True
+    return False
 
 
 def js_defines_nonfunction_export(js_source: str, name: str) -> bool:
-    return re.search(_EXPORT_NONFUNCTION_RE_TEMPLATE.format(name=re.escape(name)), js_source) is not None
+    for candidate in {name, camel_case(name)}:
+        if re.search(_EXPORT_NONFUNCTION_RE_TEMPLATE.format(name=re.escape(candidate)), js_source):
+            return True
+    return False

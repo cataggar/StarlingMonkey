@@ -82,6 +82,13 @@ enum StarlingJsTag : uint32_t {
   STARLING_JS_OPTION_SOME = 6,
   STARLING_JS_RECORD = 7,
   STARLING_JS_LIST = 8,
+  // A WIT `list<u8>` (the `wit_types.ByteList` wrapper -- see the "string vs
+  // list<u8>" note below): encodes to/from a genuine JS `Uint8Array`, never
+  // a plain Array, matching ComponentizeJS 0.21.0's observed behavior.
+  // `str_ptr`/`str_len` carry the raw bytes, reusing the same fields
+  // `STARLING_JS_STRING` uses (this tag only changes how encode_to_js builds
+  // the JS value and how decode_from_js recognizes one on the way back).
+  STARLING_JS_BYTES = 9,
 };
 
 struct StarlingJsValue;
@@ -105,15 +112,23 @@ struct StarlingJsValue {
   size_t fields_len;                   // tag == RECORD
   const StarlingJsValue *list_ptr;     // tag == LIST, `list_len` contiguous items
   size_t list_len;                     // tag == LIST
-  // tag == U64 (BigInt) only. `ToBigInt64`/`ToBigUint64` merely reinterpret
-  // the BigInt's low 64 bits, so a legitimate unsigned value >= 2**63 has an
-  // `i64_val` that *looks* negative in two's complement even though the
-  // BigInt itself is non-negative -- `i64_val < 0` is therefore NOT a valid
-  // sign test. These three flags instead reflect the BigInt's true
-  // mathematical sign/magnitude (via `JS::BigIntIsNegative`/`BigIntIsInt64`/
-  // `BigIntIsUint64`), so the Zig side can validate the full exact s64/u64
-  // domains (and reject out-of-both-ranges BigInts) without guessing from
-  // the wrapped bit pattern.
+  // tag == U64 (BigInt) only. `i64_val`/`u64_val` are always populated via
+  // `JS::ToBigInt64`/`JS::ToBigUint64` (the same modulo-2**64
+  // reinterpretation the real ComponentizeJS/Wasmtime canonical-ABI JS
+  // embedding performs when lowering a JS export's own BigInt return value),
+  // so they are valid and authoritative for *every* BigInt, in range or not
+  // -- an out-of-domain (too large, or negative-for-u64) BigInt result wraps
+  // like real ComponentizeJS does, it is never rejected on that basis alone
+  // (empirically re-verified against the pinned 0.21.0 reference itself; see
+  // tests/compat/fixtures/integers-64bit's "sum-list-basic" case, which
+  // deliberately sums past u64::MAX and expects the identical wrapped
+  // result on both pipelines). These three flags are therefore only
+  // diagnostic metadata now (not consulted by the current Zig-side decode
+  // to reject anything): `bigint_is_negative` reflects the BigInt's true
+  // mathematical sign (via `JS::BigIntIsNegative`, immune to two's
+  // complement wraparound, unlike `i64_val < 0`), and `bigint_fits_i64`/
+  // `bigint_fits_u64` (via `JS::BigIntFits`) report whether the BigInt's
+  // true mathematical value happened to fit without truncation.
   uint8_t bigint_is_negative;
   uint8_t bigint_fits_i64;
   uint8_t bigint_fits_u64;
@@ -156,45 +171,79 @@ struct StarlingJsValue {
 //   that arena -- freeing it first and only afterwards reading through
 //   dangling `str_ptr`/`list_ptr`/`fields_ptr` pointers is a use-after-free.
 //
-// Known limitation: WIT `string` and `list<u8>` both lower, in the current
-// wit-to-Zig bindgen (`zigType` in component_bindgen.zig), to the identical
-// Zig type `[]const u8`. Neither `encode_to_js`/`decode_from_js` here nor
-// `encodeNative`/`decodeNative` in js_dispatch.zig have any way to recover
-// which WIT type a given `[]const u8` value actually came from, so both
-// sides treat `[]const u8` as a UTF-8 `string` (matching the far more common
-// case, and consistent with the JSON bridge's existing `[]const u8` <->
-// JSON-string handling). A WIT `list<u8>` result/argument that reaches the
-// native bridge (i.e. co-occurs with an `i64`/`u64` elsewhere in the same
-// call) is therefore misrepresented as a string rather than an array of
-// byte values. Resolving this precisely requires the bindgen generator to
-// emit a distinguishing wrapper type for `list<u8>`; that is out of scope
-// here (it would ripple into every other WIT world the generator serves,
-// e.g. wasi:http bodies) and is called out as a follow-up rather than
-// silently "fixed" by guesswork.
+// Formerly-known limitation, now resolved: WIT `string` and `list<u8>` both
+// lower, under the *default* wit-to-Zig bindgen (`zigType` in
+// component_bindgen.zig), to the identical Zig type `[]const u8`, and
+// likewise `char` and `u32` both lower to a bare `u32`. The pinned
+// `--dispatch`-mode bindgen (js-dispatch shell generation only -- every other
+// WIT world the generator serves, e.g. wasi:http, is unaffected) now emits
+// nominal wrapper types `wit_types.ByteList`/`wit_types.Char` instead, whose
+// Zig type identity `encodeNative`/`decodeNative` (js_dispatch.zig) checks
+// for directly. `STARLING_JS_BYTES` (above) and single-codepoint
+// `STARLING_JS_STRING` values are how those two wrappers cross this
+// boundary; see js_dispatch.zig for the comptime dispatch on `T`.
 //
 // Calls the named export with `args`, encoding each to a JS value (records ->
-// plain objects by field name, i64/u64 -> exact BigInt, lists -> JS Arrays).
-// If the call returns a Promise (or a thenable), this pumps the engine's
-// event loop -- microtask/job queue plus any queued timer/host-task
-// callbacks -- until it settles, then uses the fulfilled value as if it had
-// been returned directly (see `resolve_promise_like` in js_dispatch.cpp).
-// On success writes the JS return value into `*out_result` (valid until
-// freed) and an opaque arena handle into `*out_arena`; the caller must
-// eventually pass that handle to `starling_js_dispatch_native_free`, even for
-// `void` results (pass a scratch `out_result` in that case; the arena may
-// still hold string/record bookkeeping). Returns 0 on success, non-zero if
-// the export was missing, wasn't callable, raised a JS exception, its
-// returned Promise rejected, or its returned Promise never settled (no
-// further microtask/task progress was possible while still pending -- a
-// deterministic diagnostic, not a hang). The pending exception (if any) is
-// left for the caller to surface as a trap; Promise rejection/deadlock/
-// reentrancy diagnostics are instead dumped directly to stderr (see
-// `resolve_promise_like`), since they aren't always backed by a live JS
-// exception value.
+// plain objects by field name, i64/u64 -> exact BigInt, lists -> JS Arrays,
+// `wit_types.ByteList` -> a genuine `Uint8Array`, `wit_types.Char` -> a
+// single-codepoint string, variant/result -> `{tag, val}` objects, flags ->
+// a plain object with every flag name present as a boolean). If the call
+// returns a Promise (or a thenable), this pumps the engine's event loop --
+// microtask/job queue plus any queued timer/host-task callbacks -- until it
+// settles, then uses the fulfilled value as if it had been returned
+// directly (see `resolve_promise_like` in js_dispatch.cpp). On success
+// writes the JS return value into `*out_result` (valid until freed) and an
+// opaque arena handle into `*out_arena`; the caller must eventually pass that
+// handle to `starling_js_dispatch_native_free`, even for `void` results (pass
+// a scratch `out_result` in that case; the arena may still hold
+// string/record bookkeeping).
+//
+// `result_is_wit_result` must be true iff the export's own return type is
+// directly a WIT `result<T, E>` (i.e. `Result` in js_dispatch.zig's
+// `callNative` is exactly `wit_types.Result(T, E)`, not merely containing one
+// nested inside a record/list/option). ComponentizeJS's JS-visible calling
+// convention special-cases exactly this position: the JS implementation
+// returns the `ok` payload directly (no `{tag, val}` wrapper) and signals
+// `err` by *throwing* the err payload (or throwing anything at all, if `E`
+// is `void`) rather than returning a tagged object. When
+// `result_is_wit_result` is true and the call throws a plain JS exception
+// (not a missing/uncallable export, not a returned Promise), this function
+// decodes the *thrown value* into `*out_result` and returns 2 instead of
+// treating the exception as a hard dispatch failure; `callNative` then
+// builds the `.err` case from it. Any other synchronous exception (or any
+// exception at all when `result_is_wit_result` is false) is treated as
+// before: it is left pending for the caller to dump/surface as a trap.
+//
+// A *Promise* returned by a `result_is_wit_result` export is deliberately
+// **not** given the same err-via-throw treatment: only a plain synchronous
+// exception at the `JS::Call` boundary above takes the status-2 path.
+// `resolve_promise_like` still pumps the event loop for it exactly as for
+// any other export, and a rejection (or a deadlock/reentrancy diagnostic
+// from that pump) is surfaced the same way as for a non-result export --
+// dumped to stderr and reported as a hard dispatch failure (status 1), not
+// silently reinterpreted as `err` -- because this matches actual pinned
+// ComponentizeJS 0.21.0/Wasmtime 42 behavior for a `result<T, E>` export
+// whose implementation is `async`/returns a rejected Promise, verified
+// empirically rather than assumed (see
+// tests/compat/fixtures/promises-result and manifest.json's
+// "promise-result-rejection" known_deviation for the differential evidence
+// this was checked against). Only a real JS-visible Promise rejection is
+// covered by that verification; an event-loop deadlock/no-progress or
+// reentrancy diagnostic is never turned into `err` regardless of
+// `result_is_wit_result`, since those are StarlingMonkey-internal dispatch
+// failures with no ComponentizeJS equivalent to defer to.
+//
+// Returns 0 on success, 1 if the export was missing, wasn't callable,
+// returned a Promise that rejected/deadlocked/hit reentrancy, or raised a
+// JS exception that isn't the `result_is_wit_result` err-via-throw case
+// above, or 2 for that err-via-throw case (see above; only ever returned
+// when `result_is_wit_result` is true and the exception was synchronous,
+// never for a rejected Promise).
 extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 size_t export_name_len,
                                                 const StarlingJsValue *args_ptr,
                                                 size_t args_len,
+                                                uint8_t result_is_wit_result,
                                                 StarlingJsValue *out_result,
                                                 void **out_arena);
 

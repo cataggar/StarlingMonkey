@@ -1,0 +1,79 @@
+package compat:advanced-types;
+
+// Phase 1b+ compatibility fixture: every synchronous WIT value shape the
+// JSON-only Phase 0 harness didn't cover (see manifest.json's
+// "no-variants-enums-flags-results-resources" known_deviation, now closed
+// by this fixture for everything except resources/streams/futures) --
+// char, list<u8> (vs. string), tuple, enum, flags, variant, result<T, E>
+// (both nested and as an export's own top-level return type), and
+// multi-word-identifier naming/version edge cases (record fields/flags
+// labels camelCase on the JS side; enum/variant case labels keep their
+// original kebab-case spelling).
+world js-exports {
+  export echo-char: func(c: char) -> char;
+
+  export echo-bytes: func(data: list<u8>) -> list<u8>;
+  export bytes-len: func(data: list<u8>) -> u32;
+
+  export swap-pair: func(pair: tuple<u32, string>) -> tuple<string, u32>;
+
+  enum direction {
+    north,
+    south,
+    north-east,
+  }
+  export echo-direction: func(d: direction) -> direction;
+
+  flags perms {
+    can-read,
+    can-write,
+    can-execute,
+  }
+  export echo-perms: func(p: perms) -> perms;
+
+  variant shape {
+    circle(u32),
+    square(u32),
+    point,
+  }
+  export echo-shape: func(s: shape) -> shape;
+
+  // Nested (argument/field) position: JS-visible as a `{tag, val}` object.
+  record wrapped-result {
+    r: result<u32, string>,
+  }
+  export echo-wrapped-result: func(w: wrapped-result) -> wrapped-result;
+
+  // Top-level export return-type position: ComponentizeJS's "return means
+  // Ok, throw means Err" calling convention applies only here.
+  export divide: func(a: u32, b: u32) -> result<u32, string>;
+  // `err` case where E is void: failure is signaled by throwing anything.
+  export checked-negate: func(value: s32) -> result<s32>;
+
+  // Naming/version edge cases: multi-word record fields/flags labels become
+  // camelCase JS identifiers; multi-word enum/variant case labels keep
+  // their original kebab-case spelling as a string value.
+  record multi-word-record {
+    first-value: u32,
+    second-value: string,
+  }
+  export echo-multi-word-record: func(r: multi-word-record) -> multi-word-record;
+
+  flags multi-word-flags {
+    can-read-write,
+    can-execute-only,
+  }
+  export echo-multi-word-flags: func(f: multi-word-flags) -> multi-word-flags;
+
+  enum multi-word-enum {
+    north-east,
+    south-west,
+  }
+  export echo-multi-word-enum: func(e: multi-word-enum) -> multi-word-enum;
+
+  variant multi-word-variant {
+    left-turn(u32),
+    right-turn(u32),
+  }
+  export echo-multi-word-variant: func(v: multi-word-variant) -> multi-word-variant;
+}

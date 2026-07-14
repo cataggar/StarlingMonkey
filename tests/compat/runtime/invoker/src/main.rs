@@ -77,6 +77,16 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
         (Type::Float32, v) => Val::Float32(v.as_f64().context("expected f32")? as f32),
         (Type::Float64, v) => Val::Float64(v.as_f64().context("expected f64")?),
         (Type::String, J::String(s)) => Val::String(s.clone()),
+        (Type::Char, J::String(s)) => {
+            let mut chars = s.chars();
+            let c = chars
+                .next()
+                .with_context(|| format!("expected a single-character string for char, got '{}'", s))?;
+            if chars.next().is_some() {
+                anyhow::bail!("expected exactly one Unicode scalar value for char, got '{}'", s);
+            }
+            Val::Char(c)
+        }
         (Type::List(list_ty), J::Array(items)) => {
             let elem_ty = list_ty.ty();
             let mut vals = Vec::with_capacity(items.len());
@@ -94,6 +104,93 @@ fn json_to_val(ty: &Type, value: &serde_json::Value) -> Result<Val> {
                 vals.push((field.name.to_string(), json_to_val(&field.ty, field_value)?));
             }
             Val::Record(vals)
+        }
+        (Type::Tuple(tuple_ty), J::Array(items)) => {
+            let elem_types: Vec<Type> = tuple_ty.types().collect();
+            if elem_types.len() != items.len() {
+                anyhow::bail!(
+                    "tuple arity mismatch: expected {} elements, got {}",
+                    elem_types.len(),
+                    items.len()
+                );
+            }
+            let mut vals = Vec::with_capacity(items.len());
+            for (elem_ty, item) in elem_types.iter().zip(items) {
+                vals.push(json_to_val(elem_ty, item)?);
+            }
+            Val::Tuple(vals)
+        }
+        (Type::Enum(enum_ty), J::String(s)) => {
+            if !enum_ty.names().any(|n| n == s) {
+                anyhow::bail!("unknown enum case '{}'", s);
+            }
+            Val::Enum(s.clone())
+        }
+        // Flags are encoded as a JSON array of the *set* flag names (order-
+        // independent), matching `Val::Flags`' own representation (a list
+        // of set names, not a full name->bool map).
+        (Type::Flags(flags_ty), J::Array(items)) => {
+            let valid: Vec<&str> = flags_ty.names().collect();
+            let mut set = Vec::with_capacity(items.len());
+            for item in items {
+                let name = item.as_str().context("expected a flag name string")?;
+                if !valid.contains(&name) {
+                    anyhow::bail!("unknown flag '{}'", name);
+                }
+                set.push(name.to_string());
+            }
+            Val::Flags(set)
+        }
+        // Variants/results are encoded uniformly as `{"tag": "<case>", "val":
+        // <payload, omitted if the case has none>}` -- a `result<T,E>` is
+        // just a 2-case variant with fixed tag names `ok`/`err`.
+        (Type::Variant(variant_ty), J::Object(obj)) => {
+            let tag = obj
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .context("variant JSON requires a string 'tag'")?;
+            let case = variant_ty
+                .cases()
+                .find(|c| c.name == tag)
+                .with_context(|| format!("unknown variant case '{}'", tag))?;
+            let payload = match case.ty {
+                Some(ty) => Some(Box::new(json_to_val(
+                    &ty,
+                    obj.get("val")
+                        .with_context(|| format!("variant case '{}' has a payload but JSON has no 'val'", tag))?,
+                )?)),
+                None => None,
+            };
+            Val::Variant(tag.to_string(), payload)
+        }
+        (Type::Result(result_ty), J::Object(obj)) => {
+            let tag = obj
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .context("result JSON requires a string 'tag' of 'ok' or 'err'")?;
+            match tag {
+                "ok" => {
+                    let payload = match result_ty.ok() {
+                        Some(ty) => Some(Box::new(json_to_val(
+                            &ty,
+                            obj.get("val").context("result ok-case has a payload but JSON has no 'val'")?,
+                        )?)),
+                        None => None,
+                    };
+                    Val::Result(Ok(payload))
+                }
+                "err" => {
+                    let payload = match result_ty.err() {
+                        Some(ty) => Some(Box::new(json_to_val(
+                            &ty,
+                            obj.get("val").context("result err-case has a payload but JSON has no 'val'")?,
+                        )?)),
+                        None => None,
+                    };
+                    Val::Result(Err(payload))
+                }
+                other => anyhow::bail!("result tag must be 'ok' or 'err', got '{}'", other),
+            }
         }
         (Type::Option(_), J::Null) => Val::Option(None),
         (Type::Option(opt_ty), v) => Val::Option(Some(Box::new(json_to_val(&opt_ty.ty(), v)?))),
@@ -122,6 +219,33 @@ fn val_to_json(val: &Val) -> serde_json::Value {
             let mut map = serde_json::Map::new();
             for (name, v) in fields {
                 map.insert(name.clone(), val_to_json(v));
+            }
+            J::Object(map)
+        }
+        Val::Tuple(items) => J::Array(items.iter().map(val_to_json).collect()),
+        Val::Enum(name) => J::String(name.clone()),
+        Val::Flags(names) => J::Array(names.iter().map(|n| J::String(n.clone())).collect()),
+        Val::Variant(tag, payload) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String(tag.clone()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
+            }
+            J::Object(map)
+        }
+        Val::Result(Ok(payload)) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String("ok".to_string()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
+            }
+            J::Object(map)
+        }
+        Val::Result(Err(payload)) => {
+            let mut map = serde_json::Map::new();
+            map.insert("tag".to_string(), J::String("err".to_string()));
+            if let Some(p) = payload {
+                map.insert("val".to_string(), val_to_json(p));
             }
             J::Object(map)
         }

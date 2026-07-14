@@ -1,0 +1,314 @@
+{
+  "fixture": "advanced-types",
+  "world": "js-exports",
+  "wit_dir": "fixtures/advanced-types/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "echo-char-ascii",
+      "function": "echo-char",
+      "args": [
+        "e"
+      ],
+      "result": "e",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-char-multibyte",
+      "function": "echo-char",
+      "args": [
+        "é"
+      ],
+      "result": "é",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-bytes-basic",
+      "function": "echo-bytes",
+      "args": [
+        [
+          1,
+          2,
+          3,
+          255,
+          0
+        ]
+      ],
+      "result": [
+        1,
+        2,
+        3,
+        255,
+        0
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-bytes-empty",
+      "function": "echo-bytes",
+      "args": [
+        []
+      ],
+      "result": [],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "bytes-len-basic",
+      "function": "bytes-len",
+      "args": [
+        [
+          1,
+          2,
+          3
+        ]
+      ],
+      "result": 3,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "swap-pair-basic",
+      "function": "swap-pair",
+      "args": [
+        [
+          5,
+          "hi"
+        ]
+      ],
+      "result": [
+        "hi",
+        5
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-direction-north",
+      "function": "echo-direction",
+      "args": [
+        "north"
+      ],
+      "result": "north",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-direction-multiword",
+      "function": "echo-direction",
+      "args": [
+        "north-east"
+      ],
+      "result": "north-east",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-perms-some",
+      "function": "echo-perms",
+      "args": [
+        [
+          "can-read",
+          "can-execute"
+        ]
+      ],
+      "result": [
+        "can-read",
+        "can-execute"
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-perms-none",
+      "function": "echo-perms",
+      "args": [
+        []
+      ],
+      "result": [],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-perms-all",
+      "function": "echo-perms",
+      "args": [
+        [
+          "can-read",
+          "can-write",
+          "can-execute"
+        ]
+      ],
+      "result": [
+        "can-read",
+        "can-write",
+        "can-execute"
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-shape-payload",
+      "function": "echo-shape",
+      "args": [
+        {
+          "tag": "circle",
+          "val": 5
+        }
+      ],
+      "result": {
+        "tag": "circle",
+        "val": 5
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-shape-void-payload",
+      "function": "echo-shape",
+      "args": [
+        {
+          "tag": "point"
+        }
+      ],
+      "result": {
+        "tag": "point"
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-wrapped-result-ok",
+      "function": "echo-wrapped-result",
+      "args": [
+        {
+          "r": {
+            "tag": "ok",
+            "val": 5
+          }
+        }
+      ],
+      "result": {
+        "r": {
+          "tag": "ok",
+          "val": 5
+        }
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-wrapped-result-err",
+      "function": "echo-wrapped-result",
+      "args": [
+        {
+          "r": {
+            "tag": "err",
+            "val": "bad"
+          }
+        }
+      ],
+      "result": {
+        "r": {
+          "tag": "err",
+          "val": "bad"
+        }
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "divide-ok",
+      "function": "divide",
+      "args": [
+        10,
+        2
+      ],
+      "result": {
+        "tag": "ok",
+        "val": 5
+      },
+      "confidence": "reference-verified",
+      "notes": "Top-level export return type is the export's own result<T,E>: success returns the Ok payload directly from JS (no {tag,val} wrapper at the JS boundary), and the canonical-ABI value observed through Wasmtime is Val::Result(Ok(5))."
+    },
+    {
+      "id": "divide-err",
+      "function": "divide",
+      "args": [
+        10,
+        0
+      ],
+      "result": {
+        "tag": "err",
+        "val": "division by zero"
+      },
+      "confidence": "reference-verified",
+      "notes": "Failure is signaled by the JS export throwing; both the pinned ComponentizeJS reference and the current bridge translate any thrown value into Val::Result(Err(..))."
+    },
+    {
+      "id": "checked-negate-ok",
+      "function": "checked-negate",
+      "args": [
+        5
+      ],
+      "result": {
+        "tag": "ok",
+        "val": -5
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "checked-negate-err",
+      "function": "checked-negate",
+      "args": [
+        -2147483648
+      ],
+      "result": {
+        "tag": "err"
+      },
+      "confidence": "reference-verified",
+      "notes": "result<s32> (E is void, WIT's err-omitted shorthand): the invoker's Val::Result(Err(None)) round-trips to bare {\"tag\":\"err\"} with no \"val\" key."
+    },
+    {
+      "id": "echo-multi-word-record-basic",
+      "function": "echo-multi-word-record",
+      "args": [
+        {
+          "first-value": 1,
+          "second-value": "x"
+        }
+      ],
+      "result": {
+        "first-value": 1,
+        "second-value": "x"
+      },
+      "confidence": "reference-verified",
+      "notes": "Component-model-level record field names are the literal WIT identifiers (kebab-case, e.g. \"first-value\"); camelCasing (firstValue) is purely a JS-object-property detail internal to each pipeline's own JS boundary, not observable at the Wasmtime Val::Record level this invoker inspects."
+    },
+    {
+      "id": "echo-multi-word-flags-some",
+      "function": "echo-multi-word-flags",
+      "args": [
+        [
+          "can-read-write"
+        ]
+      ],
+      "result": [
+        "can-read-write"
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-multi-word-enum-basic",
+      "function": "echo-multi-word-enum",
+      "args": [
+        "south-west"
+      ],
+      "result": "south-west",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "echo-multi-word-variant-basic",
+      "function": "echo-multi-word-variant",
+      "args": [
+        {
+          "tag": "right-turn",
+          "val": 7
+        }
+      ],
+      "result": {
+        "tag": "right-turn",
+        "val": 7
+      },
+      "confidence": "reference-verified"
+    }
+  ]
+}

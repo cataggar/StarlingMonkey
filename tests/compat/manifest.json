@@ -38,7 +38,7 @@
     }
   },
   "bridge": {
-    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell JSON-encodes its typed WIT arguments, calls starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. A returned Promise/thenable is pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way; see known_deviations promise-exports-pumped.",
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/option/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. Any signature containing i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen -- see the sync-value-parity WABT worktree commit) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved: a wrong *kind* of JS return value (string/object/etc. where a number/BigInt is required, or vice versa) or an invalid variant/enum discriminant traps, but an out-of-range/negative/fractional/non-finite Number or BigInt of the *correct* kind wraps modulo 2**bitwidth (matching ECMAScript ToInt32/ToUint32-family and ToBigInt64/ToBigUint64 semantics, re-verified against the pinned ComponentizeJS reference itself -- see known_deviations and tests/e2e/native-dispatch/run.sh's wrap-numbers/sum-list-overflow cases), not a trap. A returned Promise/thenable (on either path) is instead pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way a directly-returned value would be; see known_deviations promise-exports-pumped.",
     "known_deviations": [
       {
         "id": "option-none-representation",
@@ -63,9 +63,24 @@
       },
       {
         "id": "integer-64-bit-precision",
-        "summary": "u64/s64 are not exercised by Phase 0 fixtures. ComponentizeJS lifts them as JS BigInt; the current JSON bridge round-trips them as JS Number via JSON text, which loses precision above Number.MAX_SAFE_INTEGER (2^53-1). Phase 1a is expected to move to a typed bridge with BigInt support.",
+        "summary": "RESOLVED as of sync-value-parity for u64 and non-negative s64: any signature containing i64/u64 (scalar, nested in a record/option/list, or as a plain argument/result) routes through the native tagged-value bridge (runtime/js_dispatch.zig), which exchanges exact full-domain JS BigInt values with no JSON-text round-trip, matching the pinned ComponentizeJS reference's own BigInt lifting exactly for every value the reference itself can accept, including values >= 2^63 and wraparound arithmetic. Negative s64 specifically hits a separate, more severe reference-side defect -- see known_deviations componentizejs-s64-negative-value-defect -- so tests/compat/fixtures/integers-64bit deliberately exercises only non-negative s64/u64; negative s64 is instead build-verified against the bridge alone by tests/e2e/native-dispatch/run.sh's full-domain i64/u64 boundary checks (which include a near-i64::MIN case the reference cannot run at all).",
         "phase_addressed": "1a",
-        "confidence": "documented-not-tested"
+        "confidence": "build-verified",
+        "evidence": "tests/compat/fixtures/integers-64bit; tests/compat/runtime (bridge/integers-64bit); expected/integers-64bit.json; tests/e2e/native-dispatch/run.sh 'Full-domain i64/u64 boundaries' section"
+      },
+      {
+        "id": "componentizejs-s64-negative-value-defect",
+        "summary": "Empirically, the pinned ComponentizeJS 0.21.0 reference unconditionally traps (wasm `unreachable`, guest stderr diagnostic 'Redirecting call to abort() to mozalloc_abort') on *any* negative-valued `s64`, whether as an argument or as a return value, regardless of magnitude -- not just near the i64::MIN boundary: a minimal isolated probe world (`id-s64: func(v: s64) -> s64` returning its argument unchanged; `neg-s64: func(v: s64) -> s64` returning `-v`) shows `id-s64(-5)` and `neg-s64(5)` (i.e. returning -5) both trap, while `id-s64(0)`/`neg-s64(0)` and large positive s64 near i64::MAX succeed. u64 (which has no negative values), and negative s8/s16/s32 (exercised elsewhere by numeric-primitives/records/advanced-types' checked-negate), are unaffected -- this is specific to the `s64` lifting/lowering path. Re-verified directly through Wasmtime (tests/compat/runtime/invoker) against the real componentize-js output with no other transpiler in the call path, so the defect is attributable to ComponentizeJS/its embedded engine itself. A trap also poisons the shared Wasmtime component instance for every subsequent call in the same invocation (Wasmtime's own component-model reentrancy semantics), so this cannot be exercised as an ordinary passing case inside a shared-instance fixture batch like tests/compat/fixtures/integers-64bit's; see that fixture's own notes. The current Zig/WABT native bridge (runtime/js_dispatch.zig) is unaffected: build-verified via tests/e2e/native-dispatch/run.sh's 'big-sub near i64::MIN' case (a negative s64 argument and a negative s64 result, both exact).",
+        "phase_addressed": "sync-value-parity",
+        "confidence": "wasmtime-verified (defect, no transpiler adapter involved), build-verified (bridge unaffected)",
+        "evidence": "Reproduced against the pinned reference (tests/compat/reference's pinned @bytecodealliance/componentize-js@0.21.0, commit 12c2b4a25033f65047f8ec5c5fb9e3013bfc4950) via tests/compat/runtime/invoker (compat-invoker) using an isolated single-function probe world, not embedded in the checked-in fixture set because the resulting trap poisons the shared component instance for later calls; tests/e2e/native-dispatch/run.sh 'big-sub near i64::MIN' shows the bridge itself handling the same value class correctly."
+      },
+      {
+        "id": "string-vs-list-u8-ambiguity-resolved",
+        "summary": "Not a behavioral deviation from the reference, but an internal architecture note: WIT `string` and `list<u8>` both reflect as the identical Zig type `[]const u8`, so the native bridge cannot distinguish them from runtime data alone (and must not guess). Resolved by generating a nominal wrapper type (`wit_types.ByteList`) at the WABT bindgen boundary for `list<u8>` specifically (leaving `string` as plain `[]const u8`), giving the native lifting/lowering code an unambiguous compile-time type to dispatch on; likewise `char` (which also reflects as plain `u32` in Zig) is wrapped as `wit_types.Char`. This is a code-generation-time distinction, never a runtime heuristic.",
+        "phase_addressed": "sync-value-parity",
+        "confidence": "source-verified",
+        "evidence": "wabt worktree (feat/sync-value-parity-types, commit 5ee61e0787f95b43593111846eff9931746ab0ea): src/wit_types.zig, build/bindgen/component_bindgen.zig; runtime/js_dispatch.zig's encodeNative/decodeNative special-casing of wit_types.Char/wit_types.ByteList before the generic type switch"
       },
       {
         "id": "promise-exports-pumped",
@@ -76,15 +91,16 @@
       },
       {
         "id": "json-bridge-overhead",
-        "summary": "Every call boundary serializes arguments and results through JSON text rather than a typed SpiderMonkey JS::Value conversion.",
+        "summary": "NARROWED as of sync-value-parity: only applies to the JSON-only path (bool/numeric-scalar/string/list/option/record signatures that need no native lifting). Any signature containing i64/u64, char, tuple, enum, flags, variant, result<T,E> or list<u8> instead uses a typed native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}) with no JSON serialization involved; see bridge.description.",
         "phase_addressed": "1a",
         "confidence": "source-verified"
       },
       {
         "id": "no-variants-enums-flags-results-resources",
-        "summary": "Enums, flags, variants, results, resources, futures and streams are not represented by the bridge or by any Phase 0 fixture.",
+        "summary": "NARROWED as of sync-value-parity: enums, flags, variants and result<T,E> (both nested and as an export's own top-level return type) are now represented by the native tagged-value bridge and build-verified end to end (tests/compat/fixtures/advanced-types). Only resources, futures and streams remain entirely unrepresented (still out of scope; see feature_matrix resources, phase 4).",
         "phase_addressed": 2,
-        "confidence": "source-verified"
+        "confidence": "build-verified",
+        "evidence": "tests/compat/fixtures/advanced-types; tests/compat/runtime (bridge/advanced-types); expected/advanced-types.json; tests/e2e/native-dispatch/run.sh"
       },
       {
         "id": "interface-export-flattening",
@@ -103,24 +119,24 @@
   },
   "feature_matrix": [
     { "category": "bool", "status": "supported", "phase": 0, "fixtures": ["booleans"] },
-    { "category": "integers-u8-u16-u32-s8-s16-s32", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"], "notes": "u32 values >= 2^31 are reference-pipeline-risky; see known_deviations componentizejs-u32-high-bit-defect." },
-    { "category": "integers-u64-s64", "status": "unsupported", "phase": "1a", "fixtures": [] },
+    { "category": "integers-u8-u16-u32-s8-s16-s32", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"], "notes": "u32 values >= 2^31 are reference-pipeline-risky; see known_deviations componentizejs-u32-high-bit-defect. An out-of-range/negative/fractional/non-finite Number of the correct kind wraps modulo 2**bitwidth (ToInt32/ToUint32-family), not a trap, matching the pinned reference exactly (build-verified: tests/e2e/native-dispatch/run.sh 'wrap-numbers' case)." },
+    { "category": "integers-u64-s64", "status": "supported", "phase": "1a", "fixtures": ["integers-64bit"], "notes": "Native tagged-value bridge path (runtime/js_dispatch.zig, active whenever a signature contains i64/u64) exchanges exact BigInt values; see known_deviations integer-64-bit-precision (narrowed). An out-of-range or negative BigInt of the correct kind wraps modulo 2**64 (ToBigInt64/ToBigUint64), not a trap, matching the pinned reference exactly (both reference-verified: fixtures/integers-64bit 'sum-list-basic', and build-verified: tests/e2e/native-dispatch/run.sh 'sum-list wraps past u64::MAX' / 'wrap-numbers' cases)." },
     { "category": "float32-float64", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"] },
-    { "category": "char", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "char", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
     { "category": "string", "status": "supported", "phase": 0, "fixtures": ["strings"] },
     { "category": "list", "status": "supported", "phase": 0, "fixtures": ["lists"] },
     { "category": "record", "status": "supported", "phase": 0, "fixtures": ["records"], "notes": "Includes a record nested inside another record." },
-    { "category": "tuple", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "tuple", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
     { "category": "option", "status": "supported", "phase": 0, "fixtures": ["options"] },
-    { "category": "enum", "status": "unsupported", "phase": 2, "fixtures": [] },
-    { "category": "flags", "status": "unsupported", "phase": 2, "fixtures": [] },
-    { "category": "variant", "status": "unsupported", "phase": 2, "fixtures": [] },
-    { "category": "result", "status": "unsupported", "phase": 2, "fixtures": [] },
+    { "category": "enum", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
+    { "category": "flags", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
+    { "category": "variant", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
+    { "category": "result", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"], "notes": "Covers both nested result<T,E> (record field, {tag,val} JS shape) and an export's own top-level result<T,E> return type (Ok returns directly, Err signaled by throw)." },
     { "category": "void", "status": "supported", "phase": 0, "fixtures": ["void"] },
     { "category": "many-arguments", "status": "supported", "phase": 0, "fixtures": ["many-arguments"] },
     { "category": "repeated-calls", "status": "supported", "phase": 0, "fixtures": ["repeated-calls"] },
     { "category": "missing-or-invalid-export", "status": "supported-as-trap", "phase": 0, "fixtures": ["negative-missing-export", "negative-invalid-export"], "notes": "Detection timing differs between pipelines; see known_deviations missing-export-detection-timing." },
-    { "category": "kebab-case-and-naming", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "kebab-case-and-naming", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"], "notes": "Multi-word kebab-case WIT identifiers: record fields/flags labels camelCased at the JS boundary, enum/variant case labels keep kebab-case string spelling, and function export names resolved via a camelCase fallback (see bridge known_deviations none needed -- this matches ComponentizeJS's own convention exactly, not a deviation)." },
     { "category": "resources", "status": "unsupported", "phase": 4, "fixtures": [] },
     { "category": "imports", "status": "unsupported", "phase": 3, "fixtures": [] },
     { "category": "promise-exports", "status": "supported", "phase": 5, "fixtures": ["promises", "promises-rejected", "promises-deadlock"], "notes": "A returned Promise/thenable is pumped to completion via EventLoop::pump_until_promise_settled, then its fulfilled value is lowered exactly like a directly-returned value. Rejections and no-progress (deadlock) both surface as deterministic call-time traps rather than hanging; see known_deviations promise-exports-pumped." }
@@ -137,14 +153,86 @@
       "description": "Boolean identity/logic functions, including a 3-argument majority vote.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "negate-true", "function": "negate", "args": [true], "result": false, "confidence": "reference-verified" },
-        { "id": "negate-false", "function": "negate", "args": [false], "result": true, "confidence": "reference-verified" },
-        { "id": "both-true-true", "function": "both", "args": [true, true], "result": true, "confidence": "reference-verified" },
-        { "id": "both-true-false", "function": "both", "args": [true, false], "result": false, "confidence": "reference-verified" },
-        { "id": "either-false-false", "function": "either", "args": [false, false], "result": false, "confidence": "reference-verified" },
-        { "id": "either-true-false", "function": "either", "args": [true, false], "result": true, "confidence": "reference-verified" },
-        { "id": "majority-true-true-false", "function": "majority", "args": [true, true, false], "result": true, "confidence": "reference-verified" },
-        { "id": "majority-false-false-true", "function": "majority", "args": [false, false, true], "result": false, "confidence": "reference-verified" }
+        {
+          "id": "negate-true",
+          "function": "negate",
+          "args": [
+            true
+          ],
+          "result": false,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "negate-false",
+          "function": "negate",
+          "args": [
+            false
+          ],
+          "result": true,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "both-true-true",
+          "function": "both",
+          "args": [
+            true,
+            true
+          ],
+          "result": true,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "both-true-false",
+          "function": "both",
+          "args": [
+            true,
+            false
+          ],
+          "result": false,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "either-false-false",
+          "function": "either",
+          "args": [
+            false,
+            false
+          ],
+          "result": false,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "either-true-false",
+          "function": "either",
+          "args": [
+            true,
+            false
+          ],
+          "result": true,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "majority-true-true-false",
+          "function": "majority",
+          "args": [
+            true,
+            true,
+            false
+          ],
+          "result": true,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "majority-false-false-true",
+          "function": "majority",
+          "args": [
+            false,
+            false,
+            true
+          ],
+          "result": false,
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -158,30 +246,154 @@
       "description": "Identity functions per numeric width plus a two-argument sum, at boundary values.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "u8-min", "function": "echou8", "args": [0], "result": 0, "confidence": "reference-verified" },
-        { "id": "u8-max", "function": "echou8", "args": [255], "result": 255, "confidence": "reference-verified" },
-        { "id": "u16-min", "function": "echou16", "args": [0], "result": 0, "confidence": "reference-verified" },
-        { "id": "u16-max", "function": "echou16", "args": [65535], "result": 65535, "confidence": "reference-verified" },
-        { "id": "u32-min", "function": "echou32", "args": [0], "result": 0, "confidence": "reference-verified" },
-        { "id": "u32-safe-max", "function": "echou32", "args": [2147483647], "result": 2147483647, "confidence": "reference-verified", "notes": "2^31-1: the largest u32 value confirmed to round-trip through the pinned reference in this environment." },
+        {
+          "id": "u8-min",
+          "function": "echou8",
+          "args": [
+            0
+          ],
+          "result": 0,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "u8-max",
+          "function": "echou8",
+          "args": [
+            255
+          ],
+          "result": 255,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "u16-min",
+          "function": "echou16",
+          "args": [
+            0
+          ],
+          "result": 0,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "u16-max",
+          "function": "echou16",
+          "args": [
+            65535
+          ],
+          "result": 65535,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "u32-min",
+          "function": "echou32",
+          "args": [
+            0
+          ],
+          "result": 0,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "u32-safe-max",
+          "function": "echou32",
+          "args": [
+            2147483647
+          ],
+          "result": 2147483647,
+          "confidence": "reference-verified",
+          "notes": "2^31-1: the largest u32 value confirmed to round-trip through the pinned reference in this environment."
+        },
         {
           "id": "u32-max",
           "function": "echou32",
-          "args": [4294967295],
+          "args": [
+            4294967295
+          ],
           "bridge_result": 4294967295,
           "reference_result": 4292870144,
           "confidence": "bridge_result=static-reasoning, reference_result=reference-verified",
           "notes": "See known_deviations componentizejs-u32-high-bit-defect. This case intentionally has divergent bridge_result/reference_result instead of a single result."
         },
-        { "id": "s8-min", "function": "echos8", "args": [-128], "result": -128, "confidence": "reference-verified" },
-        { "id": "s8-max", "function": "echos8", "args": [127], "result": 127, "confidence": "reference-verified" },
-        { "id": "s16-min", "function": "echos16", "args": [-32768], "result": -32768, "confidence": "reference-verified" },
-        { "id": "s16-max", "function": "echos16", "args": [32767], "result": 32767, "confidence": "reference-verified" },
-        { "id": "s32-min", "function": "echos32", "args": [-2147483648], "result": -2147483648, "confidence": "reference-verified" },
-        { "id": "s32-max", "function": "echos32", "args": [2147483647], "result": 2147483647, "confidence": "reference-verified" },
-        { "id": "f32-fraction", "function": "echof32", "args": [1.5], "result": 1.5, "confidence": "reference-verified" },
-        { "id": "f64-fraction", "function": "echof64", "args": [3.14159265], "result": 3.14159265, "confidence": "reference-verified" },
-        { "id": "sum-basic", "function": "sum", "args": [2, 40], "result": 42, "confidence": "reference-verified" }
+        {
+          "id": "s8-min",
+          "function": "echos8",
+          "args": [
+            -128
+          ],
+          "result": -128,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "s8-max",
+          "function": "echos8",
+          "args": [
+            127
+          ],
+          "result": 127,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "s16-min",
+          "function": "echos16",
+          "args": [
+            -32768
+          ],
+          "result": -32768,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "s16-max",
+          "function": "echos16",
+          "args": [
+            32767
+          ],
+          "result": 32767,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "s32-min",
+          "function": "echos32",
+          "args": [
+            -2147483648
+          ],
+          "result": -2147483648,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "s32-max",
+          "function": "echos32",
+          "args": [
+            2147483647
+          ],
+          "result": 2147483647,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "f32-fraction",
+          "function": "echof32",
+          "args": [
+            1.5
+          ],
+          "result": 1.5,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "f64-fraction",
+          "function": "echof64",
+          "args": [
+            3.14159265
+          ],
+          "result": 3.14159265,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "sum-basic",
+          "function": "sum",
+          "args": [
+            2,
+            40
+          ],
+          "result": 42,
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -195,12 +407,62 @@
       "description": "String identity, concatenation and UTF-16 length, including an empty string and astral (surrogate-pair) content.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "identity-ascii", "function": "identity", "args": ["hello"], "result": "hello", "confidence": "reference-verified" },
-        { "id": "identity-empty", "function": "identity", "args": [""], "result": "", "confidence": "reference-verified" },
-        { "id": "identity-unicode", "function": "identity", "args": ["h\u00e9llo \ud83d\ude00 world"], "result": "h\u00e9llo \ud83d\ude00 world", "confidence": "reference-verified" },
-        { "id": "concat-basic", "function": "concat", "args": ["foo", "bar"], "result": "foobar", "confidence": "reference-verified" },
-        { "id": "length-ascii", "function": "length", "args": ["hello"], "result": 5, "confidence": "reference-verified" },
-        { "id": "length-unicode", "function": "length", "args": ["h\u00e9llo \ud83d\ude00 world"], "result": 14, "confidence": "reference-verified", "notes": "UTF-16 code units: 5 + 1 space + 2 (surrogate pair) + 1 space + 5 = 14." }
+        {
+          "id": "identity-ascii",
+          "function": "identity",
+          "args": [
+            "hello"
+          ],
+          "result": "hello",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "identity-empty",
+          "function": "identity",
+          "args": [
+            ""
+          ],
+          "result": "",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "identity-unicode",
+          "function": "identity",
+          "args": [
+            "héllo 😀 world"
+          ],
+          "result": "héllo 😀 world",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "concat-basic",
+          "function": "concat",
+          "args": [
+            "foo",
+            "bar"
+          ],
+          "result": "foobar",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "length-ascii",
+          "function": "length",
+          "args": [
+            "hello"
+          ],
+          "result": 5,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "length-unicode",
+          "function": "length",
+          "args": [
+            "héllo 😀 world"
+          ],
+          "result": 14,
+          "confidence": "reference-verified",
+          "notes": "UTF-16 code units: 5 + 1 space + 2 (surrogate pair) + 1 space + 5 = 14."
+        }
       ]
     },
     {
@@ -214,11 +476,73 @@
       "description": "list<u32> sum, list<string> reverse, and list<bool> identity, including empty lists.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "sum-empty", "function": "sum", "args": [[]], "result": 0, "confidence": "reference-verified" },
-        { "id": "sum-values", "function": "sum", "args": [[1, 2, 3, 4, 5]], "result": 15, "confidence": "reference-verified" },
-        { "id": "reverse-values", "function": "reverse", "args": [["a", "b", "c"]], "result": ["c", "b", "a"], "confidence": "reference-verified" },
-        { "id": "reverse-empty", "function": "reverse", "args": [[]], "result": [], "confidence": "reference-verified" },
-        { "id": "identity-bools", "function": "identity", "args": [[true, false, true]], "result": [true, false, true], "confidence": "reference-verified" }
+        {
+          "id": "sum-empty",
+          "function": "sum",
+          "args": [
+            []
+          ],
+          "result": 0,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "sum-values",
+          "function": "sum",
+          "args": [
+            [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          ],
+          "result": 15,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "reverse-values",
+          "function": "reverse",
+          "args": [
+            [
+              "a",
+              "b",
+              "c"
+            ]
+          ],
+          "result": [
+            "c",
+            "b",
+            "a"
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "reverse-empty",
+          "function": "reverse",
+          "args": [
+            []
+          ],
+          "result": [],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "identity-bools",
+          "function": "identity",
+          "args": [
+            [
+              true,
+              false,
+              true
+            ]
+          ],
+          "result": [
+            true,
+            false,
+            true
+          ],
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -232,10 +556,73 @@
       "description": "Record arguments/results, including a record (rectangle) nested inside another record (point).",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "translate-basic", "function": "translate", "args": [{ "x": 1, "y": 2 }, 3, 4], "result": { "x": 4, "y": 6 }, "confidence": "reference-verified" },
-        { "id": "translate-negative", "function": "translate", "args": [{ "x": -5, "y": 10 }, -1, -1], "result": { "x": -6, "y": 9 }, "confidence": "reference-verified" },
-        { "id": "area-basic", "function": "area", "args": [{ "topleft": { "x": 0, "y": 0 }, "bottomright": { "x": 4, "y": 5 } }], "result": 20, "confidence": "reference-verified" },
-        { "id": "identity-basic", "function": "identity", "args": [{ "x": 7, "y": -9 }], "result": { "x": 7, "y": -9 }, "confidence": "reference-verified" }
+        {
+          "id": "translate-basic",
+          "function": "translate",
+          "args": [
+            {
+              "x": 1,
+              "y": 2
+            },
+            3,
+            4
+          ],
+          "result": {
+            "x": 4,
+            "y": 6
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "translate-negative",
+          "function": "translate",
+          "args": [
+            {
+              "x": -5,
+              "y": 10
+            },
+            -1,
+            -1
+          ],
+          "result": {
+            "x": -6,
+            "y": 9
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "area-basic",
+          "function": "area",
+          "args": [
+            {
+              "topleft": {
+                "x": 0,
+                "y": 0
+              },
+              "bottomright": {
+                "x": 4,
+                "y": 5
+              }
+            }
+          ],
+          "result": 20,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "identity-basic",
+          "function": "identity",
+          "args": [
+            {
+              "x": 7,
+              "y": -9
+            }
+          ],
+          "result": {
+            "x": 7,
+            "y": -9
+          },
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -249,12 +636,73 @@
       "description": "option<T> for a numeric, string and record payload, both some and none.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "maybenumber-some", "function": "maybenumber", "args": [41], "result": 42, "confidence": "reference-verified" },
-        { "id": "maybenumber-none", "function": "maybenumber", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified", "notes": "See known_deviations option-none-representation." },
-        { "id": "maybestring-some", "function": "maybestring", "args": ["hi"], "result": "HI", "confidence": "reference-verified" },
-        { "id": "maybestring-none", "function": "maybestring", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified" },
-        { "id": "maybepoint-some", "function": "maybepoint", "args": [{ "x": 1, "y": 2 }], "result": { "x": 1, "y": 2 }, "confidence": "reference-verified" },
-        { "id": "maybepoint-none", "function": "maybepoint", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified" }
+        {
+          "id": "maybenumber-some",
+          "function": "maybenumber",
+          "args": [
+            41
+          ],
+          "result": 42,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybenumber-none",
+          "function": "maybenumber",
+          "args": [
+            null
+          ],
+          "result": null,
+          "bridge_none_representation": "null",
+          "reference_none_representation": "undefined",
+          "confidence": "reference-verified",
+          "notes": "See known_deviations option-none-representation."
+        },
+        {
+          "id": "maybestring-some",
+          "function": "maybestring",
+          "args": [
+            "hi"
+          ],
+          "result": "HI",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybestring-none",
+          "function": "maybestring",
+          "args": [
+            null
+          ],
+          "result": null,
+          "bridge_none_representation": "null",
+          "reference_none_representation": "undefined",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybepoint-some",
+          "function": "maybepoint",
+          "args": [
+            {
+              "x": 1,
+              "y": 2
+            }
+          ],
+          "result": {
+            "x": 1,
+            "y": 2
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybepoint-none",
+          "function": "maybepoint",
+          "args": [
+            null
+          ],
+          "result": null,
+          "bridge_none_representation": "null",
+          "reference_none_representation": "undefined",
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -268,8 +716,23 @@
       "description": "Exports with no WIT result, with and without arguments.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "cases": [
-        { "id": "notify-basic", "function": "notify", "args": ["hello from void fixture"], "void": true, "confidence": "reference-verified", "notes": "No decoded result; the JS export's own return value (undefined) is not observable through a void WIT result." },
-        { "id": "ping-basic", "function": "ping", "args": [], "void": true, "confidence": "reference-verified" }
+        {
+          "id": "notify-basic",
+          "function": "notify",
+          "args": [
+            "hello from void fixture"
+          ],
+          "void": true,
+          "confidence": "reference-verified",
+          "notes": "No decoded result; the JS export's own return value (undefined) is not observable through a void WIT result."
+        },
+        {
+          "id": "ping-basic",
+          "function": "ping",
+          "args": [],
+          "void": true,
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -284,8 +747,36 @@
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, all 11 fixtures pass, 2026-07-14)",
       "notes": "reference-verified against the pinned ComponentizeJS install; the current Zig/WABT bindgen's 8-argument/6-argument arity here has now been build-verified via tests/compat/runtime (the actual reactor was built, componentized, and invoked through Wasmtime), though its overall maximum supported arity beyond what these cases exercise remains unconfirmed.",
       "cases": [
-        { "id": "sum8-basic", "function": "sum8", "args": [1, 2, 3, 4, 5, 6, 7, 8], "result": 36, "confidence": "reference-verified" },
-        { "id": "describe-basic", "function": "describe", "args": [true, 3, "widget", -7, false, 42], "result": "widget:3:-7:42:true:false", "confidence": "reference-verified" }
+        {
+          "id": "sum8-basic",
+          "function": "sum8",
+          "args": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "result": 36,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "describe-basic",
+          "function": "describe",
+          "args": [
+            true,
+            3,
+            "widget",
+            -7,
+            false,
+            42
+          ],
+          "result": "widget:3:-7:42:true:false",
+          "confidence": "reference-verified"
+        }
       ]
     },
     {
@@ -303,18 +794,48 @@
           "id": "increment-sequence",
           "function": "increment",
           "calls": [
-            { "args": [], "result": 1, "confidence": "reference-verified" },
-            { "args": [], "result": 2, "confidence": "reference-verified" },
-            { "args": [], "result": 3, "confidence": "reference-verified" }
+            {
+              "args": [],
+              "result": 1,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [],
+              "result": 2,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [],
+              "result": 3,
+              "confidence": "reference-verified"
+            }
           ]
         },
         {
           "id": "accumulate-sequence",
           "function": "accumulate",
           "calls": [
-            { "args": [5], "result": 5, "confidence": "reference-verified" },
-            { "args": [10], "result": 15, "confidence": "reference-verified" },
-            { "args": [-3], "result": 12, "confidence": "reference-verified" }
+            {
+              "args": [
+                5
+              ],
+              "result": 5,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [
+                10
+              ],
+              "result": 15,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [
+                -3
+              ],
+              "result": 12,
+              "confidence": "reference-verified"
+            }
           ]
         }
       ]
@@ -468,6 +989,326 @@
       ]
     },
     {
+      "id": "advanced-types",
+      "category": "char-tuple-enum-flags-variant-result-naming",
+      "dir": "fixtures/advanced-types",
+      "wit_dir": "fixtures/advanced-types/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/advanced-types.json",
+      "description": "char, list<u8>, tuple, enum, flags, variant, result<T,E> (both nested inside a record and as an export's own top-level return type), and multi-word-identifier naming edge cases (kebab-case WIT names resolved as camelCase JS export/property identifiers). Closes feature_matrix categories char/tuple/enum/flags/variant/result/kebab-case-and-naming for everything except resources/futures/streams (still phase 4+, out of scope).",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, 2026-... see git history for this fixture's commit)",
+      "notes": "Wrong-type/out-of-range/invalid-discriminant negative cases for these same value classes are covered at a finer grain (per exact trap condition) by tests/e2e/native-dispatch/run.sh (51/51 checks) rather than duplicated here as additional full-reactor-build negative fixtures, since a compat fixture here is all-positive or all-negative per tests/compat/runtime/lib/run_bridge_tests.py's run_positive_fixture/run_negative_fixture split, and this suite's per-fixture build cost (~15-20 minutes, see run_bridge_tests.py's own docstring) makes one-condition-per-fixture impractical; this fixture instead focuses on positive value-shape parity against the real ComponentizeJS reference through the same Wasmtime host.",
+      "cases": [
+        {
+          "id": "echo-char-ascii",
+          "function": "echo-char",
+          "args": [
+            "e"
+          ],
+          "result": "e",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-char-multibyte",
+          "function": "echo-char",
+          "args": [
+            "é"
+          ],
+          "result": "é",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-bytes-basic",
+          "function": "echo-bytes",
+          "args": [
+            [
+              1,
+              2,
+              3,
+              255,
+              0
+            ]
+          ],
+          "result": [
+            1,
+            2,
+            3,
+            255,
+            0
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-bytes-empty",
+          "function": "echo-bytes",
+          "args": [
+            []
+          ],
+          "result": [],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "bytes-len-basic",
+          "function": "bytes-len",
+          "args": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "result": 3,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "swap-pair-basic",
+          "function": "swap-pair",
+          "args": [
+            [
+              5,
+              "hi"
+            ]
+          ],
+          "result": [
+            "hi",
+            5
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-direction-north",
+          "function": "echo-direction",
+          "args": [
+            "north"
+          ],
+          "result": "north",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-direction-multiword",
+          "function": "echo-direction",
+          "args": [
+            "north-east"
+          ],
+          "result": "north-east",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-perms-some",
+          "function": "echo-perms",
+          "args": [
+            [
+              "can-read",
+              "can-execute"
+            ]
+          ],
+          "result": [
+            "can-read",
+            "can-execute"
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-perms-none",
+          "function": "echo-perms",
+          "args": [
+            []
+          ],
+          "result": [],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-perms-all",
+          "function": "echo-perms",
+          "args": [
+            [
+              "can-read",
+              "can-write",
+              "can-execute"
+            ]
+          ],
+          "result": [
+            "can-read",
+            "can-write",
+            "can-execute"
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-shape-payload",
+          "function": "echo-shape",
+          "args": [
+            {
+              "tag": "circle",
+              "val": 5
+            }
+          ],
+          "result": {
+            "tag": "circle",
+            "val": 5
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-shape-void-payload",
+          "function": "echo-shape",
+          "args": [
+            {
+              "tag": "point"
+            }
+          ],
+          "result": {
+            "tag": "point"
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-wrapped-result-ok",
+          "function": "echo-wrapped-result",
+          "args": [
+            {
+              "r": {
+                "tag": "ok",
+                "val": 5
+              }
+            }
+          ],
+          "result": {
+            "r": {
+              "tag": "ok",
+              "val": 5
+            }
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-wrapped-result-err",
+          "function": "echo-wrapped-result",
+          "args": [
+            {
+              "r": {
+                "tag": "err",
+                "val": "bad"
+              }
+            }
+          ],
+          "result": {
+            "r": {
+              "tag": "err",
+              "val": "bad"
+            }
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "divide-ok",
+          "function": "divide",
+          "args": [
+            10,
+            2
+          ],
+          "result": {
+            "tag": "ok",
+            "val": 5
+          },
+          "confidence": "reference-verified",
+          "notes": "Top-level export return type is the export's own result<T,E>: success returns the Ok payload directly from JS (no {tag,val} wrapper at the JS boundary), and the canonical-ABI value observed through Wasmtime is Val::Result(Ok(5))."
+        },
+        {
+          "id": "divide-err",
+          "function": "divide",
+          "args": [
+            10,
+            0
+          ],
+          "result": {
+            "tag": "err",
+            "val": "division by zero"
+          },
+          "confidence": "reference-verified",
+          "notes": "Failure is signaled by the JS export throwing; both the pinned ComponentizeJS reference and the current bridge translate any thrown value into Val::Result(Err(..))."
+        },
+        {
+          "id": "checked-negate-ok",
+          "function": "checked-negate",
+          "args": [
+            5
+          ],
+          "result": {
+            "tag": "ok",
+            "val": -5
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "checked-negate-err",
+          "function": "checked-negate",
+          "args": [
+            -2147483648
+          ],
+          "result": {
+            "tag": "err"
+          },
+          "confidence": "reference-verified",
+          "notes": "result<s32> (E is void, WIT's err-omitted shorthand): the invoker's Val::Result(Err(None)) round-trips to bare {\"tag\":\"err\"} with no \"val\" key."
+        },
+        {
+          "id": "echo-multi-word-record-basic",
+          "function": "echo-multi-word-record",
+          "args": [
+            {
+              "first-value": 1,
+              "second-value": "x"
+            }
+          ],
+          "result": {
+            "first-value": 1,
+            "second-value": "x"
+          },
+          "confidence": "reference-verified",
+          "notes": "Component-model-level record field names are the literal WIT identifiers (kebab-case, e.g. \"first-value\"); camelCasing (firstValue) is purely a JS-object-property detail internal to each pipeline's own JS boundary, not observable at the Wasmtime Val::Record level this invoker inspects."
+        },
+        {
+          "id": "echo-multi-word-flags-some",
+          "function": "echo-multi-word-flags",
+          "args": [
+            [
+              "can-read-write"
+            ]
+          ],
+          "result": [
+            "can-read-write"
+          ],
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-multi-word-enum-basic",
+          "function": "echo-multi-word-enum",
+          "args": [
+            "south-west"
+          ],
+          "result": "south-west",
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "echo-multi-word-variant-basic",
+          "function": "echo-multi-word-variant",
+          "args": [
+            {
+              "tag": "right-turn",
+              "val": 7
+            }
+          ],
+          "result": {
+            "tag": "right-turn",
+            "val": 7
+          },
+          "confidence": "reference-verified"
+        }
+      ]
+    },
+    {
       "id": "promises-deadlock",
       "category": "promise-exports",
       "dir": "fixtures/promises-deadlock",
@@ -492,6 +1333,97 @@
             "bridge_confidence": "build-verified",
             "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress once both the microtask queue (js::RunJobs) and the async task queue (api::AsyncTask::select) are exhausted while the promise is still Pending; js_dispatch.cpp's resolve_promise_like prints a deterministic diagnostic to stderr (\"...returned a Promise that never settled -- the JavaScript job queue and async task queue both ran empty while it was still pending (deadlock)\") and returns false so the dispatch entry point traps (bare wasm 'unreachable'), rather than looping forever. This is the deterministic no-progress/deadlock diagnostic required by the promise-sync roadmap phase, not a hang. build-verified via tests/compat/runtime/run-bridge-tests.sh (real Wasmtime 42 crate invoker, which captured this exact diagnostic text on the guest's WASI stderr pipe, 2026-07-14); also cross-checked via tests/e2e/native-dispatch/run.sh's 'promise-deadlock' case, which wraps every wasmtime CLI invocation in a 30s timeout as an independent safety net and observed a fast trap, well under the timeout. The pinned ComponentizeJS 0.21.0 reference (reference_message_contains above) independently detects the same condition -- its own embedded engine's event-loop driver aborts with 'Error while (call) event loop error, but no exception is pending. Aborting, since that doesn't seem recoverable at all.' rather than hanging -- reference-verified via tests/compat/reference/run-reference.mjs, 2026-07-14: componentize() succeeds, and the componentized output traps deterministically (well under a manual 20s timeout probe) when invoked through the same tests/compat/runtime/invoker used for the bridge. The exact diagnostic wording differs between the two independent implementations (expected -- see bridge_message_contains), but both surface a deterministic call-time trap rather than a hang, matching this fixture's requirement."
           }
+        }
+      ]
+    },
+    {
+      "id": "integers-64bit",
+      "category": "integers-u64-s64",
+      "dir": "fixtures/integers-64bit",
+      "wit_dir": "fixtures/integers-64bit/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/integers-64bit.json",
+      "description": "Full-domain u64/s64 (including values >= 2**63 and >= Number.MAX_SAFE_INTEGER), exchanged as JS BigInt by both pipelines: a plain scalar, a nested record field, option<u64> some/none, and list<u64>. Deliberately exercises only non-negative s64 values; see known_deviations componentizejs-s64-negative-value-defect for why negative s64 is not exercised here.",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, 2026-... see git history for this fixture's commit)",
+      "cases": [
+        {
+          "id": "big-add-u64-max",
+          "function": "big-add",
+          "args": [
+            18446744073709551615,
+            0
+          ],
+          "result": 18446744073709551615,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "big-add-basic",
+          "function": "big-add",
+          "args": [
+            1000000000000,
+            2000000000000
+          ],
+          "result": 3000000000000,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "big-sub-near-i64-max",
+          "function": "big-sub",
+          "args": [
+            9223372036854775807,
+            1
+          ],
+          "result": 9223372036854775806,
+          "confidence": "reference-verified",
+          "notes": "Exercises the s64 upper boundary (i64::MAX) with a full-domain (> Number.MAX_SAFE_INTEGER) value on both sides. Deliberately avoids any negative s64 value: see known_deviations componentizejs-s64-negative-value-defect -- the pinned ComponentizeJS 0.21.0 reference traps unconditionally on *any* negative s64 argument or return value, so a near-i64::MIN case cannot be expressed as a normal passing fixture case here (a trap also poisons the shared Wasmtime component instance for every later call in the same invocation, so it can't safely coexist with this fixture's other cases either); the current Zig/WABT native bridge itself is unaffected (build-verified: tests/e2e/native-dispatch/run.sh 'big-sub near i64::MIN' case)."
+        },
+        {
+          "id": "label-id-basic",
+          "function": "label-id",
+          "args": [
+            "widget",
+            18446744073709551615
+          ],
+          "result": {
+            "label": "widget",
+            "id": 18446744073709551615
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybe-big-some",
+          "function": "maybe-big",
+          "args": [
+            18446744073709551614
+          ],
+          "result": 18446744073709551615,
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "maybe-big-none",
+          "function": "maybe-big",
+          "args": [
+            null
+          ],
+          "result": null,
+          "confidence": "reference-verified",
+          "bridge_none_representation": "null",
+          "reference_none_representation": "undefined",
+          "notes": "Same option<T> none-representation deviation as known_deviations option-none-representation; both null and undefined lower back to none, so this case's own args/result round-trip is unaffected."
+        },
+        {
+          "id": "sum-list-basic",
+          "function": "sum-list",
+          "args": [
+            [
+              18446744073709551615,
+              1
+            ]
+          ],
+          "result": 0,
+          "confidence": "reference-verified",
+          "notes": "Deliberately wraps past u64::MAX (mod 2**64) to also exercise BigInt wraparound arithmetic identically in both pipelines, not just round-tripping."
         }
       ]
     }
