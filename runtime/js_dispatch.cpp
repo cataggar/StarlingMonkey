@@ -844,11 +844,11 @@ bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra
   return true;
 }
 
-// Splits one manifest TSV line "<iface-id>\t<js-name>\t<dispatch-key>\t<arity>"
+// Splits one manifest TSV line "<module-id>\t<js-name>\t<dispatch-key>\t<arity>"
 // into its four columns. Returns false (rather than asserting) on a
 // malformed line so a corrupt/mismatched manifest is an actionable JS
 // exception rather than an out-of-bounds read.
-bool parse_manifest_line(std::string_view line, std::string_view *iface_id,
+bool parse_manifest_line(std::string_view line, std::string_view *module_id,
                          std::string_view *js_name, std::string_view *dispatch_key,
                          unsigned *arity) {
   size_t t1 = line.find('\t');
@@ -858,9 +858,10 @@ bool parse_manifest_line(std::string_view line, std::string_view *iface_id,
   size_t t3 = line.find('\t', t2 + 1);
   if (t3 == std::string_view::npos) return false;
 
-  *iface_id = line.substr(0, t1);
+  *module_id = line.substr(0, t1);
   *js_name = line.substr(t1 + 1, t2 - t1 - 1);
   *dispatch_key = line.substr(t2 + 1, t3 - t2 - 1);
+  if (module_id->empty() || js_name->empty() || dispatch_key->empty()) return false;
   std::string_view arity_str = line.substr(t3 + 1);
   unsigned value = 0;
   for (char c : arity_str) {
@@ -876,15 +877,12 @@ bool parse_manifest_line(std::string_view line, std::string_view *iface_id,
 namespace builtins {
 namespace wit_imports {
 
-// Registers one builtin ES module per WIT interface id found in the
-// `--js-imports`-generated manifest (see js_dispatch.h), each exposing its
-// bridged functions under their verbatim WIT names (matching
-// `resolve_export_function`'s export-side convention and ComponentizeJS's
-// own module/export naming for versioned package/interface identifiers, so
-// `import { "get-flag" as getFlag } from "test:flags/imports@1.2.3"` resolves
-// with no hand-written glue). Runs during `install_builtins`, i.e. before
-// any content script executes, so imports are available the moment user
-// code's top-level `import` statements run.
+// Registers one builtin ES module per manifest module id. Interface imports
+// expose their verbatim WIT function names (for example
+// `import { "get-flag" as getFlag } from "test:flags/imports@1.2.3"`).
+// World-level function imports use module=<WIT function>, export=default, so
+// `import addOne from "add-one"` matches ComponentizeJS 0.21. Runs during
+// `install_builtins`, before content scripts' top-level imports execute.
 bool install(api::Engine *engine) {
   JSContext *cx = engine->cx();
   size_t manifest_len = 0;
@@ -905,22 +903,22 @@ bool install(api::Engine *engine) {
     pos = nl + 1;
     if (line.empty()) continue;
 
-    std::string_view iface_id, js_name, dispatch_key;
+    std::string_view module_id, js_name, dispatch_key;
     unsigned arity = 0;
-    if (!parse_manifest_line(line, &iface_id, &js_name, &dispatch_key, &arity)) {
+    if (!parse_manifest_line(line, &module_id, &js_name, &dispatch_key, &arity)) {
       JS_ReportErrorUTF8(cx, "malformed js_import_manifest line: '%.*s'", (int)line.size(),
                          line.data());
       return false;
     }
 
-    if (current_id.empty() || current_id != iface_id) {
+    if (current_id.empty() || current_id != module_id) {
       if (!current_id.empty()) {
         JS::RootedValue module_val(cx, JS::ObjectValue(*current_obj));
         if (!engine->define_builtin_module(current_id.c_str(), module_val)) {
           return false;
         }
       }
-      current_id.assign(iface_id);
+      current_id.assign(module_id);
       current_obj = JS_NewPlainObject(cx);
       if (!current_obj) {
         return false;

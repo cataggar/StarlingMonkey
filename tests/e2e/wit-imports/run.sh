@@ -104,6 +104,13 @@ echo "[wit-imports e2e] confirming test:wit-imports/host@1.2.3 is a real compone
   exit 1
 }
 echo "PASS component declares versioned import/export interface names"
+for root_import in add-one root-note root-note-count root-boom; do
+  "$BIN/wasm-tools" component wit "$COMPONENT" | grep -q "import ${root_import}: func" || {
+    echo "FAIL: componentized output does not declare root function import ${root_import}"
+    exit 1
+  }
+done
+echo "PASS component declares all world-level function imports"
 
 echo "[wit-imports e2e] building wit-imports-invoker (tests/compat/runtime/invoker)"
 INVOKER_DIR="$REPO_ROOT/tests/compat/runtime/invoker"
@@ -158,6 +165,14 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-checked-div", "args": [10, 0]},
   {"function": "run-validate-non-negative", "args": [5]},
   {"function": "run-validate-non-negative", "args": [-1]},
+
+  {"function": "run-root-add", "args": [41]},
+  {"function": "run-root-repeated", "args": [7]},
+  {"function": "run-root-note-count", "args": []},
+  {"function": "run-root-note", "args": []},
+  {"function": "run-root-note-count", "args": []},
+  {"function": "run-root-note", "args": []},
+  {"function": "run-root-note-count", "args": []},
 
   {"function": "run-boom", "args": []}
 ]
@@ -276,9 +291,26 @@ assert_field "run-checked-div err: division by zero" 35 "rec['value']" "{'tag': 
 assert_field "run-validate-non-negative ok (void payload, no 'val' key)" 36 "rec['value']" "{'tag': 'ok'}"
 assert_field "run-validate-non-negative err: negative value rejected" 37 "rec['value']" "{'tag': 'err', 'val': 'value is negative'}"
 
-assert_field "run-boom host trap propagates" 38 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 38 \
+assert_field "root add-one carries an argument and result" 38 "rec['value']" "42"
+assert_field "root add-one supports repeated calls" 39 "rec['value']" "[8, 9, 10, 11, 12]"
+assert_field "root-note-count starts at 0" 40 "rec['value']" "0"
+assert_field "root void result is exactly undefined" 41 "rec['value']" "True"
+assert_field "root-note side effect ran once" 42 "rec['value']" "1"
+assert_field "root void result stays undefined on repeat" 43 "rec['value']" "True"
+assert_field "root-note side effect ran twice" 44 "rec['value']" "2"
+
+assert_field "run-boom host trap propagates" 45 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 45 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
+
+echo "[wit-imports e2e] invoking root-boom in a fresh instance"
+ROOT_TRAP_CALLS_JSON="$PREFIX/root_trap_calls.json"
+echo '[{"function":"run-root-boom","args":[]}]' > "$ROOT_TRAP_CALLS_JSON"
+OUTPUT_JSON="$PREFIX/root_trap_output.json"
+"$INVOKER" "$COMPONENT" "$ROOT_TRAP_CALLS_JSON" > "$OUTPUT_JSON"
+assert_field "root-boom host trap propagates" 0 "rec['ok']" "False"
+assert_field "root-boom trap names the world-level host function" 0 \
+  "'root-boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"
 EMPTY_CALLS_JSON="$PREFIX/calls_empty.json"
@@ -292,6 +324,20 @@ else
     echo "PASS missing-import diagnostics: Wasmtime reported an actionable error naming the unresolved import"
   else
     echo "FAIL missing-import diagnostics: error message did not name the missing import actionably: $OMIT_OUTPUT"
+    fail=1
+  fi
+fi
+
+echo "[wit-imports e2e] instantiating with root-boom OMITTED"
+if OMIT_OUTPUT=$("$INVOKER" --omit-root-boom "$COMPONENT" "$EMPTY_CALLS_JSON" 2>&1); then
+  echo "FAIL root missing-import diagnostics: expected instantiation to fail, but it succeeded: $OMIT_OUTPUT"
+  fail=1
+else
+  if echo "$OMIT_OUTPUT" | grep -q "root-boom" && \
+     echo "$OMIT_OUTPUT" | grep -qi "not found in the linker"; then
+    echo "PASS root missing-import diagnostics: Wasmtime named the unresolved root function"
+  else
+    echo "FAIL root missing-import diagnostics: error did not name root-boom actionably: $OMIT_OUTPUT"
     fail=1
   fi
 fi

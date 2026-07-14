@@ -47,6 +47,14 @@ world js-dispatch {
   // module-specifier conventions.
   import test:wit-imports/host@1.2.3;
 
+  // World-level function imports. The generated core wasm imports these from
+  // `$root`; ComponentizeJS-compatible JavaScript sees one default-export
+  // module per function (`import addOne from "add-one"`, etc.).
+  import add-one: func(value: u32) -> u32;
+  import root-note: func();
+  import root-note-count: func() -> u32;
+  import root-boom: func() -> u32;
+
   export wasi:cli/run@0.2.10;
   export wasi:http/incoming-handler@0.2.10;
   export test:wit-imports/api@1.2.3;

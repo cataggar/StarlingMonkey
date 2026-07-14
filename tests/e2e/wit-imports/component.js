@@ -64,6 +64,13 @@ import {
   "validate-non-negative" as validateNonNegative,
 } from "test:wit-imports/host@1.2.3";
 
+// Frozen ComponentizeJS 0.21 root-function convention: each world-level
+// function is a default export from a module named after the WIT function.
+import addOne from "add-one";
+import rootNote from "root-note";
+import rootNoteCount from "root-note-count";
+import rootBoom from "root-boom";
+
 export function runAdd(a, b) {
   return add(a, b);
 }
@@ -126,6 +133,35 @@ function runNoteCount() {
   return noteCount();
 }
 export { runNoteCount as "run-note-count" };
+
+function runRootAdd(value) {
+  return addOne(value);
+}
+export { runRootAdd as "run-root-add" };
+
+function runRootRepeated(value) {
+  const results = [];
+  for (let i = 0; i < 5; i++) {
+    results.push(addOne(value + i));
+  }
+  return results;
+}
+export { runRootRepeated as "run-root-repeated" };
+
+function runRootNote() {
+  return rootNote() === undefined;
+}
+export { runRootNote as "run-root-note" };
+
+function runRootNoteCount() {
+  return rootNoteCount();
+}
+export { runRootNoteCount as "run-root-note-count" };
+
+function runRootBoom() {
+  return rootBoom();
+}
+export { runRootBoom as "run-root-boom" };
 
 function runSumNestedLists(rows) {
   return sumNestedLists(rows);
