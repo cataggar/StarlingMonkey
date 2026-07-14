@@ -34,9 +34,9 @@
 #     throughout.
 #   * kebab-case interface namespace mapping: the exact versioned
 #     `test:wit-imports/incoming-handler@1.2.3` export resolves through the
-#     ComponentizeJS `incomingHandler` spelling, while a second component
-#     proves literal namespace/member spellings take precedence when both
-#     literal and camelCase properties exist.
+#     ComponentizeJS `incomingHandler` spelling, while focused components
+#     separately prove literal namespace and member spellings take precedence
+#     over their camelCase aliases.
 #   * root-function preservation: `root-add` remains a callable top-level
 #     export beside the versioned named `api` interface.
 #   * void import result contract: `note` (a WIT import with no result)
@@ -338,7 +338,7 @@ assert_field "root-boom host trap propagates" 0 "rec['ok']" "False"
 assert_field "root-boom trap names the world-level host function" 0 \
   "'root-boom: deliberate host-side trap' in rec['trap']" "True"
 
-echo "[wit-imports e2e] checking literal namespace/member precedence over camelCase"
+echo "[wit-imports e2e] checking literal member precedence over camelCase"
 LITERAL_COMPONENT="$PREFIX/wit-imports-literal-names.wasm"
 WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
 WASM_TOOLS_BIN="$BIN/wasm-tools" \
@@ -353,7 +353,21 @@ EOF
 LITERAL_OUTPUT_JSON="$PREFIX/output_literal_names.json"
 "$INVOKER" "$LITERAL_COMPONENT" "$LITERAL_CALLS_JSON" > "$LITERAL_OUTPUT_JSON"
 OUTPUT_JSON="$LITERAL_OUTPUT_JSON"
-assert_field "literal kebab-case namespace/member take precedence over camelCase aliases" 0 \
+assert_field "literal kebab-case member takes precedence over camelCase alias in the selected namespace" 0 \
+  "rec['value']" "42"
+
+echo "[wit-imports e2e] checking literal namespace precedence over camelCase"
+LITERAL_NAMESPACE_COMPONENT="$PREFIX/wit-imports-literal-namespace.wasm"
+WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+WASM_TOOLS_BIN="$BIN/wasm-tools" \
+  "$BIN/componentize.sh" tests/e2e/wit-imports/component-literal-namespace.js \
+    -o "$LITERAL_NAMESPACE_COMPONENT"
+"$BIN/wasm-tools" validate --features all "$LITERAL_NAMESPACE_COMPONENT"
+LITERAL_NAMESPACE_OUTPUT_JSON="$PREFIX/output_literal_namespace.json"
+"$INVOKER" "$LITERAL_NAMESPACE_COMPONENT" "$LITERAL_CALLS_JSON" \
+  > "$LITERAL_NAMESPACE_OUTPUT_JSON"
+OUTPUT_JSON="$LITERAL_NAMESPACE_OUTPUT_JSON"
+assert_field "literal kebab-case namespace takes precedence over camelCase alias" 0 \
   "rec['value']" "42"
 OUTPUT_JSON="$PREFIX/output.json"
 

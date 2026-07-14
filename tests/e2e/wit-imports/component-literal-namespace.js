@@ -1,8 +1,12 @@
 const literalIncomingHandler = {
   "kebab-interface-add": (value) => value + 1,
-  kebabInterfaceAdd: (value) => value + 10,
+};
+
+const camelIncomingHandler = {
+  "kebab-interface-add": (value) => value + 100,
 };
 
 export {
   literalIncomingHandler as "incoming-handler",
+  camelIncomingHandler as incomingHandler,
 };
