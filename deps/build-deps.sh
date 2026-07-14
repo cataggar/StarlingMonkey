@@ -69,9 +69,39 @@ mk_add_options MOZ_OBJDIR=$SM_OBJ
 mk_add_options AUTOCLOBBER=1
 EOF
 
+  # (Captured to a log file, not just left on the terminal, so the -fPIC
+  # guard below can grep it directly: mach re-runs a second, unrelated
+  # "configure" pass immediately after a successful build (its own normal
+  # behavior, nothing to do with this script) that touches config.log again
+  # right as this script regains control, which makes grepping config.log
+  # itself for the -fPIC probe racy. mach's own build console output, which
+  # includes each configure probe result on one line
+  # ("checking ... -fPIC... yes"), doesn't have that problem.)
+  BUILD_LOG="$DEPS/sm-build.log"
   MOZCONFIG="$MOZCONFIG" MOZBUILD_STATE_PATH="$DEPS/mozbuild-state" LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib}" \
     env CC="$WRAP/zig-cc" CXX="$WRAP/zig-cxx" AR="$WRAP/zig-ar" HOST_CC="${HOST_CC:-clang}" HOST_CXX="${HOST_CXX:-clang++}" \
-    python3 "$SM_SRC/mach" --no-interactive build
+    python3 "$SM_SRC/mach" --no-interactive build 2>&1 | tee "$BUILD_LOG"
+
+  # libspidermonkey.a must be usable as a wasm32-wasi -dynamic -fPIC dylib
+  # (see docs/pic-spidermonkey.md): build/moz.configure/flags.configure
+  # auto-adds -fPIC to every C/C++/asm compile whenever the compiler passes
+  # its "-fPIC" feature probe (building_with_gnu_compatible_cc, which zig
+  # cc/zig c++ satisfy) -- no mozconfig option is needed for this target.
+  # That auto-detection is silent and easy to regress (e.g. a zig-wrappers
+  # change that stops reporting as gnu-compatible, or a probe compile that
+  # starts failing for an unrelated reason), so fail loudly here rather than
+  # only discovering a non-PIC archive later, at `wasm-tools component link`
+  # time.
+  for probe in "checking whether the C compiler supports -fPIC... yes" \
+               "checking whether the C++ compiler supports -fPIC... yes"; do
+    grep -qF "$probe" "$BUILD_LOG" || {
+      echo "ERROR: SpiderMonkey configure did not confirm -fPIC support" \
+        "($probe) -- see $BUILD_LOG; libspidermonkey.a would not be" \
+        "usable as a wasm32-wasi -dynamic -fPIC dylib" >&2
+      exit 1
+    }
+  done
+  echo ">>> Confirmed -fPIC is enabled for the SpiderMonkey build (see $BUILD_LOG)"
 
   # Combine libjs_static.a with the extra objects StarlingMonkey needs (matches
   # SM_OBJ_FILES in cmake/spidermonkey.cmake).
