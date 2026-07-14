@@ -17,6 +17,14 @@
       "version": "0.3.0",
       "source": "version.txt / build.zig.zon (fingerprint 0x990a2f6e2fa7fb45)"
     },
+    "wasmtime_invoker_pin": {
+      "repository_pin": "42.0.1",
+      "repository_pin_source": "cmake/wasmtime.cmake, build.zig.zon",
+      "invoker_pin": "27",
+      "status": "blocked, not silently retained",
+      "blocker": "The published `wasmtime` 42.0.1 crate requires rustc >= 1.91.0 (Cargo.toml rust-version=\"1.91.0\", edition=\"2024\"); this repository's rust-toolchain.toml pins rustc 1.88.0. `cargo build` under that pinned toolchain fails with rustc-1.88.0-is-not-supported errors for wasmtime@42.0.1 and 35+ of its cranelift/pulley/wiggle dependencies. `cargo update -p cranelift-codegen --precise <older>` cannot resolve it either: wasmtime-internal-cranelift@42.0.1 requires cranelift-codegen = \"^0.129.1\", and every published 0.129.x release already requires rustc 1.91.0. See tests/compat/runtime/README.md's 'Wasmtime version' section and tests/compat/runtime/invoker/Cargo.toml's comment for the reproduced error and reasoning.",
+      "resolution": "Revisit once this repository's Rust toolchain is bumped to >= 1.91.0, or a future Wasmtime release restores rustc-1.88 compatibility."
+    },
     "bridge_source_reviewed": [
       "runtime/js_dispatch.cpp",
       "runtime/js_dispatch.zig",
@@ -82,6 +90,13 @@
         "summary": "When a WIT world exports a named interface (e.g. `export api;` with `api` containing `add`), the pinned ComponentizeJS reference requires the JS module to export a matching namespace object (e.g. `export const api = { add, ... }`); it fails componentization otherwise with 'does not export an \"<iface>\" interface as expected by the world'. The current Zig/WABT bridge instead strips everything up to and including the last '#' in the canonical export name and looks up that bare name directly as a flat top-level export, regardless of interface qualification (see js_dispatch.cpp's `export_name.rfind('#')`), matching the existing tests/fixtures/js-dispatch.js fixture which uses flat exports under an interface-qualified world. Phase 0 fixtures therefore declare exports directly on `world js-exports { export name: func(...); }` (no named interface) so the same JS source is valid under both pipelines.",
         "phase_addressed": 2,
         "confidence": "reference-verified"
+      },
+      {
+        "id": "bridge-harness-starling-js-api-wrapping",
+        "summary": "This is a deviation of the tests/compat/runtime harness itself, not of the underlying bridge: each fixture's original `tests/compat/fixtures/<id>/wit/world.wit` declares its exports directly on the world (flat top-level exports; see interface-export-flattening above). The pinned ComponentizeJS reference pipeline (tests/compat/reference/run-reference.mjs) componentizes that unmodified flat world.wit directly, so its componentized output's fixture functions are genuine flat top-level component exports. The real-bridge pipeline (tests/compat/runtime), however, cannot build the fixture's flat world directly against the actual StarlingMonkey js-dispatch host WIT (host-apis/wasi-0.2.10/wit/js-dispatch.wit), which requires the guest to export a named `starling:js/api` interface alongside the full WASI 0.2.10 import closure; tests/compat/lib/gen_bridge_wit.py therefore mechanically rewrites each fixture's flat exports into `interface api { ... } world js-exports { export api; }` under `package starling:js;` before building the reactor (see gen_bridge_wit.py's module docstring). The two pipelines' componentized artifacts therefore have genuinely different WIT export surfaces for the same fixture: the bridge's output exports its functions nested one level down, under the `starling:js/api` interface instance, while the reference's output exports the same functions flat at the component's top level. tests/compat/runtime/invoker's `resolve_func` deliberately searches both shapes (top-level first, then one level of nested interface instances) purely so one invoker/manifest can drive both pipelines by bare function name -- this is a pragmatic harness convenience, not evidence that the two componentized artifacts present an identical WIT interface. The 11/11 pass counts in this manifest validate call-level argument/result semantics parity between the pipelines; they do not validate WIT-surface/interface-shape parity, which is out of scope for Phase 0 and remains open (a future phase could close it by also wrapping the reference's WIT in a matching named interface, provided ComponentizeJS's own namespace-object export requirement -- see interface-export-flattening -- is satisfied).",
+        "phase_addressed": 2,
+        "confidence": "source-verified",
+        "evidence": "tests/compat/lib/gen_bridge_wit.py (render_package_wit), tests/compat/reference/run-reference.mjs (componentizeFixture uses fixture.wit_dir unmodified), tests/compat/runtime/invoker/src/main.rs (resolve_func)"
       }
     ]
   },

@@ -9,12 +9,27 @@ name = "compat-invoker"
 path = "src/main.rs"
 
 [dependencies]
+# NOTE: this repository itself pins Wasmtime v42.0.1 (cmake/wasmtime.cmake,
+# build.zig.zon). Matching that exact pin here is BLOCKED, not an oversight:
+# the published `wasmtime` 42.0.1 crate requires rustc >= 1.91.0 (edition
+# 2024), while this repository's rust-toolchain.toml pins rustc 1.88.0; the
+# build fails outright under that toolchain, and no older, rustc-1.88-
+# compatible release of wasmtime/cranelift 42.0.1's own dependency range
+# exists to work around it. See ../README.md's "Wasmtime version" section
+# for the exact reproduced error and why `cargo update --precise` cannot
+# help. Revisit once this repository's Rust toolchain is bumped to >= 1.91.
 wasmtime = { version = "27", features = ["component-model"] }
 wasmtime-wasi = "27"
 wasmtime-wasi-http = "27"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+
+[dev-dependencies]
+# Only used by the #[cfg(test)] unit tests in src/main.rs to compile small
+# hand-written component WAT text fixtures (e.g. a post-return that traps)
+# without needing a real StarlingMonkey/JS component.
+wat = "1"
 
 [profile.release]
 opt-level = 1

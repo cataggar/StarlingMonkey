@@ -12,7 +12,7 @@ index 16665860..5e704e9f 100644
              } else {
                  const u_val: u32 = @as(u32, lanes[lane]);
 @@ -4285,18 +4285,18 @@ pub const Interpreter = struct {
- 
+
      /// Compare op: pop two v128, compare per lane, push v128 with all-1s or all-0s per lane.
      fn simdCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
 -        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));
@@ -25,7 +25,7 @@ index 16665860..5e704e9f 100644
 +        for (0..count) |i| result[i] = if (op(a[i], b[i])) @as(Unsigned, @bitCast(@as(@Int(.signed, @bitSizeOf(T)), -1))) else 0;
          try self.pushValue(.{ .v128 = @bitCast(result) });
      }
- 
+
      /// Float compare op: pop two v128 of float type, compare per lane.
      fn simdFloatCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
 -        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));

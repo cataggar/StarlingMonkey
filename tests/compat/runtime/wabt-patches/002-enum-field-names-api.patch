@@ -3,7 +3,7 @@ index dc81fd7a..31a65f98 100644
 --- a/src/binary/reader.zig
 +++ b/src/binary/reader.zig
 @@ -65,8 +65,8 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
- 
+
  /// Safe enum cast: returns null if the integer doesn't match any tag.
  fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E {
 -    inline for (@typeInfo(E).@"enum".fields) |field| {

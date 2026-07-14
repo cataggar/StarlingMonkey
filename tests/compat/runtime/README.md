@@ -67,10 +67,48 @@ crate's dynamic Component Model API
 (`wasmtime::component::{Component, Linker, Val, Type}`) that instantiates
 a component once and calls a JSON-declared sequence of exports against
 that single instance, printing a JSON array of `{"ok": true, "value": ...}`
-or `{"ok": false, "trap": "..."}` results. It is also used, unmodified, by
+or `{"ok": false, "trap": "..."}` results (a `post_return` failure after an
+otherwise-successful call is reported as its own distinct
+`{"ok": false, "trap": "post_return failed: ...", "post_return_failed":
+true}` record -- see `invoker/src/main.rs`'s `call_and_finalize` -- so it
+can never be misreported as a PASS). It is also used, unmodified, by
 `../reference/run-reference.mjs` to invoke ComponentizeJS's output, so both
 "sides" of the compatibility comparison run through the same Wasmtime
 execution path.
+
+### Wasmtime version: pinned to `27`, not this repository's `42.0.1` (known, proven blocker)
+
+This repository itself pins Wasmtime `v42.0.1` (`cmake/wasmtime.cmake`,
+`build.zig.zon`). `invoker/Cargo.toml` was attempted at an exact `=42.0.1`
+pin for all three of `wasmtime`/`wasmtime-wasi`/`wasmtime-wasi-http` to
+match, but that upgrade is **blocked**, not merely deferred: the published
+`wasmtime` 42.0.1 crate declares `rust-version = "1.91.0"` and
+`edition = "2024"` in its own `Cargo.toml`, while this repository's
+`rust-toolchain.toml` pins `channel = "1.88.0"`. `cargo build` under that
+pinned toolchain fails outright (not a warning) with:
+
+```
+error: rustc 1.88.0 is not supported by the following packages:
+  wasmtime@42.0.1 requires rustc 1.91.0
+  cranelift-assembler-x64@0.129.2 requires rustc 1.91.0
+  ... (35+ more wasmtime/cranelift/pulley/wiggle crates, all requiring 1.91.0)
+```
+
+`cargo update -p cranelift-codegen --precise <older>` cannot route around
+this either: `wasmtime-internal-cranelift@42.0.1` requires
+`cranelift-codegen = "^0.129.1"`, and every published `0.129.x` release
+already requires rustc 1.91.0 -- there is no older, rustc-1.88-compatible
+release satisfying that exact range. This is a hard upstream MSRV
+requirement of the pinned `42.0.1` release itself, not a resolvable
+dependency conflict.
+
+`invoker/Cargo.toml` therefore remains pinned to Wasmtime `27` (the
+version already validated by this harness's real 11/11 bridge and
+reference runs) until either this repository's Rust toolchain is bumped to
+>= 1.91.0 (a repository-wide change out of scope here) or a future
+Wasmtime release restores compatibility with an older rustc. This is
+recorded here deliberately, rather than silently keeping the old pin with
+no explanation.
 
 ## Requirements (all fail loudly if missing -- see `lib/run_bridge_tests.py`)
 

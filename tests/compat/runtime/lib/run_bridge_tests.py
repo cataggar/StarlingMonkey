@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -107,28 +106,42 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 # Preflight: every check below must fail loudly, never SKIP.
 # ---------------------------------------------------------------------------
 
+# This harness (specifically build-wabt.sh's two local Zig-toolchain-compat
+# patches, tests/compat/runtime/wabt-patches/*.patch) is written against one
+# exact upstream Zig dev build, not just any toolchain satisfying
+# build.zig.zon's looser `minimum_zig_version` ("0.17.0"). Accepting any
+# "0.17"-prefixed toolchain here previously let a *different* 0.17.x dev
+# build silently pass preflight even though the wabt patches (and their
+# `@Int`/`@Enum`-builtin-rename assumptions) are only known to apply to this
+# exact commit; a version drift would surface later as a confusing wabt
+# build failure instead of a clear preflight error. See build-wabt.sh's own
+# header comment for the same pin.
+REQUIRED_ZIG_VERSION = "0.17.0-dev.902+7255f3e72"
+
+
 def find_zig() -> str:
     zig = os.environ.get("ZIG") or shutil.which("zig")
     if not zig:
         raise PreflightError(
             "no Zig toolchain found: set $ZIG to the pinned binary path "
-            "(see README.md/AGENTS.md for the exact required version) or "
+            f"(exactly {REQUIRED_ZIG_VERSION}; see README.md/AGENTS.md) or "
             "put a matching `zig` on PATH."
         )
     if not os.access(zig, os.X_OK):
         raise PreflightError(f"$ZIG ('{zig}') is not executable")
-    zon = (ROOT / "build.zig.zon").read_text()
-    m = re.search(r'\.minimum_zig_version\s*=\s*"([^"]+)"', zon)
-    required = m.group(1) if m else None
     result = run([zig, "version"])
     if result.returncode != 0:
         raise PreflightError(f"`{zig} version` failed: {result.stderr}")
     version = result.stdout.strip()
-    if required and not version.startswith(required.rsplit(".", 1)[0]):
+    if version != REQUIRED_ZIG_VERSION:
         raise PreflightError(
-            f"$ZIG reports version '{version}', but build.zig.zon requires "
-            f"'{required}' (a prefix match on major.minor is required here); "
-            "this suite refuses to silently skip on a toolchain mismatch."
+            f"$ZIG ('{zig}') reports version '{version}', but this harness "
+            f"requires exactly '{REQUIRED_ZIG_VERSION}' (not merely a "
+            "matching major.minor prefix): tests/compat/runtime/wabt-patches/ "
+            "is only known to apply cleanly to that exact upstream Zig dev "
+            "build. This suite refuses to silently accept a different "
+            "0.17.x toolchain and risk a confusing downstream wabt build "
+            "failure instead of a clear preflight error."
         )
     return zig
 

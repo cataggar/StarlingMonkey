@@ -14,6 +14,14 @@
 //   {"ok": false, "trap": "..."}    -- call trapped (e.g. the current
 //                                      bridge's call-time missing/invalid
 //                                      export failure; see js_dispatch.cpp)
+//   {"ok": false, "trap": "post_return failed: ...",
+//    "post_return_failed": true}   -- the call itself returned successfully,
+//                                      but the canonical ABI's mandatory
+//                                      `post_return` cleanup then trapped;
+//                                      reported as a failed call (not a
+//                                      PASS) so a post-return trap can never
+//                                      be misattributed to the *next* call
+//                                      in a sequence.
 // A component instantiation failure is reported on stderr and exits 2.
 use std::collections::HashMap;
 
@@ -130,6 +138,16 @@ struct Call {
 /// shape produced by `gen_bridge_wit.py` for the compat fixtures). This
 /// mirrors what `wasmtime run --invoke <name>(...)` does internally, since
 /// fixture manifests only record bare function names.
+///
+/// NOTE: this dual lookup is a harness convenience, not evidence that the
+/// bridge and reference componentized artifacts expose the same WIT
+/// surface for a given fixture -- they don't. See manifest.json's
+/// known_deviations "bridge-harness-starling-js-api-wrapping": the bridge
+/// pipeline's output nests fixture functions one level down, under a
+/// `starling:js/api` interface instance, while the reference pipeline's
+/// output exports the same functions flat at the top level. This function
+/// resolving both shapes uniformly must not be read as validating
+/// interface-shape parity between the two pipelines.
 fn resolve_func(
     instance: &wasmtime::component::Instance,
     store: &mut Store<Host>,
@@ -158,6 +176,163 @@ fn resolve_func(
     anyhow::bail!("export '{}' not found (checked top-level and nested interfaces)", name)
 }
 
+
+/// Calls `func` with `params`/`results`, then runs the canonical ABI's
+/// mandatory `post_return` cleanup (only after a *successful* call: the
+/// instance has no pending return to finalize after a trap, and Wasmtime
+/// panics if `post_return` is invoked without a preceding successful
+/// `call`). Returns the JSON record for this call plus the new stderr
+/// buffer read position, both accounting for a `post_return` failure:
+///
+///   - call traps: `{"ok": false, "trap": "...", "diagnostics": "..."}`.
+///   - call succeeds, `post_return` succeeds: `{"ok": true, "value": ...}`.
+///   - call succeeds, `post_return` traps: the call's own success is
+///     *not* reported -- reporting `{"ok": true, ...}` here would be a
+///     false PASS (the instance never reached a clean post-call state,
+///     which the canonical ABI requires before the next call/drop can be
+///     considered well-formed) and could misattribute a later divergence
+///     to the wrong call. Instead this returns a distinct
+///     `{"ok": false, "trap": "post_return failed: ...",
+///     "post_return_failed": true}` record so callers can tell this case
+///     apart from an ordinary call-time trap.
+fn call_and_finalize<T>(
+    func: &wasmtime::component::Func,
+    store: &mut Store<T>,
+    params: &[Val],
+    results: &mut [Val],
+    stderr_pipe: &MemoryOutputPipe,
+    stderr_pos: usize,
+) -> (serde_json::Value, usize) {
+    let mut stderr_pos = stderr_pos;
+    let call_result = func.call(&mut *store, params, results);
+    let mut record = match &call_result {
+        Ok(()) => {
+            let value = match results.len() {
+                0 => serde_json::Value::Null,
+                1 => val_to_json(&results[0]),
+                _ => serde_json::Value::Array(results.iter().map(val_to_json).collect()),
+            };
+            serde_json::json!({"ok": true, "value": value})
+        }
+        Err(err) => {
+            // Capture any new guest stderr output produced by this call
+            // (e.g. js_dispatch's own panic diagnostic) alongside the
+            // opaque wasm trap message, so callers can match on the
+            // actual descriptive error text rather than just detecting
+            // that *some* trap occurred.
+            let all_stderr = stderr_pipe.contents();
+            let new_stderr = String::from_utf8_lossy(&all_stderr[stderr_pos..]).into_owned();
+            serde_json::json!({
+                "ok": false,
+                "trap": format!("{:#}", err),
+                "diagnostics": new_stderr,
+            })
+        }
+    };
+    stderr_pos = stderr_pipe.contents().len();
+    if call_result.is_ok() {
+        // `post_return` must run before the next call reuses the same
+        // instance/store (canonical ABI requirement).
+        if let Err(post_return_err) = func.post_return(&mut *store) {
+            let all_stderr = stderr_pipe.contents();
+            let new_stderr = String::from_utf8_lossy(&all_stderr[stderr_pos..]).into_owned();
+            stderr_pos = stderr_pipe.contents().len();
+            record = serde_json::json!({
+                "ok": false,
+                "trap": format!("post_return failed: {:#}", post_return_err),
+                "diagnostics": new_stderr,
+                "post_return_failed": true,
+            });
+        }
+    }
+    (record, stderr_pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmtime::component::Linker;
+
+    /// Builds and instantiates a no-imports component from WAT text, with a
+    /// `MemoryOutputPipe`-backed WASI stderr so `call_and_finalize`'s
+    /// diagnostics capture can be exercised without any real guest program.
+    fn instantiate(
+        wat: &str,
+    ) -> (Engine, wasmtime::component::Instance, Store<Host>, MemoryOutputPipe) {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).unwrap();
+        let bytes = wat::parse_str(wat).expect("valid component WAT");
+        let component = Component::from_binary(&engine, &bytes).expect("component compiles");
+        let linker = Linker::<Host>::new(&engine);
+        let stderr_pipe = MemoryOutputPipe::new(64 * 1024);
+        let wasi = WasiCtxBuilder::new().stderr(stderr_pipe.clone()).build();
+        let host = Host { wasi, http: WasiHttpCtx::new(), table: ResourceTable::new() };
+        let mut store = Store::new(&engine, host);
+        let instance = linker.instantiate(&mut store, &component).expect("instantiates");
+        (engine, instance, store, stderr_pipe)
+    }
+
+    /// A component whose export's canonical-ABI `post-return` traps
+    /// (`unreachable`) even though the call itself returns normally.
+    const POST_RETURN_TRAPS_WAT: &str = r#"
+        (component
+          (core module $m
+            (func (export "run") (result i32) i32.const 42)
+            (func (export "run_post") (param i32) unreachable)
+          )
+          (core instance $i (instantiate $m))
+          (func (export "run") (result u32)
+            (canon lift (core func $i "run") (post-return (func $i "run_post"))))
+        )
+    "#;
+
+    /// A component whose export's `post-return` returns normally.
+    const POST_RETURN_OK_WAT: &str = r#"
+        (component
+          (core module $m
+            (func (export "run") (result i32) i32.const 42)
+            (func (export "run_post") (param i32))
+          )
+          (core instance $i (instantiate $m))
+          (func (export "run") (result u32)
+            (canon lift (core func $i "run") (post-return (func $i "run_post"))))
+        )
+    "#;
+
+    #[test]
+    fn post_return_trap_is_reported_as_failure_not_false_pass() {
+        let (_engine, instance, mut store, stderr_pipe) = instantiate(POST_RETURN_TRAPS_WAT);
+        let func = instance.get_func(&mut store, "run").expect("export exists");
+        let mut results = vec![Val::Bool(false)];
+        let (record, _pos) =
+            call_and_finalize(&func, &mut store, &[], &mut results, &stderr_pipe, 0);
+
+        assert_eq!(record["ok"], false, "a post_return trap must not be reported as ok:true");
+        assert_eq!(record["post_return_failed"], true);
+        let trap = record["trap"].as_str().unwrap();
+        assert!(
+            trap.starts_with("post_return failed:"),
+            "expected a distinct post_return diagnostic, got {trap:?}"
+        );
+        // The call's own successful result must not leak through as a
+        // (misleading) top-level "value" field on a failure record.
+        assert!(record.get("value").is_none());
+    }
+
+    #[test]
+    fn successful_post_return_still_reports_call_value() {
+        let (_engine, instance, mut store, stderr_pipe) = instantiate(POST_RETURN_OK_WAT);
+        let func = instance.get_func(&mut store, "run").expect("export exists");
+        let mut results = vec![Val::Bool(false)];
+        let (record, _pos) =
+            call_and_finalize(&func, &mut store, &[], &mut results, &stderr_pipe, 0);
+
+        assert_eq!(record["ok"], true);
+        assert_eq!(record["value"], 42);
+        assert!(record.get("post_return_failed").is_none());
+    }
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -243,40 +418,9 @@ fn main() -> Result<()> {
         }
         let result_tys = func.results(&store);
         let mut results = vec![Val::Bool(false); result_tys.len()];
-        let call_result = func.call(&mut store, &params, &mut results);
-        let record = match &call_result {
-            Ok(()) => {
-                let value = match results.len() {
-                    0 => serde_json::Value::Null,
-                    1 => val_to_json(&results[0]),
-                    _ => serde_json::Value::Array(results.iter().map(val_to_json).collect()),
-                };
-                serde_json::json!({"ok": true, "value": value})
-            }
-            Err(err) => {
-                // Capture any new guest stderr output produced by this call
-                // (e.g. js_dispatch's own panic diagnostic) alongside the
-                // opaque wasm trap message, so callers can match on the
-                // actual descriptive error text rather than just detecting
-                // that *some* trap occurred.
-                let all_stderr = stderr_pipe.contents();
-                let new_stderr = String::from_utf8_lossy(&all_stderr[stderr_pos..]).into_owned();
-                serde_json::json!({
-                    "ok": false,
-                    "trap": format!("{:#}", err),
-                    "diagnostics": new_stderr,
-                })
-            }
-        };
-        stderr_pos = stderr_pipe.contents().len();
-        // `post_return` must run after a *successful* call, before the next
-        // call reuses the same instance/store (canonical ABI requirement).
-        // Skip it after a trap: the instance has no pending return to
-        // finalize, and Wasmtime panics if `post_return` is called without
-        // a preceding successful `call`.
-        if call_result.is_ok() {
-            let _ = func.post_return(&mut store);
-        }
+        let (record, new_stderr_pos) =
+            call_and_finalize(&func, &mut store, &params, &mut results, &stderr_pipe, stderr_pos);
+        stderr_pos = new_stderr_pos;
         out.push(record);
     }
 
