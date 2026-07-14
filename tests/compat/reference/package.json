@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "name": "starlingmonkey-compat-reference",
+  "version": "0.0.0",
+  "description": "Opt-in reference mode for tests/compat: runs the Phase 0 fixtures through the real pinned ComponentizeJS release for differential comparison against tests/compat/manifest.json. NOT part of the normal Zig/WABT build or test suite -- see README.md.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.21.0",
+    "@bytecodealliance/jco": "1.25.2"
+  },
+  "scripts": {
+    "run": "node run-reference.mjs"
+  }
+}

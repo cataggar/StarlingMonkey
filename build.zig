@@ -303,6 +303,17 @@ pub fn build(b: *std.Build) void {
     dispatch_e2e.addArg(b.graph.zig_exe);
     test_step.dependOn(&dispatch_e2e.step);
 
+    // `zig build compat-test`: Node-free ComponentizeJS compatibility
+    // harness (tests/compat, cataggar/StarlingMonkey#6 Phase 0). Unlike
+    // `test` above, this does not require the full wasm build/install step:
+    // it validates tests/compat/manifest.json's fixtures/WIT/expected
+    // outputs structurally (plus a best-effort optional Node self-check,
+    // skipped cleanly when Node is absent). See tests/compat/README.md.
+    const compat_test_step = b.step("compat-test", "Run the Node-free ComponentizeJS compatibility harness (tests/compat)");
+    const compat_run = b.addSystemCommand(&.{ "bash", "tests/compat/run-compat-tests.sh" });
+    compat_test_step.dependOn(&compat_run.step);
+    test_step.dependOn(compat_test_step);
+
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the
     // SpiderMonkey/Rust/OpenSSL externals.

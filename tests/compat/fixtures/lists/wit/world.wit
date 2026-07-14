@@ -1,0 +1,9 @@
+package compat:lists;
+
+// Phase 0 compatibility fixture: list<T> arguments/results for numeric,
+// string and boolean element types.
+world js-exports {
+  export sum: func(values: list<u32>) -> u32;
+  export reverse: func(values: list<string>) -> list<string>;
+  export identity: func(values: list<bool>) -> list<bool>;
+}

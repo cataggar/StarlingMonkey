@@ -1,0 +1,64 @@
+{
+  "fixture": "strings",
+  "world": "js-exports",
+  "wit_dir": "fixtures/strings/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "identity-ascii",
+      "function": "identity",
+      "args": [
+        "hello"
+      ],
+      "result": "hello",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "identity-empty",
+      "function": "identity",
+      "args": [
+        ""
+      ],
+      "result": "",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "identity-unicode",
+      "function": "identity",
+      "args": [
+        "héllo 😀 world"
+      ],
+      "result": "héllo 😀 world",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "concat-basic",
+      "function": "concat",
+      "args": [
+        "foo",
+        "bar"
+      ],
+      "result": "foobar",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "length-ascii",
+      "function": "length",
+      "args": [
+        "hello"
+      ],
+      "result": 5,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "length-unicode",
+      "function": "length",
+      "args": [
+        "héllo 😀 world"
+      ],
+      "result": 14,
+      "confidence": "reference-verified",
+      "notes": "UTF-16 code units: 5 + 1 space + 2 (surrogate pair) + 1 space + 5 = 14."
+    }
+  ]
+}

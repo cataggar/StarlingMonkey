@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/cataggar/StarlingMonkey/tests/compat/schema/manifest.schema.json",
+  "title": "StarlingMonkey Zig/WABT JavaScript bridge compatibility manifest",
+  "description": "Data-driven description of the WIT/JavaScript bridge's compatibility with a pinned ComponentizeJS release (cataggar/StarlingMonkey#6). New WIT categories (enums, flags, variants, results, resources, imports, Promise exports, ...) are added by appending feature_matrix rows and fixtures entries; the harness itself does not need to change.",
+  "type": "object",
+  "required": ["manifest_version", "phase", "provenance", "bridge", "feature_matrix", "fixtures"],
+  "properties": {
+    "manifest_version": { "type": "integer", "minimum": 1 },
+    "phase": { "type": ["integer", "string"] },
+    "issue": { "type": "string" },
+    "provenance": {
+      "type": "object",
+      "required": ["componentizejs", "starlingmonkey"],
+      "properties": {
+        "componentizejs": {
+          "type": "object",
+          "required": ["package", "npm_version", "repository", "pinned_commit"],
+          "properties": {
+            "package": { "type": "string" },
+            "npm_version": { "type": "string" },
+            "repository": { "type": "string" },
+            "pinned_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "pinned_commit_date": { "type": "string" },
+            "pinned_commit_note": { "type": "string" },
+            "value_shape_baseline_source": { "type": "string" }
+          }
+        },
+        "starlingmonkey": {
+          "type": "object",
+          "required": ["version"],
+          "properties": {
+            "version": { "type": "string" },
+            "source": { "type": "string" }
+          }
+        }
+      }
+    },
+    "bridge": {
+      "type": "object",
+      "required": ["description", "known_deviations"],
+      "properties": {
+        "description": { "type": "string" },
+        "known_deviations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "summary", "phase_addressed"],
+            "properties": {
+              "id": { "type": "string" },
+              "summary": { "type": "string" },
+              "phase_addressed": { "type": ["integer", "string"] },
+              "confidence": { "type": "string" },
+              "evidence": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "feature_matrix": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "status", "phase"],
+        "properties": {
+          "category": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["supported", "unsupported", "untested", "rejected", "supported-as-trap"]
+          },
+          "phase": { "type": ["integer", "string"] },
+          "fixtures": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "dir", "wit_dir", "world", "js_file", "expected_file", "description"],
+        "properties": {
+          "id": { "type": "string" },
+          "category": { "type": "string" },
+          "dir": { "type": "string" },
+          "wit_dir": { "type": "string" },
+          "world": { "type": "string" },
+          "js_file": { "type": "string" },
+          "expected_file": { "type": "string" },
+          "description": { "type": "string" },
+          "negative": { "type": "boolean" },
+          "runtime_verification": { "type": "string" },
+          "notes": { "type": "string" },
+          "cases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "function", "args"],
+              "properties": {
+                "id": { "type": "string" },
+                "function": { "type": "string" },
+                "args": { "type": "array" },
+                "result": {},
+                "bridge_result": {},
+                "reference_result": {},
+                "void": { "type": "boolean" },
+                "confidence": { "type": "string" },
+                "notes": { "type": "string" },
+                "bridge_none_representation": { "type": "string" },
+                "reference_none_representation": { "type": "string" },
+                "expect_error": {
+                  "type": "object",
+                  "properties": {
+                    "reference_class": { "type": "string" },
+                    "reference_message_contains": { "type": "string" },
+                    "reference_confidence": { "type": "string" },
+                    "bridge_class": { "type": "string" },
+                    "bridge_message_contains": { "type": "string" },
+                    "bridge_confidence": { "type": "string" },
+                    "bridge_source": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "sequences": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "function", "calls"],
+              "properties": {
+                "id": { "type": "string" },
+                "function": { "type": "string" },
+                "calls": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["args", "result"],
+                    "properties": {
+                      "args": { "type": "array" },
+                      "result": {},
+                      "confidence": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -47,3 +47,10 @@
 /deps/link.log
 /deps/rust-staticlib-build/
 /deps/mozconfig-zig
+
+# Compatibility harness (tests/compat): Python bytecode cache and the
+# opt-in reference mode's Node.js dependencies/build output.
+__pycache__/
+tests/compat/reference/node_modules/
+tests/compat/reference/.jco-out/
+

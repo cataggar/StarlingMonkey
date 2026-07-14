@@ -1,0 +1,9 @@
+package compat:strings;
+
+// Phase 0 compatibility fixture: string arguments/results, including empty and
+// multi-byte/astral Unicode content.
+world js-exports {
+  export identity: func(value: string) -> string;
+  export concat: func(a: string, b: string) -> string;
+  export length: func(value: string) -> u32;
+}

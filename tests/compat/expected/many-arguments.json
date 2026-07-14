@@ -1,0 +1,38 @@
+{
+  "fixture": "many-arguments",
+  "world": "js-exports",
+  "wit_dir": "fixtures/many-arguments/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "sum8-basic",
+      "function": "sum8",
+      "args": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "result": 36,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "describe-basic",
+      "function": "describe",
+      "args": [
+        true,
+        3,
+        "widget",
+        -7,
+        false,
+        42
+      ],
+      "result": "widget:3:-7:42:true:false",
+      "confidence": "reference-verified"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+package compat:records;
+
+// Phase 0 compatibility fixture: records, including a record nested inside
+// another record (rectangle.topleft/bottomright are `point` records). Field
+// and type names are deliberately single-word (no kebab-case) because
+// kebab-case identifier handling is out of scope until Phase 2 (see
+// manifest.json feature_matrix).
+world js-exports {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  record rectangle {
+    topleft: point,
+    bottomright: point,
+  }
+
+  export translate: func(point: point, dx: s32, dy: s32) -> point;
+  export area: func(rect: rectangle) -> s32;
+  export identity: func(point: point) -> point;
+}

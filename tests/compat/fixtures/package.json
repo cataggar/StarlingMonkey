@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "comment": "This file exists only so that an optional local Node.js self-check (tests/compat/lib/run_compat_tests.py, skipped gracefully when Node is absent) can dynamic-import fixtures/*/component.js as ES modules. It declares no dependencies and is not used by the normal Zig/WABT build or test suite."
+}

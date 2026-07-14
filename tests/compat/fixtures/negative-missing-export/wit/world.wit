@@ -1,0 +1,11 @@
+package compat:negative-missing-export;
+
+// Phase 0 negative fixture: the world declares `phantom`, but component.js
+// intentionally does not implement it. See manifest.json fixture
+// "negative-missing-export" for how the two pipelines are documented to
+// detect this (componentization-time for the pinned ComponentizeJS reference,
+// call-time for the current Zig/WABT bridge).
+world js-exports {
+  export present: func() -> u32;
+  export phantom: func() -> u32;
+}

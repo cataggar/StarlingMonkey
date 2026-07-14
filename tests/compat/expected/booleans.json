@@ -1,0 +1,88 @@
+{
+  "fixture": "booleans",
+  "world": "js-exports",
+  "wit_dir": "fixtures/booleans/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "negate-true",
+      "function": "negate",
+      "args": [
+        true
+      ],
+      "result": false,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "negate-false",
+      "function": "negate",
+      "args": [
+        false
+      ],
+      "result": true,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "both-true-true",
+      "function": "both",
+      "args": [
+        true,
+        true
+      ],
+      "result": true,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "both-true-false",
+      "function": "both",
+      "args": [
+        true,
+        false
+      ],
+      "result": false,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "either-false-false",
+      "function": "either",
+      "args": [
+        false,
+        false
+      ],
+      "result": false,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "either-true-false",
+      "function": "either",
+      "args": [
+        true,
+        false
+      ],
+      "result": true,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "majority-true-true-false",
+      "function": "majority",
+      "args": [
+        true,
+        true,
+        false
+      ],
+      "result": true,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "majority-false-false-true",
+      "function": "majority",
+      "args": [
+        false,
+        false,
+        true
+      ],
+      "result": false,
+      "confidence": "reference-verified"
+    }
+  ]
+}

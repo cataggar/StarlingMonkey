@@ -1,0 +1,25 @@
+{
+  "fixture": "void",
+  "world": "js-exports",
+  "wit_dir": "fixtures/void/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "notify-basic",
+      "function": "notify",
+      "args": [
+        "hello from void fixture"
+      ],
+      "void": true,
+      "confidence": "reference-verified",
+      "notes": "No decoded result; the JS export's own return value (undefined) is not observable through a void WIT result."
+    },
+    {
+      "id": "ping-basic",
+      "function": "ping",
+      "args": [],
+      "void": true,
+      "confidence": "reference-verified"
+    }
+  ]
+}

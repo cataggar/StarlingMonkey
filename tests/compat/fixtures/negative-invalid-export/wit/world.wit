@@ -1,0 +1,7 @@
+package compat:negative-invalid-export;
+
+// Phase 0 negative fixture: the world declares `phantom` as a function, but
+// component.js exports a non-function value under that name.
+world js-exports {
+  export phantom: func() -> u32;
+}

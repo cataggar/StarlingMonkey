@@ -1,0 +1,10 @@
+package compat:booleans;
+
+// Phase 0 compatibility fixture: boolean arguments/results, including a
+// many-argument (3-bool) case. See ../../manifest.json for its call cases.
+world js-exports {
+  export negate: func(value: bool) -> bool;
+  export both: func(a: bool, b: bool) -> bool;
+  export either: func(a: bool, b: bool) -> bool;
+  export majority: func(a: bool, b: bool, c: bool) -> bool;
+}

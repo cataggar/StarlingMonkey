@@ -1,0 +1,75 @@
+{
+  "fixture": "options",
+  "world": "js-exports",
+  "wit_dir": "fixtures/options/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "maybenumber-some",
+      "function": "maybenumber",
+      "args": [
+        41
+      ],
+      "result": 42,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "maybenumber-none",
+      "function": "maybenumber",
+      "args": [
+        null
+      ],
+      "result": null,
+      "confidence": "reference-verified",
+      "notes": "See known_deviations option-none-representation.",
+      "bridge_none_representation": "null",
+      "reference_none_representation": "undefined"
+    },
+    {
+      "id": "maybestring-some",
+      "function": "maybestring",
+      "args": [
+        "hi"
+      ],
+      "result": "HI",
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "maybestring-none",
+      "function": "maybestring",
+      "args": [
+        null
+      ],
+      "result": null,
+      "confidence": "reference-verified",
+      "bridge_none_representation": "null",
+      "reference_none_representation": "undefined"
+    },
+    {
+      "id": "maybepoint-some",
+      "function": "maybepoint",
+      "args": [
+        {
+          "x": 1,
+          "y": 2
+        }
+      ],
+      "result": {
+        "x": 1,
+        "y": 2
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "maybepoint-none",
+      "function": "maybepoint",
+      "args": [
+        null
+      ],
+      "result": null,
+      "confidence": "reference-verified",
+      "bridge_none_representation": "null",
+      "reference_none_representation": "undefined"
+    }
+  ]
+}

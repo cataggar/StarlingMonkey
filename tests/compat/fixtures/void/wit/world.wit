@@ -1,0 +1,9 @@
+package compat:void;
+
+// Phase 0 compatibility fixture: exports with no result ("functions without
+// results" per the issue's current type coverage), with and without
+// arguments.
+world js-exports {
+  export notify: func(message: string);
+  export ping: func();
+}

@@ -125,6 +125,11 @@ The JavaScript bridge currently supports synchronous JSON-representable
 primitives, strings, lists, records, options, and functions without a result.
 Promise results are rejected.
 
+See `tests/compat/README.md` for a data-driven manifest and Node-free test
+harness tracking this bridge's compatibility with a pinned ComponentizeJS
+release (`tests/compat/manifest.json`), including known deviations between
+the two and original WIT/JavaScript fixtures for the surface described above.
+
 Notes:
 - SpiderMonkey must be built from source with Zig because the upstream prebuilt
   artifacts use a libc++ ABI incompatible with Zig's.
@@ -141,7 +146,14 @@ zig build test
 ```
 
 This runs the e2e and integration suites (`tests/run-suite.sh`) against the
-runtime in `zig-out/bin`.
+runtime in `zig-out/bin`, plus the Node-free ComponentizeJS compatibility
+harness (`tests/compat/run-compat-tests.sh`; see `tests/compat/README.md`).
+Run the compatibility harness alone, without needing the wasm build above,
+with:
+
+```console
+zig build compat-test
+```
 
 ## Using StarlingMonkey with dynamically loaded JS code
 

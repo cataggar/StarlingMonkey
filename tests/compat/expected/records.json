@@ -1,0 +1,75 @@
+{
+  "fixture": "records",
+  "world": "js-exports",
+  "wit_dir": "fixtures/records/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "translate-basic",
+      "function": "translate",
+      "args": [
+        {
+          "x": 1,
+          "y": 2
+        },
+        3,
+        4
+      ],
+      "result": {
+        "x": 4,
+        "y": 6
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "translate-negative",
+      "function": "translate",
+      "args": [
+        {
+          "x": -5,
+          "y": 10
+        },
+        -1,
+        -1
+      ],
+      "result": {
+        "x": -6,
+        "y": 9
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "area-basic",
+      "function": "area",
+      "args": [
+        {
+          "topleft": {
+            "x": 0,
+            "y": 0
+          },
+          "bottomright": {
+            "x": 4,
+            "y": 5
+          }
+        }
+      ],
+      "result": 20,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "identity-basic",
+      "function": "identity",
+      "args": [
+        {
+          "x": 7,
+          "y": -9
+        }
+      ],
+      "result": {
+        "x": 7,
+        "y": -9
+      },
+      "confidence": "reference-verified"
+    }
+  ]
+}

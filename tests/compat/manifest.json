@@ -1,0 +1,355 @@
+{
+  "$schema": "./schema/manifest.schema.json",
+  "manifest_version": 1,
+  "phase": 0,
+  "issue": "cataggar/StarlingMonkey#6",
+  "provenance": {
+    "componentizejs": {
+      "package": "@bytecodealliance/componentize-js",
+      "npm_version": "0.21.0",
+      "repository": "https://github.com/bytecodealliance/ComponentizeJS",
+      "pinned_commit": "12c2b4a25033f65047f8ec5c5fb9e3013bfc4950",
+      "pinned_commit_date": "2026-06-10T15:46:53Z",
+      "pinned_commit_note": "Post-release maintenance commit on main; package.json version is still 0.21.0 at this commit (verified via GitHub contents API on 2026-07-14). The published git tag for 0.21.0 is a different, earlier commit (5be3a668d3c0612adf93592cbc8b91d4a6190c9d); both represent the same 0.21.0 release line. The npm-published 0.21.0 tarball (which has no recorded gitHead) is used as the operational reference install in tests/compat/reference/, since it is what an opt-in user would actually install.",
+      "value_shape_baseline_source": "Documented public behavior (README.md/EXAMPLE.md of the pinned repository, https://github.com/WebAssembly/component-model canonical ABI conventions) plus empirical verification performed for this manifest (see verified_by_reference_run below). Not copied from any ComponentizeJS or jco source file."
+    },
+    "starlingmonkey": {
+      "version": "0.3.0",
+      "source": "version.txt / build.zig.zon (fingerprint 0x990a2f6e2fa7fb45)"
+    },
+    "bridge_source_reviewed": [
+      "runtime/js_dispatch.cpp",
+      "runtime/js_dispatch.zig",
+      "host-apis/wasi-0.2.10/wit/js-dispatch.wit",
+      "host-apis/wasi-0.2.10/wit/deps/starling-js/package.wit"
+    ],
+    "verified_by_reference_run": {
+      "description": "Every fixture below except the two negative fixtures was actually componentized with the pinned npm package (@bytecodealliance/componentize-js@0.21.0, which required a portable Node.js >=22 since the environment's default Node 20.14 cannot load that package's native optional dependencies) and executed via a jco-transpiled JS caller, to record real observed reference values rather than assumed ones. The two negative fixtures were run through the same componentize() call to observe componentization-time behavior. This one-time verification pass is not part of normal CI; tests/compat/reference/ lets it be reproduced.",
+      "date": "2026-07-14",
+      "environment_note": "This repository does not depend on Node/npm normally; the verification pass above used a temporary, non-committed Node 22 install and is not required to build or test this repository."
+    }
+  },
+  "bridge": {
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell JSON-encodes its typed WIT arguments, calls starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. A returned Promise traps rather than being awaited.",
+    "known_deviations": [
+      {
+        "id": "option-none-representation",
+        "summary": "WIT `none` arrives to the JS export as `null` in the current JSON bridge (Zig `std.json` serializes a Zig optional's null case as JSON `null`, and `JSON.parse` yields JS `null`), whereas the pinned ComponentizeJS reference lifts `none` as JS `undefined`. Both bridges accept `null` or `undefined` returned from JS as lowering to `none`.",
+        "phase_addressed": "1a",
+        "confidence": "reference-verified",
+        "evidence": "tests/compat/fixtures/options + tests/compat/reference (see maybenumber/maybestring/maybepoint cases in expected/options.json)"
+      },
+      {
+        "id": "missing-export-detection-timing",
+        "summary": "The pinned ComponentizeJS reference rejects a WIT-declared export that JavaScript does not implement (or implements as a non-function) at componentization time, with a message naming the missing/invalid export. The current Zig/WABT bridge resolves the JS export lazily by name on each call (see js_dispatch.cpp's JS_GetProperty/JS::IsCallable check), so the same mistake is only observed as a call-time trap, not a componentization-time failure.",
+        "phase_addressed": 2,
+        "confidence": "reference-verified",
+        "evidence": "tests/compat/fixtures/negative-missing-export, tests/compat/fixtures/negative-invalid-export"
+      },
+      {
+        "id": "componentizejs-u32-high-bit-defect",
+        "summary": "Empirically, values of a plain `u32` argument/result at or above 2^31 (2147483648) did not round-trip correctly through the pinned ComponentizeJS 0.21.0 reference in this environment (e.g. echou32(4294967295) returned 4292870144, echou32(2147483648) returned 0), even in a minimal single-function isolated world. Root cause not diagnosed here (candidates include the embedded engine's own canonical-ABI numeric lifting/lowering); root-caused and either fixed upstream or worked around in a later phase. The current Zig/WABT bridge is expected (by static review of runtime/js_dispatch.zig, which serializes numbers as JSON decimal text parsed by JS as an exact float64) to be unaffected, since JSON round-tripping of an integer within Number.MAX_SAFE_INTEGER does not go through this path; this expectation is NOT yet build-verified (see fixtures/numeric-primitives runtime_verification).",
+        "phase_addressed": "1a",
+        "confidence": "reference-verified (defect), static-reasoning (bridge unaffected)",
+        "evidence": "tests/compat/reference notes; expected/numeric-primitives.json case echou32-max"
+      },
+      {
+        "id": "integer-64-bit-precision",
+        "summary": "u64/s64 are not exercised by Phase 0 fixtures. ComponentizeJS lifts them as JS BigInt; the current JSON bridge round-trips them as JS Number via JSON text, which loses precision above Number.MAX_SAFE_INTEGER (2^53-1). Phase 1a is expected to move to a typed bridge with BigInt support.",
+        "phase_addressed": "1a",
+        "confidence": "documented-not-tested"
+      },
+      {
+        "id": "promise-rejected",
+        "summary": "A Promise-returned from a JS export traps synchronously (js_dispatch.cpp explicitly rejects JS::IsPromiseObject results) instead of being driven to completion, unlike the pinned ComponentizeJS reference which can synchronously drive Promise-returning exports to completion.",
+        "phase_addressed": 5,
+        "confidence": "source-verified"
+      },
+      {
+        "id": "json-bridge-overhead",
+        "summary": "Every call boundary serializes arguments and results through JSON text rather than a typed SpiderMonkey JS::Value conversion.",
+        "phase_addressed": "1a",
+        "confidence": "source-verified"
+      },
+      {
+        "id": "no-variants-enums-flags-results-resources",
+        "summary": "Enums, flags, variants, results, resources, futures and streams are not represented by the bridge or by any Phase 0 fixture.",
+        "phase_addressed": 2,
+        "confidence": "source-verified"
+      },
+      {
+        "id": "interface-export-flattening",
+        "summary": "When a WIT world exports a named interface (e.g. `export api;` with `api` containing `add`), the pinned ComponentizeJS reference requires the JS module to export a matching namespace object (e.g. `export const api = { add, ... }`); it fails componentization otherwise with 'does not export an \"<iface>\" interface as expected by the world'. The current Zig/WABT bridge instead strips everything up to and including the last '#' in the canonical export name and looks up that bare name directly as a flat top-level export, regardless of interface qualification (see js_dispatch.cpp's `export_name.rfind('#')`), matching the existing tests/fixtures/js-dispatch.js fixture which uses flat exports under an interface-qualified world. Phase 0 fixtures therefore declare exports directly on `world js-exports { export name: func(...); }` (no named interface) so the same JS source is valid under both pipelines.",
+        "phase_addressed": 2,
+        "confidence": "reference-verified"
+      }
+    ]
+  },
+  "feature_matrix": [
+    { "category": "bool", "status": "supported", "phase": 0, "fixtures": ["booleans"] },
+    { "category": "integers-u8-u16-u32-s8-s16-s32", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"], "notes": "u32 values >= 2^31 are reference-pipeline-risky; see known_deviations componentizejs-u32-high-bit-defect." },
+    { "category": "integers-u64-s64", "status": "unsupported", "phase": "1a", "fixtures": [] },
+    { "category": "float32-float64", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"] },
+    { "category": "char", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "string", "status": "supported", "phase": 0, "fixtures": ["strings"] },
+    { "category": "list", "status": "supported", "phase": 0, "fixtures": ["lists"] },
+    { "category": "record", "status": "supported", "phase": 0, "fixtures": ["records"], "notes": "Includes a record nested inside another record." },
+    { "category": "tuple", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "option", "status": "supported", "phase": 0, "fixtures": ["options"] },
+    { "category": "enum", "status": "unsupported", "phase": 2, "fixtures": [] },
+    { "category": "flags", "status": "unsupported", "phase": 2, "fixtures": [] },
+    { "category": "variant", "status": "unsupported", "phase": 2, "fixtures": [] },
+    { "category": "result", "status": "unsupported", "phase": 2, "fixtures": [] },
+    { "category": "void", "status": "supported", "phase": 0, "fixtures": ["void"] },
+    { "category": "many-arguments", "status": "supported", "phase": 0, "fixtures": ["many-arguments"] },
+    { "category": "repeated-calls", "status": "supported", "phase": 0, "fixtures": ["repeated-calls"] },
+    { "category": "missing-or-invalid-export", "status": "supported-as-trap", "phase": 0, "fixtures": ["negative-missing-export", "negative-invalid-export"], "notes": "Detection timing differs between pipelines; see known_deviations missing-export-detection-timing." },
+    { "category": "kebab-case-and-naming", "status": "untested", "phase": 2, "fixtures": [] },
+    { "category": "resources", "status": "unsupported", "phase": 4, "fixtures": [] },
+    { "category": "imports", "status": "unsupported", "phase": 3, "fixtures": [] },
+    { "category": "promise-exports", "status": "rejected", "phase": 5, "fixtures": [] }
+  ],
+  "fixtures": [
+    {
+      "id": "booleans",
+      "category": "bool",
+      "dir": "fixtures/booleans",
+      "wit_dir": "fixtures/booleans/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/booleans.json",
+      "description": "Boolean identity/logic functions, including a 3-argument majority vote.",
+      "cases": [
+        { "id": "negate-true", "function": "negate", "args": [true], "result": false, "confidence": "reference-verified" },
+        { "id": "negate-false", "function": "negate", "args": [false], "result": true, "confidence": "reference-verified" },
+        { "id": "both-true-true", "function": "both", "args": [true, true], "result": true, "confidence": "reference-verified" },
+        { "id": "both-true-false", "function": "both", "args": [true, false], "result": false, "confidence": "reference-verified" },
+        { "id": "either-false-false", "function": "either", "args": [false, false], "result": false, "confidence": "reference-verified" },
+        { "id": "either-true-false", "function": "either", "args": [true, false], "result": true, "confidence": "reference-verified" },
+        { "id": "majority-true-true-false", "function": "majority", "args": [true, true, false], "result": true, "confidence": "reference-verified" },
+        { "id": "majority-false-false-true", "function": "majority", "args": [false, false, true], "result": false, "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "numeric-primitives",
+      "category": "integers-u8-u16-u32-s8-s16-s32,float32-float64",
+      "dir": "fixtures/numeric-primitives",
+      "wit_dir": "fixtures/numeric-primitives/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/numeric-primitives.json",
+      "description": "Identity functions per numeric width plus a two-argument sum, at boundary values.",
+      "runtime_verification": "pending-full-zig-wabt-build",
+      "cases": [
+        { "id": "u8-min", "function": "echou8", "args": [0], "result": 0, "confidence": "reference-verified" },
+        { "id": "u8-max", "function": "echou8", "args": [255], "result": 255, "confidence": "reference-verified" },
+        { "id": "u16-min", "function": "echou16", "args": [0], "result": 0, "confidence": "reference-verified" },
+        { "id": "u16-max", "function": "echou16", "args": [65535], "result": 65535, "confidence": "reference-verified" },
+        { "id": "u32-min", "function": "echou32", "args": [0], "result": 0, "confidence": "reference-verified" },
+        { "id": "u32-safe-max", "function": "echou32", "args": [2147483647], "result": 2147483647, "confidence": "reference-verified", "notes": "2^31-1: the largest u32 value confirmed to round-trip through the pinned reference in this environment." },
+        {
+          "id": "u32-max",
+          "function": "echou32",
+          "args": [4294967295],
+          "bridge_result": 4294967295,
+          "reference_result": 4292870144,
+          "confidence": "bridge_result=static-reasoning, reference_result=reference-verified",
+          "notes": "See known_deviations componentizejs-u32-high-bit-defect. This case intentionally has divergent bridge_result/reference_result instead of a single result."
+        },
+        { "id": "s8-min", "function": "echos8", "args": [-128], "result": -128, "confidence": "reference-verified" },
+        { "id": "s8-max", "function": "echos8", "args": [127], "result": 127, "confidence": "reference-verified" },
+        { "id": "s16-min", "function": "echos16", "args": [-32768], "result": -32768, "confidence": "reference-verified" },
+        { "id": "s16-max", "function": "echos16", "args": [32767], "result": 32767, "confidence": "reference-verified" },
+        { "id": "s32-min", "function": "echos32", "args": [-2147483648], "result": -2147483648, "confidence": "reference-verified" },
+        { "id": "s32-max", "function": "echos32", "args": [2147483647], "result": 2147483647, "confidence": "reference-verified" },
+        { "id": "f32-fraction", "function": "echof32", "args": [1.5], "result": 1.5, "confidence": "reference-verified" },
+        { "id": "f64-fraction", "function": "echof64", "args": [3.14159265], "result": 3.14159265, "confidence": "reference-verified" },
+        { "id": "sum-basic", "function": "sum", "args": [2, 40], "result": 42, "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "strings",
+      "category": "string",
+      "dir": "fixtures/strings",
+      "wit_dir": "fixtures/strings/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/strings.json",
+      "description": "String identity, concatenation and UTF-16 length, including an empty string and astral (surrogate-pair) content.",
+      "cases": [
+        { "id": "identity-ascii", "function": "identity", "args": ["hello"], "result": "hello", "confidence": "reference-verified" },
+        { "id": "identity-empty", "function": "identity", "args": [""], "result": "", "confidence": "reference-verified" },
+        { "id": "identity-unicode", "function": "identity", "args": ["h\u00e9llo \ud83d\ude00 world"], "result": "h\u00e9llo \ud83d\ude00 world", "confidence": "reference-verified" },
+        { "id": "concat-basic", "function": "concat", "args": ["foo", "bar"], "result": "foobar", "confidence": "reference-verified" },
+        { "id": "length-ascii", "function": "length", "args": ["hello"], "result": 5, "confidence": "reference-verified" },
+        { "id": "length-unicode", "function": "length", "args": ["h\u00e9llo \ud83d\ude00 world"], "result": 14, "confidence": "reference-verified", "notes": "UTF-16 code units: 5 + 1 space + 2 (surrogate pair) + 1 space + 5 = 14." }
+      ]
+    },
+    {
+      "id": "lists",
+      "category": "list",
+      "dir": "fixtures/lists",
+      "wit_dir": "fixtures/lists/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/lists.json",
+      "description": "list<u32> sum, list<string> reverse, and list<bool> identity, including empty lists.",
+      "cases": [
+        { "id": "sum-empty", "function": "sum", "args": [[]], "result": 0, "confidence": "reference-verified" },
+        { "id": "sum-values", "function": "sum", "args": [[1, 2, 3, 4, 5]], "result": 15, "confidence": "reference-verified" },
+        { "id": "reverse-values", "function": "reverse", "args": [["a", "b", "c"]], "result": ["c", "b", "a"], "confidence": "reference-verified" },
+        { "id": "reverse-empty", "function": "reverse", "args": [[]], "result": [], "confidence": "reference-verified" },
+        { "id": "identity-bools", "function": "identity", "args": [[true, false, true]], "result": [true, false, true], "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "records",
+      "category": "record",
+      "dir": "fixtures/records",
+      "wit_dir": "fixtures/records/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/records.json",
+      "description": "Record arguments/results, including a record (rectangle) nested inside another record (point).",
+      "cases": [
+        { "id": "translate-basic", "function": "translate", "args": [{ "x": 1, "y": 2 }, 3, 4], "result": { "x": 4, "y": 6 }, "confidence": "reference-verified" },
+        { "id": "translate-negative", "function": "translate", "args": [{ "x": -5, "y": 10 }, -1, -1], "result": { "x": -6, "y": 9 }, "confidence": "reference-verified" },
+        { "id": "area-basic", "function": "area", "args": [{ "topleft": { "x": 0, "y": 0 }, "bottomright": { "x": 4, "y": 5 } }], "result": 20, "confidence": "reference-verified" },
+        { "id": "identity-basic", "function": "identity", "args": [{ "x": 7, "y": -9 }], "result": { "x": 7, "y": -9 }, "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "options",
+      "category": "option",
+      "dir": "fixtures/options",
+      "wit_dir": "fixtures/options/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/options.json",
+      "description": "option<T> for a numeric, string and record payload, both some and none.",
+      "cases": [
+        { "id": "maybenumber-some", "function": "maybenumber", "args": [41], "result": 42, "confidence": "reference-verified" },
+        { "id": "maybenumber-none", "function": "maybenumber", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified", "notes": "See known_deviations option-none-representation." },
+        { "id": "maybestring-some", "function": "maybestring", "args": ["hi"], "result": "HI", "confidence": "reference-verified" },
+        { "id": "maybestring-none", "function": "maybestring", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified" },
+        { "id": "maybepoint-some", "function": "maybepoint", "args": [{ "x": 1, "y": 2 }], "result": { "x": 1, "y": 2 }, "confidence": "reference-verified" },
+        { "id": "maybepoint-none", "function": "maybepoint", "args": [null], "result": null, "bridge_none_representation": "null", "reference_none_representation": "undefined", "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "void",
+      "category": "void",
+      "dir": "fixtures/void",
+      "wit_dir": "fixtures/void/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/void.json",
+      "description": "Exports with no WIT result, with and without arguments.",
+      "cases": [
+        { "id": "notify-basic", "function": "notify", "args": ["hello from void fixture"], "void": true, "confidence": "reference-verified", "notes": "No decoded result; the JS export's own return value (undefined) is not observable through a void WIT result." },
+        { "id": "ping-basic", "function": "ping", "args": [], "void": true, "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "many-arguments",
+      "category": "many-arguments",
+      "dir": "fixtures/many-arguments",
+      "wit_dir": "fixtures/many-arguments/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/many-arguments.json",
+      "description": "An 8-argument numeric sum and a 6-argument heterogeneous-type export.",
+      "runtime_verification": "pending-full-zig-wabt-build",
+      "notes": "reference-verified against the pinned ComponentizeJS install; the current Zig/WABT bindgen's maximum supported arity is not yet independently confirmed in this repository.",
+      "cases": [
+        { "id": "sum8-basic", "function": "sum8", "args": [1, 2, 3, 4, 5, 6, 7, 8], "result": 36, "confidence": "reference-verified" },
+        { "id": "describe-basic", "function": "describe", "args": [true, 3, "widget", -7, false, 42], "result": "widget:3:-7:42:true:false", "confidence": "reference-verified" }
+      ]
+    },
+    {
+      "id": "repeated-calls",
+      "category": "repeated-calls",
+      "dir": "fixtures/repeated-calls",
+      "wit_dir": "fixtures/repeated-calls/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/repeated-calls.json",
+      "description": "Exports with module-level state that must persist across calls within one component instance. Cases within a sequence must run in the given order.",
+      "runtime_verification": "pending-full-zig-wabt-build",
+      "sequences": [
+        {
+          "id": "increment-sequence",
+          "function": "increment",
+          "calls": [
+            { "args": [], "result": 1, "confidence": "reference-verified" },
+            { "args": [], "result": 2, "confidence": "reference-verified" },
+            { "args": [], "result": 3, "confidence": "reference-verified" }
+          ]
+        },
+        {
+          "id": "accumulate-sequence",
+          "function": "accumulate",
+          "calls": [
+            { "args": [5], "result": 5, "confidence": "reference-verified" },
+            { "args": [10], "result": 15, "confidence": "reference-verified" },
+            { "args": [-3], "result": 12, "confidence": "reference-verified" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "negative-missing-export",
+      "category": "missing-or-invalid-export",
+      "dir": "fixtures/negative-missing-export",
+      "wit_dir": "fixtures/negative-missing-export/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/negative-missing-export.json",
+      "description": "The world declares `phantom`, which component.js does not implement.",
+      "negative": true,
+      "cases": [
+        {
+          "id": "call-missing-export",
+          "function": "phantom",
+          "args": [],
+          "expect_error": {
+            "reference_class": "componentization-error",
+            "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "is not a function",
+            "bridge_confidence": "static-reasoning",
+            "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call"
+          }
+        }
+      ]
+    },
+    {
+      "id": "negative-invalid-export",
+      "category": "missing-or-invalid-export",
+      "dir": "fixtures/negative-invalid-export",
+      "wit_dir": "fixtures/negative-invalid-export/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/negative-invalid-export.json",
+      "description": "The world declares `phantom` as a function, but component.js exports a non-function value under that name.",
+      "negative": true,
+      "cases": [
+        {
+          "id": "call-non-function-export",
+          "function": "phantom",
+          "args": [],
+          "expect_error": {
+            "reference_class": "componentization-error",
+            "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "is not a function",
+            "bridge_confidence": "static-reasoning",
+            "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call"
+          }
+        }
+      ]
+    }
+  ]
+}

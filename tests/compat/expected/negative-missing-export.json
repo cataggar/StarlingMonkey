@@ -1,0 +1,23 @@
+{
+  "fixture": "negative-missing-export",
+  "world": "js-exports",
+  "wit_dir": "fixtures/negative-missing-export/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "call-missing-export",
+      "function": "phantom",
+      "args": [],
+      "expect_error": {
+        "reference_class": "componentization-error",
+        "reference_message_contains": "does not export a \"phantom\" function as expected by the world",
+        "reference_confidence": "reference-verified",
+        "bridge_class": "call-time-trap",
+        "bridge_message_contains": "is not a function",
+        "bridge_confidence": "static-reasoning",
+        "bridge_source": "runtime/js_dispatch.cpp: JS_GetProperty + JS::IsCallable check before JS::Call"
+      }
+    }
+  ],
+  "negative": true
+}

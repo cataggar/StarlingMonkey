@@ -1,0 +1,156 @@
+{
+  "fixture": "numeric-primitives",
+  "world": "js-exports",
+  "wit_dir": "fixtures/numeric-primitives/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "u8-min",
+      "function": "echou8",
+      "args": [
+        0
+      ],
+      "result": 0,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "u8-max",
+      "function": "echou8",
+      "args": [
+        255
+      ],
+      "result": 255,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "u16-min",
+      "function": "echou16",
+      "args": [
+        0
+      ],
+      "result": 0,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "u16-max",
+      "function": "echou16",
+      "args": [
+        65535
+      ],
+      "result": 65535,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "u32-min",
+      "function": "echou32",
+      "args": [
+        0
+      ],
+      "result": 0,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "u32-safe-max",
+      "function": "echou32",
+      "args": [
+        2147483647
+      ],
+      "result": 2147483647,
+      "confidence": "reference-verified",
+      "notes": "2^31-1: the largest u32 value confirmed to round-trip through the pinned reference in this environment."
+    },
+    {
+      "id": "u32-max",
+      "function": "echou32",
+      "args": [
+        4294967295
+      ],
+      "bridge_result": 4294967295,
+      "reference_result": 4292870144,
+      "confidence": "bridge_result=static-reasoning, reference_result=reference-verified",
+      "notes": "See known_deviations componentizejs-u32-high-bit-defect. This case intentionally has divergent bridge_result/reference_result instead of a single result."
+    },
+    {
+      "id": "s8-min",
+      "function": "echos8",
+      "args": [
+        -128
+      ],
+      "result": -128,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "s8-max",
+      "function": "echos8",
+      "args": [
+        127
+      ],
+      "result": 127,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "s16-min",
+      "function": "echos16",
+      "args": [
+        -32768
+      ],
+      "result": -32768,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "s16-max",
+      "function": "echos16",
+      "args": [
+        32767
+      ],
+      "result": 32767,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "s32-min",
+      "function": "echos32",
+      "args": [
+        -2147483648
+      ],
+      "result": -2147483648,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "s32-max",
+      "function": "echos32",
+      "args": [
+        2147483647
+      ],
+      "result": 2147483647,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "f32-fraction",
+      "function": "echof32",
+      "args": [
+        1.5
+      ],
+      "result": 1.5,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "f64-fraction",
+      "function": "echof64",
+      "args": [
+        3.14159265
+      ],
+      "result": 3.14159265,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "sum-basic",
+      "function": "sum",
+      "args": [
+        2,
+        40
+      ],
+      "result": 42,
+      "confidence": "reference-verified"
+    }
+  ]
+}

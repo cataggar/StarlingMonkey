@@ -1,0 +1,56 @@
+{
+  "fixture": "repeated-calls",
+  "world": "js-exports",
+  "wit_dir": "fixtures/repeated-calls/wit",
+  "js_file": "component.js",
+  "sequences": [
+    {
+      "id": "increment-sequence",
+      "function": "increment",
+      "calls": [
+        {
+          "args": [],
+          "result": 1,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [],
+          "result": 2,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [],
+          "result": 3,
+          "confidence": "reference-verified"
+        }
+      ]
+    },
+    {
+      "id": "accumulate-sequence",
+      "function": "accumulate",
+      "calls": [
+        {
+          "args": [
+            5
+          ],
+          "result": 5,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [
+            10
+          ],
+          "result": 15,
+          "confidence": "reference-verified"
+        },
+        {
+          "args": [
+            -3
+          ],
+          "result": 12,
+          "confidence": "reference-verified"
+        }
+      ]
+    }
+  ]
+}

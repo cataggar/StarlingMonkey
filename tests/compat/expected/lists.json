@@ -1,0 +1,75 @@
+{
+  "fixture": "lists",
+  "world": "js-exports",
+  "wit_dir": "fixtures/lists/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "sum-empty",
+      "function": "sum",
+      "args": [
+        []
+      ],
+      "result": 0,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "sum-values",
+      "function": "sum",
+      "args": [
+        [
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      ],
+      "result": 15,
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "reverse-values",
+      "function": "reverse",
+      "args": [
+        [
+          "a",
+          "b",
+          "c"
+        ]
+      ],
+      "result": [
+        "c",
+        "b",
+        "a"
+      ],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "reverse-empty",
+      "function": "reverse",
+      "args": [
+        []
+      ],
+      "result": [],
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "identity-bools",
+      "function": "identity",
+      "args": [
+        [
+          true,
+          false,
+          true
+        ]
+      ],
+      "result": [
+        true,
+        false,
+        true
+      ],
+      "confidence": "reference-verified"
+    }
+  ]
+}
