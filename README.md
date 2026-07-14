@@ -133,9 +133,23 @@ Runtime-evaluated components can set the same option through their WASI
 arguments or `STARLINGMONKEY_CONFIG`. Values must be whole MiB in the range
 1–4095.
 
-The JavaScript bridge currently supports synchronous JSON-representable
-primitives, strings, lists, records, options, and functions without a result.
-Promise results are rejected.
+The JavaScript bridge supports synchronous WIT exports covering every value
+shape ComponentizeJS itself supports except resources, streams, and futures:
+JSON-representable primitives, exact-precision s64/u64 (as JS `BigInt`, via a
+native, non-JSON dispatch path), f32/f64, strings, `char`, `list<u8>` (a
+JS `Uint8Array`, kept distinct from a generic `list<T>`), records, options,
+tuples, enums, flags, variants, and `result<T, E>` (both nested and as an
+export's own top-level return type: the JS implementation returns the `ok`
+payload directly and signals `err` by throwing it, matching ComponentizeJS's
+own calling convention). A JS implementation may also return a Promise or
+thenable: it is pumped to completion using the engine's own job/task queues,
+and its fulfilled value is lowered exactly like a directly-returned value. A
+rejected Promise is a deterministic call-time trap for a non-result export;
+for a top-level `result<T, E>` export, a rejection is instead treated exactly
+like a synchronous throw (`Err(reason)` if the reason's JS shape matches `E`,
+a trap otherwise) -- and, either way, a Promise that never settles at all
+(no progress possible on the job/task queues) always traps deterministically
+rather than hanging, never silently becoming `Err(...)`.
 
 See `tests/compat/README.md` for a data-driven manifest and two Node-free test
 harness modes tracking this bridge's compatibility with a pinned ComponentizeJS

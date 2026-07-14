@@ -38,6 +38,23 @@
 #     queried via the side-channel `note-count` import) proves the
 #     canonical-ABI import genuinely ran, not merely that the JS call site
 #     didn't throw.
+#   * requirement 5 (every synchronous type, reverse direction, where the
+#     pinned WABT's `--js-imports` bindgen currently allows it): nesting (a
+#     list of lists) round-trips through the reverse bridge. `char`,
+#     `list<u8>` (bytes), `tuple`, `enum`, `flags`, `variant`, and
+#     `result<T,E>` do NOT yet -- two real, narrow bugs in the pinned
+#     commit's component_bindgen.zig: (1) `nativeBridgeSupported`'s type
+#     gate is a conservative allow-list written before js_dispatch.zig grew
+#     support for char/tuple/enum/flags/variant/result (in the
+#     independently-developed sync-value-parity branch); (2) `list<u8>`
+#     passes that gate but its generated import-parameter-lowering fast
+#     path forgets the `wit_types.ByteList` wrapper indirection dispatch
+#     mode uses for a *direct* `list<u8>`, causing a genuine Zig compile
+#     error. See tests/compat/manifest.json's
+#     `wit-imports-native-bridge-type-gate` known_deviation for the exact
+#     empirical diagnostics and a focused, fully-tested (but, per this
+#     integration's "do not push/post" constraint, unpublished)
+#     cataggar/wabt fix for both.
 #
 # Usage: run.sh [zig-binary] [install-prefix]
 #   zig-binary defaults to `zig` on PATH; install-prefix defaults to
@@ -105,6 +122,7 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-note-count", "args": []},
   {"function": "run-note", "args": []},
   {"function": "run-note-count", "args": []},
+  {"function": "run-sum-nested-lists", "args": [[[1, 2], [3, 4], [5, 6]]]},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -152,8 +170,21 @@ assert_field "run-note: JS observes exactly undefined for a void import" 6 "rec[
 assert_field "note-count is 1 after one 'note' call (host side effect proves the import ran)" 7 "rec['value']" "1"
 assert_field "run-note: undefined result is consistent across repeated calls" 8 "rec['value']" "True"
 assert_field "note-count is 2 after a second 'note' call" 9 "rec['value']" "2"
-assert_field "run-boom host trap propagates" 10 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 10 \
+
+# -- advanced synchronous value types (requirement 5), scoped to what the
+# pinned WABT's `--js-imports` bindgen currently accepts: nesting (a list
+# of lists). char, list<u8> (bytes), tuple, enum, flags, variant, and
+# result<T,E> do NOT yet -- see this fixture's package.wit and
+# tests/compat/manifest.json's `wit-imports-native-bridge-type-gate`
+# known_deviation. Must run BEFORE run-boom below: this invoker
+# instantiates the component once and replays every call against that same
+# instance (see wit_imports_invoker.rs's main()), and a real Wasmtime trap
+# poisons the instance for any later call ("cannot enter component
+# instance") -- so the deliberately-trapping call has to be last.
+assert_field "run-sum-nested-lists sums a nested list<list<u32>>" 10 "rec['value']" "21"
+
+assert_field "run-boom host trap propagates" 11 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 11 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"

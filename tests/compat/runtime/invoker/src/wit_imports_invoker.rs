@@ -335,6 +335,35 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
         }
     })?;
 
+    // -- advanced synchronous value types (requirement 5), scoped to what
+    // the pinned WABT's `--js-imports` bindgen currently accepts (see
+    // ../../../../e2e/wit-imports/wit/deps/test-wit-imports/package.wit's
+    // doc comment for why char/list<u8>/tuple/enum/flags/variant/result
+    // are not wired in here) --
+
+    host.func_new(
+        "sum-nested-lists",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let Val::List(rows) = &args[0] else {
+                return Err(wasm_err("sum-nested-lists: expected list<list<u32>>"));
+            };
+            let mut sum: u32 = 0;
+            for row in rows {
+                let Val::List(items) = row else {
+                    return Err(wasm_err("sum-nested-lists: expected list<u32> rows"));
+                };
+                for item in items {
+                    let Val::U32(v) = item else {
+                        return Err(wasm_err("sum-nested-lists: expected u32 elements"));
+                    };
+                    sum = sum.wrapping_add(*v);
+                }
+            }
+            results[0] = Val::U32(sum);
+            Ok(())
+        },
+    )?;
+
     Ok(())
 }
 

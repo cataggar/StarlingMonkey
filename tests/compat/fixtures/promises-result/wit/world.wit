@@ -1,0 +1,24 @@
+package compat:promises-result;
+
+// Integration fixture (feat/js-bridge-parity-integration): async
+// (Promise-returning) counterparts to advanced-types' `divide`/
+// `checked-negate`, confirming a Promise settling on a top-level WIT
+// `result<T, E>` export is treated identically to a synchronous
+// return/throw at this same boundary -- both fulfillment and rejection
+// (when the rejection reason's JS shape matches E). Kept separate from
+// advanced-types (a purely synchronous fixture) since these need `async`
+// exports/`await` on the invoking side to actually observe a Promise
+// settle rather than a same-tick throw.
+//
+// Only the never-trapping sub-cases live here (fulfillment, and rejection
+// whose reason matches E's shape, including the E-is-void case where any
+// rejection reason at all is accepted): see the separate single-case
+// fixtures 'promises-result-rejected-wrong-shape' and
+// 'promises-result-deadlock' for the two trapping sub-cases, kept apart
+// for the same reason as 'promises-rejected'/'promises-deadlock' (a
+// trapped Wasmtime component instance is poisoned for further calls in
+// the same store).
+world js-exports {
+  export divide-async: func(a: u32, b: u32) -> result<u32, string>;
+  export checked-negate-async: func(value: s32) -> result<s32>;
+}

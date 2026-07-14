@@ -1,0 +1,26 @@
+{
+  "fixture": "promises-result-rejected-wrong-shape",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises-result-rejected-wrong-shape/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "divide-async-wrong-shape",
+      "function": "divide-async",
+      "args": [
+        10,
+        0
+      ],
+      "expect_error": {
+        "reference_class": "wrong-kind-result-err-value",
+        "reference_message_contains": "expected a string, received [object]",
+        "reference_confidence": "reference-verified",
+        "bridge_class": "call-time-trap",
+        "bridge_message_contains": "expected a string result, got a JavaScript value of kind record",
+        "bridge_confidence": "build-verified",
+        "bridge_source": "runtime/js_dispatch.cpp: resolve_promise_like's Rejected branch, when result_is_wit_result is true, hands the rejection reason (the Error object) to starling_js_dispatch_native's existing decode_from_js (which decodes any JS object, including an Error, as a generic STARLING_JS_RECORD) + js_dispatch.zig's decodeNative(string, ...) path -- the same one a synchronous throw already goes through -- which panics with 'native dispatch: expected a string result, got a JavaScript value of kind record' since a record was decoded where E=string was expected; build-verified via tests/compat/runtime/run-bridge-tests.sh promises-result-rejected-wrong-shape, 2026-07-14."
+      }
+    }
+  ],
+  "negative": true
+}

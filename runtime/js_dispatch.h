@@ -230,31 +230,34 @@ struct StarlingJsValue {
 // exception at all when `result_is_wit_result` is false) is treated as
 // before: it is left pending for the caller to dump/surface as a trap.
 //
-// A *Promise* returned by a `result_is_wit_result` export is deliberately
-// **not** given the same err-via-throw treatment: only a plain synchronous
-// exception at the `JS::Call` boundary above takes the status-2 path.
-// `resolve_promise_like` still pumps the event loop for it exactly as for
-// any other export, and a rejection (or a deadlock/reentrancy diagnostic
-// from that pump) is surfaced the same way as for a non-result export --
-// dumped to stderr and reported as a hard dispatch failure (status 1), not
-// silently reinterpreted as `err` -- because this matches actual pinned
-// ComponentizeJS 0.21.0/Wasmtime 42 behavior for a `result<T, E>` export
-// whose implementation is `async`/returns a rejected Promise, verified
-// empirically rather than assumed (see
-// tests/compat/fixtures/promises-result and manifest.json's
-// "promise-result-rejection" known_deviation for the differential evidence
-// this was checked against). Only a real JS-visible Promise rejection is
-// covered by that verification; an event-loop deadlock/no-progress or
-// reentrancy diagnostic is never turned into `err` regardless of
-// `result_is_wit_result`, since those are StarlingMonkey-internal dispatch
-// failures with no ComponentizeJS equivalent to defer to.
+// A *Promise* returned by a `result_is_wit_result` export gets the exact
+// same err-via-throw treatment, not just a plain synchronous exception at
+// the `JS::Call` boundary above: `resolve_promise_like` pumps the event loop
+// for it exactly as for any other export, and if it settles Rejected, the
+// rejection reason is decoded into `*out_result` and this function returns
+// 2 here too -- a rejected Promise and a synchronous throw are
+// indistinguishable at this boundary, and re-verified directly against the
+// pinned ComponentizeJS 0.21.0 reference (not assumed): both simply become
+// the `err` payload, and both trap if decoding that payload as `E` fails
+// (wrong JS kind for `E`; `E == void` never even inspects the payload, so
+// *any* rejection reason of *any* shape becomes a bare `Err()` there -- see
+// js_dispatch.zig's `callNative`). A deadlock/no-progress or reentrancy
+// diagnostic from that pump is, however, *never* reinterpreted as `err`
+// regardless of `result_is_wit_result` -- surfaced the same way as for a
+// non-result export (dumped to stderr, hard dispatch failure, status 1) --
+// since those are StarlingMonkey-internal dispatch failures with no
+// ComponentizeJS equivalent to defer to, confirmed by the same empirical
+// check (see tests/compat/fixtures/promises-result and manifest.json's
+// "promise-result-rejection-matches-throw" known_deviation for the
+// differential evidence, gathered through the real Wasmtime 42 CLI, this
+// was checked against).
 //
 // Returns 0 on success, 1 if the export was missing, wasn't callable,
-// returned a Promise that rejected/deadlocked/hit reentrancy, or raised a
-// JS exception that isn't the `result_is_wit_result` err-via-throw case
-// above, or 2 for that err-via-throw case (see above; only ever returned
-// when `result_is_wit_result` is true and the exception was synchronous,
-// never for a rejected Promise).
+// returned a Promise that deadlocked/hit reentrancy, or raised/rejected with
+// a JS exception/reason that isn't the `result_is_wit_result` err case
+// above, or 2 for that err case (see above; returned whether the exception
+// was synchronous or arrived via a rejected Promise, as long as
+// `result_is_wit_result` is true).
 extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 size_t export_name_len,
                                                 const StarlingJsValue *args_ptr,

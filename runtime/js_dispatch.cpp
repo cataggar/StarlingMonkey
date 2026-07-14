@@ -144,16 +144,36 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
 // lookup for the (non-callable, non-existent on ordinary records) `then`
 // property.
 //
-// Returns true with `value` updated in place to the fulfilled result (or
-// left untouched if `value` was never Promise-or-thenable-shaped to begin
-// with). Returns false if the Promise rejected, deadlocked (no further
-// microtask/task progress possible while still pending -- a deterministic
-// diagnostic, never a hang), or the event loop was already being pumped by
-// an outer/reentrant call; in every false case, a description has already
-// been dumped to stderr, so the caller should simply propagate failure
-// (return 1) without any further reporting.
-bool resolve_promise_like(JSContext *cx, const char *function_name,
-                          JS::MutableHandleValue value) {
+// `result_is_wit_result` must be true iff the export's own return type is
+// directly a WIT `result<T, E>` (see js_dispatch.h/starling_js_dispatch_native
+// for the synchronous-throw half of this same convention). Re-verified
+// directly against the pinned ComponentizeJS 0.21.0 reference (not assumed):
+// a rejected Promise is indistinguishable there from a synchronous throw at
+// this boundary -- both simply become the `err` payload, decoded/validated
+// exactly like any other value of type `E`, and both trap if that decode
+// fails (wrong JS kind for `E`), not just for a mismatched throw. `E == void`
+// never even inspects the payload (see js_dispatch.zig's `callNative`), so
+// *any* rejection reason -- of *any* shape -- becomes a bare `Err()` there.
+// See manifest.json known_deviations "promise-result-rejection-matches-throw"
+// for the differential evidence (tests/compat/fixtures/promises-result) this
+// was checked against, gathered through the real Wasmtime 42 CLI.
+//
+// Returns true with `value` updated in place to either the fulfilled result,
+// or (only when `result_is_wit_result` and the Promise rejected)
+// `*out_is_err_rejection` set and `value` set to the raw rejection reason for
+// the caller to decode as the `Err(E)` payload, exactly like a synchronous
+// throw. Returns false if the Promise rejected while `result_is_wit_result`
+// is false, deadlocked (no further microtask/task progress possible while
+// still pending -- a deterministic diagnostic, never a hang, and never
+// reinterpreted as `Err` regardless of `result_is_wit_result`: an event-loop
+// no-progress/reentrancy failure has no ComponentizeJS equivalent to defer
+// to), or the event loop was already being pumped by an outer/reentrant
+// call; in every false case, a description has already been dumped to
+// stderr, so the caller should simply propagate failure (return 1) without
+// any further reporting.
+bool resolve_promise_like(JSContext *cx, const char *function_name, bool result_is_wit_result,
+                          JS::MutableHandleValue value, bool *out_is_err_rejection) {
+  *out_is_err_rejection = false;
   if (!value.isObject()) {
     return true;
   }
@@ -215,6 +235,17 @@ bool resolve_promise_like(JSContext *cx, const char *function_name,
   JS::PromiseState state = JS::GetPromiseState(promise);
   if (state == JS::PromiseState::Rejected) {
     JS::RootedValue reason(cx, JS::GetPromiseResult(promise));
+    if (result_is_wit_result) {
+      // Mirrors starling_js_dispatch_native's synchronous err-via-throw
+      // path exactly: the rejection reason becomes the raw `Err(E)` payload
+      // for the caller to decode, not a hard failure. `reason` is handed
+      // back as-is (not re-validated here) -- the caller's decode step is
+      // exactly the same one a synchronous throw already goes through, so
+      // a wrong-kind `reason` traps there, identically either way.
+      value.set(reason);
+      *out_is_err_rejection = true;
+      return true;
+    }
     engine->dump_promise_rejection(reason, promise, stderr);
     return false;
   }
@@ -290,7 +321,13 @@ extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
   if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
     return dispatch_error(cx, "calling a JavaScript module export");
   }
-  if (!resolve_promise_like(cx, function_name.c_str(), &return_value)) {
+  // The JSON bridge never carries a top-level WIT `result<T, E>` export (see
+  // js_dispatch.zig's typeNeedsNative: any `result`/variant unconditionally
+  // routes through the native bridge below instead), so a rejected Promise
+  // here is always a hard failure -- `result_is_wit_result` is always false.
+  bool unused_is_err_rejection = false;
+  if (!resolve_promise_like(cx, function_name.c_str(), false, &return_value,
+                            &unused_is_err_rejection)) {
     return 1;
   }
 
@@ -685,11 +722,26 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
     }
     return dispatch_error(cx, "calling a JavaScript module export");
   }
-  if (!resolve_promise_like(cx, function_name.c_str(), &return_value)) {
+  bool is_err_rejection = false;
+  if (!resolve_promise_like(cx, function_name.c_str(), result_is_wit_result != 0, &return_value,
+                            &is_err_rejection)) {
     return 1;
   }
 
   auto *arena = new NativeArena();
+  if (is_err_rejection) {
+    // See resolve_promise_like/js_dispatch.h: a rejected Promise on a
+    // result_is_wit_result export is decoded as the `Err(E)` payload here,
+    // exactly like the synchronous-throw case above (status 2), not treated
+    // as a dispatch failure.
+    if (!decode_from_js(cx, return_value, *arena, out_result)) {
+      delete arena;
+      *out_arena = nullptr;
+      return dispatch_error(cx, "decoding a rejected Promise's reason as a WIT result<T, E> error value");
+    }
+    *out_arena = arena;
+    return 2;
+  }
   if (!decode_from_js(cx, return_value, *arena, out_result)) {
     delete arena;
     *out_arena = nullptr;

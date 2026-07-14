@@ -53,6 +53,77 @@ interface host {
     // counter) rather than merely returning without error.
     note: func();
     note-count: func() -> u32;
+
+    // -- advanced synchronous value types (integration requirement 5: WIT
+    // imports must support every synchronous type the native bridge
+    // handles for exports -- char/bytes/tuple/enum/flags/variant/result/
+    // nesting, see tests/compat/fixtures/advanced-types/ for the export
+    // side of the same type set -- everywhere WABT's `--js-imports`
+    // bindgen (cataggar/wabt) allows it). These reuse the exact same
+    // encode_to_js/decode_from_js and STARLING_JS_* tagged-value bridge as
+    // the export direction, just with the encode/decode roles reversed.
+    //
+    // Of that type set, only `list<list<u32>>` nesting is wired into this
+    // E2E fixture. Everything else the native bridge supports for exports
+    // -- `char`, `list<u8>` (bytes), `tuple`, `enum`, `flags`, `variant`,
+    // `result<T,E>` -- hits one of two real bugs in the pinned
+    // `cataggar/wabt` commit's `--js-imports` codegen, each empirically
+    // confirmed against this fixture's own `wasip3-bindgen --js-imports`
+    // invocation (and, for the second, a full `zig build`):
+    //
+    //   1. `char`/`tuple`/`enum`/`flags`/`variant`/`result<T,E>` are
+    //      rejected outright by `nativeBridgeSupported` in
+    //      component_bindgen.zig -- a conservative allow-list (bool/
+    //      integers/f32/f64/string, list/option/record recursively) written
+    //      before js_dispatch.zig grew encodeNative/decodeNative support
+    //      for those shapes (in the independently-developed
+    //      sync-value-parity branch). Its own doc comment anticipates
+    //      exactly this ("keep this in sync ... if it ever grows"). E.g.:
+    //        error: generating bindings for world 'js-exports': UnsupportedWitType
+    //          imported function '...#identity-char': parameter 'c' has a WIT
+    //          type not supported by the JS import bridge (bool/integers/f32/
+    //          f64/string/option<T>/list<T>/record only -- resource, variant,
+    //          enum, flags, tuple, result<T,E>, char, future/stream need a
+    //          further WABT phase)
+    //
+    //   2. `list<u8>` (bytes) *passes* that gate (list/option recursion
+    //      already covers a `u8` element type) but its generated import
+    //      wrapper's parameter-lowering fast path (`lowerParams`'s `.list`
+    //      arm in component_bindgen.zig) unconditionally emits `<param>.ptr`
+    //      / `<param>.len`, assuming every `list<T>` Zig-side parameter is a
+    //      bare `[]const T`. In `--dispatch` mode (the mode `--js-imports`
+    //      always runs in) `zigType()` deliberately maps `list<u8>` one
+    //      level deeper, to the wrapper struct `wit_types.ByteList = struct
+    //      { bytes: []const u8 }` (so the JS bridge can tell a byte list
+    //      apart from a bare `list<u32>`-like list at runtime -- see that
+    //      struct's own doc comment), and `lowerParams` never accounts for
+    //      that indirection. The result is a genuine Zig **compile error**
+    //      (not a generation-time rejection) as soon as any function takes
+    //      a bare `list<u8>` *parameter*: `error: no field named 'ptr' in
+    //      struct 'wit_types.ByteList'`. (`list<u8>` used only as a
+    //      *result* is unaffected: the indirect-result path lifts through
+    //      the fully-generic, reflection-based `wit_types.lift`, which
+    //      already round-trips `ByteList` correctly -- proven by this same
+    //      pinned commit's own `Char/ByteList wrappers have the same
+    //      canonical layout as their bare payload` unit test.)
+    //
+    // Both are narrow, well-understood, single-function-body fixes (no
+    // codegen redesign: `emitImportWrapper`/`emitJsImportBridge` are
+    // otherwise fully generic over the WIT type graph). A focused,
+    // fully-tested (but, per this integration's "do not push/post"
+    // constraint, unpublished) fix for both has been prepared for
+    // cataggar/wabt -- see tests/compat/manifest.json's
+    // `wit-imports-native-bridge-type-gate` known_deviation for the exact
+    // branch/commit and root-cause/fix summary.
+
+    // Nesting: a `list` of `list<u32>`s, proving composite-of-composite
+    // types round-trip through the reverse bridge, not just single-level
+    // types. Unlike a bare `list<u8>` (see the doc comment above this
+    // function), no element of this type is ever wrapped in `ByteList`
+    // (that wrapper only applies to a *direct* `list<u8>`, never a
+    // `list<u32>` nested inside another `list`), so neither of the two
+    // bugs described above applies here.
+    sum-nested-lists: func(rows: list<list<u32>>) -> u32;
 }
 
 interface api {
@@ -77,6 +148,8 @@ interface api {
     // confirm the canonical-ABI import actually ran (not a no-op stub).
     run-note: func() -> bool;
     run-note-count: func() -> u32;
+
+    run-sum-nested-lists: func(rows: list<list<u32>>) -> u32;
 }
 
 world js-exports {

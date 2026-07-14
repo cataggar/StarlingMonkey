@@ -18,7 +18,15 @@
 //   * a WIT import with no result (`note`) surfaces to JavaScript as
 //     exactly `undefined` -- never `false`/`null` -- and its host-side
 //     implementation genuinely ran (proven via the side-channel
-//     `note-count` import, not just "no exception was thrown").
+//     `note-count` import, not just "no exception was thrown");
+//   * requirement 5 (every synchronous type, reverse direction, where the
+//     pinned WABT's `--js-imports` bindgen currently allows it): nesting (a
+//     list of lists) round-trips through the reverse bridge. `char`,
+//     `list<u8>` (bytes), `tuple`, `enum`, `flags`, `variant`, and
+//     `result<T,E>` do NOT yet -- see this fixture's package.wit and
+//     tests/compat/manifest.json's `wit-imports-native-bridge-type-gate`
+//     known_deviation for the empirical diagnostics and the prepared
+//     (unpublished) cataggar/wabt fix.
 import {
   add,
   "sum-list" as sumList,
@@ -27,6 +35,7 @@ import {
   boom,
   note,
   "note-count" as noteCount,
+  "sum-nested-lists" as sumNestedLists,
 } from "test:wit-imports/host@1.2.3";
 
 export function runAdd(a, b) {
@@ -91,3 +100,13 @@ function runNoteCount() {
   return noteCount();
 }
 export { runNoteCount as "run-note-count" };
+
+// -- advanced synchronous value types (requirement 5), scoped to what the
+// pinned WABT's `--js-imports` bindgen currently accepts -- see this
+// fixture's package.wit for why char/list<u8>/tuple/enum/flags/variant/
+// result are not (yet) included here.
+
+function runSumNestedLists(rows) {
+  return sumNestedLists(rows);
+}
+export { runSumNestedLists as "run-sum-nested-lists" };

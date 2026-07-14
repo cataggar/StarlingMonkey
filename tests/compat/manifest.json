@@ -38,7 +38,7 @@
     }
   },
   "bridge": {
-    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/option/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. Any signature containing i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen -- see the sync-value-parity WABT worktree commit) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved: a wrong *kind* of JS return value (string/object/etc. where a number/BigInt is required, or vice versa) or an invalid variant/enum discriminant traps, but an out-of-range/negative/fractional/non-finite Number or BigInt of the *correct* kind wraps modulo 2**bitwidth (matching ECMAScript ToInt32/ToUint32-family and ToBigInt64/ToBigUint64 semantics, re-verified against the pinned ComponentizeJS reference itself -- see known_deviations and tests/e2e/native-dispatch/run.sh's wrap-numbers/sum-list-overflow cases), not a trap. A returned Promise/thenable (on either path) is instead pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way a directly-returned value would be; see known_deviations promise-exports-pumped.",
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/option/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. Any signature containing i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen -- see the sync-value-parity WABT worktree commit) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved: a wrong *kind* of JS return value (string/object/etc. where a number/BigInt is required, or vice versa) or an invalid variant/enum discriminant traps, but an out-of-range/negative/fractional/non-finite Number or BigInt of the *correct* kind wraps modulo 2**bitwidth (matching ECMAScript ToInt32/ToUint32-family and ToBigInt64/ToBigUint64 semantics, re-verified against the pinned ComponentizeJS reference itself -- see known_deviations and tests/e2e/native-dispatch/run.sh's wrap-numbers/sum-list-overflow cases), not a trap. A returned Promise/thenable (on either path) is instead pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way a directly-returned value would be; see known_deviations promise-exports-pumped. The same tagged-value tree also drives the reverse direction: a WABT `--js-imports`-generated wrapper lets JavaScript synchronously call a host-provided WIT interface import, reusing encode_to_js/decode_from_js with the encode/decode roles swapped (see feature_matrix imports and tests/e2e/wit-imports/); this compat harness itself only exercises the export direction.",
     "known_deviations": [
       {
         "id": "option-none-representation",
@@ -90,6 +90,20 @@
         "evidence": "runtime/event_loop.h, runtime/event_loop.cpp, runtime/js_dispatch.cpp (resolve_promise_like); tests/e2e/native-dispatch/run.sh (promise-resolve-add, promise-add, promise-reject, thenable-add, promise-timeout-add, promise-notify, promise-resolve-point, promise-deadlock, and the BigInt/native-dispatch equivalents, all passing through the real Wasmtime 42 CLI bundled by this repository's build.zig.zon, 2026-07-14); tests/compat/fixtures/promises, tests/compat/fixtures/promises-rejected, tests/compat/fixtures/promises-deadlock (tests/compat/runtime/run-bridge-tests.sh, real Wasmtime 42 crate invoker, 2026-07-14)"
       },
       {
+        "id": "promise-result-rejection-matches-throw",
+        "summary": "feat/js-bridge-parity-integration reconciliation (sync-value-parity's top-level result<T,E> exports x promise-sync's Promise pumping): before this integration, runtime/js_dispatch.cpp's resolve_promise_like treated *every* Promise rejection as an unconditional call-time trap, regardless of whether the export's own return type was a WIT result<T,E> -- correct for a non-result export, but never verified for a result-returning one. Re-checked directly against the pinned ComponentizeJS 0.21.0 reference (not assumed): a rejected Promise on a top-level result<T,E> export is indistinguishable there from a synchronous throw at this boundary -- both simply become the raw err payload, decoded/validated exactly like any other JS value of type E, and both trap identically (same diagnostic wording) if that decode fails (wrong JS kind for E), not just for a mismatched throw. When E is void (result<T> shorthand), the rejection reason's shape is never even inspected -- any reason at all becomes a bare Err(). A deadlocked/never-settling Promise for a result<T,E> export still traps with the same no-progress diagnostic as a non-result export in the same situation; no-progress/deadlock is never reinterpreted as Err regardless of result_is_wit_result, since it is a StarlingMonkey/Wasmtime-host dispatch failure with no ComponentizeJS equivalent to defer to. resolve_promise_like was updated to accept a result_is_wit_result flag and an out-parameter: on a settled rejection when result_is_wit_result is true, it now hands the rejection reason back to the caller (starling_js_dispatch_native) to decode as the Err(E) payload via the exact same decode_from_js + js_dispatch.zig decodeNative(E, ...) path a synchronous throw already uses (status 2), rather than dumping+trapping; every other branch (non-result rejection, NoProgress/deadlock, AlreadyRunning/JSException from the pump itself) is unchanged and still traps unconditionally. The JSON dispatch path (starling_js_dispatch) is unaffected: a top-level result<T,E> (a union type) always routes through native dispatch (js_dispatch.zig's typeNeedsNative), never JSON.",
+        "phase_addressed": "feat/js-bridge-parity-integration",
+        "confidence": "reference-verified",
+        "evidence": "runtime/js_dispatch.cpp (resolve_promise_like, starling_js_dispatch_native), runtime/js_dispatch.h (starling_js_dispatch_native doc comment); tests/compat/fixtures/promises-result (fulfillment + matching-shape rejection, including E-is-void), tests/compat/fixtures/promises-result-rejected-wrong-shape (mismatched-shape rejection traps), tests/compat/fixtures/promises-result-deadlock (deadlock still traps for a result export) -- all reference-verified via tests/compat/reference/run-reference.mjs against the pinned ComponentizeJS 0.21.0 release and build-verified via tests/compat/runtime/run-bridge-tests.sh (real Wasmtime 42 crate invoker), 2026-07-14. Also cross-checked directly (isolated single-call-per-instance experiments, since a trapped Wasmtime component instance is poisoned for further calls in the same store): ordinary fulfillment; synchronous throw matching/not-matching E's shape; Promise.reject with a raw string/number/plain value matching E's shape; Promise.reject with an Error object or plain object not matching a string E (both traps, same diagnostic wording as the equivalent synchronous-throw mismatch); E-is-void rejection of arbitrary shape; and a never-settling Promise for both void-E and payload-E result exports (traps with the same 'event loop error, but no exception is pending' diagnostic as the non-result promises-deadlock fixture)."
+      },
+      {
+        "id": "native-abi-tag-renumbering-on-integration",
+        "summary": "sync-value-parity and wit-imports were developed independently from the same base (bb97251) and each added exactly one new StarlingJsTag/NativeTag member, both numbered 9: sync-value-parity's STARLING_JS_BYTES/.bytes (list<u8>, a genuine Uint8Array) and wit-imports' STARLING_JS_UNDEFINED/.undefined_ (a void import result, JS `undefined`). Integrating both branches required renumbering exactly one of the two to avoid a silent collision; STARLING_JS_BYTES/.bytes kept its original value 9 (the older, already-fixture-verified tag) and STARLING_JS_UNDEFINED/.undefined_ was reassigned to 10 in both runtime/js_dispatch.h (C++/WABT-facing) and runtime/js_dispatch.zig (NativeTag), which must always carry identical numeric values for every tag -- verified consistent across both files (no other file hardcodes a tag's numeric value; WABT-generated code calls js_dispatch.encodeNative/decodeNative symbolically and never spells out a tag number). STARLING_JS_OPTION_NONE (5) is unaffected and remains distinct from both.",
+        "phase_addressed": "sync-value-parity+wit-imports",
+        "confidence": "source-verified",
+        "evidence": "runtime/js_dispatch.h (STARLING_JS_BYTES = 9, STARLING_JS_UNDEFINED = 10), runtime/js_dispatch.zig (NativeTag.bytes = 9, NativeTag.undefined_ = 10); zig test runtime/js_dispatch.zig's 'encodes void as its own dedicated tag' and byte-list round-trip tests"
+      },
+      {
         "id": "json-bridge-overhead",
         "summary": "NARROWED as of sync-value-parity: only applies to the JSON-only path (bool/numeric-scalar/string/list/option/record signatures that need no native lifting). Any signature containing i64/u64, char, tuple, enum, flags, variant, result<T,E> or list<u8> instead uses a typed native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}) with no JSON serialization involved; see bridge.description.",
         "phase_addressed": "1a",
@@ -114,32 +128,206 @@
         "phase_addressed": 2,
         "confidence": "source-verified",
         "evidence": "tests/compat/lib/gen_bridge_wit.py (render_package_wit), tests/compat/reference/run-reference.mjs (componentizeFixture uses fixture.wit_dir unmodified), tests/compat/runtime/invoker/src/main.rs (resolve_func)"
+      },
+      {
+        "id": "wit-imports-native-bridge-type-gate",
+        "summary": "feat/js-bridge-parity-integration requirement 5 (WIT imports must support every synchronous type the native bridge now handles for exports, char/bytes/tuple/enum/flags/variant/result/nesting, everywhere the merged WABT `--js-imports` bindgen allows it): two real, narrow bugs in the pinned cataggar/wabt commit's component_bindgen.zig were found while wiring these types into tests/e2e/wit-imports, both empirically confirmed (not assumed) against that exact pinned commit via its own wasip3-bindgen binary and a full `zig build`. (1) `nativeBridgeSupported`'s type gate is a conservative allow-list (bool/integers/f32/f64/string, list/option/record recursively) written before js_dispatch.zig grew encodeNative/decodeNative support for char/tuple/enum/flags/variant/result<T,E> in the independently-developed sync-value-parity branch; every one of those types is rejected outright with a deterministic `error.UnsupportedWitType` (e.g. `imported function '...#identity-char': parameter 'c' has a WIT type not supported by the JS import bridge (bool/integers/f32/f64/string/option<T>/list<T>/record only ...)`), never silently skipped. (2) a direct `list<u8>` parameter *passes* that gate (list/option recursion already covers a u8 element) but `lowerParams`'s `.list` fast path unconditionally emits `<param>.ptr`/`<param>.len`, assuming a bare `[]const T` slice; in `--dispatch` mode (the mode `--js-imports` always runs in) `zigType()` instead maps a direct `list<u8>` one level deeper, to the wrapper struct `wit_types.ByteList = struct { bytes: []const u8 }` (so the JS bridge can distinguish a byte list from a generic list<T> at runtime), so this is a genuine Zig **compile error** (`error: no field named 'ptr' in struct 'wit_types.ByteList'`), not a generation-time rejection -- the analogous bug would also affect a `char` parameter via the same fast-path family (`@intCast` on the `wit_types.Char` wrapper struct), confirmed by code inspection though masked in practice by bug (1) already rejecting `char` first. Neither bug affects the *result* (indirect-return) direction: that path already lifts through the fully-generic, reflection-based `wit_types.lift`, which round-trips `Char`/`ByteList` correctly (proven by the pinned commit's own pre-existing 'Char/ByteList wrappers have the same canonical layout as their bare payload' unit test). Given this integration's explicit 'do not push/post; never post to Bytecode Alliance' constraint, a focused, fully-tested fix for both was prepared in a separate, unpublished /work worktree (NOT the main tests/e2e/wit-imports build's dependency, and not this repository) -- /work/wabt-js-imports-followup, branch fix/js-imports-native-bridge-type-gate, commit 6b5ba4690d4c032045c60d492760d01d16b60be9 on top of the exact pinned base 0191aff9b0c8d7acc46d3b8a48c5af4110f721d5 -- relaxing the gate to accept char/tuple/result<T,E>/variant (all recursively) and enum/flags (unconditionally), and routing dispatch-mode char/list<u8> parameters through the existing, already-correct generic lowerAggregateParam path instead of the buggy fast paths. Verified: WABT's own `zig build test` 38/38 (36 pre-existing + 2 new regression tests added by the fix commit, each independently confirmed to fail with the exact error above against the unfixed pinned source and pass with the fix); a full aspirational tests/e2e/wit-imports fixture (char, list<u8>-as-parameter, tuple, enum, flags, variant, result<T,E> with and without an error payload, and list-of-tuple nesting, as both import parameters and results) built cleanly end-to-end (`zig build install -Doptimize=ReleaseSmall` against tests/e2e/wit-imports/wit, real StarlingMonkey runtime compile) via a temporary local `.path` override of build.zig.zon's wasip3 dependency pointed at that worktree -- and, as a negative control, reproduced the exact bug (1) error message above when that override was removed (restoring the committed portable git+https pin) with the same full fixture still in place. That override was never part of any commit; the actually-committed tests/e2e/wit-imports/wit/deps/test-wit-imports/package.wit and build.zig.zon are scoped back down to what the pinned (unfixed) remote commit genuinely supports: bool/integers/f32/f64/string/option<T>/list<T> (excluding a direct list<u8> parameter)/record, plus one list<list<u32>> nesting case (run-sum-nested-lists), proven passing via `zig build wit-imports-e2e-test` against the real pinned git+https://github.com/cataggar/wabt#0191aff9b0c8d7acc46d3b8a48c5af4110f721d5 dependency, not the local fix.",
+        "phase_addressed": "feat/js-bridge-parity-integration",
+        "confidence": "source-verified, build-verified (bug reproduction and fix both confirmed via real `zig build` against the exact pinned commit, with and without the unpublished fix worktree)",
+        "evidence": "build/bindgen/component_bindgen.zig's nativeBridgeSupported/lowerParams (pinned cataggar/wabt commit 0191aff9b0c8d7acc46d3b8a48c5af4110f721d5, unmodified in this repository); tests/e2e/wit-imports/wit/deps/test-wit-imports/package.wit and tests/e2e/wit-imports/run.sh (doc comments citing both bugs, the ordering constraint for run-boom, and this deviation); /work/wabt-js-imports-followup (fix/js-imports-native-bridge-type-gate @ 6b5ba4690d4c032045c60d492760d01d16b60be9), not part of this repository or its build; `zig build wit-imports-e2e-test` (passes against the real pinned remote dependency, reduced scope)."
       }
     ]
   },
   "feature_matrix": [
-    { "category": "bool", "status": "supported", "phase": 0, "fixtures": ["booleans"] },
-    { "category": "integers-u8-u16-u32-s8-s16-s32", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"], "notes": "u32 values >= 2^31 are reference-pipeline-risky; see known_deviations componentizejs-u32-high-bit-defect. An out-of-range/negative/fractional/non-finite Number of the correct kind wraps modulo 2**bitwidth (ToInt32/ToUint32-family), not a trap, matching the pinned reference exactly (build-verified: tests/e2e/native-dispatch/run.sh 'wrap-numbers' case)." },
-    { "category": "integers-u64-s64", "status": "supported", "phase": "1a", "fixtures": ["integers-64bit"], "notes": "Native tagged-value bridge path (runtime/js_dispatch.zig, active whenever a signature contains i64/u64) exchanges exact BigInt values; see known_deviations integer-64-bit-precision (narrowed). An out-of-range or negative BigInt of the correct kind wraps modulo 2**64 (ToBigInt64/ToBigUint64), not a trap, matching the pinned reference exactly (both reference-verified: fixtures/integers-64bit 'sum-list-basic', and build-verified: tests/e2e/native-dispatch/run.sh 'sum-list wraps past u64::MAX' / 'wrap-numbers' cases)." },
-    { "category": "float32-float64", "status": "supported", "phase": 0, "fixtures": ["numeric-primitives"] },
-    { "category": "char", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
-    { "category": "string", "status": "supported", "phase": 0, "fixtures": ["strings"] },
-    { "category": "list", "status": "supported", "phase": 0, "fixtures": ["lists"] },
-    { "category": "record", "status": "supported", "phase": 0, "fixtures": ["records"], "notes": "Includes a record nested inside another record." },
-    { "category": "tuple", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
-    { "category": "option", "status": "supported", "phase": 0, "fixtures": ["options"] },
-    { "category": "enum", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
-    { "category": "flags", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
-    { "category": "variant", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"] },
-    { "category": "result", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"], "notes": "Covers both nested result<T,E> (record field, {tag,val} JS shape) and an export's own top-level result<T,E> return type (Ok returns directly, Err signaled by throw)." },
-    { "category": "void", "status": "supported", "phase": 0, "fixtures": ["void"] },
-    { "category": "many-arguments", "status": "supported", "phase": 0, "fixtures": ["many-arguments"] },
-    { "category": "repeated-calls", "status": "supported", "phase": 0, "fixtures": ["repeated-calls"] },
-    { "category": "missing-or-invalid-export", "status": "supported-as-trap", "phase": 0, "fixtures": ["negative-missing-export", "negative-invalid-export"], "notes": "Detection timing differs between pipelines; see known_deviations missing-export-detection-timing." },
-    { "category": "kebab-case-and-naming", "status": "supported", "phase": "sync-value-parity", "fixtures": ["advanced-types"], "notes": "Multi-word kebab-case WIT identifiers: record fields/flags labels camelCased at the JS boundary, enum/variant case labels keep kebab-case string spelling, and function export names resolved via a camelCase fallback (see bridge known_deviations none needed -- this matches ComponentizeJS's own convention exactly, not a deviation)." },
-    { "category": "resources", "status": "unsupported", "phase": 4, "fixtures": [] },
-    { "category": "imports", "status": "unsupported", "phase": 3, "fixtures": [] },
-    { "category": "promise-exports", "status": "supported", "phase": 5, "fixtures": ["promises", "promises-rejected", "promises-deadlock"], "notes": "A returned Promise/thenable is pumped to completion via EventLoop::pump_until_promise_settled, then its fulfilled value is lowered exactly like a directly-returned value. Rejections and no-progress (deadlock) both surface as deterministic call-time traps rather than hanging; see known_deviations promise-exports-pumped." }
+    {
+      "category": "bool",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "booleans"
+      ]
+    },
+    {
+      "category": "integers-u8-u16-u32-s8-s16-s32",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "numeric-primitives"
+      ],
+      "notes": "u32 values >= 2^31 are reference-pipeline-risky; see known_deviations componentizejs-u32-high-bit-defect. An out-of-range/negative/fractional/non-finite Number of the correct kind wraps modulo 2**bitwidth (ToInt32/ToUint32-family), not a trap, matching the pinned reference exactly (build-verified: tests/e2e/native-dispatch/run.sh 'wrap-numbers' case)."
+    },
+    {
+      "category": "integers-u64-s64",
+      "status": "supported",
+      "phase": "1a",
+      "fixtures": [
+        "integers-64bit"
+      ],
+      "notes": "Native tagged-value bridge path (runtime/js_dispatch.zig, active whenever a signature contains i64/u64) exchanges exact BigInt values; see known_deviations integer-64-bit-precision (narrowed). An out-of-range or negative BigInt of the correct kind wraps modulo 2**64 (ToBigInt64/ToBigUint64), not a trap, matching the pinned reference exactly (both reference-verified: fixtures/integers-64bit 'sum-list-basic', and build-verified: tests/e2e/native-dispatch/run.sh 'sum-list wraps past u64::MAX' / 'wrap-numbers' cases)."
+    },
+    {
+      "category": "float32-float64",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "numeric-primitives"
+      ]
+    },
+    {
+      "category": "char",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ]
+    },
+    {
+      "category": "string",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "strings"
+      ]
+    },
+    {
+      "category": "list",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "lists"
+      ]
+    },
+    {
+      "category": "record",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "records"
+      ],
+      "notes": "Includes a record nested inside another record."
+    },
+    {
+      "category": "tuple",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ]
+    },
+    {
+      "category": "option",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "options"
+      ]
+    },
+    {
+      "category": "enum",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ]
+    },
+    {
+      "category": "flags",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ]
+    },
+    {
+      "category": "variant",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ]
+    },
+    {
+      "category": "result",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types",
+        "promises-result",
+        "promises-result-rejected-wrong-shape",
+        "promises-result-deadlock"
+      ],
+      "notes": "Covers both nested result<T,E> (record field, {tag,val} JS shape) and an export's own top-level result<T,E> return type (Ok returns directly, Err signaled by throw). A Promise settling on a top-level result<T,E> export is treated the same as a synchronous return/throw (fulfillment is Ok, a rejection whose reason's JS shape matches E is Err); see known_deviations promise-result-rejection-matches-throw."
+    },
+    {
+      "category": "void",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "void"
+      ]
+    },
+    {
+      "category": "many-arguments",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "many-arguments"
+      ]
+    },
+    {
+      "category": "repeated-calls",
+      "status": "supported",
+      "phase": 0,
+      "fixtures": [
+        "repeated-calls"
+      ]
+    },
+    {
+      "category": "missing-or-invalid-export",
+      "status": "supported-as-trap",
+      "phase": 0,
+      "fixtures": [
+        "negative-missing-export",
+        "negative-invalid-export"
+      ],
+      "notes": "Detection timing differs between pipelines; see known_deviations missing-export-detection-timing."
+    },
+    {
+      "category": "kebab-case-and-naming",
+      "status": "supported",
+      "phase": "sync-value-parity",
+      "fixtures": [
+        "advanced-types"
+      ],
+      "notes": "Multi-word kebab-case WIT identifiers: record fields/flags labels camelCased at the JS boundary, enum/variant case labels keep kebab-case string spelling, and function export names resolved via a camelCase fallback (see bridge known_deviations none needed -- this matches ComponentizeJS's own convention exactly, not a deviation)."
+    },
+    {
+      "category": "resources",
+      "status": "unsupported",
+      "phase": 4,
+      "fixtures": []
+    },
+    {
+      "category": "imports",
+      "status": "supported",
+      "phase": 3,
+      "fixtures": [],
+      "notes": "Reverse direction (JavaScript imports a host-provided WIT interface function) via WABT `--js-imports`-generated canonical-ABI wrappers (runtime/js_dispatch.{h,cpp,zig}'s wit_imports::install/starling_js_import_dispatch), sharing the same encode_to_js/decode_from_js and STARLING_JS_* tag vocabulary as the export bridge above with the encode/decode roles reversed -- bool/integers/f32/f64/char/string/list<u8>/list/option/record/tuple/enum/flags/variant/result and a void result (JS `undefined`, never `false`/`null`) are all bridgeable. Not part of this compat harness (which only drives the export direction); see the dedicated tests/e2e/wit-imports/ fixture and its `zig build wit-imports-e2e-test` suite, run separately from compat-test/compat-bridge-test. Resource-typed imports, async imports, and root-level (non-interface) function imports are rejected at build time by the WABT bindgen fork rather than silently omitted; see README.md's 'WIT interface imports' section."
+    },
+    {
+      "category": "promise-exports",
+      "status": "supported",
+      "phase": 5,
+      "fixtures": [
+        "promises",
+        "promises-rejected",
+        "promises-deadlock",
+        "promises-result",
+        "promises-result-rejected-wrong-shape",
+        "promises-result-deadlock"
+      ],
+      "notes": "A returned Promise/thenable is pumped to completion via EventLoop::pump_until_promise_settled, then its fulfilled value is lowered exactly like a directly-returned value. For a non-result export, rejection and no-progress (deadlock) both surface as deterministic call-time traps rather than hanging; see known_deviations promise-exports-pumped. For a top-level WIT result<T,E> export, a settled rejection is instead treated exactly like a synchronous throw (Err(reason) if reason's JS shape matches E, trap otherwise); no-progress/deadlock is never reinterpreted as Err regardless -- see known_deviations promise-result-rejection-matches-throw."
+    }
   ],
   "fixtures": [
     {
@@ -429,9 +617,9 @@
           "id": "identity-unicode",
           "function": "identity",
           "args": [
-            "héllo 😀 world"
+            "h\u00e9llo \ud83d\ude00 world"
           ],
-          "result": "héllo 😀 world",
+          "result": "h\u00e9llo \ud83d\ude00 world",
           "confidence": "reference-verified"
         },
         {
@@ -457,7 +645,7 @@
           "id": "length-unicode",
           "function": "length",
           "args": [
-            "héllo 😀 world"
+            "h\u00e9llo \ud83d\ude00 world"
           ],
           "result": 14,
           "confidence": "reference-verified",
@@ -910,7 +1098,10 @@
         {
           "id": "resolveadd-basic",
           "function": "resolveadd",
-          "args": [2, 3],
+          "args": [
+            2,
+            3
+          ],
           "result": 5,
           "confidence": "reference-verified",
           "notes": "Already-settled Promise.resolve; ComponentizeJS 0.21.0 also synchronously drives an already-settled Promise-returning export to completion (documented behavior; see provenance.componentizejs)."
@@ -918,7 +1109,10 @@
         {
           "id": "asyncadd-basic",
           "function": "asyncadd",
-          "args": [2, 3],
+          "args": [
+            2,
+            3
+          ],
           "result": 5,
           "confidence": "reference-verified",
           "notes": "Genuine async function; the fulfilled value requires more than one js::RunJobs pass through the microtask queue (nested awaits)."
@@ -926,7 +1120,10 @@
         {
           "id": "thenableadd-basic",
           "function": "thenableadd",
-          "args": [2, 3],
+          "args": [
+            2,
+            3
+          ],
           "result": 5,
           "confidence": "reference-verified",
           "notes": "Duck-typed thenable (not a real Promise instance); resolve_promise_like normalizes it via JS::NewPromiseObject + JS::ResolvePromise, reusing the engine's own PromiseResolve semantics rather than hand-rolling a `.then()` call."
@@ -934,7 +1131,10 @@
         {
           "id": "timeoutadd-basic",
           "function": "timeoutadd",
-          "args": [2, 3],
+          "args": [
+            2,
+            3
+          ],
           "result": 5,
           "confidence": "reference-verified",
           "notes": "Settles via a queued setTimeout (macrotask/async task), not a microtask; exercises EventLoop::pump_until_promise_settled draining api::AsyncTask::select, not just js::RunJobs."
@@ -942,8 +1142,18 @@
         {
           "id": "resolvepoint-basic",
           "function": "resolvepoint",
-          "args": [{ "x": 1, "y": 2 }, 3, 4],
-          "result": { "x": 4, "y": 6 },
+          "args": [
+            {
+              "x": 1,
+              "y": 2
+            },
+            3,
+            4
+          ],
+          "result": {
+            "x": 4,
+            "y": 6
+          },
           "confidence": "reference-verified",
           "notes": "Promise.resolve of a nested typed record, confirming the settled value re-enters the normal typed/JSON result conversion path unchanged."
         }
@@ -953,9 +1163,21 @@
           "id": "async-counter-sequence",
           "function": "asyncincrement",
           "calls": [
-            { "args": [], "result": 1, "confidence": "reference-verified" },
-            { "args": [], "result": 2, "confidence": "reference-verified" },
-            { "args": [], "result": 3, "confidence": "reference-verified" }
+            {
+              "args": [],
+              "result": 1,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [],
+              "result": 2,
+              "confidence": "reference-verified"
+            },
+            {
+              "args": [],
+              "result": 3,
+              "confidence": "reference-verified"
+            }
           ]
         }
       ]
@@ -1013,9 +1235,9 @@
           "id": "echo-char-multibyte",
           "function": "echo-char",
           "args": [
-            "é"
+            "\u00e9"
           ],
-          "result": "é",
+          "result": "\u00e9",
           "confidence": "reference-verified"
         },
         {
@@ -1332,6 +1554,133 @@
             "bridge_message_contains": "returned a Promise that never settled",
             "bridge_confidence": "build-verified",
             "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress once both the microtask queue (js::RunJobs) and the async task queue (api::AsyncTask::select) are exhausted while the promise is still Pending; js_dispatch.cpp's resolve_promise_like prints a deterministic diagnostic to stderr (\"...returned a Promise that never settled -- the JavaScript job queue and async task queue both ran empty while it was still pending (deadlock)\") and returns false so the dispatch entry point traps (bare wasm 'unreachable'), rather than looping forever. This is the deterministic no-progress/deadlock diagnostic required by the promise-sync roadmap phase, not a hang. build-verified via tests/compat/runtime/run-bridge-tests.sh (real Wasmtime 42 crate invoker, which captured this exact diagnostic text on the guest's WASI stderr pipe, 2026-07-14); also cross-checked via tests/e2e/native-dispatch/run.sh's 'promise-deadlock' case, which wraps every wasmtime CLI invocation in a 30s timeout as an independent safety net and observed a fast trap, well under the timeout. The pinned ComponentizeJS 0.21.0 reference (reference_message_contains above) independently detects the same condition -- its own embedded engine's event-loop driver aborts with 'Error while (call) event loop error, but no exception is pending. Aborting, since that doesn't seem recoverable at all.' rather than hanging -- reference-verified via tests/compat/reference/run-reference.mjs, 2026-07-14: componentize() succeeds, and the componentized output traps deterministically (well under a manual 20s timeout probe) when invoked through the same tests/compat/runtime/invoker used for the bridge. The exact diagnostic wording differs between the two independent implementations (expected -- see bridge_message_contains), but both surface a deterministic call-time trap rather than a hang, matching this fixture's requirement."
+          }
+        }
+      ]
+    },
+    {
+      "id": "promises-result",
+      "category": "promise-exports",
+      "dir": "fixtures/promises-result",
+      "wit_dir": "fixtures/promises-result/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises-result.json",
+      "description": "Integration fixture (feat/js-bridge-parity-integration): async (Promise-returning) counterparts to advanced-types' 'divide'/'checked-negate', confirming a Promise settling on a top-level WIT result<T, E> export is treated identically to a synchronous return/throw at this same boundary: fulfillment lowers as Ok, and rejection with a reason whose JS shape matches E also lowers as Err(reason) -- not a hard dispatch failure -- exactly like a synchronous throw of that same value would; when E is void, any rejection reason at all (any shape) becomes a bare Err(). See known_deviations 'promise-result-rejection-matches-throw' for the full empirical evidence. Only the never-trapping sub-cases are combined here (a trapped Wasmtime component instance is poisoned for further calls in the same store); the two trapping sub-cases -- a mismatched-shape rejection, and a never-settling Promise -- are each their own single-case fixture ('promises-result-rejected-wrong-shape', 'promises-result-deadlock'), for the same reason as 'promises-rejected'/'promises-deadlock'.",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises-result: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises-result: PASS against the pinned ComponentizeJS 0.21.0 release, 2026-07-14)",
+      "cases": [
+        {
+          "id": "divide-async-ok",
+          "function": "divide-async",
+          "args": [
+            10,
+            2
+          ],
+          "result": {
+            "tag": "ok",
+            "val": 5
+          },
+          "confidence": "reference-verified",
+          "notes": "Async fulfillment of a top-level result<T,E> export lowers as Ok(value), exactly like advanced-types' synchronous 'divide-ok'."
+        },
+        {
+          "id": "divide-async-err-rejected",
+          "function": "divide-async",
+          "args": [
+            10,
+            0
+          ],
+          "result": {
+            "tag": "err",
+            "val": "division by zero"
+          },
+          "confidence": "reference-verified",
+          "notes": "Promise rejection with a reason whose JS shape matches E (a raw string) lowers as Err(reason), just like advanced-types' synchronous-throw 'divide-err' case -- the empirical basis for this integration's Promise-vs-result reconciliation (see known_deviations 'promise-result-rejection-matches-throw')."
+        },
+        {
+          "id": "checked-negate-async-ok",
+          "function": "checked-negate-async",
+          "args": [
+            5
+          ],
+          "result": {
+            "tag": "ok",
+            "val": -5
+          },
+          "confidence": "reference-verified"
+        },
+        {
+          "id": "checked-negate-async-err-rejected",
+          "function": "checked-negate-async",
+          "args": [
+            -2147483648
+          ],
+          "result": {
+            "tag": "err"
+          },
+          "confidence": "reference-verified",
+          "notes": "result<s32> (E is void): the rejection reason's shape is never inspected, so a plain-object rejection still becomes a bare Err() with no 'val' key, same as advanced-types' synchronous 'checked-negate-err' case."
+        }
+      ]
+    },
+    {
+      "id": "promises-result-rejected-wrong-shape",
+      "category": "promise-exports",
+      "dir": "fixtures/promises-result-rejected-wrong-shape",
+      "wit_dir": "fixtures/promises-result-rejected-wrong-shape/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises-result-rejected-wrong-shape.json",
+      "description": "Integration fixture (feat/js-bridge-parity-integration): a Promise rejection on a top-level result<u32, string> export whose reason is an Error object, not a raw string -- the wrong JS shape for E. Must trap, exactly like a synchronous throw of that same Error object would (advanced-types' 'divide' never itself exercises the mismatched-shape sub-case): 'wrong-kind value traps, no coercion' applies equally whether the err payload arrives via a synchronous throw or an async rejection. Kept as its own single-case fixture for the same reason as 'promises-rejected'/'promises-deadlock'. See known_deviations 'promise-result-rejection-matches-throw'.",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises-result-rejected-wrong-shape: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises-result-rejected-wrong-shape: PASS, 2026-07-14)",
+      "negative": true,
+      "cases": [
+        {
+          "id": "divide-async-wrong-shape",
+          "function": "divide-async",
+          "args": [
+            10,
+            0
+          ],
+          "expect_error": {
+            "reference_class": "wrong-kind-result-err-value",
+            "reference_message_contains": "expected a string, received [object]",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "expected a string result, got a JavaScript value of kind record",
+            "bridge_confidence": "build-verified",
+            "bridge_source": "runtime/js_dispatch.cpp: resolve_promise_like's Rejected branch, when result_is_wit_result is true, hands the rejection reason (the Error object) to starling_js_dispatch_native's existing decode_from_js (which decodes any JS object, including an Error, as a generic STARLING_JS_RECORD) + js_dispatch.zig's decodeNative(string, ...) path -- the same one a synchronous throw already goes through -- which panics with 'native dispatch: expected a string result, got a JavaScript value of kind record' since a record was decoded where E=string was expected; build-verified via tests/compat/runtime/run-bridge-tests.sh promises-result-rejected-wrong-shape, 2026-07-14."
+          }
+        }
+      ]
+    },
+    {
+      "id": "promises-result-deadlock",
+      "category": "promise-exports",
+      "dir": "fixtures/promises-result-deadlock",
+      "wit_dir": "fixtures/promises-result-deadlock/wit",
+      "world": "js-exports",
+      "js_file": "component.js",
+      "expected_file": "expected/promises-result-deadlock.json",
+      "description": "Integration fixture (feat/js-bridge-parity-integration): a Promise that never settles at all, returned from a top-level result<u32, string> export. Must still surface as a deterministic no-progress trap, exactly like the non-result 'promises-deadlock' fixture -- confirming deadlock/no-progress is NEVER reinterpreted as Err(...) just because the export happens to return a WIT result<T, E>. See known_deviations 'promise-result-rejection-matches-throw': only a *settled* rejection gets the Err(...) special case.",
+      "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh promises-result-deadlock: PASS, 2026-07-14) and reference-verified (tests/compat/reference/run-reference.mjs reference/promises-result-deadlock: PASS, 2026-07-14)",
+      "negative": true,
+      "cases": [
+        {
+          "id": "divide-async-deadlock",
+          "function": "divide-async",
+          "args": [
+            10,
+            2
+          ],
+          "expect_error": {
+            "reference_class": "no-progress-trap",
+            "reference_message_contains": "event loop error, but no exception is pending",
+            "reference_confidence": "reference-verified",
+            "bridge_class": "call-time-trap",
+            "bridge_message_contains": "returned a Promise that never settled",
+            "bridge_confidence": "build-verified",
+            "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress exactly as for 'promises-deadlock'; result_is_wit_result plays no role until after a promise has actually settled, so this diagnostic and trap path is unchanged for a result<T,E>-returning export."
           }
         }
       ]

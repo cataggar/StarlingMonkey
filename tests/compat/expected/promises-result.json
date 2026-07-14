@@ -1,0 +1,60 @@
+{
+  "fixture": "promises-result",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises-result/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "divide-async-ok",
+      "function": "divide-async",
+      "args": [
+        10,
+        2
+      ],
+      "result": {
+        "tag": "ok",
+        "val": 5
+      },
+      "confidence": "reference-verified",
+      "notes": "Async fulfillment of a top-level result<T,E> export lowers as Ok(value), exactly like advanced-types' synchronous 'divide-ok'."
+    },
+    {
+      "id": "divide-async-err-rejected",
+      "function": "divide-async",
+      "args": [
+        10,
+        0
+      ],
+      "result": {
+        "tag": "err",
+        "val": "division by zero"
+      },
+      "confidence": "reference-verified",
+      "notes": "Promise rejection with a reason whose JS shape matches E (a raw string) lowers as Err(reason), just like advanced-types' synchronous-throw 'divide-err' case -- the empirical basis for this integration's Promise-vs-result reconciliation (see known_deviations 'promise-result-rejection-matches-throw')."
+    },
+    {
+      "id": "checked-negate-async-ok",
+      "function": "checked-negate-async",
+      "args": [
+        5
+      ],
+      "result": {
+        "tag": "ok",
+        "val": -5
+      },
+      "confidence": "reference-verified"
+    },
+    {
+      "id": "checked-negate-async-err-rejected",
+      "function": "checked-negate-async",
+      "args": [
+        -2147483648
+      ],
+      "result": {
+        "tag": "err"
+      },
+      "confidence": "reference-verified",
+      "notes": "result<s32> (E is void): the rejection reason's shape is never inspected, so a plain-object rejection still becomes a bare Err() with no 'val' key, same as advanced-types' synchronous 'checked-negate-err' case."
+    }
+  ]
+}

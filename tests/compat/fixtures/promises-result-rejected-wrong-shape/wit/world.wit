@@ -1,0 +1,11 @@
+package compat:promises-result-rejected-wrong-shape;
+
+// Integration fixture (feat/js-bridge-parity-integration): a Promise
+// rejection on a top-level WIT `result<T, E>` export whose reason's JS
+// shape does NOT match E. Kept as its own single-case fixture (see
+// 'promises-rejected'/'promises-deadlock' for the same established
+// convention): a Wasmtime component instance that has trapped once is
+// poisoned for any further call in the same store.
+world js-exports {
+  export divide-async: func(a: u32, b: u32) -> result<u32, string>;
+}

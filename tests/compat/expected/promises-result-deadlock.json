@@ -1,0 +1,26 @@
+{
+  "fixture": "promises-result-deadlock",
+  "world": "js-exports",
+  "wit_dir": "fixtures/promises-result-deadlock/wit",
+  "js_file": "component.js",
+  "cases": [
+    {
+      "id": "divide-async-deadlock",
+      "function": "divide-async",
+      "args": [
+        10,
+        2
+      ],
+      "expect_error": {
+        "reference_class": "no-progress-trap",
+        "reference_message_contains": "event loop error, but no exception is pending",
+        "reference_confidence": "reference-verified",
+        "bridge_class": "call-time-trap",
+        "bridge_message_contains": "returned a Promise that never settled",
+        "bridge_confidence": "build-verified",
+        "bridge_source": "runtime/event_loop.cpp: EventLoop::pump_until_promise_settled returns PromisePumpResult::NoProgress exactly as for 'promises-deadlock'; result_is_wit_result plays no role until after a promise has actually settled, so this diagnostic and trap path is unchanged for a result<T,E>-returning export."
+      }
+    }
+  ],
+  "negative": true
+}
