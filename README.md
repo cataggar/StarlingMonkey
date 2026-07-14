@@ -219,10 +219,11 @@ Host traps propagate back through the wasm export call as JS exceptions, and
 a component instantiated against a linker that doesn't implement a required
 import fails deterministically at instantiation time with an actionable
 diagnostic (this is enforced by the host, e.g. Wasmtime, not silently
-skipped). Resource-typed imports, async imports, and root-level (non-interface)
-function imports are not yet supported; the WABT bindgen fork used by this
-build (`cataggar/wabt`, see `build.zig.zon`'s `.wasip3` dependency) rejects
-those with a build-time diagnostic rather than silently omitting them.
+skipped). Root-level function imports are also generated as default ES module
+imports and use the same typed bridge. Resource-typed and async imports are not
+yet supported; the WABT bindgen fork used by this build (`cataggar/wabt`, see
+`build.zig.zon`'s `.wasip3` dependency) rejects those with a build-time
+diagnostic rather than silently omitting them.
 
 See `tests/e2e/wit-imports/` for the full fixture (a custom
 `test:wit-imports/host@1.2.3` interface implemented by a Wasmtime host, and

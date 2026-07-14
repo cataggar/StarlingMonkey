@@ -79,7 +79,7 @@ std::string kebab_to_camel_case(std::string_view kebab) {
 bool resolve_property_lookup(JSContext *cx, JS::HandleObject object, std::string_view literal_name,
                              std::string *lookup_name, bool *has_property) {
   *lookup_name = literal_name;
-  if (!JS_HasProperty(cx, object, lookup_name->c_str(), has_property)) {
+  if (!JS_HasOwnProperty(cx, object, lookup_name->c_str(), has_property)) {
     return false;
   }
   if (*has_property) {
@@ -91,7 +91,7 @@ bool resolve_property_lookup(JSContext *cx, JS::HandleObject object, std::string
     return true;
   }
   *lookup_name = std::move(camel_name);
-  return JS_HasProperty(cx, object, lookup_name->c_str(), has_property);
+  return JS_HasOwnProperty(cx, object, lookup_name->c_str(), has_property);
 }
 
 // Shared by both dispatch bridges. WABT names root-function exports with

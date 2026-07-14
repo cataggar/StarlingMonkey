@@ -3,6 +3,7 @@ package starling:js;
 interface api {
   present: func() -> u32;
   phantom: func() -> u32;
+  to-string: func() -> string;
 }
 
 world js-exports {

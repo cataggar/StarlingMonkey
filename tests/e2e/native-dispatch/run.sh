@@ -126,12 +126,13 @@ expect_trap() {
   echo "PASS $name (trapped with exit $status)"
 }
 
-# expect_core_diagnostic NAME CORE_MODULE EXPECTED_DIAGNOSTIC
+# expect_core_diagnostic NAME CORE_MODULE EXPECTED_DIAGNOSTIC [INVOKE_EXPR]
 expect_core_diagnostic() {
-  local name="$1" core_module="$2" expected_diagnostic="$3" actual status
+  local name="$1" core_module="$2" expected_diagnostic="$3"
+  local invoke_expr="${4:-starling:js/api#phantom}" actual status
   actual=$(timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/wasmtime" run \
     -S cli -W unknown-imports-trap \
-    --invoke 'starling:js/api#phantom' "$core_module" 2>&1) && status=0 || status=$?
+    --invoke "$invoke_expr" "$core_module" 2>&1) && status=0 || status=$?
   if [ "$status" -eq 124 ]; then
     echo "FAIL $name: invocation timed out after ${TIMEOUT_SECS}s"
     fail=1
@@ -368,6 +369,11 @@ for shape in flat missing-namespace nonobject-namespace missing-member noncallab
   esac
   expect_core_diagnostic "interface namespace rejects $shape shape" \
     "$core_module" "$diagnostic"
+  if [ "$shape" = missing-member ]; then
+    expect_core_diagnostic "interface namespace rejects inherited prototype members" \
+      "$core_module" "JavaScript module does not export 'to-string'" \
+      "starling:js/api#to-string"
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then
