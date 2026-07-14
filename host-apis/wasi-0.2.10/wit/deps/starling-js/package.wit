@@ -26,6 +26,32 @@ interface api {
   big-sub: func(a: s64, b: s64) -> s64;
   // Nested aggregate carrying an exact u64 field alongside a nested record.
   tag-point: func(p: point, id: u64) -> big-point;
+
+  // A record combining a string field with an exact u64 field: this is the
+  // shape that actually exercises the native-dispatch UAF fix (the string
+  // and the u64 both live in the same decoded result, so the string must
+  // survive past the point where the C++ NativeArena backing it is freed).
+  record labeled-id {
+    label: string,
+    id: u64,
+  }
+  label-id: func(label: string, id: u64) -> labeled-id;
+
+  // Optional 64-bit round trips (both `some` and `none`), decoded from the
+  // "bare tag, no option_some wrapper" shape that decode_from_js actually
+  // produces for a present JS value.
+  maybe-big: func(value: option<u64>) -> option<u64>;
+  maybe-signed: func(value: option<s64>) -> option<s64>;
+
+  // list<u64>: exercises the native LIST tag end to end (JS array in,
+  // JS array out), including exact values beyond 2^53.
+  sum-list: func(values: list<u64>) -> u64;
+  echo-list: func(values: list<u64>) -> list<u64>;
+
+  // Deliberately returns the wrong JS type (a string) where a u64 is
+  // expected, to prove decodeNative traps instead of silently coercing to
+  // zero/false.
+  wrong-type: func() -> u64;
 }
 
 world js-exports {

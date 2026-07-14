@@ -189,6 +189,7 @@ struct NativeArena {
   std::vector<std::unique_ptr<StarlingJsValue>> boxed_values;
   std::vector<std::unique_ptr<StarlingJsField[]>> field_arrays;
   std::vector<std::unique_ptr<uint8_t[]>> byte_buffers;
+  std::vector<std::unique_ptr<StarlingJsValue[]>> list_arrays;
 
   const StarlingJsValue *box(StarlingJsValue v) {
     boxed_values.push_back(std::make_unique<StarlingJsValue>(v));
@@ -205,6 +206,12 @@ struct NativeArena {
     }
     byte_buffers.push_back(std::move(buf));
     return byte_buffers.back().get();
+  }
+  // A contiguous array of `n` list-item nodes (tag == LIST); unlike record
+  // fields these are unnamed, so no `StarlingJsField` wrapper is needed.
+  StarlingJsValue *list_items(size_t n) {
+    list_arrays.push_back(std::make_unique<StarlingJsValue[]>(n));
+    return list_arrays.back().get();
   }
 };
 
@@ -280,6 +287,23 @@ bool encode_to_js(JSContext *cx, const StarlingJsValue &v, JS::MutableHandleValu
     out.setObject(*obj);
     return true;
   }
+  case STARLING_JS_LIST: {
+    JS::RootedObject arr(cx, JS::NewArrayObject(cx, v.list_len));
+    if (!arr) {
+      return false;
+    }
+    for (size_t i = 0; i < v.list_len; ++i) {
+      JS::RootedValue item_value(cx);
+      if (!encode_to_js(cx, v.list_ptr[i], &item_value)) {
+        return false;
+      }
+      if (!JS_DefineElement(cx, arr, i, item_value, JSPROP_ENUMERATE)) {
+        return false;
+      }
+    }
+    out.setObject(*arr);
+    return true;
+  }
   }
   JS_ReportErrorASCII(cx, "native dispatch: unrecognized argument tag");
   return false;
@@ -302,21 +326,35 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
     return true;
   }
   if (v.isBigInt()) {
-    // Both fields always carry the same 64-bit pattern; the Zig side reads
-    // whichever matches its comptime-known target signedness (see
-    // js_dispatch.h).
+    // `ToBigInt64`/`ToBigUint64` only reinterpret bits (they don't report
+    // whether the BigInt actually fits the target domain), so use the
+    // exact-fit queries instead: they report both the precise value and
+    // whether the BigInt's true mathematical value fits, letting the Zig
+    // side validate the full s64/u64 domains without being fooled by two's
+    // complement wraparound (see the field comments in js_dispatch.h).
     JS::BigInt *bi = v.toBigInt();
-    int64_t raw = JS::ToBigInt64(bi);
+    int64_t i64_out = 0;
+    uint64_t u64_out = 0;
+    bool fits_i64 = JS::BigIntFits<int64_t>(bi, &i64_out);
+    bool fits_u64 = JS::BigIntFits<uint64_t>(bi, &u64_out);
     *out = {.tag = STARLING_JS_U64,
-            .i64_val = raw,
-            .u64_val = static_cast<uint64_t>(raw)};
+            .i64_val = i64_out,
+            .u64_val = u64_out,
+            .bigint_is_negative = static_cast<uint8_t>(JS::BigIntIsNegative(bi)),
+            .bigint_fits_i64 = static_cast<uint8_t>(fits_i64),
+            .bigint_fits_u64 = static_cast<uint8_t>(fits_u64)};
     return true;
   }
   if (v.isNumber()) {
+    // `i64_val`/`u64_val` are left zeroed here (not derived from `d`): a
+    // JS `Number` result is only ever decoded by Zig's non-64-bit integer
+    // path, which validates range/integrality directly against `f64_val`
+    // (see `decodeNative`). Computing an `int64_t` cast of `d` here would be
+    // undefined behavior for any `d` outside the int64 range (e.g. `1e300`),
+    // and this tag is never used for exact 64-bit results (those are
+    // `isBigInt()` above), so there is nothing useful to precompute.
     double d = v.toNumber();
-    auto raw = static_cast<int64_t>(d);
-    *out = {.tag = STARLING_JS_F64, .i64_val = raw, .u64_val = static_cast<uint64_t>(raw),
-            .f64_val = d};
+    *out = {.tag = STARLING_JS_F64, .f64_val = d};
     return true;
   }
   if (v.isString()) {
@@ -332,6 +370,36 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
   }
   if (v.isObject()) {
     JS::RootedObject obj(cx, &v.toObject());
+
+    // Arrays must be detected *before* the generic own-property-keys walk
+    // below: `js::GetPropertyKeys` would enumerate a dense array's elements
+    // as integer-valued jsids, which `id.isString()` then filters out
+    // entirely (they're not string keys) -- silently coercing every JS
+    // array into an empty `STARLING_JS_RECORD` and dropping its contents.
+    // WIT `list<T>` results must decode to `STARLING_JS_LIST` instead.
+    bool is_array = false;
+    if (!JS::IsArrayObject(cx, obj, &is_array)) {
+      return false;
+    }
+    if (is_array) {
+      uint32_t len = 0;
+      if (!JS::GetArrayLength(cx, obj, &len)) {
+        return false;
+      }
+      StarlingJsValue *items = arena.list_items(len);
+      for (uint32_t i = 0; i < len; ++i) {
+        JS::RootedValue item_value(cx);
+        if (!JS_GetElement(cx, obj, i, &item_value)) {
+          return false;
+        }
+        if (!decode_from_js(cx, item_value, arena, &items[i])) {
+          return false;
+        }
+      }
+      *out = {.tag = STARLING_JS_LIST, .list_ptr = items, .list_len = len};
+      return true;
+    }
+
     JS::RootedIdVector ids(cx);
     if (!js::GetPropertyKeys(cx, obj, JSITER_OWNONLY, &ids)) {
       return false;

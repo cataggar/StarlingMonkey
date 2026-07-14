@@ -34,6 +34,7 @@
 # Zig build (zig17 conversion)
 /.zig-cache/
 /zig-out/
+/zig-out-native-dispatch-e2e/
 /deps/sm-obj-zig/
 /deps/mozbuild-state/
 /deps/openssl-zig/

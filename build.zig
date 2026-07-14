@@ -290,6 +290,19 @@ pub fn build(b: *std.Build) void {
     suite.step.dependOn(b.getInstallStep());
     test_step.dependOn(&suite.step);
 
+    // Typed native JS dispatch bridge E2E coverage: builds a dedicated
+    // dispatch-enabled runtime, componentizes tests/fixtures/js-dispatch.js,
+    // and drives it through `wasmtime run --invoke` (see
+    // tests/e2e/native-dispatch/run.sh for the full case list: full-domain
+    // i64/u64 boundaries, nested record+string, optional some/none,
+    // list<u64>, wrong-type traps, and JSON-path regressions). This is a
+    // separate nested `zig build install` (its own `-Dcomponent-world`), so
+    // it doesn't depend on -- or get skipped by -- whatever component-world
+    // flags the outer `zig build test` invocation itself used.
+    const dispatch_e2e = b.addSystemCommand(&.{ "bash", "tests/e2e/native-dispatch/run.sh" });
+    dispatch_e2e.addArg(b.graph.zig_exe);
+    test_step.dependOn(&dispatch_e2e.step);
+
     // ---- Objects-only verification step ----
     // A static archive that compiles the full C++ tree without resolving the
     // SpiderMonkey/Rust/OpenSSL externals.
