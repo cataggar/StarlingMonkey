@@ -214,7 +214,11 @@ fn typeNeedsNative(comptime T: type) bool {
     if (T == i64 or T == u64) return true;
     if (T == wit_types.Char or T == wit_types.ByteList) return true;
     return switch (@typeInfo(T)) {
-        .optional => |o| typeNeedsNative(o.child),
+        // JSON cannot preserve JavaScript `undefined`, nor can it express
+        // the tagged object needed for option<option<T>>. Route every
+        // option-containing signature through the native bridge instead of
+        // introducing a JSON sentinel that would conflate canonical states.
+        .optional => true,
         .@"enum", .@"union" => true,
         .@"struct" => |s| comptime blk: {
             // A `flags` type: a packed struct backing integer. Always needs
@@ -339,6 +343,25 @@ pub fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) Na
             @compileError("native dispatch: unsupported argument type " ++ @typeName(T));
         },
         .optional => |o| blk: {
+            // ComponentizeJS keeps option<option<T>>'s three canonical
+            // states distinct with a tagged object. A direct option<T>
+            // remains unboxed: none is `undefined`, some is its value.
+            // This construction must happen before the generic C++ encoder
+            // sees the tree, because only this comptime-known type has the
+            // nesting context needed to select the JS representation.
+            if (@typeInfo(o.child) == .optional) {
+                const tag_name: []const u8 = if (value == null) "none" else "some";
+                const tag_boxed = allocator.create(NativeValue) catch @panic("OOM");
+                tag_boxed.* = .{ .tag = .string_, .str_ptr = tag_name.ptr, .str_len = tag_name.len };
+                const fields = allocator.alloc(NativeField, if (value == null) 1 else 2) catch @panic("OOM");
+                fields[0] = .{ .name_ptr = "tag".ptr, .name_len = "tag".len, .value = tag_boxed };
+                if (value) |present| {
+                    const val_boxed = allocator.create(NativeValue) catch @panic("OOM");
+                    val_boxed.* = encodeNative(o.child, present, allocator);
+                    fields[1] = .{ .name_ptr = "val".ptr, .name_len = "val".len, .value = val_boxed };
+                }
+                break :blk .{ .tag = .record, .fields_ptr = fields.ptr, .fields_len = fields.len };
+            }
             if (value) |present| {
                 const boxed = allocator.create(NativeValue) catch @panic("OOM");
                 boxed.* = encodeNative(o.child, present, allocator);
@@ -700,6 +723,36 @@ pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.
         },
         .optional => |o| blk: {
             if (value.tag == .option_none) break :blk null;
+            // Nested options have the same `{tag:"none"|"some", val?}`
+            // shape as variants. Decode it only when the concrete target is
+            // option<option<T>>; an ordinary record with those field names
+            // must remain an ordinary record at every other type position.
+            if (@typeInfo(o.child) == .optional) {
+                if (value.tag != .record) {
+                    std.debug.panic(
+                        "native dispatch: expected a {{tag, val}} object result for option<option<T>>, got a JavaScript value of kind {t}",
+                        .{value.tag},
+                    );
+                }
+                const tag_value = findNativeField(value, "tag") orelse
+                    @panic("native dispatch: nested option result is missing its 'tag' field");
+                if (tag_value.tag != .string_) {
+                    std.debug.panic(
+                        "native dispatch: nested option 'tag' must be a string, got a JavaScript value of kind {t}",
+                        .{tag_value.tag},
+                    );
+                }
+                const tag_ptr = tag_value.str_ptr orelse
+                    @panic("native dispatch: nested option 'tag' is missing its byte pointer");
+                const tag = tag_ptr[0..tag_value.str_len];
+                if (std.mem.eql(u8, tag, "none")) break :blk null;
+                if (!std.mem.eql(u8, tag, "some")) {
+                    std.debug.panic("native dispatch: invalid nested option tag '{s}'", .{tag});
+                }
+                const val_value = findNativeField(value, "val") orelse
+                    @panic("native dispatch: nested option 'some' result is missing its 'val' field");
+                break :blk decodeNative(o.child, val_value, allocator);
+            }
             // Real dispatch results (built by C++'s `decode_from_js`) never
             // wrap a present value in `.option_some`/`option_ptr` -- C++
             // can't know the Zig target type is optional, so it leaves the
@@ -1007,9 +1060,11 @@ test "decodes structured JavaScript results" {
     try std.testing.expectEqual(null, result.extra);
 }
 
-test "needsNative routes plain types to JSON and u64/s64 to the native bridge" {
+test "needsNative routes plain types to JSON and option-containing signatures to the native bridge" {
     const Plain = struct { x: i32, y: i32 };
     try std.testing.expect(!needsNative(Plain, @TypeOf(.{ @as(i32, 1), @as(i32, 2) })));
+    try std.testing.expect(needsNative(?u32, @TypeOf(.{})));
+    try std.testing.expect(needsNative(void, @TypeOf(.{@as(?u32, null)})));
     try std.testing.expect(needsNative(void, @TypeOf(.{@as(u64, 1)})));
     try std.testing.expect(needsNative(i64, @TypeOf(.{})));
 
@@ -1150,6 +1205,40 @@ test "round-trips an optional u64 through option_some/option_none" {
     try std.testing.expectEqual(absent, decodeNative(?u64, &encoded_none, arena.allocator()));
 }
 
+test "nested options preserve none, some-none, and some-some" {
+    const Nested = ??u32;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const outer_none: Nested = null;
+    const encoded_none = encodeNative(Nested, outer_none, arena.allocator());
+    try std.testing.expectEqual(NativeTag.record, encoded_none.tag);
+    try std.testing.expectEqual(@as(usize, 1), encoded_none.fields_len);
+    const none_tag = findNativeField(&encoded_none, "tag") orelse return error.MissingField;
+    try std.testing.expectEqualStrings("none", none_tag.str_ptr.?[0..none_tag.str_len]);
+    try std.testing.expectEqual(outer_none, decodeNative(Nested, &encoded_none, arena.allocator()));
+
+    const outer_some_none: Nested = @as(?u32, null);
+    const encoded_some_none = encodeNative(Nested, outer_some_none, arena.allocator());
+    const some_tag = findNativeField(&encoded_some_none, "tag") orelse return error.MissingField;
+    try std.testing.expectEqualStrings("some", some_tag.str_ptr.?[0..some_tag.str_len]);
+    const some_none_val = findNativeField(&encoded_some_none, "val") orelse return error.MissingField;
+    try std.testing.expectEqual(NativeTag.option_none, some_none_val.tag);
+    try std.testing.expectEqual(outer_some_none, decodeNative(Nested, &encoded_some_none, arena.allocator()));
+
+    const outer_some_some: Nested = @as(?u32, 42);
+    const encoded_some_some = encodeNative(Nested, outer_some_some, arena.allocator());
+    const some_some_val = findNativeField(&encoded_some_some, "val") orelse return error.MissingField;
+    try std.testing.expectEqual(NativeTag.option_some, some_some_val.tag);
+    try std.testing.expectEqual(NativeTag.f64_, some_some_val.option_ptr.?.tag);
+    try std.testing.expectEqual(outer_some_some, decodeNative(Nested, &encoded_some_some, arena.allocator()));
+
+    // JavaScript null and undefined both decode to this tag. At a nested
+    // target they lower to the outer none state, never some-none.
+    const js_null_or_undefined: NativeValue = .{ .tag = .option_none };
+    try std.testing.expectEqual(outer_none, decodeNative(Nested, &js_null_or_undefined, arena.allocator()));
+}
+
 test "encodes void as its own dedicated tag, never bool_/option_none" {
     // The reverse (`--js-imports`) bridge's generated dispatch trampoline
     // calls `encodeNative(void, {}, alloc)` for a WIT import with no
@@ -1165,6 +1254,7 @@ test "encodes void as its own dedicated tag, never bool_/option_none" {
     try std.testing.expectEqual(NativeTag.undefined_, encoded.tag);
     try std.testing.expect(encoded.tag != .bool_);
     try std.testing.expect(encoded.tag != .option_none);
+    try std.testing.expect(NativeTag.option_none != NativeTag.undefined_);
 }
 
 test "decodeNative(void, ...) accepts either the undefined tag or a real export's option_none shape" {

@@ -19,6 +19,18 @@ interface api {
   notify: func(message: string);
   move: func(point: point, dx: s32, dy: s32) -> point;
   maybe: func(value: option<u32>) -> option<u32>;
+  // Option parity: direct and aggregate none values lift to JavaScript
+  // `undefined`; nested options use `{tag:"none"|"some", val?}` so their
+  // three canonical states remain distinguishable. Both JS null and
+  // undefined lower to WIT none.
+  direct-option-shape: func(value: option<u32>) -> string;
+  aggregate-option-shapes: func(value: option-aggregate) -> list<string>;
+  record nested-option-argument {
+    nested: option<option<u32>>,
+  }
+  nested-option-shape: func(value: nested-option-argument) -> string;
+  lower-null: func() -> option<u32>;
+  lower-undefined: func() -> option<u32>;
 
   // Exact 64-bit round trips beyond 2^53 (JSON numbers lose precision here;
   // the native typed dispatch path carries them as JavaScript BigInt).
@@ -178,6 +190,19 @@ interface api {
   invalid-variant-tag: func() -> shape;
   // JS returns a non-object where the `{tag, val}` shape is expected.
   wrong-type-variant: func() -> shape;
+
+  // Exercise option<T> in every aggregate position that needs the typed
+  // bridge. `option-aggregate` is echoed by JavaScript; the E2E invokes all
+  // fields so this covers record, list, tuple, variant, and result payload
+  // positions without a JSON sentinel.
+  record option-aggregate {
+    direct: option<u32>,
+    items: list<option<u32>>,
+    pair: tuple<option<u32>, option<u32>>,
+    maybe-shape: option<shape>,
+    maybe-result: option<result<u32, string>>,
+  }
+  echo-option-aggregate: func(value: option-aggregate) -> option-aggregate;
 
   // --- result<T, E> --------------------------------------------------------
   // Nested (argument/field) position: JS-visible as the same `{tag, val}`

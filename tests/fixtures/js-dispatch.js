@@ -15,8 +15,46 @@ export function move(point, dx, dy) {
 }
 
 export function maybe(value) {
-  return value === null ? null : value + 1;
+  return value == null ? null : value + 1;
 }
+
+function optionShape(value) {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  return "value";
+}
+
+function directOptionShapeImpl(value) {
+  return optionShape(value);
+}
+export { directOptionShapeImpl as "direct-option-shape" };
+
+function aggregateOptionShapesImpl(value) {
+  return [
+    optionShape(value.direct),
+    ...value.items.map(optionShape),
+    ...value.pair.map(optionShape),
+  ];
+}
+export { aggregateOptionShapesImpl as "aggregate-option-shapes" };
+
+function nestedOptionShapeImpl(value) {
+  const nested = value.nested;
+  if (nested === undefined || nested === null) return optionShape(nested);
+  const hasVal = Object.prototype.hasOwnProperty.call(nested, "val");
+  return `${nested.tag}:${hasVal ? optionShape(nested.val) : "missing"}`;
+}
+export { nestedOptionShapeImpl as "nested-option-shape" };
+
+function lowerNullImpl() {
+  return null;
+}
+export { lowerNullImpl as "lower-null" };
+
+function lowerUndefinedImpl() {
+  return undefined;
+}
+export { lowerUndefinedImpl as "lower-undefined" };
 
 // Exact u64/s64 round trips beyond 2^53: both operands and the result stay
 // native BigInt end to end, so this is exact where a JSON-number round trip
@@ -53,12 +91,12 @@ export { nulLabelImpl as "nul-label" };
 
 // Optional 64-bit round trips, both present and absent.
 function maybeBigImpl(value) {
-  return value === null ? null : value + 1n;
+  return value == null ? null : value + 1n;
 }
 export { maybeBigImpl as "maybe-big" };
 
 function maybeSignedImpl(value) {
-  return value === null ? null : value - 1n;
+  return value == null ? null : value - 1n;
 }
 export { maybeSignedImpl as "maybe-signed" };
 
@@ -293,6 +331,11 @@ function wrongTypeVariantImpl() {
   return 42; // not a {tag, val} object
 }
 export { wrongTypeVariantImpl as "wrong-type-variant" };
+
+function echoOptionAggregateImpl(value) {
+  return value;
+}
+export { echoOptionAggregateImpl as "echo-option-aggregate" };
 
 // --- result<T, E> --------------------------------------------------------
 function echoWrappedResultImpl(w) {

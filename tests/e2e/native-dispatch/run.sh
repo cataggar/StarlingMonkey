@@ -123,12 +123,34 @@ expect_trap() {
   echo "PASS $name (trapped with exit $status)"
 }
 
-# --- Existing JSON-path regressions (unmigrated types keep working) -------
+# --- Existing scalar/record regressions -----------------------------------
 expect_eq "add (JSON path)" "add(2, 3)" "5"
 expect_eq "greet (JSON path)" 'greet("world")' '"Hello, world!"'
 expect_eq "move (JSON path)" "move({x: 1, y: 2}, 3, 4)" "{x: 4, y: 6}"
-expect_eq "maybe none (JSON path)" "maybe(none)" "none"
-expect_eq "maybe some (JSON path)" "maybe(some(41))" "some(42)"
+expect_eq "maybe none (native option path)" "maybe(none)" "none"
+expect_eq "maybe some (native option path)" "maybe(some(41))" "some(42)"
+
+# --- option<T> JavaScript shape parity ----------------------------------
+# These options intentionally use the native bridge even though u32 itself
+# is JSON-safe: JSON cannot represent undefined or nested option states.
+expect_eq "direct option none lifts to undefined" \
+  "direct-option-shape(none)" '"undefined"'
+expect_eq "direct option some stays its bare value" \
+  "direct-option-shape(some(7))" '"value"'
+expect_eq "aggregate option none lifts to undefined in record/list/tuple" \
+  "aggregate-option-shapes({direct: none, items: [none, some(1)], pair: (none, some(2)), maybe-shape: none, maybe-result: none})" \
+  '["undefined", "undefined", "value", "undefined", "value"]'
+expect_eq "nested option outer none is tagged" \
+  "nested-option-shape({nested: none})" '"none:missing"'
+expect_eq "nested option some-none keeps undefined payload" \
+  "nested-option-shape({nested: some(none)})" '"some:undefined"'
+expect_eq "nested option some-some keeps value payload" \
+  "nested-option-shape({nested: some(some(42))})" '"some:value"'
+expect_eq "JS null lowers to option none" "lower-null()" "none"
+expect_eq "JS undefined lowers to option none" "lower-undefined()" "none"
+expect_eq "option values round-trip in variant and result positions" \
+  'echo-option-aggregate({direct: some(4), items: [none, some(1)], pair: (none, some(2)), maybe-shape: some(circle(3)), maybe-result: some(err("bad"))})' \
+  '{direct: some(4), items: [none, some(1)], pair: (none, some(2)), maybe-shape: some(circle(3)), maybe-result: some(err("bad"))}'
 
 # --- Full-domain i64/u64 boundaries (native bridge) ------------------------
 expect_eq "big-add u64::MAX" "big-add(18446744073709551615, 0)" "18446744073709551615"

@@ -1,10 +1,8 @@
 // Phase 0 compatibility fixture: option<T> arguments/results.
 //
-// Uses `== null` (matches both `null` and `undefined`) and always returns
-// `null` for "none" so the same source is portable across the current
-// Zig/WABT JSON bridge (which represents WIT `none` as JS `null`) and the
-// pinned ComponentizeJS reference (which represents it as JS `undefined`).
-// See manifest.json known_deviations "option-none-representation".
+// Uses `== null` so this fixture also verifies that both JavaScript `null`
+// and `undefined` lower to WIT `none`. The native dispatch bridge lifts a
+// WIT `none` to JavaScript `undefined`, matching ComponentizeJS 0.21.
 //
 // Independently authored for cataggar/StarlingMonkey#6 (Phase 0).
 export function maybenumber(value) {

@@ -38,15 +38,8 @@
     }
   },
   "bridge": {
-    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/option/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. Any signature containing i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen -- see the sync-value-parity WABT worktree commit) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved: a wrong *kind* of JS return value (string/object/etc. where a number/BigInt is required, or vice versa) or an invalid variant/enum discriminant traps, but an out-of-range/negative/fractional/non-finite Number or BigInt of the *correct* kind wraps modulo 2**bitwidth (matching ECMAScript ToInt32/ToUint32-family and ToBigInt64/ToBigUint64 semantics, re-verified against the pinned ComponentizeJS reference itself -- see known_deviations and tests/e2e/native-dispatch/run.sh's wrap-numbers/sum-list-overflow cases), not a trap. A returned Promise/thenable (on either path) is instead pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way a directly-returned value would be; see known_deviations promise-exports-pumped. The same tagged-value tree also drives the reverse direction: a WABT `--js-imports`-generated wrapper lets JavaScript synchronously call a host-provided WIT interface import, reusing encode_to_js/decode_from_js with the encode/decode roles swapped (see feature_matrix imports and tests/e2e/wit-imports/); this compat harness itself only exercises the export direction.",
+    "description": "Zig/WABT dispatch bridge (runtime/js_dispatch.cpp + runtime/js_dispatch.zig): a WABT-generated per-export Zig shell dispatches through one of two paths, chosen at bindgen time per export signature. Signatures containing only bool/numeric-scalar/string/list/record shapes that fit losslessly in JSON text still JSON-encode their arguments, call starling_js_dispatch(), which JSON.parses them into a JS array and applies it as positional arguments to a same-named (or camelCase-fallback-named) top-level export of the initialized top-level JS module, then JSON.stringifies the return value back across the boundary. Any signature containing an option (at any depth), i64/u64 (anywhere, including nested), char, tuple, enum, flags, variant, result<T,E>, or list<u8> instead routes through a native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}'s STARLING_JS_* tags), preserving exact BigInt precision, distinguishing `string` from `list<u8>` (both `[]const u8` under plain Zig reflection; disambiguated by a generated `wit_types.ByteList`/`wit_types.Char` wrapper type emitted by the WABT bindgen -- see the sync-value-parity WABT worktree commit) and doing deep-copied, strictly-validated lifting/lowering with no JSON text involved: a wrong *kind* of JS return value (string/object/etc. where a number/BigInt is required, or vice versa) or an invalid variant/enum discriminant traps, but an out-of-range/negative/fractional/non-finite Number or BigInt of the *correct* kind wraps modulo 2**bitwidth (matching ECMAScript ToInt32/ToUint32-family and ToBigInt64/ToBigUint64 semantics, re-verified against the pinned ComponentizeJS reference itself -- see known_deviations and tests/e2e/native-dispatch/run.sh's wrap-numbers/sum-list-overflow cases), not a trap. A returned Promise/thenable (on either path) is instead pumped to completion (EventLoop::pump_until_promise_settled) and its fulfilled value is lowered the same way a directly-returned value would be; see known_deviations promise-exports-pumped. The same tagged-value tree also drives the reverse direction: a WABT `--js-imports`-generated wrapper lets JavaScript synchronously call a host-provided WIT interface import, reusing encode_to_js/decode_from_js with the encode/decode roles swapped (see feature_matrix imports and tests/e2e/wit-imports/); this compat harness itself only exercises the export direction.",
     "known_deviations": [
-      {
-        "id": "option-none-representation",
-        "summary": "WIT `none` arrives to the JS export as `null` in the current JSON bridge (Zig `std.json` serializes a Zig optional's null case as JSON `null`, and `JSON.parse` yields JS `null`), whereas the pinned ComponentizeJS reference lifts `none` as JS `undefined`. Both bridges accept `null` or `undefined` returned from JS as lowering to `none`.",
-        "phase_addressed": "1a",
-        "confidence": "reference-verified",
-        "evidence": "tests/compat/fixtures/options + tests/compat/reference (see maybenumber/maybestring/maybepoint cases in expected/options.json)"
-      },
       {
         "id": "missing-export-detection-timing",
         "summary": "The pinned ComponentizeJS reference rejects a WIT-declared export that JavaScript does not implement (or implements as a non-function) at componentization time, with a message naming the missing/invalid export. The current Zig/WABT bridge resolves the JS export lazily by name on each call (see js_dispatch.cpp's JS_GetProperty/JS::IsCallable check), so the same mistake is only observed as a call-time trap, not a componentization-time failure: build-verified by actually building and componentizing both negative fixtures' reactors and invoking the missing/invalid export through Wasmtime (tests/compat/runtime), which traps rather than failing componentization. The wasm trap itself carries no message text (a bare `unreachable`); the descriptive \"... is not a function\" diagnostic is printed by the JS engine's own panic handler to the guest's stderr stream, which tests/compat/runtime/invoker captures alongside the trap for comparison.",
@@ -105,7 +98,7 @@
       },
       {
         "id": "json-bridge-overhead",
-        "summary": "NARROWED as of sync-value-parity: only applies to the JSON-only path (bool/numeric-scalar/string/list/option/record signatures that need no native lifting). Any signature containing i64/u64, char, tuple, enum, flags, variant, result<T,E> or list<u8> instead uses a typed native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}) with no JSON serialization involved; see bridge.description.",
+        "summary": "NARROWED as of sync-value-parity: only applies to the JSON-only path (bool/numeric-scalar/string/list/record signatures that need no native lifting). Any signature containing an option, i64/u64, char, tuple, enum, flags, variant, result<T,E> or list<u8> instead uses a typed native tagged-value tree (runtime/js_dispatch.{h,cpp,zig}) with no JSON serialization involved; see bridge.description.",
         "phase_addressed": "1a",
         "confidence": "source-verified"
       },
@@ -840,10 +833,7 @@
             null
           ],
           "result": null,
-          "bridge_none_representation": "null",
-          "reference_none_representation": "undefined",
-          "confidence": "reference-verified",
-          "notes": "See known_deviations option-none-representation."
+          "confidence": "reference-verified"
         },
         {
           "id": "maybestring-some",
@@ -861,8 +851,6 @@
             null
           ],
           "result": null,
-          "bridge_none_representation": "null",
-          "reference_none_representation": "undefined",
           "confidence": "reference-verified"
         },
         {
@@ -887,8 +875,6 @@
             null
           ],
           "result": null,
-          "bridge_none_representation": "null",
-          "reference_none_representation": "undefined",
           "confidence": "reference-verified"
         }
       ]
@@ -1757,9 +1743,7 @@
           ],
           "result": null,
           "confidence": "reference-verified",
-          "bridge_none_representation": "null",
-          "reference_none_representation": "undefined",
-          "notes": "Same option<T> none-representation deviation as known_deviations option-none-representation; both null and undefined lower back to none, so this case's own args/result round-trip is unaffected."
+          "notes": "Both JavaScript null and undefined lower back to WIT none."
         },
         {
           "id": "sum-list-basic",

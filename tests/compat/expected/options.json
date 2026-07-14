@@ -20,10 +20,7 @@
         null
       ],
       "result": null,
-      "confidence": "reference-verified",
-      "notes": "See known_deviations option-none-representation.",
-      "bridge_none_representation": "null",
-      "reference_none_representation": "undefined"
+      "confidence": "reference-verified"
     },
     {
       "id": "maybestring-some",
@@ -41,9 +38,7 @@
         null
       ],
       "result": null,
-      "confidence": "reference-verified",
-      "bridge_none_representation": "null",
-      "reference_none_representation": "undefined"
+      "confidence": "reference-verified"
     },
     {
       "id": "maybepoint-some",
@@ -67,9 +62,7 @@
         null
       ],
       "result": null,
-      "confidence": "reference-verified",
-      "bridge_none_representation": "null",
-      "reference_none_representation": "undefined"
+      "confidence": "reference-verified"
     }
   ]
 }
