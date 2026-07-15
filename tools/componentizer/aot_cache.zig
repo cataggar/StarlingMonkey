@@ -394,6 +394,7 @@ const sqlite_integer = 1;
 const sqlite_blob = 4;
 const sqlite_row = 100;
 const sqlite_done = 101;
+const canonical_sqlite_version = [4]u8{ 0x00, 0x2e, 0x72, 0xa0 };
 
 fn canonicalizeCacheDatabase(
     allocator: Allocator,
@@ -413,6 +414,7 @@ fn canonicalizeCacheDatabase(
     defer Dir.deleteFileAbsolute(io, temporary_path) catch {};
 
     try writeCanonicalCache(allocator, source_path, temporary_path);
+    try normalizeCanonicalHeader(io, temporary_path);
     try verifyCacheDatabase(allocator, temporary_path, engine_sha);
 
     var canonical = try Dir.openFileAbsolute(io, temporary_path, .{});
@@ -521,6 +523,26 @@ fn writeCanonicalCache(
         "CREATE INDEX idx ON weval_cache(module_hash, key)",
     );
     try execute(&sqlite, output, "COMMIT");
+}
+
+fn normalizeCanonicalHeader(io: Io, path: []const u8) !void {
+    var file = try Dir.openFileAbsolute(io, path, .{
+        .mode = .read_write,
+        .allow_directory = false,
+    });
+    defer file.close(io);
+    var header: [100]u8 = undefined;
+    if (try file.readPositionalAll(io, &header, 0) != header.len)
+        return error.InvalidCacheFormat;
+    try normalizeCanonicalHeaderBytes(&header);
+    try file.writePositionalAll(io, &canonical_sqlite_version, 96);
+    try file.sync(io);
+}
+
+fn normalizeCanonicalHeaderBytes(header: *[100]u8) Error!void {
+    if (!std.mem.eql(u8, header[0..16], "SQLite format 3\x00"))
+        return error.InvalidCacheFormat;
+    @memcpy(header[96..100], &canonical_sqlite_version);
 }
 
 fn execute(sqlite: *const Sqlite, db: *SqliteDb, sql: []const u8) Error!void {
@@ -730,4 +752,26 @@ test "cache key covers every declared semantic input" {
     );
     defer std.testing.allocator.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "canonical SQLite header produces identical bytes and seals across versions" {
+    var older: [128]u8 = @splat(0);
+    @memcpy(older[0..16], "SQLite format 3\x00");
+    @memcpy(older[96..100], &[4]u8{ 0x00, 0x2e, 0x72, 0xa0 });
+    var newer = older;
+    @memcpy(newer[96..100], &[4]u8{ 0x00, 0x2e, 0x76, 0x8b });
+
+    try normalizeCanonicalHeaderBytes(older[0..100]);
+    try normalizeCanonicalHeaderBytes(newer[0..100]);
+    try std.testing.expectEqualSlices(u8, &older, &newer);
+
+    var older_hasher = Sha256.init(.{});
+    older_hasher.update(&older);
+    var older_seal: [Sha256.digest_length]u8 = undefined;
+    older_hasher.final(&older_seal);
+    var newer_hasher = Sha256.init(.{});
+    newer_hasher.update(&newer);
+    var newer_seal: [Sha256.digest_length]u8 = undefined;
+    newer_hasher.final(&newer_seal);
+    try std.testing.expectEqualSlices(u8, &older_seal, &newer_seal);
 }

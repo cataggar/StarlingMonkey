@@ -2857,6 +2857,20 @@ fn execute(
         needs_initialization,
     );
 
+    const aot_staging_dir = if (config.aot)
+        try createAotStagingDir(
+            allocator,
+            io,
+            environ,
+            cwd,
+            executable_dir,
+            tools.weval.?,
+            std.fs.path.dirname(resolved_output) orelse return error.InvalidPath,
+        )
+    else
+        null;
+    defer if (aot_staging_dir) |path| removeAotStagingDir(io, path);
+
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
     const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -3104,7 +3118,7 @@ fn execute(
         const snapshot = try snapshotAotInputs(
             allocator,
             io,
-            transaction_dir,
+            aot_staging_dir.?,
             runtime.engine,
             tools.weval.?,
             bundle,
@@ -5723,6 +5737,27 @@ fn snapshotAotInputs(
     try Dir.copyFileAbsolute(weval, snapshot_weval, io, .{});
     try Dir.copyFileAbsolute(bundle.cache, snapshot_cache, io, .{});
     try Dir.copyFileAbsolute(bundle.manifest, snapshot_manifest, io, .{});
+    const readonly_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o400)
+    else
+        .default_file;
+    const executable_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o500)
+    else
+        .executable_file;
+    for ([_][]const u8{ snapshot_engine, snapshot_cache, snapshot_manifest }) |path| {
+        try setRegularFilePermissions(io, path, readonly_permissions);
+    }
+    try setRegularFilePermissions(io, snapshot_weval, executable_permissions);
+    var snapshot_dir = try Dir.openDirAbsolute(
+        io,
+        transaction_dir,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer snapshot_dir.close(io);
+    if ((try snapshot_dir.stat(io)).kind != .directory)
+        return error.InvalidPath;
+    try snapshot_dir.setPermissions(io, executable_permissions);
     return .{
         .engine = snapshot_engine,
         .weval = snapshot_weval,
@@ -5732,6 +5767,117 @@ fn snapshotAotInputs(
             .expected_feature_abi = bundle.expected_feature_abi,
         },
     };
+}
+
+fn setRegularFilePermissions(
+    io: Io,
+    path: []const u8,
+    permissions: File.Permissions,
+) !void {
+    var file = try Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.InvalidPath;
+    try file.setPermissions(io, permissions);
+    try file.sync(io);
+}
+
+fn createAotStagingDir(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    executable_dir: []const u8,
+    weval: []const u8,
+    output_parent: []const u8,
+) ![]const u8 {
+    var candidates: std.ArrayList([]const u8) = .empty;
+    candidates.append(
+        allocator,
+        std.fs.path.dirname(weval) orelse return error.InvalidPath,
+    ) catch @panic("out of memory");
+    candidates.append(allocator, executable_dir) catch @panic("out of memory");
+    for ([_][]const u8{ "ZIG_GLOBAL_CACHE_DIR", "XDG_RUNTIME_DIR", "TMPDIR" }) |name| {
+        if (environ.get(name)) |path| {
+            candidates.append(
+                allocator,
+                try absolutePath(allocator, cwd, path),
+            ) catch @panic("out of memory");
+        }
+    }
+    candidates.append(allocator, cwd) catch @panic("out of memory");
+
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    for (candidates.items) |candidate_root| {
+        const root = Dir.realPathFileAbsoluteAlloc(
+            io,
+            candidate_root,
+            allocator,
+        ) catch continue;
+        if (pathContains(output_parent, root)) continue;
+        var random_bytes: [8]u8 = undefined;
+        io.random(&random_bytes);
+        const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ root, try std.fmt.allocPrint(
+                allocator,
+                ".starling-aot-exec-{s}",
+                .{&random_hex},
+            ) },
+        );
+        Dir.createDirAbsolute(io, path, private_permissions) catch continue;
+        probeExecutableStagingDir(allocator, io, path) catch {
+            Dir.cwd().deleteTree(io, path) catch {};
+            continue;
+        };
+        return path;
+    }
+    return error.InvalidPath;
+}
+
+fn probeExecutableStagingDir(
+    allocator: Allocator,
+    io: Io,
+    staging_dir: []const u8,
+) !void {
+    if (!File.Permissions.has_executable_bit) return;
+    const probe = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, ".execution-probe" },
+    );
+    defer Dir.deleteFileAbsolute(io, probe) catch {};
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = probe,
+        .data = "#!/bin/sh\nexit 0\n",
+        .flags = .{ .permissions = File.Permissions.fromMode(0o500) },
+    });
+    var child = try std.process.spawn(io, .{
+        .argv = &.{probe},
+        .cwd = .{ .path = staging_dir },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    if (!(try child.wait(io)).success()) return error.InvalidPath;
+}
+
+fn removeAotStagingDir(io: Io, path: []const u8) void {
+    if (File.Permissions.has_executable_bit) {
+        var dir = Dir.openDirAbsolute(
+            io,
+            path,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch {
+            Dir.cwd().deleteTree(io, path) catch {};
+            return;
+        };
+        dir.setPermissions(io, File.Permissions.fromMode(0o700)) catch {};
+        dir.close(io);
+    }
+    Dir.cwd().deleteTree(io, path) catch {};
 }
 
 fn resolvedFeatureAbi(
@@ -5781,7 +5927,7 @@ fn resolveExecutable(
         std.mem.indexOfScalar(u8, name, std.fs.path.sep) != null)
     {
         const path = try absolutePath(allocator, cwd, name);
-        try requireFile(io, path);
+        try requireExecutableFile(allocator, io, path);
         return Dir.realPathFileAbsoluteAlloc(io, path, allocator);
     }
     const path_value = environ.get("PATH") orelse return error.MissingBuildArtifact;
@@ -5795,9 +5941,52 @@ fn resolveExecutable(
             try absolutePath(allocator, cwd, candidate);
         const stat = Dir.cwd().statFile(io, absolute, .{}) catch continue;
         if (stat.kind != .file) continue;
+        if (!hasEffectiveExecuteAccess(allocator, io, absolute)) continue;
         return Dir.realPathFileAbsoluteAlloc(io, absolute, allocator);
     }
     return error.MissingBuildArtifact;
+}
+
+fn requireExecutableFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) !void {
+    try requireFile(io, path);
+    if (!hasEffectiveExecuteAccess(allocator, io, path))
+        return error.MissingBuildArtifact;
+}
+
+fn hasEffectiveExecuteAccess(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) bool {
+    if (!File.Permissions.has_executable_bit) return true;
+    switch (builtin.os.tag) {
+        .linux,
+        .macos,
+        .freebsd,
+        .netbsd,
+        .dragonfly,
+        .openbsd,
+        .haiku,
+        .illumos,
+        .serenity,
+        => {
+            const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
+            return std.c.faccessat(
+                std.c.AT.FDCWD,
+                path_z,
+                std.c.X_OK,
+                if (builtin.os.tag == .linux) 0x200 else std.c.AT.EACCESS,
+            ) == 0;
+        },
+        else => {
+            Dir.cwd().access(io, path, .{ .execute = true }) catch return false;
+            return true;
+        },
+    }
 }
 
 fn discoverBuildRoot(

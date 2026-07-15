@@ -14,11 +14,16 @@ stage="$release_dir/.aot-package-$BASHPID"
 previous="$stage/previous"
 publication_started=0
 publication_complete=0
+lock_acquired=0
 artifacts=(
   starling-raw-weval.wasm
   starling-ics.wevalcache
   starling-ics.wevalcache.manifest
 )
+
+run_without_publication_lock() {
+  "$@" {lock_fd}>&-
+}
 
 cleanup() {
   local status=$?
@@ -26,13 +31,26 @@ cleanup() {
   if [ "$publication_started" -eq 1 ] &&
     [ "$publication_complete" -eq 0 ]; then
     for artifact in "${artifacts[@]}"; do
-      rm -f "$release_dir/$artifact"
+      if [ "$lock_acquired" -eq 1 ]; then
+        run_without_publication_lock rm -f "$release_dir/$artifact"
+      else
+        rm -f "$release_dir/$artifact"
+      fi
       if [ -e "$previous/$artifact" ]; then
-        mv "$previous/$artifact" "$release_dir/$artifact"
+        if [ "$lock_acquired" -eq 1 ]; then
+          run_without_publication_lock \
+            mv "$previous/$artifact" "$release_dir/$artifact"
+        else
+          mv "$previous/$artifact" "$release_dir/$artifact"
+        fi
       fi
     done
   fi
-  rm -rf "$stage"
+  if [ "$lock_acquired" -eq 1 ]; then
+    run_without_publication_lock rm -rf "$stage"
+  else
+    rm -rf "$stage"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -67,21 +85,24 @@ cp "$bin/starling-ics.wevalcache.manifest" \
 command -v flock >/dev/null
 exec {lock_fd}> "$release_dir/.starling-aot-release.lock"
 flock -x "$lock_fd"
+lock_acquired=1
 
-mkdir "$previous"
+run_without_publication_lock mkdir "$previous"
 for artifact in "${artifacts[@]}"; do
   if [ -e "$release_dir/$artifact" ]; then
-    cp -p "$release_dir/$artifact" "$previous/$artifact"
+    run_without_publication_lock \
+      cp -p "$release_dir/$artifact" "$previous/$artifact"
   fi
 done
 publication_started=1
 for artifact in "${artifacts[@]}"; do
-  mv "$stage/$artifact" "$release_dir/$artifact"
+  run_without_publication_lock \
+    mv "$stage/$artifact" "$release_dir/$artifact"
 done
 
-"$bin/wasm-tools" validate --features all \
+run_without_publication_lock "$bin/wasm-tools" validate --features all \
   "$release_dir/starling-raw-weval.wasm"
-"$bin/starling-aot-cache" validate \
+run_without_publication_lock "$bin/starling-aot-cache" validate \
   --engine "$release_dir/starling-raw-weval.wasm" \
   --weval "$bin/weval" \
   --cache "$release_dir/starling-ics.wevalcache" \

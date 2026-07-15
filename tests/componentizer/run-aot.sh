@@ -157,6 +157,51 @@ for directory in sys.argv[1:]:
     assert sealed.execute("pragma integrity_check").fetchone() == ("ok",)
     sealed.close()
 PY
+
+seal_existing_cache() {
+  local directory="$1"
+  "$CACHE_TOOL" seal \
+    --engine "$AOT_BUNDLE/starling-raw.wasm" \
+    --weval "$WEVAL" \
+    --cache "$directory/raw.wevalcache" \
+    --cache-out "$directory/starling-ics.wevalcache" \
+    --primer "$PRIMER" \
+    --feature-abi 'reproducibility-test-v1' \
+    --out "$directory/starling-ics.wevalcache.manifest"
+}
+
+REPRO_SQLITE_OLD="$CACHE/repro sqlite 3044000"
+REPRO_SQLITE_NEW="$CACHE/repro sqlite 3045003"
+mkdir "$REPRO_SQLITE_OLD" "$REPRO_SQLITE_NEW"
+cp "$REPRO_ONE/raw.wevalcache" "$REPRO_SQLITE_OLD/raw.wevalcache"
+cp "$REPRO_ONE/raw.wevalcache" "$REPRO_SQLITE_NEW/raw.wevalcache"
+python3 - "$REPRO_SQLITE_OLD/raw.wevalcache" \
+  "$REPRO_SQLITE_NEW/raw.wevalcache" <<'PY'
+import sys
+
+for path, version in zip(sys.argv[1:], (3044000, 3045003)):
+    with open(path, "r+b") as cache:
+        cache.seek(96)
+        cache.write(version.to_bytes(4, "big"))
+PY
+seal_existing_cache "$REPRO_SQLITE_OLD"
+seal_existing_cache "$REPRO_SQLITE_NEW"
+cmp "$REPRO_SQLITE_OLD/starling-ics.wevalcache" \
+  "$REPRO_SQLITE_NEW/starling-ics.wevalcache"
+cmp "$REPRO_SQLITE_OLD/starling-ics.wevalcache.manifest" \
+  "$REPRO_SQLITE_NEW/starling-ics.wevalcache.manifest"
+python3 - "$REPRO_SQLITE_OLD/starling-ics.wevalcache" <<'PY'
+import sqlite3
+import sys
+
+with open(sys.argv[1], "rb") as cache:
+    cache.seek(96)
+    assert int.from_bytes(cache.read(4), "big") == 3044000
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("pragma integrity_check").fetchone() == ("ok",)
+assert db.execute("select count(*) from weval_cache where created_time = 0").fetchone()[0] > 0
+db.close()
+PY
 cmp "$REPRO_ONE/starling-ics.wevalcache" \
   "$REPRO_TWO/starling-ics.wevalcache"
 cmp "$REPRO_ONE/starling-ics.wevalcache.manifest" \

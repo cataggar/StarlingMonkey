@@ -17,7 +17,14 @@ PRIMER="$SCRATCH/primer.js"
 
 rm -rf "$SCRATCH"
 mkdir -p "$BARRIER" "$MOVE_TOOLS" "$RELEASE"
-trap 'rm -rf "$SCRATCH"' EXIT
+validator_pid=""
+cleanup() {
+  if [ -n "$validator_pid" ]; then
+    kill "$validator_pid" 2>/dev/null || true
+  fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
 printf 'function main() {}\n' > "$PRIMER"
 real_mv="$(command -v mv)"
 cat > "$MOVE_TOOLS/mv" <<EOF
@@ -64,6 +71,13 @@ mkdir -p "$BARRIER/$label.ready"
 while [ ! -d "$BARRIER/A.ready" ] || [ ! -d "$BARRIER/B.ready" ]; do
   sleep 0.01
 done
+validation_parent="\${4%/*}"
+if [ -n "\${HOLD_POST_LOCK_VALIDATOR:-}" ] &&
+  [[ "\${validation_parent##*/}" != .aot-package-* ]]; then
+  printf '%s\n' "\$\$" > "\$HOLD_POST_LOCK_VALIDATOR.pid"
+  touch "\$HOLD_POST_LOCK_VALIDATOR"
+  sleep 30
+fi
 EOF
   chmod +x "$bin/weval" "$bin/wasm-tools"
   python3 - "$bin/starling-ics.wevalcache.raw" \
@@ -148,4 +162,38 @@ cmp "$RELEASE/starling-ics.wevalcache.manifest" \
   --manifest "$RELEASE/starling-ics.wevalcache.manifest"
 test -z "$(find "$RELEASE" -maxdepth 1 -name '.aot-package-*' -print -quit)"
 
+ABNORMAL_RELEASE="$SCRATCH/abnormal release"
+VALIDATOR_MARKER="$SCRATCH/post-lock-validator"
+mkdir "$ABNORMAL_RELEASE"
+HOLD_POST_LOCK_VALIDATOR="$VALIDATOR_MARKER" \
+PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_A" "$ABNORMAL_RELEASE" \
+  > "$SCRATCH/abnormal-A.log" 2>&1 &
+controller_pid=$!
+for _ in {1..500}; do
+  [ -e "$VALIDATOR_MARKER" ] && break
+  sleep 0.01
+done
+if [ ! -e "$VALIDATOR_MARKER" ]; then
+  cat "$SCRATCH/abnormal-A.log" >&2
+  echo "post-lock validator did not start" >&2
+  exit 1
+fi
+validator_pid="$(cat "$VALIDATOR_MARKER.pid")"
+kill -KILL "$controller_pid"
+wait "$controller_pid" 2>/dev/null || true
+
+SECONDS=0
+if ! timeout 5s env PATH="$MOVE_TOOLS:$PATH" \
+  "$PACKAGE_SCRIPT" "$PREFIX_B" "$ABNORMAL_RELEASE" \
+  > "$SCRATCH/abnormal-B.log" 2>&1
+then
+  cat "$SCRATCH/abnormal-B.log" >&2
+  echo "replacement publisher did not acquire the released lock promptly" >&2
+  exit 1
+fi
+test "$SECONDS" -lt 5
+kill "$validator_pid" 2>/dev/null || true
+validator_pid=""
+
 echo "Concurrent AOT package publication passed"
+echo "Abnormal publication lock release passed"

@@ -176,7 +176,7 @@ jobs:
         "$GITHUB_WORKSPACE/.ci-tools/zig/zig" build host-api-production-matrix-test \
           -Doptimize=ReleaseSmall
     - name: Build AOT dependencies
-      run: ./deps/build-deps.sh --aot
+      run: ./deps/build-deps.sh --all
 
     - name: Build and test sealed AOT runtime
       run: just builddir=zig-out-aot aot-test

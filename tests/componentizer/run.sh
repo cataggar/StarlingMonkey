@@ -86,6 +86,17 @@ touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
 printf 'adapter-bytes\n' > \
   "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
+rm -rf "$SCRATCH"
+mkdir -p "$TOOLS" "$WORK/wit package"
+NOEXEC_MOUNTED=0
+NOEXEC_OUTPUT_DIR=""
+cleanup() {
+  if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
+    umount "$NOEXEC_OUTPUT_DIR" || true
+  fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
 
 if cmake -S "$ROOT" -B "$SCRATCH/cmake aot rejected" -DWEVAL=ON \
   >"$SCRATCH/cmake aot.log" 2>&1
@@ -295,12 +306,22 @@ if [ "${EXPECT_AOT_SNAPSHOT:-0}" = 1 ]; then
   test "$cache" != "$ORIGINAL_AOT_CACHE"
   test "$(dirname "$0")" = "$(dirname "$input")"
   test "$(dirname "$input")" = "$(dirname "$cache")"
-  test "$(stat -c %a "$(dirname "$input")")" = 700
+  test "$(stat -c %a "$(dirname "$input")")" = 500
   printf 'replacement engine\n' > "$ORIGINAL_AOT_ENGINE"
   printf 'replacement cache\n' > "$ORIGINAL_AOT_CACHE"
   printf '# replaced after validation\n' > "$ORIGINAL_AOT_WEVAL"
   cmp "$input" "$EXPECTED_AOT_ENGINE"
   cmp "$cache" "$EXPECTED_AOT_CACHE"
+fi
+if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
+  case "$0" in
+    "$EXPECT_AOT_EXEC_STAGE_OUTSIDE"/*)
+      echo "AOT executable snapshot remained under the output parent" >&2
+      exit 28
+      ;;
+  esac
+  test "$(stat -c %a "$(dirname "$0")")" = 500
+  test "$(stat -c %a "$0")" = 500
 fi
 if [ "${FAKE_AOT_FAIL:-0}" = 1 ]; then
   exit 27
@@ -795,6 +816,23 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
+
+PATH_SHADOW="$SCRATCH/non-executable path shadow"
+mkdir "$PATH_SHADOW"
+printf '#!/usr/bin/env bash\nexit 99\n' > "$PATH_SHADOW/path-wizer"
+chmod 644 "$PATH_SHADOW/path-wizer"
+PATH_SHADOW_OUTPUT="$WORK/path executable fallback output.wasm"
+PATH="$PATH_SHADOW:$TOOLS:$PATH" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin path-wizer \
+  --wabt-bin path-wabt \
+  --wasm-tools-bin path-wasm-tools \
+  --out "$PATH_SHADOW_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$PATH_SHADOW_OUTPUT"
 
 PATH_ENV_OUTPUT="$WORK/path environment output.wasm"
 env PATH="$TOOLS:$PATH" \
@@ -1573,6 +1611,39 @@ assert db.execute("select distinct created_time from weval_cache").fetchall() ==
 assert db.execute("pragma integrity_check").fetchone() == ("ok",)
 db.close()
 PY
+
+NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
+mkdir "$NOEXEC_OUTPUT_DIR"
+noexec_result="structural fallback"
+if command -v mount >/dev/null &&
+  mount -t tmpfs -o noexec,mode=700,size=8m \
+    starling-componentizer-noexec "$NOEXEC_OUTPUT_DIR" \
+    2>"$SCRATCH/noexec-mount.log"
+then
+  NOEXEC_MOUNTED=1
+  noexec_result="mounted noexec filesystem"
+fi
+NOEXEC_OUTPUT="$NOEXEC_OUTPUT_DIR/aot component.wasm"
+EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
+"$COMPONENTIZER" \
+  --aot \
+  --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE" \
+  --weval-bin "$TOOLS/fake weval" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$NOEXEC_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$NOEXEC_OUTPUT"
+test -z "$(find "$TOOLS" -maxdepth 1 -name '.starling-aot-exec-*' -print -quit)"
+if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
+  umount "$NOEXEC_OUTPUT_DIR"
+  NOEXEC_MOUNTED=0
+fi
+echo "AOT noexec output staging passed ($noexec_result)"
 
 expect_seal_failure() {
   local cache="$1" label="$2"

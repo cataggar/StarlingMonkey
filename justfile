@@ -25,7 +25,7 @@ build target="all" *flags:
 
     if [[ '{{ mode }}' == weval ]]; then
         case '{{ target }}' in
-            ''|all|starling|starling-ics.wevalcache)
+            ''|all|starling|starling-raw.wasm|starling-ics.wevalcache)
                 zig_step=()
                 ;;
             *)
@@ -93,6 +93,8 @@ aot-build *flags:
 
 [group('aot')]
 aot-test: aot-build
+    just --justfile '{{ justdir }}/justfile' mode=weval \
+        builddir='{{ builddir }}' build starling-raw.wasm
     '{{ zig }}' build componentizer-test --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true
     '{{ zig }}' build aot-engine-test --prefix '{{ builddir }}' \
