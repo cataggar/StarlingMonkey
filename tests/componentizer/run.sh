@@ -47,6 +47,7 @@ printf '%s\n' "$*" | grep -q -- '--allow-wasi'
 printf '%s\n' "$*" | grep -q -- '--init-func wizer-initialize'
 printf '%s\n' "$*" | grep -q -- '--inherit-env true'
 printf '%s\n' "$*" | grep -q -- '--wasm-bulk-memory true'
+printf '%s\n' "$@" > "$FAKE_WIZER_ARGS_LOG"
 cat > "$FAKE_RUNTIME_ARGS_LOG"
 if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-source\n' > "$FAKE_REPLACE_SOURCE"
@@ -121,6 +122,17 @@ if [ "$1" = "validate" ] && [ -n "${FAKE_RACE_DESTINATION:-}" ]; then
       ;;
   esac
 fi
+if [ "$1" = "validate" ] && [ -n "${FAKE_REPLACED_TRANSACTION:-}" ]; then
+  storage="$(dirname "${!#}")"
+  transaction="$(dirname "$storage")"
+  mv "$transaction" "$FAKE_REPLACED_TRANSACTION"
+  mkdir "$transaction"
+  printf 'preserve-replacement\n' > "$transaction/sentinel"
+fi
+if [ "$1" = "validate" ] && [ -n "${FAKE_ADD_TRANSACTION_ENTRY:-}" ]; then
+  storage="$(dirname "${!#}")"
+  printf 'preserve-unowned\n' > "$storage/unowned-sentinel"
+fi
 if [ "$1 $2" = "component new" ]; then
   out=""
   for ((i = 1; i <= $#; i++)); do
@@ -193,6 +205,7 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasm-opt"
 chmod +x "$TOOLS"/*
 
 export FAKE_RUNTIME_ARGS_LOG="$SCRATCH/runtime args.log"
+export FAKE_WIZER_ARGS_LOG="$SCRATCH/wizer args.log"
 export FAKE_ENGINE="$ENGINE"
 export FAKE_ADAPTER="$ADAPTER"
 export FAKE_ZIG_PREFIX_LOG="$SCRATCH/zig prefixes.log"
@@ -230,21 +243,30 @@ DEBUG_DIR="$WORK/debug output"
 cmp "$ENGINE" "$OUTPUT"
 grep -Fq -- '-d' "$FAKE_RUNTIME_ARGS_LOG"
 grep -Fq -- '--js-heap-limit-mib 256' "$FAKE_RUNTIME_ARGS_LOG"
-grep -Fq -- 'starling-componentize-source-' "$FAKE_RUNTIME_ARGS_LOG"
+grep -Fq -- "\"$SOURCE\"" "$FAKE_RUNTIME_ARGS_LOG"
+if grep -Fq -- '.starling-componentize-' "$FAKE_RUNTIME_ARGS_LOG"; then
+  echo "FAIL: Wizer consumed randomized runtime arguments" >&2
+  exit 1
+fi
+grep -Fq -- "::$WORK" "$FAKE_WIZER_ARGS_LOG"
 test -f "$DEBUG_DIR/initialized.wasm"
 test -f "$DEBUG_DIR/embedded.wasm"
 test -f "$DEBUG_DIR/component.wasm"
 test -f "$DEBUG_DIR/commands.txt"
 test -f "$DEBUG_DIR/imports.json"
 test -f "$DEBUG_DIR/metadata.json"
-python3 - "$DEBUG_DIR/imports.json" "$DEBUG_DIR/metadata.json" <<'PY'
-import json, sys
+python3 - "$DEBUG_DIR/imports.json" "$DEBUG_DIR/metadata.json" \
+  "$DEBUG_DIR/runtime-args.txt" <<'PY'
+import hashlib, json, sys
 imports = json.load(open(sys.argv[1], encoding="utf-8"))
 metadata = json.load(open(sys.argv[2], encoding="utf-8"))
 assert imports["complete"] is False
 assert imports["imports"] == []
 assert metadata["provenance"]["features"] is None
 assert metadata["provenance"]["features_sha256"] is None
+runtime_args = open(sys.argv[3], "rb").read()
+assert metadata["provenance"]["inputs"]["runtime_arguments_sha256"] == \
+    hashlib.sha256(runtime_args).hexdigest()
 PY
 grep -Fq '<transaction>' "$DEBUG_DIR/commands.txt"
 if grep -Fq '.starling-componentize-' "$DEBUG_DIR/commands.txt"; then
@@ -346,9 +368,48 @@ ln -s "$SOURCE_ALIAS_DIR/source.js" "$SOURCE_ALIAS"
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
     "$SOURCE_ALIAS"
 )
-grep -Fq -- "$SOURCE_ALIAS_DIR/.source.starling-componentize-source-" \
-  "$FAKE_RUNTIME_ARGS_LOG"
+grep -Fq -- "\"$SOURCE_ALIAS_DIR/source.js\"" "$FAKE_RUNTIME_ARGS_LOG"
 cmp "$ENGINE" "$SOURCE_ALIAS_OUTPUT"
+
+SYMLINK_OUTPUT="$WORK/symlinked inputs.wasm"
+ln -s "$ENGINE" "$WORK/engine link.wasm"
+ln -s "$ADAPTER" "$WORK/adapter link.wasm"
+ln -s "$TOOLS/fake wizer" "$WORK/wizer link"
+ln -s "$TOOLS/fake wabt" "$WORK/wabt link"
+ln -s "$TOOLS/fake wasm-tools" "$WORK/wasm-tools link"
+"$COMPONENTIZER" \
+  --engine "$WORK/engine link.wasm" \
+  --preview2-adapter "$WORK/adapter link.wasm" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$WORK/wizer link" \
+  --wabt-bin "$WORK/wabt link" \
+  --wasm-tools-bin "$WORK/wasm-tools link" \
+  --out "$SYMLINK_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$SYMLINK_OUTPUT"
+
+READ_ONLY_DIR="$WORK/read only source"
+READ_ONLY_SOURCE="$READ_ONLY_DIR/read only.js"
+READ_ONLY_INITIALIZER="$READ_ONLY_DIR/initializer.js"
+READ_ONLY_OUTPUT="$WORK/read only output.wasm"
+mkdir "$READ_ONLY_DIR"
+printf 'export const readOnly = true;\n' > "$READ_ONLY_SOURCE"
+printf 'globalThis.initialized = true;\n' > "$READ_ONLY_INITIALIZER"
+chmod 444 "$READ_ONLY_SOURCE" "$READ_ONLY_INITIALIZER"
+chmod 555 "$READ_ONLY_DIR"
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --initializer-script-path "$READ_ONLY_INITIALIZER" \
+  --out "$READ_ONLY_OUTPUT" \
+  "$READ_ONLY_SOURCE"
+chmod 755 "$READ_ONLY_DIR"
+grep -Fq -- "\"$READ_ONLY_SOURCE\"" "$FAKE_RUNTIME_ARGS_LOG"
+grep -Fq -- "\"$READ_ONLY_INITIALIZER\"" "$FAKE_RUNTIME_ARGS_LOG"
+cmp "$ENGINE" "$READ_ONLY_OUTPUT"
 
 SOURCE_CONTENT="$(cat "$SOURCE")"
 if "$COMPONENTIZER" \
@@ -568,6 +629,43 @@ if find "$WORK" -maxdepth 1 -name '.*.starling-componentize-*' | grep -q .; then
   exit 1
 fi
 
+REPLACED_OUTPUT="$WORK/replaced transaction.wasm"
+REPLACED_OWNED="$WORK/replaced transaction owned"
+REPLACED_ERROR="$SCRATCH/replaced-transaction-error.log"
+if FAKE_REPLACED_TRANSACTION="$REPLACED_OWNED" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$REPLACED_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$REPLACED_ERROR"
+then
+  echo "FAIL: replaced transaction unexpectedly published" >&2
+  exit 1
+fi
+REPLACEMENT_ROOT="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.replaced transaction.wasm.starling-componentize-*' -print -quit)"
+test -n "$REPLACEMENT_ROOT"
+test "$(cat "$REPLACEMENT_ROOT/sentinel")" = "preserve-replacement"
+test -f "$REPLACED_OWNED/data/component.wasm"
+test ! -e "$REPLACED_OUTPUT"
+rm -rf "$REPLACEMENT_ROOT" "$REPLACED_OWNED"
+
+IDENTITY_OUTPUT="$WORK/identity cleanup.wasm"
+FAKE_ADD_TRANSACTION_ENTRY=1 "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$IDENTITY_OUTPUT" \
+  "$SOURCE"
+IDENTITY_ROOT="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.identity cleanup.wasm.starling-componentize-*' -print -quit)"
+test -n "$IDENTITY_ROOT"
+test "$(cat "$IDENTITY_ROOT/data/unowned-sentinel")" = "preserve-unowned"
+cmp "$ENGINE" "$IDENTITY_OUTPUT"
+rm -rf "$IDENTITY_ROOT"
+
 RACE_OUTPUT="$WORK/publish-race.wasm"
 RACE_METADATA="$WORK/publish-race.json"
 RACE_DEBUG="$WORK/publish-race.debug"
@@ -764,8 +862,9 @@ cp "$METADATA_OUTPUT" "$METADATA_REFERENCE"
 test -s "$BUILD_DEBUG_DIR/component-bindings.zig"
 test -s "$BUILD_DEBUG_DIR/imports.json"
 cmp "$METADATA_OUTPUT" "$BUILD_DEBUG_DIR/metadata.json"
-python3 - "$METADATA_OUTPUT" "$BUILD_DEBUG_DIR/imports.json" <<'PY'
-import json, re, sys
+python3 - "$METADATA_OUTPUT" "$BUILD_DEBUG_DIR/imports.json" \
+  "$BUILD_DEBUG_DIR/runtime-args.txt" <<'PY'
+import hashlib, json, re, sys
 metadata = json.load(open(sys.argv[1], encoding="utf-8"))
 imports = json.load(open(sys.argv[2], encoding="utf-8"))
 sha256 = re.compile(r"^[0-9a-f]{64}$")
@@ -801,6 +900,9 @@ assert [t["name"] for t in provenance["tools"]] == [
 ]
 assert all(sha256.match(t["sha256"]) for t in provenance["tools"])
 assert sha256.match(metadata["component_sha256"])
+runtime_args = open(sys.argv[3], "rb").read()
+assert provenance["inputs"]["runtime_arguments_sha256"] == \
+    hashlib.sha256(runtime_args).hexdigest()
 PY
 build_with_fake_zig "$WORK/metadata component.wasm" \
   --metadata-out "$METADATA_OUTPUT"

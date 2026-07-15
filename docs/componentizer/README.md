@@ -18,8 +18,10 @@ command string):
 
 Any failure leaves existing component and metadata outputs unchanged and never
 publishes a partial debug directory. The temporary transaction directory is
-created beside the output; optional metadata and debug destinations must use
-that same parent so publication and rollback cannot cross filesystems.
+created beside the output, is identity-checked before entry-by-entry cleanup,
+and is never recursively removed by pathname. Optional metadata and debug
+destinations must use that same parent so publication and rollback cannot cross
+filesystems.
 
 ## Building
 
@@ -121,8 +123,11 @@ Canonical aggregate hashes cover worlds, features, and tools. It contains no
 timestamps, random transaction names, or host paths, so its provenance fields
 are deterministic even if an underlying snapshot tool emits byte-distinct
 components. Files, WIT trees, and executables are copied to immutable
-per-run snapshots before use; hashes are computed while creating those
-snapshots, and every child executes or consumes the corresponding snapshot.
+per-run snapshots in controlled transaction storage before use; hashes are
+computed while creating those snapshots, and every child executes or consumes
+the corresponding snapshot. Source and initializer snapshots are mapped to
+their original logical paths for Wizer, and the runtime-argument hash covers
+the exact stable byte stream supplied to Wizer.
 The component itself also receives standard WebAssembly producers metadata
 compatible with `wasm-tools metadata show`.
 

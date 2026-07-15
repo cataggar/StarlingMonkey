@@ -36,6 +36,174 @@ const Snapshot = struct {
     digest: []const u8,
 };
 
+const InputSnapshot = struct {
+    file: Snapshot,
+    logical_path: []const u8,
+    host_dir: []const u8,
+    guest_dir: []const u8,
+};
+
+const EntryIdentity = struct {
+    inode: File.INode,
+    kind: File.Kind,
+
+    fn fromStat(stat: File.Stat) EntryIdentity {
+        return .{ .inode = stat.inode, .kind = stat.kind };
+    }
+
+    fn matches(self: EntryIdentity, stat: File.Stat) bool {
+        return self.inode == stat.inode and self.kind == stat.kind;
+    }
+};
+
+const Transaction = struct {
+    path: []const u8,
+    cleanup_path: []const u8,
+    storage_path: []const u8,
+    root: Dir,
+    storage: Dir,
+    root_identity: EntryIdentity,
+    storage_identity: EntryIdentity,
+    owner_identity: EntryIdentity,
+
+    fn create(
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+        owner: []const u8,
+    ) !Transaction {
+        try Dir.createDirAbsolute(io, path, .fromMode(0o700));
+        var root = try Dir.openDirAbsolute(
+            io,
+            path,
+            .{ .iterate = true, .follow_symlinks = false },
+        );
+        errdefer root.close(io);
+        try root.setPermissions(io, .fromMode(0o700));
+        const root_identity = EntryIdentity.fromStat(try root.stat(io));
+
+        var owner_file = try root.createFile(io, ".owner", .{ .exclusive = true });
+        defer owner_file.close(io);
+        try owner_file.writeStreamingAll(io, owner);
+        try owner_file.sync(io);
+        const owner_identity = EntryIdentity.fromStat(try owner_file.stat(io));
+        try root.createDir(io, "data", .fromMode(0o700));
+        var storage = try root.openDir(
+            io,
+            "data",
+            .{ .iterate = true, .follow_symlinks = false },
+        );
+        errdefer storage.close(io);
+        const storage_identity = EntryIdentity.fromStat(try storage.stat(io));
+
+        return .{
+            .path = path,
+            .cleanup_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}.cleanup",
+                .{path},
+            ),
+            .storage_path = try std.fs.path.join(allocator, &.{ path, "data" }),
+            .root = root,
+            .storage = storage,
+            .root_identity = root_identity,
+            .storage_identity = storage_identity,
+            .owner_identity = owner_identity,
+        };
+    }
+
+    fn deinit(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        safe_to_remove: bool,
+    ) void {
+        if (safe_to_remove) self.cleanup(allocator, io) catch {};
+        self.storage.close(io);
+        self.root.close(io);
+    }
+
+    fn cleanup(self: *Transaction, allocator: Allocator, io: Io) !void {
+        if (!try self.pathHasIdentity(io, self.path, self.root_identity)) return;
+        if (!try self.rootEntryHasIdentity(io, ".owner", self.owner_identity)) return;
+        if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) return;
+
+        var iterator = self.root.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (!std.mem.eql(u8, entry.name, ".owner") and
+                !std.mem.eql(u8, entry.name, "data"))
+            {
+                return;
+            }
+        }
+        var storage_iterator = self.storage.iterate();
+        while (try storage_iterator.next(io)) |entry| {
+            if (!isOwnedTransactionEntry(entry.name)) return;
+        }
+
+        Dir.renamePreserve(
+            .cwd(),
+            self.path,
+            .cwd(),
+            self.cleanup_path,
+            io,
+        ) catch return;
+        if (!try self.pathHasIdentity(io, self.cleanup_path, self.root_identity)) {
+            Dir.renamePreserve(
+                .cwd(),
+                self.cleanup_path,
+                .cwd(),
+                self.path,
+                io,
+            ) catch {};
+            return;
+        }
+
+        try removeOwnedContents(allocator, io, self.storage);
+        if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) return;
+        try self.root.deleteDir(io, "data");
+        if (!try self.rootEntryHasIdentity(io, ".owner", self.owner_identity)) return;
+        try self.root.deleteFile(io, ".owner");
+        if (!try self.pathHasIdentity(io, self.cleanup_path, self.root_identity)) return;
+        try Dir.deleteDirAbsolute(io, self.cleanup_path);
+    }
+
+    fn pathHasIdentity(
+        self: *const Transaction,
+        io: Io,
+        path: []const u8,
+        identity: EntryIdentity,
+    ) !bool {
+        _ = self;
+        const stat = Dir.cwd().statFile(
+            io,
+            path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return identity.matches(stat);
+    }
+
+    fn rootEntryHasIdentity(
+        self: *const Transaction,
+        io: Io,
+        name: []const u8,
+        identity: EntryIdentity,
+    ) !bool {
+        const stat = self.root.statFile(
+            io,
+            name,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return identity.matches(stat);
+    }
+};
+
 const Runtime = struct {
     engine: Snapshot,
     adapter: Snapshot,
@@ -209,27 +377,29 @@ fn execute(
         allocator,
         &.{ output_parent, transaction_name },
     );
-    try Dir.createDirAbsolute(io, transaction_dir, .default_dir);
+    var transaction = try Transaction.create(
+        allocator,
+        io,
+        transaction_dir,
+        &random_hex,
+    );
+    const transaction_storage = transaction.storage_path;
     var transaction_safe_to_remove = true;
-    defer if (transaction_safe_to_remove) {
-        Dir.cwd().deleteTree(io, transaction_dir) catch {};
-    };
+    defer transaction.deinit(
+        allocator,
+        io,
+        transaction_safe_to_remove,
+    );
 
-    const source_snapshot = try snapshotAdjacent(
+    const input_snapshots = try snapshotInputs(
         allocator,
         io,
         source,
-        "source",
-        &random_hex,
+        initializer,
+        transaction_storage,
     );
-    defer Dir.deleteFileAbsolute(io, source_snapshot.path) catch {};
-    const initializer_snapshot = if (initializer) |path|
-        try snapshotAdjacent(allocator, io, path, "initializer", &random_hex)
-    else
-        null;
-    defer if (initializer_snapshot) |snapshot| {
-        Dir.deleteFileAbsolute(io, snapshot.path) catch {};
-    };
+    const source_snapshot = input_snapshots.source;
+    const initializer_snapshot = input_snapshots.initializer;
 
     diagnostic.begin(.inputs);
     const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
@@ -249,7 +419,7 @@ fn execute(
             executable_dir,
             config,
             engine_override,
-            transaction_dir,
+            transaction_storage,
         )
     else
         try buildRuntime(
@@ -261,7 +431,7 @@ fn execute(
             executable_dir,
             config,
             diagnostic,
-            transaction_dir,
+            transaction_storage,
         );
     defer if (runtime.cache_lock) |lock| {
         lock.unlock(io);
@@ -277,25 +447,18 @@ fn execute(
         executable_dir,
         config,
         runtime.component_wit != null,
-        transaction_dir,
+        transaction_storage,
     );
 
     const runtime_args_path = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "runtime-args.txt" },
-    );
-    const provenance_runtime_args = try renderRuntimeArgs(
-        allocator,
-        cwd,
-        source,
-        initializer,
-        config,
+        &.{ transaction_storage, "runtime-args.txt" },
     );
     const runtime_args = try renderRuntimeArgs(
         allocator,
         cwd,
-        source_snapshot.path,
-        if (initializer_snapshot) |snapshot| snapshot.path else null,
+        source_snapshot.logical_path,
+        if (initializer_snapshot) |snapshot| snapshot.logical_path else null,
         config,
     );
     try Dir.cwd().writeFile(io, .{
@@ -306,7 +469,7 @@ fn execute(
     var command_log: std.ArrayList(u8) = .empty;
     const initialized = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "initialized.wasm" },
+        &.{ transaction_storage, "initialized.wasm" },
     );
     var wizer_args: std.ArrayList([]const u8) = .empty;
     wizer_args.append(allocator, tools.wizer.executable.path) catch @panic("out of memory");
@@ -334,12 +497,21 @@ fn execute(
         }) catch @panic("out of memory");
     }
 
-    const source_dir = std.fs.path.dirname(source_snapshot.path) orelse return error.InvalidPath;
-    try addPreopen(allocator, &wizer_args, source_dir);
+    try addMappedPreopen(
+        allocator,
+        &wizer_args,
+        source_snapshot.host_dir,
+        source_snapshot.guest_dir,
+    );
     if (initializer_snapshot) |snapshot| {
-        const initializer_path = snapshot.path;
-        const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
-        try addPreopen(allocator, &wizer_args, initializer_dir);
+        if (!std.mem.eql(u8, snapshot.host_dir, source_snapshot.host_dir)) {
+            try addMappedPreopen(
+                allocator,
+                &wizer_args,
+                snapshot.host_dir,
+                snapshot.guest_dir,
+            );
+        }
     }
     for (config.preopen_dirs) |preopen| {
         const preopen_abs = try absolutePath(allocator, cwd, preopen);
@@ -364,24 +536,24 @@ fn execute(
         config.verbose,
         &command_log,
         diagnostic,
-        transaction_dir,
+        transaction_storage,
     );
 
     var stripped: ?[]const u8 = null;
     var embedded: ?[]const u8 = null;
     const candidate = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "candidate.wasm" },
+        &.{ transaction_storage, "candidate.wasm" },
     );
     if (runtime.component_wit) |component_wit| {
         const wabt = tools.wabt.?.path;
         stripped = try std.fs.path.join(
             allocator,
-            &.{ transaction_dir, "stripped.wasm" },
+            &.{ transaction_storage, "stripped.wasm" },
         );
         embedded = try std.fs.path.join(
             allocator,
-            &.{ transaction_dir, "embedded.wasm" },
+            &.{ transaction_storage, "embedded.wasm" },
         );
         diagnostic.begin(.strip);
         try runCommand(
@@ -395,7 +567,7 @@ fn execute(
             config.verbose,
             &command_log,
             diagnostic,
-            transaction_dir,
+            transaction_storage,
         );
         diagnostic.begin(.embed);
         try runCommand(
@@ -419,7 +591,7 @@ fn execute(
             config.verbose,
             &command_log,
             diagnostic,
-            transaction_dir,
+            transaction_storage,
         );
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
@@ -447,7 +619,7 @@ fn execute(
             config.verbose,
             &command_log,
             diagnostic,
-            transaction_dir,
+            transaction_storage,
         );
     } else {
         const adapter_arg = try std.fmt.allocPrint(
@@ -476,13 +648,13 @@ fn execute(
             config.verbose,
             &command_log,
             diagnostic,
-            transaction_dir,
+            transaction_storage,
         );
     }
 
     const processed = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "component.wasm" },
+        &.{ transaction_storage, "component.wasm" },
     );
     const processed_by = try std.fmt.allocPrint(
         allocator,
@@ -512,7 +684,7 @@ fn execute(
         config.verbose,
         &command_log,
         diagnostic,
-        transaction_dir,
+        transaction_storage,
     );
 
     diagnostic.begin(.validate);
@@ -527,7 +699,7 @@ fn execute(
         config.verbose,
         &command_log,
         diagnostic,
-        transaction_dir,
+        transaction_storage,
     );
     try requireFile(io, processed);
 
@@ -557,9 +729,9 @@ fn execute(
             allocator,
             io,
             config,
-            source_snapshot,
-            initializer_snapshot,
-            provenance_runtime_args,
+            source_snapshot.file,
+            if (initializer_snapshot) |snapshot| snapshot.file else null,
+            runtime_args,
             runtime,
             tools,
             processed,
@@ -571,7 +743,7 @@ fn execute(
     const metadata_staged = if (metadata_output != null) blk: {
         const path = try std.fs.path.join(
             allocator,
-            &.{ transaction_dir, "metadata.json" },
+            &.{ transaction_storage, "metadata.json" },
         );
         try Dir.cwd().writeFile(io, .{
             .sub_path = path,
@@ -584,7 +756,7 @@ fn execute(
         diagnostic.begin(.debug);
         const directory = try std.fs.path.join(
             allocator,
-            &.{ transaction_dir, "debug" },
+            &.{ transaction_storage, "debug" },
         );
         try Dir.cwd().createDirPath(io, directory);
         var debug_dir_handle = try Dir.openDirAbsolute(
@@ -595,13 +767,13 @@ fn execute(
         defer debug_dir_handle.close(io);
         const command_log_path = try std.fs.path.join(
             allocator,
-            &.{ transaction_dir, "commands.txt" },
+            &.{ transaction_storage, "commands.txt" },
         );
         const stable_command_log = try std.mem.replaceOwned(
             u8,
             allocator,
             command_log.items,
-            transaction_dir,
+            transaction_storage,
             "<transaction>",
         );
         try Dir.cwd().writeFile(io, .{
@@ -643,7 +815,7 @@ fn execute(
     try publishArtifacts(
         allocator,
         io,
-        transaction_dir,
+        transaction_storage,
         processed,
         output,
         metadata_staged,
@@ -1465,28 +1637,197 @@ fn readBuildToolManifest(
     return tools.toOwnedSlice(allocator) catch @panic("out of memory");
 }
 
-fn snapshotAdjacent(
+fn removeOwnedContents(
+    allocator: Allocator,
+    io: Io,
+    directory: Dir,
+) !void {
+    const Entry = struct {
+        name: []const u8,
+        identity: EntryIdentity,
+    };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry.name);
+        entries.deinit(allocator);
+    }
+
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        entries.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .identity = .{ .inode = entry.inode, .kind = entry.kind },
+        }) catch @panic("out of memory");
+    }
+
+    for (entries.items) |entry| {
+        const initial = try directory.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (!entry.identity.matches(initial)) return error.TransactionChanged;
+        var random_bytes: [8]u8 = undefined;
+        io.random(&random_bytes);
+        const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+        var cleanup_name_buffer: [".cleanup-".len + random_hex.len]u8 = undefined;
+        const cleanup_name = try std.fmt.bufPrint(
+            &cleanup_name_buffer,
+            ".cleanup-{s}",
+            .{&random_hex},
+        );
+        try directory.renamePreserve(
+            entry.name,
+            directory,
+            cleanup_name,
+            io,
+        );
+        const moved = try directory.statFile(
+            io,
+            cleanup_name,
+            .{ .follow_symlinks = false },
+        );
+        if (!entry.identity.matches(moved)) {
+            directory.renamePreserve(
+                cleanup_name,
+                directory,
+                entry.name,
+                io,
+            ) catch {};
+            return error.TransactionChanged;
+        }
+        if (entry.identity.kind == .directory) {
+            var child = try directory.openDir(
+                io,
+                cleanup_name,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            defer child.close(io);
+            if (!entry.identity.matches(try child.stat(io))) {
+                return error.TransactionChanged;
+            }
+            try removeOwnedContents(allocator, io, child);
+            const final = try directory.statFile(
+                io,
+                cleanup_name,
+                .{ .follow_symlinks = false },
+            );
+            if (!entry.identity.matches(final)) return error.TransactionChanged;
+            try directory.deleteDir(io, cleanup_name);
+        } else {
+            const final = try directory.statFile(
+                io,
+                cleanup_name,
+                .{ .follow_symlinks = false },
+            );
+            if (!entry.identity.matches(final)) return error.TransactionChanged;
+            try directory.deleteFile(io, cleanup_name);
+        }
+    }
+}
+
+fn isOwnedTransactionEntry(name: []const u8) bool {
+    const names = [_][]const u8{
+        "inputs",
+        "dispatch-wit",
+        "component-wit",
+        "engine.wasm",
+        "preview2-adapter.wasm",
+        "zig",
+        "wizer",
+        "wasm-tools",
+        "wabt",
+        "runtime-build-tools.json",
+        "runtime-args.txt",
+        "initialized.wasm",
+        "candidate.wasm",
+        "stripped.wasm",
+        "embedded.wasm",
+        "component.wasm",
+        "component-bindings.zig",
+        "metadata.json",
+        "debug",
+        "commands.txt",
+        "previous-component",
+        "previous-metadata",
+        "previous-debug",
+        "previous-debug-generated",
+    };
+    for (names) |owned| {
+        if (std.mem.eql(u8, name, owned)) return true;
+    }
+    return std.mem.startsWith(u8, name, "runtime-build-tool-");
+}
+
+fn snapshotInputs(
     allocator: Allocator,
     io: Io,
     source: []const u8,
-    label: []const u8,
-    random_hex: []const u8,
-) !Snapshot {
-    const parent = std.fs.path.dirname(source) orelse return error.InvalidPath;
-    const basename = std.fs.path.basename(source);
-    const extension = std.fs.path.extension(basename);
-    const stem = basename[0 .. basename.len - extension.len];
-    const snapshot_name = try std.fmt.allocPrint(
+    initializer: ?[]const u8,
+    transaction_dir: []const u8,
+) !struct { source: InputSnapshot, initializer: ?InputSnapshot } {
+    const source_parent = std.fs.path.dirname(source) orelse return error.InvalidPath;
+    const initializer_parent = if (initializer) |path|
+        std.fs.path.dirname(path) orelse return error.InvalidPath
+    else
+        null;
+    const shared_parent = initializer_parent != null and
+        std.mem.eql(u8, source_parent, initializer_parent.?);
+    const inputs_dir = try std.fs.path.join(
         allocator,
-        ".{s}.starling-componentize-{s}-{s}{s}",
-        .{ stem, label, random_hex, extension },
+        &.{ transaction_dir, "inputs" },
     );
-    return snapshotFile(
+    try Dir.createDirAbsolute(io, inputs_dir, .fromMode(0o700));
+    const source_host = try std.fs.path.join(
+        allocator,
+        &.{ inputs_dir, if (shared_parent) "shared" else "source" },
+    );
+    try Dir.createDirAbsolute(io, source_host, .fromMode(0o700));
+    const source_file = try snapshotFile(
         allocator,
         io,
         source,
-        try std.fs.path.join(allocator, &.{ parent, snapshot_name }),
+        try std.fs.path.join(
+            allocator,
+            &.{ source_host, std.fs.path.basename(source) },
+        ),
     );
+    const source_snapshot = InputSnapshot{
+        .file = source_file,
+        .logical_path = source,
+        .host_dir = source_host,
+        .guest_dir = source_parent,
+    };
+
+    const initializer_snapshot: ?InputSnapshot = if (initializer) |path| blk: {
+        if (std.mem.eql(u8, path, source)) break :blk source_snapshot;
+        const host = if (shared_parent)
+            source_host
+        else
+            try std.fs.path.join(allocator, &.{ inputs_dir, "initializer" });
+        if (!shared_parent) {
+            try Dir.createDirAbsolute(io, host, .fromMode(0o700));
+        }
+        break :blk .{
+            .file = try snapshotFile(
+                allocator,
+                io,
+                path,
+                try std.fs.path.join(
+                    allocator,
+                    &.{ host, std.fs.path.basename(path) },
+                ),
+            ),
+            .logical_path = path,
+            .host_dir = host,
+            .guest_dir = initializer_parent.?,
+        };
+    } else null;
+
+    return .{
+        .source = source_snapshot,
+        .initializer = initializer_snapshot,
+    };
 }
 
 fn snapshotFile(
@@ -1498,7 +1839,7 @@ fn snapshotFile(
     var source = try Dir.openFileAbsolute(
         io,
         source_path,
-        .{ .follow_symlinks = false },
+        .{},
     );
     defer source.close(io);
     const source_stat = try source.stat(io);
@@ -1975,6 +2316,22 @@ fn addPreopen(
 ) !void {
     try validateArgument(path);
     args.appendSlice(allocator, &.{ "--dir", path }) catch @panic("out of memory");
+}
+
+fn addMappedPreopen(
+    allocator: Allocator,
+    args: *std.ArrayList([]const u8),
+    host: []const u8,
+    guest: []const u8,
+) !void {
+    try validateArgument(host);
+    try validateArgument(guest);
+    const mapping = try std.fmt.allocPrint(
+        allocator,
+        "{s}::{s}",
+        .{ host, guest },
+    );
+    args.appendSlice(allocator, &.{ "--dir", mapping }) catch @panic("out of memory");
 }
 
 fn joinComma(allocator: Allocator, values: []const []const u8) ![]const u8 {
