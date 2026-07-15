@@ -595,15 +595,23 @@ pub fn build(b: *std.Build) void {
     else
         b.path(b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
     b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
-    if (component_wit) |wit_dir| {
-        const install_wit = b.addInstallDirectory(.{
-            .source_dir = inputPath(b, wit_dir),
-            .install_dir = .bin,
-            .install_subdir = "component-wit",
-            .include_extensions = &.{".wit"},
-        });
-        b.getInstallStep().dependOn(&install_wit.step);
-    }
+    const installed_component_wit = component_wit orelse
+        b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    const install_wit = b.addInstallDirectory(.{
+        .source_dir = inputPath(b, installed_component_wit),
+        .install_dir = .bin,
+        .install_subdir = "component-wit",
+        .include_extensions = &.{".wit"},
+    });
+    b.getInstallStep().dependOn(&install_wit.step);
+    const surface_wit = dispatch_wit orelse "tools/feature-surface";
+    const install_surface_wit = b.addInstallDirectory(.{
+        .source_dir = inputPath(b, surface_wit),
+        .install_dir = .bin,
+        .install_subdir = "surface-wit",
+        .include_extensions = &.{".wit"},
+    });
+    b.getInstallStep().dependOn(&install_surface_wit.step);
     const install_feature_wit = b.addInstallDirectory(.{
         .source_dir = b.path(b.pathJoin(&.{ ctx.host_api_dir, "wit" })),
         .install_dir = .bin,
@@ -621,7 +629,12 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("weval", .{})) |d|
         b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval"), "weval").step);
 
-    const componentize_sh = renderComponentizeScript(b, component_world, features);
+    const componentize_sh = renderComponentizeScript(
+        b,
+        component_world orelse "bindings",
+        dispatch_world orelse "caller",
+        features,
+    );
     const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
     b.getInstallStep().dependOn(&inst_componentize.step);
     // Installed generated files aren't executable; componentize.sh is invoked
@@ -815,14 +828,6 @@ pub fn build(b: *std.Build) void {
     const feature_selection_macro_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-macro-default-tests.sh" });
     feature_selection_macro_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_test_step.dependOn(&feature_selection_macro_run.step);
-    const feature_surface_run = b.addSystemCommand(
-        &.{ "bash", "tests/feature-selection/run-surface-tests.sh" },
-    );
-    feature_surface_run.addArtifactArg(feature_surface);
-    if (b.lazyDependency("wasm-tools", .{})) |dep| {
-        feature_surface_run.addFileArg(dep.path("wasm-tools"));
-    }
-    feature_selection_test_step.dependOn(&feature_surface_run.step);
     test_step.dependOn(feature_selection_test_step);
 
     // `zig build feature-selection-runtime-test`: the REQUIRED/FULL
@@ -992,6 +997,7 @@ pub fn build(b: *std.Build) void {
 fn renderComponentizeScript(
     b: *std.Build,
     component_world: ?[]const u8,
+    surface_target_world: []const u8,
     features: Features,
 ) std.Build.LazyPath {
     const template = @embedFile("componentize.sh.in");
@@ -999,13 +1005,9 @@ fn renderComponentizeScript(
     const gpa = b.allocator;
     var rest: []const u8 = template;
     const subs = [_]struct { from: []const u8, to: []const u8 }{
-        .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
-        .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
-        .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
-        .{ .from = "@FEATURE_SURFACE_BIN@", .to = "$(dirname \"$0\")/starling-feature-surface" },
         .{ .from = "@AOT@", .to = "0" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
-        .{ .from = "@COMPONENT_WIT_DIR@", .to = "$(dirname \"$0\")/component-wit" },
+        .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },
         .{ .from = "@FEATURE_STDIO@", .to = if (features.stdio) "1" else "0" },
         .{ .from = "@FEATURE_RANDOM@", .to = if (features.random) "1" else "0" },
         .{ .from = "@FEATURE_CLOCKS@", .to = if (features.clocks) "1" else "0" },

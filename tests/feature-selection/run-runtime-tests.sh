@@ -316,6 +316,29 @@ check_combo() {
       fail_case "$name" "unknown combo name"
       ;;
   esac
+
+  local oracle_case=""
+  case "$name" in
+    defaults) oracle_case="defaults" ;;
+    stdio-disabled) oracle_case="disable-stdio" ;;
+    random-disabled) oracle_case="disable-random" ;;
+    clocks-disabled) oracle_case="disable-clocks" ;;
+    http-disabled) oracle_case="disable-http-only" ;;
+    fetch-event-disabled) oracle_case="disable-fetch-event-only" ;;
+    all-disabled) oracle_case="disable-all" ;;
+  esac
+  if [ -n "$oracle_case" ]; then
+    "$bin/wasm-tools" component wit "$bin/probe.wasm" -o "$bin/probe.wit"
+    if python3 "$HERE/check-production-surface.py" \
+        "$HERE/reference/expected/import-surfaces.json" \
+        "$oracle_case" \
+        "wasi:cli/run@0.2.10,wasi:http/incoming-handler@0.2.10" \
+        "$bin/probe.wit"; then
+      pass_case "$name/exact-surface"
+    else
+      fail_case "$name/exact-surface" "surface differs from frozen oracle"
+    fi
+  fi
 }
 
 for name in "${REQUESTED[@]}"; do

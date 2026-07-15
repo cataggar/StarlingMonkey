@@ -41,8 +41,9 @@ For comprehensive documentation, visit our [Documentation Site][gh-pages].
 ### Requirements
 
 The runtime's build is managed by [cmake][cmake], which also takes care of downloading the build
-dependencies. To properly manage the Rust toolchain, the build script expects
-[rustup](https://rustup.rs/) to be installed in the system.
+dependencies. The build expects [rustup](https://rustup.rs/) and Zig 0.17 or
+newer; set `ZIG=/path/to/zig` when it is not on `PATH`. Zig builds the
+host-native feature-surface helper used by CMake's componentizer.
 
 ### Usage
 

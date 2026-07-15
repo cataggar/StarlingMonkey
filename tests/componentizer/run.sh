@@ -337,7 +337,13 @@ for ((i = 1; i <= $#; i++)); do
     out="${!j}"
   fi
 done
-if [ "$1 $2" = "component new" ]; then
+if [ "${FAKE_FAIL_STAGE:-}" = "$1 $2" ]; then
+  echo "injected $1 $2 failure" >&2
+  exit 23
+fi
+if [ "$1" = "strip" ]; then
+  cp "${!#}" "$out"
+elif [ "$1 $2" = "component new" ]; then
   input=""
   for arg in "${@:3}"; do
     if [ -f "$arg" ] && [ "$arg" != "$out" ]; then
@@ -354,6 +360,10 @@ elif [ "$1 $2" = "metadata add" ]; then
     fi
   done
   cp "${!#}" "$out"
+elif [ "$1" = "print" ]; then
+  cat > "$out" <<'WAT'
+(component)
+WAT
 elif [ "$1 $2" = "component wit" ]; then
   out_dir=""
   for ((i = 1; i <= $#; i++)); do
@@ -365,13 +375,22 @@ elif [ "$1 $2" = "component wit" ]; then
   if [ -n "$out_dir" ]; then
     mkdir -p "$out_dir"
     out="$out_dir/bindings.wit"
+    cat > "$out_dir/component.wit" <<'WIT'
+package test:fake;
+world root {}
+WIT
   fi
   cat > "$out" <<'WIT'
 package test:fake;
 world fake {}
 WIT
 elif [ "$1 $2" = "component embed" ]; then
-  printf 'dummy-core\n' > "$out"
+  input="${!#}"
+  if [ -f "$input" ] && [ "$input" != "$out" ]; then
+    cp "$input" "$out"
+  else
+    printf 'dummy-core\n' > "$out"
+  fi
 fi
 EOF
 

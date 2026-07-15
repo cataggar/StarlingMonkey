@@ -117,13 +117,13 @@ pub fn apply(
     const platform_root = try path(allocator, platform_dir, "bindings.wit");
     const platform_text = try readFile(allocator, io, platform_root);
     const platform_imports = try collectWasiImports(allocator, platform_text);
-    var actual_imports = platform_imports;
+    var actual_imports: []const []const u8 = &.{};
     if (options.inspect_candidate) {
         const candidate_surface = try passPath(
             allocator,
             options.work_dir,
             0,
-            "candidate.wit",
+            "candidate.wat",
         );
         try runCommand(
             allocator,
@@ -132,26 +132,26 @@ pub fn apply(
             "feature surface: inspect candidate",
             &.{
                 options.wasm_tools,
-                "component",
-                "wit",
+                "print",
                 options.component,
                 "-o",
                 candidate_surface,
             },
         );
         const candidate_text = try readFile(allocator, io, candidate_surface);
-        actual_imports = try collectWasiImports(allocator, candidate_text);
+        actual_imports = try collectComponentImports(allocator, candidate_text);
+    } else {
+        var assumed: std.ArrayList([]const u8) = .empty;
+        assumed.appendSlice(allocator, platform_imports) catch @panic("out of memory");
+        actual_imports = try assumed.toOwnedSlice(allocator);
     }
 
     var provided: std.ArrayList([]const u8) = .empty;
     const demand_driven = options.target_wit != null;
+    var preserved: std.ArrayList([]const u8) = .empty;
     for (platform_imports) |name| {
-        if (!options.inspect_candidate and contains(target_imports, name) and
-            (interface(name, "wasi:clocks/monotonic-clock") or
-                interface(name, "wasi:random/random") or
-                interface(name, "wasi:http/outgoing-handler")))
-        {
-            continue;
+        if (!shouldProvide(name, target_imports, options.features, demand_driven)) {
+            preserved.append(allocator, name) catch @panic("out of memory");
         }
         if ((options.features.pure() or contains(actual_imports, name)) and
             shouldProvide(name, target_imports, options.features, demand_driven) and
@@ -160,24 +160,25 @@ pub fn apply(
             provided.append(allocator, name) catch @panic("out of memory");
         }
     }
-    if (provided.items.len == 0) return copyFile(io, options.component, options.output);
-
     var primary: std.ArrayList([]const u8) = .empty;
     for (provided.items) |name| {
-        if (!options.features.pure() and deferDependency(name, provided.items)) continue;
         primary.append(allocator, name) catch @panic("out of memory");
     }
     var providers: std.ArrayList([]const u8) = .empty;
-    try buildProvider(
-        allocator,
-        io,
-        options,
-        primary.items,
-        target_imports,
-        demand_driven,
-        0,
-        &providers,
-    );
+    if (primary.items.len != 0) {
+        try buildProvider(
+            allocator,
+            io,
+            options,
+            primary.items,
+            preserved.items,
+            target_imports,
+            demand_driven,
+            providers.items.len,
+            &providers,
+        );
+    }
+    if (providers.items.len == 0) return copyFile(io, options.component, options.output);
     var consumer = options.component;
     for (providers.items, 0..) |provider, index| {
         const output = if (index + 1 == providers.items.len)
@@ -203,20 +204,12 @@ pub fn apply(
     }
 }
 
-fn deferDependency(name: []const u8, provided: []const []const u8) bool {
-    if (interface(name, "wasi:clocks/monotonic-clock")) {
-        for (provided) |candidate| {
-            if (std.mem.startsWith(u8, candidate, "wasi:sockets/")) return true;
-        }
-    }
-    return false;
-}
-
 fn buildProvider(
     allocator: Allocator,
     io: Io,
     options: Options,
     provided: []const []const u8,
+    preserved: []const []const u8,
     target_imports: []const []const u8,
     demand_driven: bool,
     depth: usize,
@@ -279,8 +272,24 @@ fn buildProvider(
     );
     const provider_wit = try path(allocator, provider_dir, "component.wit");
     const provider_base_text = try readFile(allocator, io, provider_wit);
-    const provider_text = try renderProviderWit(allocator, provider_base_text, provided);
+    const provider_text = try renderProviderWit(
+        allocator,
+        provider_base_text,
+        provided,
+        preserved,
+    );
     try Dir.cwd().writeFile(io, .{ .sub_path = provider_wit, .data = provider_text });
+    if (!options.features.clocks) {
+        // Duration is a u64 alias. Inlining it prevents preserved HTTP and
+        // internalized socket interfaces from reintroducing monotonic-clock.
+        for ([_][]const u8{ "http.wit", "sockets.wit" }) |basename| {
+            const dependency = try path(allocator, provider_dir, "deps");
+            const wit = try path(allocator, dependency, basename);
+            const text = try readFile(allocator, io, wit);
+            const inlined = try inlineMonotonicDuration(allocator, text);
+            try Dir.cwd().writeFile(io, .{ .sub_path = wit, .data = inlined });
+        }
+    }
 
     const provider_core = try passPath(allocator, options.work_dir, depth, "provider-core.wasm");
     const provider_component = try providerComponentPath(allocator, options.work_dir, depth);
@@ -335,7 +344,12 @@ fn buildProvider(
     const provider_imports = try collectWasiImports(allocator, provider_surface_text);
     var residuals: std.ArrayList([]const u8) = .empty;
     for (provider_imports) |name| {
-        if (shouldProvide(name, target_imports, options.features, demand_driven) and
+        if (shouldProvide(
+            name,
+            target_imports,
+            options.features,
+            demand_driven,
+        ) and
             !contains(residuals.items, name))
         {
             residuals.append(allocator, name) catch @panic("out of memory");
@@ -348,6 +362,7 @@ fn buildProvider(
         io,
         options,
         residuals.items,
+        preserved,
         target_imports,
         demand_driven,
         depth + 1,
@@ -433,6 +448,27 @@ fn collectWasiImports(
         if (!std.mem.startsWith(u8, item, "wasi:")) continue;
         imports.append(allocator, item) catch @panic("out of memory");
     }
+
+    return imports.toOwnedSlice(allocator);
+}
+
+fn collectComponentImports(
+    allocator: Allocator,
+    text: []const u8,
+) ![]const []const u8 {
+    var imports: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const prefix = "(import \"";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+        const end = std.mem.indexOfScalarPos(u8, trimmed, prefix.len, '"') orelse continue;
+        const item = trimmed[prefix.len..end];
+        if (!std.mem.startsWith(u8, item, "wasi:")) continue;
+        if (!contains(imports.items, item)) {
+            imports.append(allocator, item) catch @panic("out of memory");
+        }
+    }
     return imports.toOwnedSlice(allocator);
 }
 
@@ -440,6 +476,7 @@ fn renderProviderWit(
     allocator: Allocator,
     text: []const u8,
     provided: []const []const u8,
+    preserved: []const []const u8,
 ) ![]const u8 {
     var output: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -454,6 +491,8 @@ fn renderProviderWit(
             if (contains(provided, item)) {
                 output.appendSlice(allocator, "  export ") catch @panic("out of memory");
                 output.appendSlice(allocator, line[prefix.len..]) catch @panic("out of memory");
+            } else if (contains(preserved, item)) {
+                output.appendSlice(allocator, line) catch @panic("out of memory");
             } else {
                 continue;
             }
@@ -467,10 +506,31 @@ fn renderProviderWit(
     return output.toOwnedSlice(allocator);
 }
 
+fn inlineMonotonicDuration(allocator: Allocator, text: []const u8) ![]const u8 {
+    var output: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(
+            u8,
+            line,
+            "  use wasi:clocks/monotonic-clock",
+        ) and std.mem.endsWith(u8, line, ".{duration};")) {
+            output.appendSlice(allocator, "  type duration = u64;") catch
+                @panic("out of memory");
+        } else {
+            output.appendSlice(allocator, line) catch @panic("out of memory");
+        }
+
+        output.append(allocator, '\n') catch @panic("out of memory");
+    }
+    return output.toOwnedSlice(allocator);
+}
+
 fn contains(values: []const []const u8, needle: []const u8) bool {
     for (values) |value| {
         if (std.mem.eql(u8, value, needle)) return true;
     }
+
     return false;
 }
 
@@ -634,6 +694,7 @@ test "provider WIT exports only selected interfaces" {
             "wasi:filesystem/types@0.2.10",
             "wasi:cli/environment@0.2.10",
         },
+        &.{},
     );
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(

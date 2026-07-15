@@ -14,6 +14,17 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME resource-registry COMMAND resource-registry-tests)
 endif()
 
+add_test(
+    NAME componentize-exact-surface
+    COMMAND
+        ${BASH_PROGRAM}
+        ${CMAKE_SOURCE_DIR}/tests/feature-selection/run-cmake-surface-test.sh
+        ${CMAKE_BINARY_DIR}
+        ${CMAKE_BINARY_DIR}/wasm-tools
+        "${FEATURE_SURFACE_CASE}"
+)
+set_tests_properties(componentize-exact-surface PROPERTIES TIMEOUT 180)
+
 function(test_e2e TEST_NAME)
     get_target_property(RUNTIME_DIR starling-raw.wasm BINARY_DIR)
     add_test(e2e-${TEST_NAME} ${BASH_PROGRAM} ${CMAKE_SOURCE_DIR}/tests/test.sh ${RUNTIME_DIR} ${CMAKE_SOURCE_DIR}/tests/e2e/${TEST_NAME})

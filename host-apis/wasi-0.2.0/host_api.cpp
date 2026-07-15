@@ -3,7 +3,9 @@
 #include "handles.h"
 #include "feature-defaults.h"
 
+#if STARLING_FEATURE_CLOCKS
 static std::optional<wasi_clocks_monotonic_clock_own_pollable_t> immediately_ready;
+#endif
 
 size_t poll_handles(vector<WASIHandle<host_api::Pollable>::Borrowed> handles) {
   auto list = list_borrow_pollable_t{handles.data(), handles.size()};

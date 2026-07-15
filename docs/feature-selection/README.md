@@ -62,9 +62,10 @@ For a caller world without explicit WASI imports, the frozen ComponentizeJS
 
 The executable oracle is
 `tests/feature-selection/reference/expected/import-surfaces.json`.
-`tests/feature-selection/run-surface-tests.sh` constructs a component with the
-full runtime closure and checks complete sorted import and export lists against
-that file. It checks the whole surface, not selected substrings.
+The runtime matrix and native componentizer E2E tests compare complete sorted
+import and export lists from real production components against that file.
+The native E2E runs both `starling-componentize` and its installed
+`componentize.sh` for default, pure, and representative feature selections.
 
 User-declared non-feature imports remain external. Runtime-only filesystem,
 socket, environment, and exit imports are internalized when they are not part

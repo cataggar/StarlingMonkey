@@ -2834,7 +2834,6 @@ fn execute(
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
     const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
-        const wabt = tools.wabt.?.path;
         var stripped_output = try createChildOutput(
             allocator,
             io,
@@ -2845,11 +2844,11 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt module strip",
+            "wasm-tools strip",
             &.{
-                wabt,
-                "module",
+                tools.wasm_tools.path,
                 "strip",
+                "--all",
                 "-o",
                 stripped_output.path,
                 initialized.path,
@@ -2879,16 +2878,16 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt component embed",
+            "wasm-tools component embed",
             &.{
-                wabt,
+                tools.wasm_tools.path,
                 "component",
                 "embed",
+                component_wit,
                 "--world",
                 runtime.component_world.?,
                 "-o",
                 embedded_output.path,
-                component_wit,
                 stripped_output.path,
             },
             cwd,
@@ -2921,9 +2920,9 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt component new",
+            "wasm-tools component new",
             &.{
-                wabt,
+                tools.wasm_tools.path,
                 "component",
                 "new",
                 "--adapt",
@@ -3006,7 +3005,7 @@ fn execute(
         .target_wit = runtime.surface_target_wit,
         .target_world = runtime.surface_target_world,
         .features = runtime.features,
-        .inspect_candidate = runtime.component_wit == null,
+        .inspect_candidate = true,
         .cwd = cwd,
         .verbose = config.verbose,
         .command_log = &command_log,
@@ -3368,7 +3367,13 @@ fn externalRuntime(
     const component_wit_source = if (config.component_wit orelse config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
-        null;
+        try siblingOrName(
+            allocator,
+            io,
+            executable_dir,
+            "component-wit",
+            "component-wit",
+        );
     const dispatch_wit_source = if (config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
@@ -3383,38 +3388,68 @@ fn externalRuntime(
         )
     else
         null;
-    const component_wit = if (component_wit_source) |path|
-        if (dispatch_wit_source != null and std.mem.eql(u8, path, dispatch_wit_source.?))
-            dispatch_wit
+    const component_wit =
+        if (dispatch_wit_source != null and
+            std.mem.eql(u8, component_wit_source, dispatch_wit_source.?))
+            dispatch_wit.?
         else
             try stageWit(
                 allocator,
                 io,
-                path,
+                component_wit_source,
                 try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
                 transaction,
-            )
+            );
+    const surface_target_wit_source = if (config.wit) |path|
+        try absolutePath(allocator, cwd, path)
     else
-        null;
-    const platform_wit = try siblingOrName(
+        try siblingOrName(
+            allocator,
+            io,
+            executable_dir,
+            "surface-wit",
+            "surface-wit",
+        );
+    const surface_target_wit =
+        if (std.mem.eql(u8, surface_target_wit_source, component_wit_source))
+            component_wit
+        else if (dispatch_wit_source != null and
+            std.mem.eql(u8, surface_target_wit_source, dispatch_wit_source.?))
+            dispatch_wit.?
+        else
+            try stageWit(
+                allocator,
+                io,
+                surface_target_wit_source,
+                try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
+                transaction,
+            );
+    const platform_wit_source = try siblingOrName(
         allocator,
         io,
         executable_dir,
         "feature-wit",
         "feature-wit",
     );
+    const platform_wit = try stageWit(
+        allocator,
+        io,
+        platform_wit_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
+        transaction,
+    );
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = if (component_wit) |wit| wit.absolute else null,
-        .component_world = config.component_world_name orelse config.world_name,
-        .surface_target_wit = component_wit,
-        .surface_target_world = config.component_world_name orelse config.world_name,
-        .platform_wit = platform_wit,
+        .component_wit = component_wit.absolute,
+        .component_world = config.component_world_name orelse config.world_name orelse "bindings",
+        .surface_target_wit = surface_target_wit.absolute,
+        .surface_target_world = config.world_name orelse "caller",
+        .platform_wit = platform_wit.absolute,
         .features = resolveFeatures(config),
         .bindings = null,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
-        .component_wit_digest = if (component_wit) |wit| wit.digest else null,
+        .component_wit_digest = component_wit.digest,
         .features_known = false,
         .zig = null,
         .build_tools = &.{},
@@ -3871,10 +3906,24 @@ fn buildRuntime(
         allocator,
         &.{ prefix, "bin", "feature-wit" },
     );
-    const runtime_component_wit = if (component_wit) |wit| wit.absolute else null;
-    const runtime_component_world = config.component_world_name orelse config.world_name;
-    const surface_target_wit = runtime_component_wit;
-    const surface_target_world = runtime_component_world;
+    const runtime_component_wit = if (component_wit) |wit|
+        wit.absolute
+    else
+        try std.fs.path.join(
+            allocator,
+            &.{ prefix, "bin", "component-wit" },
+        );
+    const runtime_component_world = config.component_world_name orelse
+        config.world_name orelse
+        "bindings";
+    const surface_target_wit = if (dispatch_wit) |wit|
+        wit.absolute
+    else
+        try std.fs.path.join(
+            allocator,
+            &.{ prefix, "bin", "surface-wit" },
+        );
+    const surface_target_world = config.world_name orelse "caller";
     return .{
         .engine = engine,
         .adapter = adapter,

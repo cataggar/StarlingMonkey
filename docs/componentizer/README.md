@@ -9,7 +9,7 @@ command string):
 
 1. Select and cache a WIT-specific `zig build` of `starling-raw.wasm`.
 2. Pre-initialize the JavaScript module with Wizer.
-3. Strip and embed the selected component world with WABT.
+3. Strip and embed the selected component world with `wasm-tools`.
 4. Adapt the reactor into a component.
 5. Generate and compose feature-surface providers so disabled/runtime-only
    WASI interfaces do not leak into the caller's world.
@@ -62,12 +62,13 @@ zig build componentizer-test -Doptimize=ReleaseSmall
 ```
 
 The default install places the CLI beside `wasmtime`, `wasm-tools`,
-`wabt`, `preview1-adapter.wasm`, and `starling-raw.wasm`. The bundled WABT
-contains the reactor adapter and typed-export fixes required by this pipeline.
-`starling-feature-surface` and the resolved `feature-wit` closure are installed
-beside them and are shared with the shell componentizer.
+`wabt`, `preview1-adapter.wasm`, and `starling-raw.wasm`.
+`starling-feature-surface` and the selected `feature-wit` closure are installed
+beside them and shared with the shell componentizer.
+The bundled preview1 adapters are built against that same WASI 0.2.10 closure,
+so adapting preview1 does not introduce a second, older WASI import surface.
 The componentizer test target is the required gate: it runs unit and fake-tool
-coverage plus real WABT/Wizer relinks for two distinct WIT worlds.
+coverage plus real `wasm-tools`/Wizer relinks for two distinct WIT worlds.
 
 ## Per-run WIT worlds
 
@@ -78,6 +79,10 @@ The monolithic runtime needs two related WIT views:
 - `--component-wit` / `--component-world-name` selects the complete world
   embedded into the core module. It must include StarlingMonkey's WASI
   imports/exports as well as the user exports.
+
+Feature surfacing is derived from the `--wit` caller/export world, not the
+larger component embedding world. The finished candidate is inspected before
+runtime-only WASI imports are composed away.
 
 They may point to the same directory/world only when that world already
 contains the complete component closure. For the repository's standard

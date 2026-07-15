@@ -280,6 +280,60 @@ for component_path, metadata in ((sys.argv[1], first), (sys.argv[3], second)):
 assert first == second
 PY
 
+surface_case() {
+  local name="$1" oracle_case="$2" disabled="$3"
+  local case_cache="$CACHE/surface runtime cache"
+  local native_output="$WORK/$name native.wasm"
+  local shell_output="$WORK/$name shell.wasm"
+  local native_wit="$WORK/$name native.wit"
+  local shell_wit="$WORK/$name shell.wit"
+  local -a feature_args=()
+  if [ -n "$disabled" ]; then
+    feature_args+=(--disable "$disabled")
+  fi
+
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
+    --build-root "$ROOT" \
+    --cache-dir "$case_cache" \
+    --zig-bin "$ZIG" \
+    --wit "$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js" \
+    --world-name js-exports \
+    --component-wit "$ROOT/host-apis/wasi-0.2.10/wit" \
+    --component-world-name js-dispatch \
+    --wasmtime-bin "$WASMTIME" \
+    --wabt-bin "$WABT" \
+    --wasm-tools-bin "$WASM_TOOLS" \
+    --preview2-adapter "$ADAPTER" \
+    "${feature_args[@]}" \
+    --out "$native_output" \
+    "$ROOT/tests/fixtures/js-dispatch.js"
+
+  local runtime_bin
+  runtime_bin="$(find "$case_cache/runtimes" -mindepth 3 -maxdepth 3 \
+    -type f -name componentize.sh -printf '%T@ %h\n' |
+    sort -nr | head -1 | cut -d' ' -f2-)"
+  "$runtime_bin/componentize.sh" \
+    "$ROOT/tests/fixtures/js-dispatch.js" \
+    -o "$shell_output"
+
+  "$WASM_TOOLS" validate --features all "$native_output"
+  "$WASM_TOOLS" validate --features all "$shell_output"
+  "$WASM_TOOLS" component wit "$native_output" -o "$native_wit"
+  "$WASM_TOOLS" component wit "$shell_output" -o "$shell_wit"
+  python3 "$ROOT/tests/feature-selection/check-production-surface.py" \
+    "$ROOT/tests/feature-selection/reference/expected/import-surfaces.json" \
+    "$oracle_case" \
+    "starling:js/api,wasi:cli/run@0.2.10,wasi:http/incoming-handler@0.2.10" \
+    "$native_wit" "$shell_wit"
+}
+
+surface_case defaults defaults ""
+surface_case pure disable-all "stdio,random,clocks,http,fetch-event"
+surface_case no-stdio disable-stdio "stdio"
+surface_case no-random disable-random "random"
+surface_case no-clocks disable-clocks "clocks"
+surface_case no-http disable-http-only "http"
+
 # A different dispatch and component world must produce an observably
 # different relink rather than reusing or restaging the first runtime.
 componentize \

@@ -53,6 +53,36 @@
 
 #include "feature-defaults.h"
 
+// The frozen component surface has no wasi:cli/environment import. Runtime
+// configuration is supplied through STARLINGMONKEY_CONFIG during
+// initialization, so preview1 process arguments and environment variables are
+// intentionally empty after snapshotting.
+int32_t __imported_wasi_snapshot_preview1_args_get(int32_t argv, int32_t argv_buf) {
+  (void)argv;
+  (void)argv_buf;
+  return __WASI_ERRNO_SUCCESS;
+}
+
+int32_t __imported_wasi_snapshot_preview1_args_sizes_get(int32_t argc_ptr,
+                                                         int32_t argv_buf_size_ptr) {
+  *(uint32_t *)(uintptr_t)argc_ptr = 0;
+  *(uint32_t *)(uintptr_t)argv_buf_size_ptr = 0;
+  return __WASI_ERRNO_SUCCESS;
+}
+
+int32_t __imported_wasi_snapshot_preview1_environ_get(int32_t environ, int32_t environ_buf) {
+  (void)environ;
+  (void)environ_buf;
+  return __WASI_ERRNO_SUCCESS;
+}
+
+int32_t __imported_wasi_snapshot_preview1_environ_sizes_get(int32_t environ_count_ptr,
+                                                            int32_t environ_buf_size_ptr) {
+  *(uint32_t *)(uintptr_t)environ_count_ptr = 0;
+  *(uint32_t *)(uintptr_t)environ_buf_size_ptr = 0;
+  return __WASI_ERRNO_SUCCESS;
+}
+
 #if !STARLING_FEATURE_STDIO
 
 int32_t __imported_wasi_snapshot_preview1_fd_write(int32_t fd, int32_t iovs_ptr, int32_t iovs_len,
