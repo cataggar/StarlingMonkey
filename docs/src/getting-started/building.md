@@ -74,3 +74,14 @@ script.
 
   This way, the JS file will be loaded during componentization, and the top-level code will be
   executed, and can e.g. register a handler for the `fetch` event to serve HTTP requests.
+
+### Native Zig componentizer
+
+The experimental Zig 0.17 build also installs
+`zig-out/bin/starling-componentize`. This Node-free host CLI selects WIT
+worlds per invocation, uses Zig's cache for the required monolithic relink,
+drives Wizer/WABT with structured arguments, validates the result, and only
+then atomically replaces the output.
+
+See [`docs/componentizer/README.md`](../../../docs/componentizer/README.md) for
+its current topology requirements and command-line options.

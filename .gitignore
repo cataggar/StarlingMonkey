@@ -85,3 +85,7 @@ tests/feature-selection/.build/
 tests/compat/runtime/.wabt-cache/
 tests/compat/runtime/.cache/
 tests/compat/runtime/invoker/target/
+
+# Native componentizer fake-tool orchestration scratch.
+tests/componentizer/.scratch/
+tests/componentizer/.real-cache/

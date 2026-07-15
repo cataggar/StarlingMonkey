@@ -1,5 +1,17 @@
 const std = @import("std");
 
+fn dependencyExecutable(
+    dependency: *std.Build.Dependency,
+    name: []const u8,
+) *std.Build.Step.Compile {
+    for (dependency.builder.install_tls.step.dependencies.items) |step| {
+        const install = step.cast(std.Build.Step.InstallArtifact) orelse continue;
+        if (install.artifact.kind == .exe and std.mem.eql(u8, install.artifact.name, name))
+            return install.artifact;
+    }
+    @panic("dependency executable not found");
+}
+
 // StarlingMonkey build (Zig 0.17 port of the CMake build).
 //
 // Toolchain: Zig 0.17 `zig cc`/`zig c++` targeting wasm32-wasi (reactor),
@@ -129,6 +141,70 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
+    // Native, Node-free driver for the monolithic Zig/WABT componentization
+    // pipeline. It is a host tool even though the runtime it builds targets
+    // wasm32-wasi.
+    const componentizer_options = b.addOptions();
+    componentizer_options.addOption([]const u8, "version", "0.3.0");
+    componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    const componentizer_mod = b.createModule(.{
+        .root_source_file = b.path("tools/componentizer/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    componentizer_mod.addOptions("build_options", componentizer_options);
+    const componentizer = b.addExecutable(.{
+        .name = "starling-componentize",
+        .root_module = componentizer_mod,
+    });
+    b.installArtifact(componentizer);
+    const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
+    b.installArtifact(wabt);
+    const componentizer_step = b.step(
+        "componentizer",
+        "Build the native starling-componentize CLI",
+    );
+    componentizer_step.dependOn(&componentizer.step);
+    const componentizer_test_mod = b.createModule(.{
+        .root_source_file = b.path("tools/componentizer/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    componentizer_test_mod.addOptions("build_options", componentizer_options);
+    const componentizer_tests = b.addTest(.{ .root_module = componentizer_test_mod });
+    const run_componentizer_tests = b.addRunArtifact(componentizer_tests);
+    const componentizer_test_step = b.step(
+        "componentizer-test",
+        "Run native componentizer unit and fake-tool orchestration tests",
+    );
+    componentizer_test_step.dependOn(&run_componentizer_tests.step);
+    const componentizer_orchestration = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run.sh" },
+    );
+    componentizer_orchestration.addArtifactArg(componentizer);
+    componentizer_test_step.dependOn(&componentizer_orchestration.step);
+    const componentizer_e2e_step = b.step(
+        "componentizer-e2e-test",
+        "Run the real cached monolithic native componentizer E2E",
+    );
+    const componentizer_e2e = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-real.sh" },
+    );
+    componentizer_e2e.addArtifactArg(componentizer);
+    componentizer_e2e.addArg(b.graph.zig_exe);
+    if (b.lazyDependency("wasmtime", .{})) |dep| {
+        componentizer_e2e.addFileArg(dep.path("wasmtime"));
+    }
+    if (b.lazyDependency("wasm-tools", .{})) |dep| {
+        componentizer_e2e.addFileArg(dep.path("wasm-tools"));
+    }
+    componentizer_e2e.addArtifactArg(wabt);
+    componentizer_e2e.addFileArg(
+        b.path("host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+    );
+    componentizer_e2e_step.dependOn(&componentizer_e2e.step);
+    componentizer_test_step.dependOn(componentizer_e2e_step);
+
     // StarlingMonkey only targets wasm32-wasi (reactor).
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
 
@@ -142,6 +218,11 @@ pub fn build(b: *std.Build) void {
     }
     const dispatch_wit = b.option([]const u8, "dispatch-wit", "Export-only WIT directory used to generate JavaScript dispatch bindings") orelse component_wit;
     const dispatch_world = b.option([]const u8, "dispatch-world", "Export-only world used to generate JavaScript dispatch bindings") orelse component_world;
+    const componentizer_debug_bindings = b.option(
+        bool,
+        "componentizer-debug-bindings",
+        "Install generated dispatch bindings for native componentizer debug output",
+    ) orelse false;
     if ((dispatch_wit == null) != (dispatch_world == null)) {
         @panic("-Ddispatch-wit and -Ddispatch-world must be provided together");
     }
@@ -340,6 +421,13 @@ pub fn build(b: *std.Build) void {
         link_mod.addImport("wit_types", wit_types);
         link_mod.addImport("js_dispatch", js_dispatch);
     }
+    if (componentizer_debug_bindings) {
+        if (generated_bindings) |bindings| {
+            b.getInstallStep().dependOn(
+                &b.addInstallBinFile(bindings, "component-bindings.zig").step,
+            );
+        }
+    }
     const exe = b.addExecutable(.{ .name = "starling-raw", .root_module = link_mod });
     exe.wasi_exec_model = .reactor;
     exe.rdynamic = generated_bindings != null;
@@ -462,6 +550,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test`: run the e2e + integration suites (tests/run-suite.sh)
     // against the installed runtime in zig-out/bin.
     const test_step = b.step("test", "Run the e2e and integration test suites");
+    test_step.dependOn(componentizer_test_step);
     // js_dispatch.zig's own unit tests need `wit_types` (for
     // `wit_types.Char`/`ByteList`/`Result`/`Tuple`) regardless of whether
     // this outer `zig build test` invocation itself set -Ddispatch-wit (it

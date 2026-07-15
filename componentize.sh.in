@@ -5,7 +5,7 @@ set -euo pipefail
 wizer="${WIZER:-@WASMTIME_DIR@/wasmtime wizer}"
 wasm_tools="${WASM_TOOLS:-@WASM_TOOLS_BIN@}"
 weval="${WEVAL:-@WEVAL_BIN@}"
-wabt="${WABT:-wabt}"
+wabt="${WABT:-$(dirname "$0")/wabt}"
 component_world="@COMPONENT_WORLD@"
 component_wit="@COMPONENT_WIT_DIR@"
 aot=@AOT@

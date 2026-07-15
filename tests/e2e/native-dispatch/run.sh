@@ -69,11 +69,7 @@ BIN="$PREFIX/bin"
 COMPONENT="$PREFIX/js-dispatch.wasm"
 
 echo "[native-dispatch e2e] componentizing tests/fixtures/js-dispatch.js"
-# See wabt-shim.sh: substitutes wasm-tools for the wabt CLI in this
-# environment (a discovered tooling limitation, not a js_dispatch bug).
-WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
-WASM_TOOLS_BIN="$BIN/wasm-tools" \
-  "$BIN/componentize.sh" tests/fixtures/js-dispatch.js -o "$COMPONENT"
+"$BIN/componentize.sh" tests/fixtures/js-dispatch.js -o "$COMPONENT"
 
 echo "[native-dispatch e2e] validating component"
 "$BIN/wasm-tools" validate --features all "$COMPONENT"
@@ -130,9 +126,7 @@ expect_trap() {
 expect_componentization_diagnostic() {
   local name="$1" fixture="$2" output="$3" expected_diagnostic="$4" actual status
   rm -f "$output"
-  actual=$(WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
-    WASM_TOOLS_BIN="$NAMESPACE_BIN/wasm-tools" \
-    timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/componentize.sh" \
+  actual=$(timeout "$TIMEOUT_SECS" "$NAMESPACE_BIN/componentize.sh" \
       "$fixture" -o "$output" 2>&1) && status=0 || status=$?
   if [ "$status" -eq 124 ]; then
     echo "FAIL $name: componentization timed out after ${TIMEOUT_SECS}s"

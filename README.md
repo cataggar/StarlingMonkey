@@ -105,6 +105,25 @@ zig-out/bin/componentize.sh path/to/index.js -o index.wasm
 zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 ```
 
+The Zig build also installs `starling-componentize`, a host-native, Node-free
+CLI that drives the monolithic Zig/Wizer/WABT pipeline without shell command
+construction. It supports per-run WIT/world selection, content-addressed
+cached relinking, feature and tool overrides, runtime arguments, debug
+intermediates, and atomic output replacement:
+
+```console
+zig-out/bin/starling-componentize \
+  --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
+  --world-name js-exports \
+  --component-wit host-apis/wasi-0.2.10/wit \
+  --component-world-name js-dispatch \
+  --out app.wasm \
+  app.js
+```
+
+See [`docs/componentizer/README.md`](docs/componentizer/README.md) for the
+topology contract, cache behavior, tool precedence, and debug outputs.
+
 To expose synchronous WIT exports implemented by same-named JavaScript module
 exports, configure the WIT package and world at build time. The generated Zig
 bindings dispatch typed arguments and results through StarlingMonkey, and the
@@ -117,7 +136,7 @@ zig build -Doptimize=ReleaseSmall \
   -Ddispatch-wit=host-apis/wasi-0.2.10/wit/deps/starling-js \
   -Ddispatch-world=js-exports
 
-WABT=/path/to/wabt zig-out/bin/componentize.sh app.js -o app.wasm
+zig-out/bin/componentize.sh app.js -o app.wasm
 zig-out/bin/wasmtime run -S http --invoke 'add(2, 3)' app.wasm
 ```
 
