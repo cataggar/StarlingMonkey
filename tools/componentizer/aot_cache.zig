@@ -76,6 +76,7 @@ pub fn seal(
     engine_path: []const u8,
     weval_path: []const u8,
     cache_path: []const u8,
+    canonical_cache_path: ?[]const u8,
     primer_path: []const u8,
     feature_abi: []const u8,
     manifest_path: []const u8,
@@ -83,8 +84,16 @@ pub fn seal(
     try validateValue(feature_abi);
     const engine_sha = try hashFileHex(allocator, io, engine_path);
     try verifyCacheDatabase(allocator, cache_path, engine_sha);
+    const sealed_cache_path = canonical_cache_path orelse cache_path;
+    try canonicalizeCacheDatabase(
+        allocator,
+        io,
+        cache_path,
+        sealed_cache_path,
+        engine_sha,
+    );
     const weval_sha = try hashFileHex(allocator, io, weval_path);
-    const cache_sha = try hashFileHex(allocator, io, cache_path);
+    const cache_sha = try hashFileHex(allocator, io, sealed_cache_path);
     const primer_sha = try hashFileHex(allocator, io, primer_path);
     const key = try cacheKey(
         allocator,
@@ -298,9 +307,12 @@ const Sqlite = struct {
     close: *const fn (*SqliteDb) callconv(.c) c_int,
     prepare_v2: *const fn (*SqliteDb, [*]const u8, c_int, *?*SqliteStmt, ?*?[*]const u8) callconv(.c) c_int,
     step: *const fn (*SqliteStmt) callconv(.c) c_int,
+    reset: *const fn (*SqliteStmt) callconv(.c) c_int,
     finalize: *const fn (*SqliteStmt) callconv(.c) c_int,
     column_int: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
+    column_type: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
     column_text: *const fn (*SqliteStmt, c_int) callconv(.c) ?[*]const u8,
+    column_blob: *const fn (*SqliteStmt, c_int) callconv(.c) ?*const anyopaque,
     column_bytes: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
     bind_blob: *const fn (*SqliteStmt, c_int, ?*const anyopaque, c_int, SqliteDestructor) callconv(.c) c_int,
 
@@ -333,6 +345,10 @@ const Sqlite = struct {
                 @FieldType(Sqlite, "step"),
                 "sqlite3_step",
             ) orelse return error.SqliteUnavailable,
+            .reset = library.lookup(
+                @FieldType(Sqlite, "reset"),
+                "sqlite3_reset",
+            ) orelse return error.SqliteUnavailable,
             .finalize = library.lookup(
                 @FieldType(Sqlite, "finalize"),
                 "sqlite3_finalize",
@@ -341,9 +357,17 @@ const Sqlite = struct {
                 @FieldType(Sqlite, "column_int"),
                 "sqlite3_column_int",
             ) orelse return error.SqliteUnavailable,
+            .column_type = library.lookup(
+                @FieldType(Sqlite, "column_type"),
+                "sqlite3_column_type",
+            ) orelse return error.SqliteUnavailable,
             .column_text = library.lookup(
                 @FieldType(Sqlite, "column_text"),
                 "sqlite3_column_text",
+            ) orelse return error.SqliteUnavailable,
+            .column_blob = library.lookup(
+                @FieldType(Sqlite, "column_blob"),
+                "sqlite3_column_blob",
             ) orelse return error.SqliteUnavailable,
             .column_bytes = library.lookup(
                 @FieldType(Sqlite, "column_bytes"),
@@ -363,8 +387,147 @@ const Sqlite = struct {
 
 const sqlite_ok = 0;
 const sqlite_open_readonly = 0x00000001;
+const sqlite_open_readwrite = 0x00000002;
+const sqlite_open_create = 0x00000004;
+const sqlite_open_exclusive = 0x00000010;
+const sqlite_integer = 1;
+const sqlite_blob = 4;
 const sqlite_row = 100;
 const sqlite_done = 101;
+
+fn canonicalizeCacheDatabase(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    output_path: []const u8,
+    engine_sha: []const u8,
+) !void {
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    const temporary_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.canonical-{s}",
+        .{ output_path, &random_hex },
+    );
+    defer Dir.deleteFileAbsolute(io, temporary_path) catch {};
+
+    try writeCanonicalCache(allocator, source_path, temporary_path);
+    try verifyCacheDatabase(allocator, temporary_path, engine_sha);
+
+    var canonical = try Dir.openFileAbsolute(io, temporary_path, .{});
+    defer canonical.close(io);
+    try canonical.sync(io);
+    try Dir.renameAbsolute(temporary_path, output_path, io);
+}
+
+fn writeCanonicalCache(
+    allocator: Allocator,
+    source_path: []const u8,
+    output_path: []const u8,
+) !void {
+    var sqlite = try Sqlite.load();
+    defer sqlite.deinit();
+
+    const source_path_z = allocator.dupeSentinel(u8, source_path, 0) catch
+        return error.InvalidCacheFormat;
+    var optional_source: ?*SqliteDb = null;
+    if (sqlite.open_v2(
+        source_path_z,
+        &optional_source,
+        sqlite_open_readonly,
+        null,
+    ) != sqlite_ok) {
+        if (optional_source) |db| _ = sqlite.close(db);
+        return error.InvalidCacheFormat;
+    }
+    const source = optional_source orelse return error.InvalidCacheFormat;
+    defer _ = sqlite.close(source);
+
+    const output_path_z = allocator.dupeSentinel(u8, output_path, 0) catch
+        return error.InvalidCacheFormat;
+    var optional_output: ?*SqliteDb = null;
+    if (sqlite.open_v2(
+        output_path_z,
+        &optional_output,
+        sqlite_open_readwrite | sqlite_open_create | sqlite_open_exclusive,
+        null,
+    ) != sqlite_ok) {
+        if (optional_output) |db| _ = sqlite.close(db);
+        return error.InvalidCacheFormat;
+    }
+    const output = optional_output orelse return error.InvalidCacheFormat;
+    defer _ = sqlite.close(output);
+
+    try execute(&sqlite, output, "PRAGMA page_size=4096");
+    try execute(&sqlite, output, "PRAGMA auto_vacuum=NONE");
+    try execute(&sqlite, output, "PRAGMA encoding='UTF-8'");
+    try execute(&sqlite, output, "BEGIN IMMEDIATE");
+    try execute(&sqlite, output,
+        \\CREATE TABLE weval_cache(
+        \\    module_hash BLOB NOT NULL,
+        \\    key BLOB NOT NULL,
+        \\    result BLOB NOT NULL,
+        \\    created_time INTEGER NOT NULL
+        \\)
+    );
+
+    const rows = try prepare(&sqlite, source,
+        \\SELECT module_hash, key, result, created_time
+        \\FROM weval_cache
+        \\ORDER BY module_hash, key, result
+    );
+    defer _ = sqlite.finalize(rows);
+    const insert = try prepare(&sqlite, output,
+        \\INSERT INTO weval_cache(module_hash, key, result, created_time)
+        \\VALUES(?1, ?2, ?3, 0)
+    );
+    defer _ = sqlite.finalize(insert);
+    while (true) {
+        switch (sqlite.step(rows)) {
+            sqlite_row => {
+                if (sqlite.column_type(rows, 3) != sqlite_integer)
+                    return error.InvalidCacheFormat;
+                for (0..3) |column| {
+                    if (sqlite.column_type(rows, @intCast(column)) != sqlite_blob)
+                        return error.InvalidCacheFormat;
+                    const length = sqlite.column_bytes(rows, @intCast(column));
+                    if (length < 0) return error.InvalidCacheFormat;
+                    var empty: [1]u8 = .{0};
+                    const bytes: *const anyopaque = sqlite.column_blob(
+                        rows,
+                        @intCast(column),
+                    ) orelse if (length == 0) @ptrCast(&empty) else return error.InvalidCacheFormat;
+                    if (sqlite.bind_blob(
+                        insert,
+                        @intCast(column + 1),
+                        bytes,
+                        length,
+                        null,
+                    ) != sqlite_ok) return error.InvalidCacheFormat;
+                }
+                if (sqlite.step(insert) != sqlite_done)
+                    return error.InvalidCacheFormat;
+                if (sqlite.reset(insert) != sqlite_ok)
+                    return error.InvalidCacheFormat;
+            },
+            sqlite_done => break,
+            else => return error.InvalidCacheFormat,
+        }
+    }
+    try execute(
+        &sqlite,
+        output,
+        "CREATE INDEX idx ON weval_cache(module_hash, key)",
+    );
+    try execute(&sqlite, output, "COMMIT");
+}
+
+fn execute(sqlite: *const Sqlite, db: *SqliteDb, sql: []const u8) Error!void {
+    const stmt = try prepare(sqlite, db, sql);
+    defer _ = sqlite.finalize(stmt);
+    if (sqlite.step(stmt) != sqlite_done) return error.InvalidCacheFormat;
+}
 
 fn verifyCacheDatabase(
     allocator: Allocator,

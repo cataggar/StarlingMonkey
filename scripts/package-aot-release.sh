@@ -11,7 +11,34 @@ mkdir -p "$2"
 release_dir="$(realpath "$2")"
 bin="$prefix/bin"
 stage="$release_dir/.aot-package-$BASHPID"
-trap 'rm -rf "$stage"' EXIT
+previous="$stage/previous"
+publication_started=0
+publication_complete=0
+artifacts=(
+  starling-raw-weval.wasm
+  starling-ics.wevalcache
+  starling-ics.wevalcache.manifest
+)
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$publication_started" -eq 1 ] &&
+    [ "$publication_complete" -eq 0 ]; then
+    for artifact in "${artifacts[@]}"; do
+      rm -f "$release_dir/$artifact"
+      if [ -e "$previous/$artifact" ]; then
+        mv "$previous/$artifact" "$release_dir/$artifact"
+      fi
+    done
+  fi
+  rm -rf "$stage"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir "$stage"
 
 for artifact in \
@@ -37,9 +64,28 @@ cp "$bin/starling-ics.wevalcache.manifest" \
   --cache "$stage/starling-ics.wevalcache" \
   --manifest "$stage/starling-ics.wevalcache.manifest"
 
-mv "$stage/starling-raw-weval.wasm" \
-  "$stage/starling-ics.wevalcache" \
-  "$stage/starling-ics.wevalcache.manifest" \
-  "$release_dir/"
+command -v flock >/dev/null
+exec {lock_fd}> "$release_dir/.starling-aot-release.lock"
+flock -x "$lock_fd"
+
+mkdir "$previous"
+for artifact in "${artifacts[@]}"; do
+  if [ -e "$release_dir/$artifact" ]; then
+    cp -p "$release_dir/$artifact" "$previous/$artifact"
+  fi
+done
+publication_started=1
+for artifact in "${artifacts[@]}"; do
+  mv "$stage/$artifact" "$release_dir/$artifact"
+done
+
+"$bin/wasm-tools" validate --features all \
+  "$release_dir/starling-raw-weval.wasm"
+"$bin/starling-aot-cache" validate \
+  --engine "$release_dir/starling-raw-weval.wasm" \
+  --weval "$bin/weval" \
+  --cache "$release_dir/starling-ics.wevalcache" \
+  --manifest "$release_dir/starling-ics.wevalcache.manifest"
+publication_complete=1
 
 echo "Validated AOT release artifacts in $release_dir"

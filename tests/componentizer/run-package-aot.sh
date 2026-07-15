@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 <starling-aot-cache> <package-script>" >&2
+  exit 2
+fi
+
+CACHE_TOOL="$(realpath "$1")"
+PACKAGE_SCRIPT="$(realpath "$2")"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRATCH="$ROOT/tests/componentizer/.aot-package-race"
+BARRIER="$SCRATCH/validation barrier"
+MOVE_TOOLS="$SCRATCH/move tools"
+RELEASE="$SCRATCH/release"
+PRIMER="$SCRATCH/primer.js"
+
+rm -rf "$SCRATCH"
+mkdir -p "$BARRIER" "$MOVE_TOOLS" "$RELEASE"
+trap 'rm -rf "$SCRATCH"' EXIT
+printf 'function main() {}\n' > "$PRIMER"
+real_mv="$(command -v mv)"
+cat > "$MOVE_TOOLS/mv" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+publishing=0
+for arg in "\$@"; do
+  case "\$arg" in
+    */.aot-package-*/*)
+      publishing=1
+      ;;
+  esac
+done
+if [ "\$publishing" -eq 1 ] &&
+  [ ! -e "$SCRATCH/publisher-\$PPID" ]; then
+  touch "$SCRATCH/publisher-\$PPID"
+  if ! mkdir "$SCRATCH/publication-active"; then
+    echo "concurrent AOT publications overlapped" >&2
+    exit 91
+  fi
+  trap 'rmdir "$SCRATCH/publication-active"' EXIT
+  sleep 1
+fi
+"$real_mv" "\$@"
+EOF
+chmod +x "$MOVE_TOOLS/mv"
+
+make_bundle() {
+  local label="$1"
+  local prefix="$SCRATCH/source $label"
+  local bin="$prefix/bin"
+  mkdir -p "$bin"
+  printf 'engine-%s\n' "$label" > "$bin/starling-raw.wasm"
+  cp "$CACHE_TOOL" "$bin/starling-aot-cache"
+  cat > "$bin/weval" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat > "$bin/wasm-tools" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+test "\$1 \$2 \$3" = "validate --features all"
+mkdir -p "$BARRIER/$label.ready"
+while [ ! -d "$BARRIER/A.ready" ] || [ ! -d "$BARRIER/B.ready" ]; do
+  sleep 0.01
+done
+EOF
+  chmod +x "$bin/weval" "$bin/wasm-tools"
+  python3 - "$bin/starling-ics.wevalcache.raw" \
+    "$bin/starling-raw.wasm" "$label" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+with open(sys.argv[2], "rb") as engine:
+    engine_hash = hashlib.sha256(engine.read()).digest()
+db = sqlite3.connect(sys.argv[1])
+db.execute("""create table weval_cache(
+    module_hash blob not null,
+    key blob not null,
+    result blob not null,
+    created_time integer not null
+)""")
+db.execute(
+    "insert into weval_cache values (?, ?, ?, unixepoch())",
+    (engine_hash, ("key-" + sys.argv[3]).encode(), b"result"),
+)
+db.execute("create index idx on weval_cache(module_hash, key)")
+db.commit()
+db.close()
+PY
+  "$bin/starling-aot-cache" seal \
+    --engine "$bin/starling-raw.wasm" \
+    --weval "$bin/weval" \
+    --cache "$bin/starling-ics.wevalcache.raw" \
+    --cache-out "$bin/starling-ics.wevalcache" \
+    --primer "$PRIMER" \
+    --feature-abi "package-race-$label" \
+    --out "$bin/starling-ics.wevalcache.manifest"
+}
+
+make_bundle A
+make_bundle B
+PREFIX_A="$SCRATCH/source A"
+PREFIX_B="$SCRATCH/source B"
+test "$(sha256sum "$PREFIX_A/bin/starling-ics.wevalcache" | cut -d ' ' -f 1)" != \
+  "$(sha256sum "$PREFIX_B/bin/starling-ics.wevalcache" | cut -d ' ' -f 1)"
+
+PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_A" "$RELEASE" \
+  > "$SCRATCH/package-A.log" 2>&1 &
+pid_a=$!
+PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_B" "$RELEASE" \
+  > "$SCRATCH/package-B.log" 2>&1 &
+pid_b=$!
+status_a=0
+status_b=0
+wait "$pid_a" || status_a=$?
+wait "$pid_b" || status_b=$?
+if [ "$status_a" -ne 0 ] || [ "$status_b" -ne 0 ]; then
+  cat "$SCRATCH/package-A.log" "$SCRATCH/package-B.log" >&2
+  exit 1
+fi
+test -d "$BARRIER/A.ready"
+test -d "$BARRIER/B.ready"
+test ! -e "$SCRATCH/publication-active"
+
+if cmp -s "$RELEASE/starling-raw-weval.wasm" \
+  "$PREFIX_A/bin/starling-raw.wasm"; then
+  owner="$PREFIX_A"
+elif cmp -s "$RELEASE/starling-raw-weval.wasm" \
+  "$PREFIX_B/bin/starling-raw.wasm"; then
+  owner="$PREFIX_B"
+else
+  echo "FAIL: published engine belongs to neither source bundle" >&2
+  exit 1
+fi
+
+cmp "$RELEASE/starling-ics.wevalcache" \
+  "$owner/bin/starling-ics.wevalcache"
+cmp "$RELEASE/starling-ics.wevalcache.manifest" \
+  "$owner/bin/starling-ics.wevalcache.manifest"
+"$owner/bin/wasm-tools" validate --features all \
+  "$RELEASE/starling-raw-weval.wasm"
+"$owner/bin/starling-aot-cache" validate \
+  --engine "$RELEASE/starling-raw-weval.wasm" \
+  --weval "$owner/bin/weval" \
+  --cache "$RELEASE/starling-ics.wevalcache" \
+  --manifest "$RELEASE/starling-ics.wevalcache.manifest"
+test -z "$(find "$RELEASE" -maxdepth 1 -name '.aot-package-*' -print -quit)"
+
+echo "Concurrent AOT package publication passed"

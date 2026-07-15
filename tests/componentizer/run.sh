@@ -1544,7 +1544,10 @@ db.execute("""create table weval_cache(
 db.execute("create index idx on weval_cache(module_hash, key)")
 with open(sys.argv[2], "rb") as engine:
     engine_hash = hashlib.sha256(engine.read()).digest()
-db.execute("insert into weval_cache values (?, ?, ?, 0)", (engine_hash, b"key", b"result"))
+db.execute(
+    "insert into weval_cache values (?, ?, ?, unixepoch())",
+    (engine_hash, b"key", b"result"),
+)
 db.commit()
 db.close()
 PY
@@ -1561,6 +1564,15 @@ PY
   --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
   --manifest "$AOT_BUNDLE/starling-ics.wevalcache.manifest" \
   --feature-abi 'starling-features-v1;fake=1'
+python3 - "$AOT_BUNDLE/starling-ics.wevalcache" <<'PY'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("select distinct created_time from weval_cache").fetchall() == [(0,)]
+assert db.execute("pragma integrity_check").fetchone() == ("ok",)
+db.close()
+PY
 
 expect_seal_failure() {
   local cache="$1" label="$2"

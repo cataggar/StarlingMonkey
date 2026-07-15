@@ -12,6 +12,7 @@ pub fn main(init: std.process.Init) !void {
     var engine: ?[]const u8 = null;
     var weval: ?[]const u8 = null;
     var cache: ?[]const u8 = null;
+    var canonical_cache: ?[]const u8 = null;
     var primer: ?[]const u8 = null;
     var feature_abi: ?[]const u8 = null;
     var output: ?[]const u8 = null;
@@ -25,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
             weval = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--cache")) {
             cache = args[i + 1];
+        } else if (std.mem.eql(u8, args[i], "--cache-out")) {
+            canonical_cache = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--primer")) {
             primer = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--feature-abi")) {
@@ -45,12 +48,13 @@ pub fn main(init: std.process.Init) !void {
             engine orelse usage(),
             weval orelse usage(),
             cache orelse usage(),
+            canonical_cache,
             primer orelse usage(),
             feature_abi orelse usage(),
             output orelse usage(),
         ) catch |err| std.process.fatal("failed to seal AOT cache: {t}", .{err});
     } else {
-        if (primer != null or output != null) usage();
+        if (primer != null or canonical_cache != null or output != null) usage();
         const validated = aot_cache.validate(
             allocator,
             init.io,
@@ -67,7 +71,8 @@ pub fn main(init: std.process.Init) !void {
 fn usage() noreturn {
     std.process.fatal(
         "usage: starling-aot-cache seal --engine <wasm> --weval <bin> " ++
-            "--cache <sqlite> --primer <js> --feature-abi <abi> --out <manifest>\n" ++
+            "--cache <sqlite> [--cache-out <canonical-sqlite>] --primer <js> " ++
+            "--feature-abi <abi> --out <manifest>\n" ++
             "       starling-aot-cache validate --engine <wasm> --weval <bin> " ++
             "--cache <sqlite> --manifest <manifest> [--feature-abi <abi>]",
         .{},

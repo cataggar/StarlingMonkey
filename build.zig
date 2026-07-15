@@ -264,6 +264,17 @@ pub fn build(b: *std.Build) void {
     componentizer_test_step.dependOn(&run_componentizer_tests.step);
     componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
     componentizer_test_step.dependOn(&run_feature_surface_tests.step);
+    const aot_package_test_step = b.step(
+        "aot-package-test",
+        "Race two validated AOT bundles through release publication",
+    );
+    const aot_package_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-package-aot.sh" },
+    );
+    aot_package_test.addArtifactArg(aot_cache_tool);
+    aot_package_test.addFileArg(b.path("scripts/package-aot-release.sh"));
+    aot_package_test_step.dependOn(&aot_package_test.step);
+    componentizer_test_step.dependOn(aot_package_test_step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
@@ -324,6 +335,7 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("weval", .{})) |dep| {
         aot_engine_test.addFileArg(dep.path("weval"));
     }
+    aot_engine_test.addArtifactArg(aot_cache_tool);
     aot_engine_test_step.dependOn(&aot_engine_test.step);
 
     // StarlingMonkey only targets wasm32-wasi (reactor).
@@ -740,12 +752,18 @@ pub fn build(b: *std.Build) void {
         seal_cache.addFileArg(weval_dep.path("weval"));
         seal_cache.addArg("--cache");
         seal_cache.addFileArg(cache);
+        seal_cache.addArg("--cache-out");
+        const sealed_cache =
+            seal_cache.addOutputFileArg("starling-ics.wevalcache");
         seal_cache.addArg("--primer");
         seal_cache.addFileArg(cache_primer);
         seal_cache.addArgs(&.{ "--feature-abi", feature_abi, "--out" });
         const manifest = seal_cache.addOutputFileArg("starling-ics.wevalcache.manifest");
 
-        const install_cache = b.addInstallBinFile(cache, "starling-ics.wevalcache");
+        const install_cache = b.addInstallBinFile(
+            sealed_cache,
+            "starling-ics.wevalcache",
+        );
         const install_manifest = b.addInstallBinFile(
             manifest,
             "starling-ics.wevalcache.manifest",

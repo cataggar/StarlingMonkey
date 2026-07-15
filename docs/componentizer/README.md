@@ -115,13 +115,17 @@ passes `-Daot-engine=true` to the nested Zig build. The generated cache seal
 keys the cache schema, explicit AOT engine ABI, exact engine and Weval binary
 SHA-256 digests, resolved feature/build/host ABI, dedicated cache-initializer
 ABI, and cache-primer digest. A separate cache SHA-256 protects the SQLite
-bytes. WIT closures, generated
+bytes. Before sealing, the cache is rebuilt in deterministic row order with
+`created_time` normalized to zero and fixed SQLite storage settings, so clean
+primes of the same inputs produce byte-identical packaged databases. WIT
+closures, generated
 bindings, host APIs, source/toolchain changes, and linked libraries are bound
 by the engine digest; WIT/world and feature selections also remain in the
-outer runtime key. Sealing and validation open SQLite read-only, run `integrity_check`, verify
-Weval's exact table/index shape, and require a nonempty live row for the exact
-engine digest in `weval_cache.module_hash`. Bytes in deleted or unrelated rows
-cannot bind a cache to an engine.
+outer runtime key. Sealing first opens Weval's database read-only, runs `integrity_check`, verifies
+the exact table/index shape, and requires a nonempty live row for the exact
+engine digest in `weval_cache.module_hash`. The canonical database is checked
+the same way before publication, and validation repeats those checks. Bytes in
+deleted or unrelated rows cannot bind a cache to an engine.
 
 `--aot-cache-dir` selects a read-only cache bundle containing the two
 `starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
@@ -156,14 +160,19 @@ zig build componentizer-test -Doptimize=ReleaseSmall
 zig build aot-engine-test -Doptimize=ReleaseSmall
 ```
 
-The first includes fake-tool positive and missing/stale/corrupt cache cases.
-The second builds both real engine variants, validates both components, and
-invokes the same typed JavaScript exports through Wasmtime to prove Wizer/AOT
-behavioral equivalence. Its fixtures and cache/output paths include spaces.
+The first includes fake-tool positive and missing/stale/corrupt cache cases
+and a concurrent release-publication race. The second builds both real engine
+variants, validates both components, primes clean caches in separate
+directories to prove byte-for-byte reproducibility, and invokes the same typed
+JavaScript exports through Wasmtime to prove Wizer/AOT behavioral equivalence.
+Its fixtures and cache/output paths include spaces.
 
 Release packaging must keep the cache and manifest together. The repository's
 packaging gate builds through Zig and validates both the engine module and the
-sealed SQLite bundle before moving any AOT files into the release directory:
+sealed SQLite bundle before publication. A target-scoped kernel lock serializes
+publishers and is automatically released on process termination, so a dead
+publisher cannot leave a stale lock. The final installed bundle is revalidated
+while the lock is still held:
 
 ```console
 just builddir=build-aot aot-package release-artifacts

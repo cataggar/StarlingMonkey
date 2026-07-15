@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 7 ]; then
-  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter> <weval>" >&2
+if [ "$#" -ne 8 ]; then
+  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter> <weval> <starling-aot-cache>" >&2
   exit 2
 fi
 
@@ -13,6 +13,7 @@ WASM_TOOLS="$4"
 WABT="$5"
 ADAPTER="$6"
 WEVAL="$7"
+CACHE_TOOL="$8"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="$ROOT/tests/componentizer/.aot-real-cache"
 WORK="$CACHE/work with spaces"
@@ -99,6 +100,100 @@ AOT_BUNDLE="$(dirname "${manifests[0]}")"
 test -s "$AOT_BUNDLE/starling-raw.wasm"
 test -s "$AOT_BUNDLE/starling-ics.wevalcache"
 grep -Fq 'engine_abi=spidermonkey-pbl-weval-aot-ics-v1' "${manifests[0]}"
+
+prime_clean_cache() {
+  local directory="$1" primer="$2"
+  local primer_input="${primer#"$ROOT/"}"
+  mkdir -p "$directory"
+  (
+    cd "$ROOT"
+    printf '%s\n' "$primer_input" |
+      env -u STARLINGMONKEY_CONFIG -u ENABLE_PBL \
+        RUST_MIN_STACK=8388608 WASMTIME_BACKTRACE_DETAILS=1 \
+        "$WEVAL" weval -w \
+          --init-func starling-aot-cache-initialize \
+          --dir . \
+          --cache "$directory/raw.wevalcache" \
+          -i "$AOT_BUNDLE/starling-raw.wasm" \
+          -o "$directory/primed-starling-raw.wasm"
+  )
+  "$CACHE_TOOL" seal \
+    --engine "$AOT_BUNDLE/starling-raw.wasm" \
+    --weval "$WEVAL" \
+    --cache "$directory/raw.wevalcache" \
+    --cache-out "$directory/starling-ics.wevalcache" \
+    --primer "$primer" \
+    --feature-abi 'reproducibility-test-v1' \
+    --out "$directory/starling-ics.wevalcache.manifest"
+}
+
+REPRO_ONE="$CACHE/repro clean one"
+REPRO_TWO="$CACHE/repro clean two"
+REPRO_CHANGED="$CACHE/repro changed primer"
+prime_clean_cache "$REPRO_ONE" "$PRIMER"
+sleep 1
+prime_clean_cache "$REPRO_TWO" "$PRIMER"
+python3 - "$REPRO_ONE" "$REPRO_TWO" <<'PY'
+import sqlite3
+import sys
+
+raw_times = []
+for directory in sys.argv[1:]:
+    raw = sqlite3.connect(directory + "/raw.wevalcache")
+    times = [row[0] for row in raw.execute(
+        "select created_time from weval_cache order by module_hash, key, result"
+    )]
+    raw.close()
+    assert times and all(value > 0 for value in times), times
+    raw_times.append(times)
+
+assert raw_times[0] != raw_times[1], raw_times
+for directory in sys.argv[1:]:
+    sealed = sqlite3.connect(directory + "/starling-ics.wevalcache")
+    times = [row[0] for row in sealed.execute(
+        "select created_time from weval_cache"
+    )]
+    assert times and set(times) == {0}, times
+    assert sealed.execute("pragma integrity_check").fetchone() == ("ok",)
+    sealed.close()
+PY
+cmp "$REPRO_ONE/starling-ics.wevalcache" \
+  "$REPRO_TWO/starling-ics.wevalcache"
+cmp "$REPRO_ONE/starling-ics.wevalcache.manifest" \
+  "$REPRO_TWO/starling-ics.wevalcache.manifest"
+test "$(sha256sum "$REPRO_ONE/starling-ics.wevalcache" | cut -d ' ' -f 1)" = \
+  "$(sha256sum "$REPRO_TWO/starling-ics.wevalcache" | cut -d ' ' -f 1)"
+test "$(sha256sum "$REPRO_ONE/starling-ics.wevalcache.manifest" | cut -d ' ' -f 1)" = \
+  "$(sha256sum "$REPRO_TWO/starling-ics.wevalcache.manifest" | cut -d ' ' -f 1)"
+test "$(sed -n 's/^key=//p' "$REPRO_ONE/starling-ics.wevalcache.manifest")" = \
+  "$(sed -n 's/^key=//p' "$REPRO_TWO/starling-ics.wevalcache.manifest")"
+
+CHANGED_PRIMER="$CACHE/repro-changed-primer.js"
+cat > "$CHANGED_PRIMER" <<'EOF'
+function reproducibilityPrimer(value) {
+  return value + 1;
+}
+function main() {
+  let value = 0;
+  for (let i = 0; i < 20000; i++) {
+    value = reproducibilityPrimer(value);
+  }
+  if (value !== 20000) {
+    throw new Error("cache primer failed");
+  }
+}
+EOF
+prime_clean_cache "$REPRO_CHANGED" "$CHANGED_PRIMER"
+if cmp -s "$REPRO_ONE/starling-ics.wevalcache" \
+  "$REPRO_CHANGED/starling-ics.wevalcache" &&
+  cmp -s "$REPRO_ONE/starling-ics.wevalcache.manifest" \
+    "$REPRO_CHANGED/starling-ics.wevalcache.manifest"; then
+  echo "FAIL: changed primer did not alter the sealed artifact" >&2
+  exit 1
+fi
+test "$(sed -n 's/^key=//p' "$REPRO_ONE/starling-ics.wevalcache.manifest")" != \
+  "$(sed -n 's/^key=//p' "$REPRO_CHANGED/starling-ics.wevalcache.manifest")"
+echo "Clean AOT cache reproducibility passed"
 
 "$AOT_BUNDLE/componentize.sh" --output "$AOT_RUNTIME_OUTPUT"
 "$WASM_TOOLS" validate --features all "$AOT_RUNTIME_OUTPUT"

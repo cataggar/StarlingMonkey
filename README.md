@@ -133,8 +133,9 @@ just builddir=build-aot aot-package release-artifacts
 
 The package recipe validates the AOT engine and its sealed cache before
 publishing `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
-`starling-ics.wevalcache.manifest`. Non-AOT `just build` modes continue to use
-CMake.
+`starling-ics.wevalcache.manifest`. Publication is serialized per release
+directory and the installed set is revalidated while holding that lock.
+Non-AOT `just build` modes continue to use CMake.
 
 See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT
 cache controls, integrity/ABI keys, custom-engine packaging, deterministic
