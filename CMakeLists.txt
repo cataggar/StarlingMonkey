@@ -6,6 +6,11 @@ if(WEVAL)
         "Use the sealed Zig AOT path: "
         "zig build -Doptimize=ReleaseSmall -Daot-engine=true."
     )
+option(WEVAL "Build with a SpiderMonkey variant that supports weval-based AOT compilation" OFF)
+if(WEVAL)
+    message(FATAL_ERROR
+        "CMake WEVAL=ON is disabled because it cannot produce the sealed, validated AOT cache. "
+        "Use `zig build -Doptimize=ReleaseSmall -Daot-engine=true` instead.")
 endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -260,6 +265,8 @@ add_custom_command(
 
 set(EXTERNAL_RUNTIME_FILE "starling-raw.wasm")
 set(AOT 0)
+set(AOT 0)
+set(AOT_DRIVER "")
 
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")

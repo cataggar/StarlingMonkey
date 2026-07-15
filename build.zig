@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // pipeline. It is a host tool even though the runtime it builds targets
     // wasm32-wasi.
     const componentizer_options = b.addOptions();
-    componentizer_options.addOption([]const u8, "version", "0.4.0");
+    componentizer_options.addOption([]const u8, "version", "0.4.1");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     componentizer_options.addOption([]const u8, "host_api", host_api_selection);
     componentizer_options.addOption([]const u8, "host_api_world", host_api_world);
@@ -189,6 +189,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true,
     });
     const feature_surface_lib = b.createModule(.{
         .root_source_file = b.path("tools/feature-surface/surface.zig"),
@@ -218,6 +219,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/componentizer/aot_cache_seal.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
     b.installArtifact(aot_cache_tool);
@@ -236,6 +238,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true,
     });
     componentizer_test_mod.addOptions("build_options", componentizer_options);
     componentizer_test_mod.addImport("feature_surface", feature_surface_lib);

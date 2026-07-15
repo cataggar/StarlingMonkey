@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -16,9 +17,12 @@ pub const default_min_stack_size: u64 = 8 * 1024 * 1024;
 
 pub const Error = error{
     CorruptCache,
+    IncompleteCache,
     InvalidCacheFormat,
+    InvalidCacheSchema,
     InvalidManifest,
     MissingCacheArtifact,
+    SqliteUnavailable,
     StaleEngine,
     StaleFeatureAbi,
     StaleTool,
@@ -77,9 +81,8 @@ pub fn seal(
     manifest_path: []const u8,
 ) !void {
     try validateValue(feature_abi);
-    try verifyCacheFormat(io, cache_path);
     const engine_sha = try hashFileHex(allocator, io, engine_path);
-    try verifyCacheBindsEngine(io, cache_path, engine_sha);
+    try verifyCacheDatabase(allocator, cache_path, engine_sha);
     const weval_sha = try hashFileHex(allocator, io, weval_path);
     const cache_sha = try hashFileHex(allocator, io, cache_path);
     const primer_sha = try hashFileHex(allocator, io, primer_path);
@@ -164,7 +167,7 @@ pub fn validate(
     if (!std.mem.eql(u8, parsed.key, expected_key)) return error.InvalidManifest;
     const cache_sha = try hashFileHex(allocator, io, cache_path);
     if (!std.mem.eql(u8, parsed.cache_sha256, cache_sha)) return error.CorruptCache;
-    try verifyCacheBindsEngine(io, cache_path, engine_sha);
+    try verifyCacheDatabase(allocator, cache_path, engine_sha);
     return .{ .key = parsed.key, .feature_abi = parsed.feature_abi };
 }
 
@@ -285,28 +288,252 @@ fn verifyCacheFormat(io: Io, path: []const u8) !void {
         return error.InvalidCacheFormat;
 }
 
-fn verifyCacheBindsEngine(io: Io, path: []const u8, engine_sha: []const u8) !void {
+const SqliteDb = opaque {};
+const SqliteStmt = opaque {};
+const SqliteDestructor = ?*const fn (?*anyopaque) callconv(.c) void;
+
+const Sqlite = struct {
+    library: std.DynLib,
+    open_v2: *const fn ([*:0]const u8, *?*SqliteDb, c_int, ?[*:0]const u8) callconv(.c) c_int,
+    close: *const fn (*SqliteDb) callconv(.c) c_int,
+    prepare_v2: *const fn (*SqliteDb, [*]const u8, c_int, *?*SqliteStmt, ?*?[*]const u8) callconv(.c) c_int,
+    step: *const fn (*SqliteStmt) callconv(.c) c_int,
+    finalize: *const fn (*SqliteStmt) callconv(.c) c_int,
+    column_int: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
+    column_text: *const fn (*SqliteStmt, c_int) callconv(.c) ?[*]const u8,
+    column_bytes: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
+    bind_blob: *const fn (*SqliteStmt, c_int, ?*const anyopaque, c_int, SqliteDestructor) callconv(.c) c_int,
+
+    fn load() Error!Sqlite {
+        const candidates: []const []const u8 = switch (builtin.os.tag) {
+            .linux => &.{ "libsqlite3.so.0", "libsqlite3.so" },
+            .macos => &.{ "libsqlite3.dylib", "/usr/lib/libsqlite3.dylib" },
+            .windows => &.{"sqlite3.dll"},
+            else => return error.SqliteUnavailable,
+        };
+        var library = for (candidates) |candidate| {
+            break std.DynLib.open(candidate) catch continue;
+        } else return error.SqliteUnavailable;
+        errdefer library.close();
+        return .{
+            .library = library,
+            .open_v2 = library.lookup(
+                @FieldType(Sqlite, "open_v2"),
+                "sqlite3_open_v2",
+            ) orelse return error.SqliteUnavailable,
+            .close = library.lookup(
+                @FieldType(Sqlite, "close"),
+                "sqlite3_close",
+            ) orelse return error.SqliteUnavailable,
+            .prepare_v2 = library.lookup(
+                @FieldType(Sqlite, "prepare_v2"),
+                "sqlite3_prepare_v2",
+            ) orelse return error.SqliteUnavailable,
+            .step = library.lookup(
+                @FieldType(Sqlite, "step"),
+                "sqlite3_step",
+            ) orelse return error.SqliteUnavailable,
+            .finalize = library.lookup(
+                @FieldType(Sqlite, "finalize"),
+                "sqlite3_finalize",
+            ) orelse return error.SqliteUnavailable,
+            .column_int = library.lookup(
+                @FieldType(Sqlite, "column_int"),
+                "sqlite3_column_int",
+            ) orelse return error.SqliteUnavailable,
+            .column_text = library.lookup(
+                @FieldType(Sqlite, "column_text"),
+                "sqlite3_column_text",
+            ) orelse return error.SqliteUnavailable,
+            .column_bytes = library.lookup(
+                @FieldType(Sqlite, "column_bytes"),
+                "sqlite3_column_bytes",
+            ) orelse return error.SqliteUnavailable,
+            .bind_blob = library.lookup(
+                @FieldType(Sqlite, "bind_blob"),
+                "sqlite3_bind_blob",
+            ) orelse return error.SqliteUnavailable,
+        };
+    }
+
+    fn deinit(sqlite: *Sqlite) void {
+        sqlite.library.close();
+    }
+};
+
+const sqlite_ok = 0;
+const sqlite_open_readonly = 0x00000001;
+const sqlite_row = 100;
+const sqlite_done = 101;
+
+fn verifyCacheDatabase(
+    allocator: Allocator,
+    path: []const u8,
+    engine_sha: []const u8,
+) !void {
     var digest: [Sha256.digest_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&digest, engine_sha) catch return error.InvalidManifest;
-    var file = try Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    var buffer: [64 * 1024 + digest.len - 1]u8 = undefined;
-    var offset: u64 = 0;
-    var carry: usize = 0;
-    while (true) {
-        const count = try file.readPositional(io, &.{buffer[carry..]}, offset);
-        const total = carry + count;
-        if (std.mem.indexOf(u8, buffer[0..total], &digest) != null) return;
-        if (count == 0) break;
-        offset += count;
-        carry = @min(total, digest.len - 1);
-        std.mem.copyForwards(
-            u8,
-            buffer[0..carry],
-            buffer[total - carry .. total],
-        );
+    var sqlite = try Sqlite.load();
+    defer sqlite.deinit();
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch
+        return error.InvalidCacheFormat;
+    var optional_db: ?*SqliteDb = null;
+    if (sqlite.open_v2(path_z, &optional_db, sqlite_open_readonly, null) != sqlite_ok) {
+        if (optional_db) |db| _ = sqlite.close(db);
+        return error.InvalidCacheFormat;
     }
-    return error.StaleEngine;
+    const db = optional_db orelse return error.InvalidCacheFormat;
+    defer _ = sqlite.close(db);
+
+    try verifyIntegrity(&sqlite, db);
+    try verifySchema(&sqlite, db);
+    try verifyLiveEngineRow(&sqlite, db, &digest);
+}
+
+fn prepare(sqlite: *const Sqlite, db: *SqliteDb, sql: []const u8) Error!*SqliteStmt {
+    var optional_stmt: ?*SqliteStmt = null;
+    if (sqlite.prepare_v2(
+        db,
+        sql.ptr,
+        @intCast(sql.len),
+        &optional_stmt,
+        null,
+    ) != sqlite_ok) return error.InvalidCacheFormat;
+    return optional_stmt orelse error.InvalidCacheFormat;
+}
+
+fn columnText(
+    sqlite: *const Sqlite,
+    stmt: *SqliteStmt,
+    column: c_int,
+) Error![]const u8 {
+    const pointer = sqlite.column_text(stmt, column) orelse
+        return error.InvalidCacheSchema;
+    const length = sqlite.column_bytes(stmt, column);
+    if (length < 0) return error.InvalidCacheSchema;
+    return pointer[0..@intCast(length)];
+}
+
+fn verifyIntegrity(sqlite: *const Sqlite, db: *SqliteDb) Error!void {
+    const stmt = try prepare(sqlite, db, "PRAGMA integrity_check");
+    defer _ = sqlite.finalize(stmt);
+    if (sqlite.step(stmt) != sqlite_row) return error.CorruptCache;
+    const result = columnText(sqlite, stmt, 0) catch return error.CorruptCache;
+    if (!std.mem.eql(u8, result, "ok")) return error.CorruptCache;
+    if (sqlite.step(stmt) != sqlite_done) return error.CorruptCache;
+}
+
+fn verifySchema(sqlite: *const Sqlite, db: *SqliteDb) Error!void {
+    const objects = try prepare(sqlite, db,
+        \\SELECT type, name, tbl_name
+        \\FROM sqlite_schema
+        \\WHERE name NOT LIKE 'sqlite_%'
+        \\ORDER BY type, name
+    );
+    defer _ = sqlite.finalize(objects);
+    const expected_objects = [_][3][]const u8{
+        .{ "index", "idx", "weval_cache" },
+        .{ "table", "weval_cache", "weval_cache" },
+    };
+    for (expected_objects) |expected| {
+        if (sqlite.step(objects) != sqlite_row) return error.InvalidCacheSchema;
+        for (expected, 0..) |value, column| {
+            if (!std.mem.eql(
+                u8,
+                try columnText(sqlite, objects, @intCast(column)),
+                value,
+            )) return error.InvalidCacheSchema;
+        }
+    }
+    if (sqlite.step(objects) != sqlite_done) return error.InvalidCacheSchema;
+
+    const expected_columns = [_]struct {
+        name: []const u8,
+        declared_type: []const u8,
+    }{
+        .{ .name = "module_hash", .declared_type = "BLOB" },
+        .{ .name = "key", .declared_type = "BLOB" },
+        .{ .name = "result", .declared_type = "BLOB" },
+        .{ .name = "created_time", .declared_type = "INTEGER" },
+    };
+    const table = try prepare(sqlite, db, "PRAGMA table_info('weval_cache')");
+    defer _ = sqlite.finalize(table);
+    for (expected_columns, 0..) |expected, index| {
+        if (sqlite.step(table) != sqlite_row) return error.InvalidCacheSchema;
+        if (sqlite.column_int(table, 0) != index or
+            !std.mem.eql(u8, try columnText(sqlite, table, 1), expected.name) or
+            !std.mem.eql(u8, try columnText(sqlite, table, 2), expected.declared_type) or
+            sqlite.column_int(table, 3) != 1 or
+            sqlite.column_int(table, 5) != 0)
+        {
+            return error.InvalidCacheSchema;
+        }
+    }
+    if (sqlite.step(table) != sqlite_done) return error.InvalidCacheSchema;
+
+    const indexes = try prepare(sqlite, db, "PRAGMA index_list('weval_cache')");
+    defer _ = sqlite.finalize(indexes);
+    var found_index = false;
+    while (true) {
+        switch (sqlite.step(indexes)) {
+            sqlite_row => {
+                if (std.mem.eql(u8, try columnText(sqlite, indexes, 1), "idx")) {
+                    if (found_index or
+                        sqlite.column_int(indexes, 2) != 0 or
+                        sqlite.column_int(indexes, 4) != 0)
+                    {
+                        return error.InvalidCacheSchema;
+                    }
+                    found_index = true;
+                }
+            },
+            sqlite_done => break,
+            else => return error.InvalidCacheSchema,
+        }
+    }
+    if (!found_index) return error.InvalidCacheSchema;
+
+    const index = try prepare(sqlite, db, "PRAGMA index_info('idx')");
+    defer _ = sqlite.finalize(index);
+    for ([_][]const u8{ "module_hash", "key" }, 0..) |expected, position| {
+        if (sqlite.step(index) != sqlite_row or
+            sqlite.column_int(index, 0) != position or
+            !std.mem.eql(u8, try columnText(sqlite, index, 2), expected))
+        {
+            return error.InvalidCacheSchema;
+        }
+    }
+    if (sqlite.step(index) != sqlite_done) return error.InvalidCacheSchema;
+}
+
+fn verifyLiveEngineRow(
+    sqlite: *const Sqlite,
+    db: *SqliteDb,
+    digest: *const [Sha256.digest_length]u8,
+) Error!void {
+    const stmt = try prepare(sqlite, db,
+        \\SELECT 1 FROM weval_cache
+        \\WHERE module_hash = ?1
+        \\  AND typeof(module_hash) = 'blob'
+        \\  AND length(module_hash) = 32
+        \\  AND typeof(key) = 'blob'
+        \\  AND length(key) > 0
+        \\  AND typeof(result) = 'blob'
+        \\  AND length(result) > 0
+        \\  AND typeof(created_time) = 'integer'
+        \\LIMIT 1
+    );
+    defer _ = sqlite.finalize(stmt);
+    if (sqlite.bind_blob(
+        stmt,
+        1,
+        @ptrCast(digest),
+        digest.len,
+        null,
+    ) != sqlite_ok) return error.InvalidCacheFormat;
+    if (sqlite.step(stmt) != sqlite_row) return error.IncompleteCache;
+    if (sqlite.step(stmt) != sqlite_done) return error.InvalidCacheFormat;
 }
 
 fn validateValue(value: []const u8) !void {

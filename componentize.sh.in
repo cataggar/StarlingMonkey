@@ -25,6 +25,7 @@ preopen_dir="${PREOPEN_DIR:-}"
 if [[ $aot -ne 0 && "$aot_driver" == native ]]; then
   aot_args=(
     --aot
+    --legacy-wrapper-preopen
     --engine "$(dirname "$0")/starling-raw.wasm"
     --aot-cache-dir "${WEVAL_CACHE_DIR:-$(dirname "$0")}"
     --weval-bin "$weval"
@@ -40,6 +41,9 @@ if [[ $aot -ne 0 && "$aot_driver" == native ]]; then
   fi
   if [[ -n "${AOT_MIN_STACK_SIZE:-}" ]]; then
     aot_args+=(--aot-min-stack-size "$AOT_MIN_STACK_SIZE")
+  fi
+  if [[ -n "$preopen_dir" ]]; then
+    aot_args+=(--preopen-dir "$preopen_dir")
   fi
   exec "$(dirname "$0")/starling-componentize" "${aot_args[@]}" "$@"
 fi

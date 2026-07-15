@@ -87,6 +87,16 @@ printf 'adapter-bytes\n' > \
   "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
 
+if cmake -S "$ROOT" -B "$SCRATCH/cmake aot rejected" -DWEVAL=ON \
+  >"$SCRATCH/cmake aot.log" 2>&1
+then
+  echo "FAIL: CMake accepted an unsealed WEVAL=ON build" >&2
+  exit 1
+fi
+grep -Fq 'cannot produce the sealed, validated' "$SCRATCH/cmake aot.log"
+grep -Fq 'AOT cache.' "$SCRATCH/cmake aot.log"
+grep -Fq 'zig build -Doptimize=ReleaseSmall -Daot-engine=true' "$SCRATCH/cmake aot.log"
+
 SOURCE="$WORK/source module.js"
 ENGINE_BUNDLE="$WORK/default engine bundle"
 ENGINE="$ENGINE_BUNDLE/fake engine.wasm"
@@ -258,9 +268,11 @@ if printf '%s\n' "$*" | grep -Eq -- '(^| )--cache( |$)'; then
   echo "AOT componentization attempted to mutate its read-only cache" >&2
   exit 26
 fi
+printf '%s\0' "$@" > "$FAKE_AOT_ARGV_LOG"
 cat > "$FAKE_AOT_RUNTIME_ARGS_LOG"
 out=""
 input=""
+cache=""
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
     -o)
@@ -271,8 +283,28 @@ for ((i = 1; i <= $#; i++)); do
       j=$((i + 1))
       input="${!j}"
       ;;
+    --cache-ro)
+      j=$((i + 1))
+      cache="${!j}"
+      ;;
   esac
 done
+if [ "${EXPECT_AOT_SNAPSHOT:-0}" = 1 ]; then
+  test "$0" != "$ORIGINAL_AOT_WEVAL"
+  test "$input" != "$ORIGINAL_AOT_ENGINE"
+  test "$cache" != "$ORIGINAL_AOT_CACHE"
+  test "$(dirname "$0")" = "$(dirname "$input")"
+  test "$(dirname "$input")" = "$(dirname "$cache")"
+  test "$(stat -c %a "$(dirname "$input")")" = 700
+  printf 'replacement engine\n' > "$ORIGINAL_AOT_ENGINE"
+  printf 'replacement cache\n' > "$ORIGINAL_AOT_CACHE"
+  printf '# replaced after validation\n' > "$ORIGINAL_AOT_WEVAL"
+  cmp "$input" "$EXPECTED_AOT_ENGINE"
+  cmp "$cache" "$EXPECTED_AOT_CACHE"
+fi
+if [ "${FAKE_AOT_FAIL:-0}" = 1 ]; then
+  exit 27
+fi
 cp "$input" "$out"
 EOF
 
@@ -641,9 +673,63 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasip3-bindgen"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasm-opt"
 chmod +x "$TOOLS"/*
 
+WRAPPER_DIR="$SCRATCH/wrapper with spaces"
+mkdir -p "$WRAPPER_DIR"
+python3 - "$ROOT/componentize.sh.in" "$WRAPPER_DIR/componentize.sh" <<'PY'
+import sys
+
+data = open(sys.argv[1], encoding="utf-8").read()
+replacements = {
+    "@WASMTIME_DIR@": ".",
+    "@WASM_TOOLS_BIN@": "wasm-tools",
+    "@WEVAL_BIN@": "weval",
+    "@COMPONENT_WORLD@": "",
+    "@COMPONENT_WIT_DIR@": "component wit",
+    "@AOT@": "1",
+    "@AOT_DRIVER@": "native",
+}
+for old, new in replacements.items():
+    data = data.replace(old, new)
+open(sys.argv[2], "w", encoding="utf-8").write(data)
+PY
+cat > "$WRAPPER_DIR/starling-componentize" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" > "$WRAPPER_LOG"
+EOF
+chmod +x "$WRAPPER_DIR/componentize.sh" "$WRAPPER_DIR/starling-componentize"
+touch "$WRAPPER_DIR/starling-raw.wasm" "$WRAPPER_DIR/preview1-adapter.wasm"
+export WRAPPER_LOG="$SCRATCH/wrapper args.bin"
+PREOPEN_DIR="$WORK/preopen dir" "$WRAPPER_DIR/componentize.sh" \
+  --output "$WORK/wrapper output.wasm" "$SOURCE"
+python3 - "$WRAPPER_LOG" "$WORK/preopen dir" "$WORK/wrapper output.wasm" "$SOURCE" <<'PY'
+import sys
+
+args = open(sys.argv[1], "rb").read().split(b"\0")[:-1]
+args = [arg.decode() for arg in args]
+assert "--legacy-wrapper-preopen" in args
+preopen = args.index("--preopen-dir")
+assert args[preopen + 1] == sys.argv[2]
+assert args[-3:] == ["--output", sys.argv[3], sys.argv[4]]
+PY
+"$WRAPPER_DIR/componentize.sh" "$SOURCE" "$WORK/positional output.wasm"
+python3 - "$WRAPPER_LOG" "$SOURCE" "$WORK/positional output.wasm" <<'PY'
+import sys
+args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
+assert "--legacy-wrapper-preopen" in args
+assert args[-2:] == sys.argv[2:]
+PY
+"$WRAPPER_DIR/componentize.sh" --output "$WORK/runtime only.wasm"
+python3 - "$WRAPPER_LOG" "$WORK/runtime only.wasm" <<'PY'
+import sys
+args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
+assert "--legacy-wrapper-preopen" in args
+assert args[-2:] == ["--output", sys.argv[2]]
+PY
+
 export FAKE_RUNTIME_ARGS_LOG="$SCRATCH/runtime args.log"
 export FAKE_WIZER_ARGS_LOG="$SCRATCH/wizer args.log"
 export FAKE_AOT_RUNTIME_ARGS_LOG="$SCRATCH/aot runtime args.log"
+export FAKE_AOT_ARGV_LOG="$SCRATCH/aot argv.bin"
 export FAKE_ENGINE="$ENGINE"
 export FAKE_ADAPTER="$ADAPTER"
 export FAKE_ZIG_PREFIX_LOG="$SCRATCH/zig prefixes.log"
@@ -1353,6 +1439,19 @@ assert_json_diagnostic "$WORK/missing WIT.jsonl" SMC4201 adapt \
   MissingGeneratedWitRoot "generated WIT has no root package"
 test ! -e "$WORK/missing generated WIT.wasm"
 
+POSITIONAL_OUTPUT="$WORK/positional native output.wasm"
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  "$SOURCE" \
+  "$POSITIONAL_OUTPUT"
+cmp "$ENGINE" "$POSITIONAL_OUTPUT"
+
 AOT_BUNDLE="$WORK/aot cache bundle"
 AOT_OUTPUT="$WORK/aot output component.wasm"
 mkdir -p "$AOT_BUNDLE"
@@ -1362,7 +1461,13 @@ import sqlite3
 import sys
 
 db = sqlite3.connect(sys.argv[1])
-db.execute("create table weval_cache(module_hash blob, key blob, result blob, created_time integer)")
+db.execute("""create table weval_cache(
+    module_hash blob not null,
+    key blob not null,
+    result blob not null,
+    created_time integer not null
+)""")
+db.execute("create index idx on weval_cache(module_hash, key)")
 with open(sys.argv[2], "rb") as engine:
     engine_hash = hashlib.sha256(engine.read()).digest()
 db.execute("insert into weval_cache values (?, ?, ?, 0)", (engine_hash, b"key", b"result"))
@@ -1376,6 +1481,102 @@ PY
   --primer "$SOURCE" \
   --feature-abi 'starling-features-v1;fake=1' \
   --out "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+
+expect_seal_failure() {
+  local cache="$1" label="$2"
+  if "$CACHE_TOOL" seal \
+    --engine "$ENGINE" \
+    --weval "$TOOLS/fake weval" \
+    --cache "$cache" \
+    --primer "$SOURCE" \
+    --feature-abi 'starling-features-v1;fake=1' \
+    --out "$WORK/$label.manifest"
+  then
+    echo "FAIL: $label cache unexpectedly sealed" >&2
+    exit 1
+  fi
+  test ! -e "$WORK/$label.manifest"
+}
+
+MALFORMED_SCHEMA_CACHE="$WORK/malformed schema.sqlite"
+DECOY_CACHE="$WORK/decoy digest.sqlite"
+python3 - "$MALFORMED_SCHEMA_CACHE" "$DECOY_CACHE" "$ENGINE" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+with open(sys.argv[3], "rb") as engine:
+    engine_hash = hashlib.sha256(engine.read()).digest()
+
+malformed = sqlite3.connect(sys.argv[1])
+malformed.execute(
+    "create table weval_cache(module_hash blob, key blob, result blob, created_time integer)"
+)
+malformed.execute(
+    "insert into weval_cache values (?, ?, ?, 0)",
+    (engine_hash, b"key", b"result"),
+)
+malformed.commit()
+malformed.close()
+
+decoy = sqlite3.connect(sys.argv[2])
+decoy.execute("""create table weval_cache(
+    module_hash blob not null,
+    key blob not null,
+    result blob not null,
+    created_time integer not null
+)""")
+decoy.execute("create index idx on weval_cache(module_hash, key)")
+decoy.execute(
+    "insert into weval_cache values (?, ?, ?, 0)",
+    (b"x" * 32, b"key", b"result"),
+)
+decoy.execute("create table digest_decoy(value blob not null)")
+decoy.execute("insert into digest_decoy values (?)", (engine_hash,))
+decoy.commit()
+decoy.close()
+PY
+expect_seal_failure "$MALFORMED_SCHEMA_CACHE" malformed-schema
+expect_seal_failure "$DECOY_CACHE" no-live-engine-row
+
+EXTRA_INDEX_CACHE="$WORK/extra index.sqlite"
+cp "$AOT_BUNDLE/starling-ics.wevalcache" "$EXTRA_INDEX_CACHE"
+python3 - "$EXTRA_INDEX_CACHE" <<'PY'
+import sqlite3
+import sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("create index idx_extra on weval_cache(created_time)")
+db.commit()
+db.close()
+PY
+expect_seal_failure "$EXTRA_INDEX_CACHE" extra-index
+
+INTEGRITY_CACHE="$WORK/integrity corrupt.sqlite"
+cp "$AOT_BUNDLE/starling-ics.wevalcache" "$INTEGRITY_CACHE"
+python3 - "$INTEGRITY_CACHE" <<'PY'
+import sys
+with open(sys.argv[1], "r+b") as cache:
+    cache.seek(100)
+    byte = cache.read(1)
+    cache.seek(100)
+    cache.write(bytes([byte[0] ^ 0xff]))
+PY
+expect_seal_failure "$INTEGRITY_CACHE" integrity-corrupt
+
+RUNTIME_ONLY_OUTPUT="$WORK/runtime only output.wasm"
+rm -f "$FAKE_AOT_RUNTIME_ARGS_LOG"
+"$COMPONENTIZER" \
+  --aot \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --output "$RUNTIME_ONLY_OUTPUT"
+cmp "$ENGINE" "$RUNTIME_ONLY_OUTPUT"
+test ! -e "$FAKE_AOT_RUNTIME_ARGS_LOG"
+
 export EXPECTED_RUST_MIN_STACK=123456
 RUST_MIN_STACK=999 "$COMPONENTIZER" \
   --aot \
@@ -1393,8 +1594,32 @@ RUST_MIN_STACK=999 "$COMPONENTIZER" \
 cmp "$ENGINE" "$AOT_OUTPUT"
 grep -Fq -- "\"$SOURCE\"" "$FAKE_AOT_RUNTIME_ARGS_LOG"
 
-DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
+LEGACY_PREOPEN="$SCRATCH/legacy preopen"
+LEGACY_PREOPEN_OUTPUT="$WORK/legacy preopen output.wasm"
+mkdir -p "$LEGACY_PREOPEN"
 export EXPECTED_RUST_MIN_STACK=8388608
+"$COMPONENTIZER" \
+  --aot \
+  --legacy-wrapper-preopen \
+  --preopen-dir "$LEGACY_PREOPEN" \
+  --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE" \
+  --weval-bin "$TOOLS/fake weval" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$LEGACY_PREOPEN_OUTPUT" \
+  "$SOURCE"
+python3 - "$FAKE_AOT_ARGV_LOG" "$LEGACY_PREOPEN" <<'PY'
+import sys
+args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
+preopens = [args[index + 1] for index, arg in enumerate(args) if arg == "--dir"]
+assert preopens == [sys.argv[2]], preopens
+PY
+
+DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
 "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
@@ -1408,6 +1633,63 @@ export EXPECTED_RUST_MIN_STACK=8388608
   --out "$DIRECT_CACHE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
+
+RACE_ENGINE="$WORK/race engine.wasm"
+RACE_WEVAL="$TOOLS/race weval"
+RACE_BUNDLE="$WORK/race cache bundle"
+RACE_ENGINE_BASELINE="$WORK/race engine baseline.wasm"
+RACE_CACHE_BASELINE="$WORK/race cache baseline.sqlite"
+RACE_OUTPUT="$WORK/race output component.wasm"
+cp "$ENGINE" "$RACE_ENGINE"
+cp "$TOOLS/fake weval" "$RACE_WEVAL"
+cp -R "$AOT_BUNDLE" "$RACE_BUNDLE"
+cp "$RACE_ENGINE" "$RACE_ENGINE_BASELINE"
+cp "$RACE_BUNDLE/starling-ics.wevalcache" "$RACE_CACHE_BASELINE"
+EXPECT_AOT_SNAPSHOT=1 \
+ORIGINAL_AOT_ENGINE="$RACE_ENGINE" \
+ORIGINAL_AOT_CACHE="$RACE_BUNDLE/starling-ics.wevalcache" \
+ORIGINAL_AOT_WEVAL="$RACE_WEVAL" \
+EXPECTED_AOT_ENGINE="$RACE_ENGINE_BASELINE" \
+EXPECTED_AOT_CACHE="$RACE_CACHE_BASELINE" \
+"$COMPONENTIZER" \
+  --aot \
+  --engine "$RACE_ENGINE" \
+  --aot-cache-dir "$RACE_BUNDLE" \
+  --weval-bin "$RACE_WEVAL" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$RACE_OUTPUT" \
+  "$SOURCE"
+cmp "$RACE_ENGINE_BASELINE" "$RACE_OUTPUT"
+test "$(cat "$RACE_ENGINE")" = "replacement engine"
+test "$(cat "$RACE_BUNDLE/starling-ics.wevalcache")" = "replacement cache"
+
+AOT_FAILURE_OUTPUT="$WORK/aot failure output.wasm"
+printf 'preserved-aot-output\n' > "$AOT_FAILURE_OUTPUT"
+if FAKE_AOT_FAIL=1 "$COMPONENTIZER" \
+  --aot \
+  --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE" \
+  --weval-bin "$TOOLS/fake weval" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$AOT_FAILURE_OUTPUT" \
+  "$SOURCE"
+then
+  echo "FAIL: injected AOT failure unexpectedly succeeded" >&2
+  exit 1
+fi
+test "$(cat "$AOT_FAILURE_OUTPUT")" = "preserved-aot-output"
+if find "$WORK" -maxdepth 1 -name '.*.starling-componentize-*' | grep -q .; then
+  echo "FAIL: AOT componentization left private transaction artifacts" >&2
+  exit 1
+fi
 
 expect_aot_cache_failure() {
   local bundle="$1" engine="$2" weval="$3" label="$4"

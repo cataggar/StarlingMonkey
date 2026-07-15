@@ -118,9 +118,10 @@ ABI, and cache-primer digest. A separate cache SHA-256 protects the SQLite
 bytes. WIT closures, generated
 bindings, host APIs, source/toolchain changes, and linked libraries are bound
 by the engine digest; WIT/world and feature selections also remain in the
-outer runtime key. Sealing and validation additionally require the cache
-database to contain the exact engine digest as a Weval module key, so an
-unrelated but otherwise valid SQLite cache cannot be relabeled for an engine.
+outer runtime key. Sealing and validation open SQLite read-only, run `integrity_check`, verify
+Weval's exact table/index shape, and require a nonempty live row for the exact
+engine digest in `weval_cache.module_hash`. Bytes in deleted or unrelated rows
+cannot bind a cache to an engine.
 
 `--aot-cache-dir` selects a read-only cache bundle containing the two
 `starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
@@ -130,6 +131,10 @@ defaults to a bundle beside the engine. `--weval-bin` must identify the exact
 binary in the seal. Missing artifacts, malformed manifests, non-SQLite or
 checksum-corrupt caches, and engine/tool/feature mismatches all fail before
 initialization or output publication; there is no Wizer fallback.
+The validated engine, Weval executable, cache, and manifest are copied into a
+private per-run snapshot. Weval consumes those same snapshot bytes, closing
+the validation/reopen replacement window, and the snapshot is removed on
+success or failure.
 
 `--aot-min-stack-size` sets Weval's `RUST_MIN_STACK`. The deterministic
 default is 8 MiB, and ambient `RUST_MIN_STACK` and `STARLINGMONKEY_CONFIG`
@@ -139,7 +144,10 @@ containing spaces.
 
 An AOT `componentize.sh` installation delegates to the same native driver.
 `WEVAL_CACHE_DIR` and `AOT_MIN_STACK_SIZE` provide shell-entry-point
-equivalents for the two controls.
+equivalents for the two controls. `PREOPEN_DIR`, `--output`, positional
+output, and output-only runtime componentization retain the legacy wrapper
+behavior. CMake rejects `WEVAL=ON` with the Zig AOT build command because its
+legacy cache target cannot provide this sealed/validated contract.
 
 Run the focused cache and equivalence coverage with:
 

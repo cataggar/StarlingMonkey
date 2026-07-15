@@ -85,7 +85,8 @@ An alternative build uses [Zig](https://ziglang.org/) 0.17 as the C/C++ toolchai
 `build.zig` rather than CMake. This is experimental and currently Linux/x86_64 only.
 
 Requirements: `zig` 0.17, `rustup` (the toolchain in `rust-toolchain.toml` plus the
-`wasm32-wasip1` target), `python3`, a host `clang`/`clang++`, `make`, `curl`, `git`.
+`wasm32-wasip1` target), `python3`, host `libsqlite3`, a host `clang`/`clang++`,
+`make`, `curl`, `git`.
 
 ```console
 # 1. Build the native dependencies (SpiderMonkey from source, OpenSSL, Rust crates)
@@ -119,6 +120,9 @@ zig-out/bin/starling-componentize --aot \
   --component-world-name js-dispatch \
   --out app.wasm app.js
 ```
+
+CMake intentionally rejects `WEVAL=ON`; only the Zig AOT path creates and
+validates the sealed cache required for no-fallback AOT componentization.
 
 See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT
 cache controls, integrity/ABI keys, custom-engine packaging, deterministic

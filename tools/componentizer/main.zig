@@ -2216,6 +2216,12 @@ const AotCache = struct {
     expected_feature_abi: ?[]const u8,
 };
 
+const AotSnapshot = struct {
+    engine: []const u8,
+    weval: []const u8,
+    bundle: AotCache,
+};
+
 const Runtime = struct {
     engine: Snapshot,
     adapter: Snapshot,
@@ -2575,13 +2581,25 @@ fn execute(
     try validateArgument(source_path);
     const initializer_path = if (config.initializer_script_path) |path|
         try absolutePath(allocator, cwd, path)
+    const source_argument = if (config.source) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        null;
+    const source = if (config.source) |path| blk: {
+        const resolved = try resolveExistingFile(allocator, io, cwd, path);
+        try validateArgument(resolved);
+        break :blk resolved;
+    } else null;
+    const needs_initialization = source != null;
+    const initializer = if (config.initializer_script_path) |path|
+        try resolveExistingFile(allocator, io, cwd, path)
     else
         null;
 
     const output = if (config.output) |path|
         try absolutePath(allocator, cwd, path)
     else
-        try defaultOutputPath(allocator, cwd, source_argument);
+        try defaultOutputPath(allocator, cwd, source_argument.?);
     try validateArgument(output);
     const output_parent = std.fs.path.dirname(output) orelse return error.InvalidPath;
     var publication_anchor = retainOrCreateAbsoluteDirectory(
@@ -2618,6 +2636,10 @@ fn execute(
     if (std.mem.eql(u8, source_path, resolved_output) or
         (initializer_path != null and
             std.mem.eql(u8, initializer_path.?, resolved_output)))
+    try Dir.cwd().createDirPath(io, output_parent);
+    const resolved_output = try resolveDestination(allocator, io, output);
+    if ((source != null and std.mem.eql(u8, source.?, resolved_output)) or
+        (initializer != null and std.mem.eql(u8, initializer.?, resolved_output)))
     {
         return error.InputOutputCollision;
     }
@@ -2734,6 +2756,10 @@ fn execute(
             cwd,
             configured,
             environ,
+            executable_dir,
+            config,
+            engine_override,
+            needs_initialization,
         )
     else
         null;
@@ -2769,6 +2795,11 @@ fn execute(
             allocator,
             io,
             &retained_build_root.?,
+            cwd,
+            build_root.?,
+            executable_dir,
+            config,
+            needs_initialization,
         );
     }
     if (config.cache_dir == null) if (retained_build_root) |*root| {
@@ -2819,6 +2850,12 @@ fn execute(
             };
         };
     }
+        cwd,
+        executable_dir,
+        config,
+        runtime.component_wit != null,
+        needs_initialization,
+    );
 
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
@@ -3055,6 +3092,71 @@ fn execute(
         "runtime-args.txt",
         false,
     );
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    try Dir.createDirAbsolute(io, transaction_dir, private_permissions);
+    defer Dir.cwd().deleteTree(io, transaction_dir) catch {};
+
+    const aot_snapshot = if (config.aot and needs_initialization) blk: {
+        const bundle = runtime.aot_cache orelse return error.MissingAotCache;
+        const snapshot = try snapshotAotInputs(
+            allocator,
+            io,
+            transaction_dir,
+            runtime.engine,
+            tools.weval.?,
+            bundle,
+        );
+        validateAotCache(
+            allocator,
+            io,
+            snapshot.engine,
+            snapshot.weval,
+            snapshot.bundle,
+        ) catch |err| {
+            std.debug.print(
+                "error: AOT cache validation failed for {s}: {t}\n",
+                .{ bundle.cache, err },
+            );
+            return switch (err) {
+                error.MissingCacheArtifact => error.MissingAotCache,
+                error.CorruptCache, error.InvalidCacheFormat => error.CorruptAotCache,
+                error.IncompleteCache,
+                error.InvalidCacheSchema,
+                error.InvalidManifest,
+                error.SqliteUnavailable,
+                => error.InvalidAotCache,
+                error.StaleEngine, error.StaleFeatureAbi, error.StaleTool => error.StaleAotCache,
+                else => err,
+            };
+        };
+        break :blk snapshot;
+    } else null;
+    const initialization_engine = if (aot_snapshot) |snapshot|
+        snapshot.engine
+    else
+        runtime.engine;
+
+    const runtime_args_path = if (source) |source_path| blk: {
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ transaction_dir, "runtime-args.txt" },
+        );
+        const runtime_args = try renderRuntimeArgs(
+            allocator,
+            cwd,
+            source_path,
+            initializer,
+            config,
+        );
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = runtime_args,
+        });
+        break :blk path;
+    } else null;
 
     var command_log: std.ArrayList(u8) = .empty;
     var initialized = try createChildOutput(
@@ -3081,15 +3183,15 @@ fn execute(
         wizer_args.appendSlice(allocator, &.{
             "--allow-wasi",
     var initialization_args: std.ArrayList([]const u8) = .empty;
-    if (config.aot) {
+    if (config.aot and needs_initialization) {
         initialization_args.appendSlice(allocator, &.{
-            tools.weval.?,
+            aot_snapshot.?.weval,
             "weval",
             "-w",
             "--init-func",
             "wizer-initialize",
             "--cache-ro",
-            runtime.aot_cache.?.cache,
+            aot_snapshot.?.bundle.cache,
         }) catch @panic("out of memory");
         if (config.verbose) {
             initialization_args.appendSlice(
@@ -3097,7 +3199,7 @@ fn execute(
                 &.{ "--verbose", "--show-stats" },
             ) catch @panic("out of memory");
         }
-    } else {
+    } else if (needs_initialization) {
         initialization_args.append(allocator, tools.wizer.executable) catch
             @panic("out of memory");
         if (tools.wizer.wasmtime_subcommand) {
@@ -3183,7 +3285,57 @@ fn execute(
                 "{d}",
                 .{config.aot_min_stack_size orelse aot_cache.default_min_stack_size},
             ),
+    if (source) |source_path| {
+        const source_dir = std.fs.path.dirname(source_path) orelse return error.InvalidPath;
+        if (!config.legacy_wrapper_preopen or config.preopen_dirs.len == 0) {
+            try addPreopen(allocator, &initialization_args, source_dir);
+        }
+        if (!config.legacy_wrapper_preopen) {
+            if (initializer) |initializer_path| {
+                const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
+                try addPreopen(allocator, &initialization_args, initializer_dir);
+            }
+        }
+        for (config.preopen_dirs) |preopen| {
+            const preopen_abs = try absolutePath(allocator, cwd, preopen);
+            try addPreopen(allocator, &initialization_args, preopen_abs);
+        }
+        initialization_args.appendSlice(
+            allocator,
+            if (config.aot)
+                &.{ "-o", initialized, "-i", initialization_engine }
+            else
+                &.{ "-o", initialized, initialization_engine },
+        ) catch @panic("out of memory");
+
+        var pipeline_env = std.process.Environ.Map.init(allocator);
+        try pipeline_env.putAll(environ);
+        try pipeline_env.put("WASMTIME_BACKTRACE_DETAILS", "1");
+        _ = pipeline_env.swapRemove("STARLINGMONKEY_CONFIG");
+        _ = pipeline_env.swapRemove("RUST_MIN_STACK");
+        if (config.aot) {
+            try pipeline_env.put(
+                "RUST_MIN_STACK",
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{d}",
+                    .{config.aot_min_stack_size orelse aot_cache.default_min_stack_size},
+                ),
+            );
+        }
+        try runCommand(
+            allocator,
+            io,
+            if (config.aot) "weval AOT" else "wizer",
+            initialization_args.items,
+            cwd,
+            &pipeline_env,
+            runtime_args_path,
+            config.verbose,
+            &command_log,
         );
+    } else {
+        try Dir.copyFileAbsolute(runtime.engine, initialized, io, .{});
     }
     try runCommand(
         allocator,
@@ -3204,6 +3356,7 @@ fn execute(
         io,
         &initialized,
     );
+
 
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
@@ -3670,6 +3823,36 @@ fn execute(
                 "debug/feature-provider.wasm",
             );
         }
+        const debug_dir = if (config.debug_dir) |path|
+            try absolutePath(allocator, cwd, path)
+        else
+            try std.fmt.allocPrint(allocator, "{s}.debug", .{output});
+        if (pathContains(debug_dir, output)) return error.DebugOutputCollision;
+        Dir.cwd().createDirPath(io, debug_dir) catch |err| switch (err) {
+            error.NotDir => return error.DebugOutputCollision,
+            else => return err,
+        };
+        var debug_dir_handle = Dir.openDirAbsolute(
+            io,
+            debug_dir,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.SymLinkLoop, error.NotDir => return error.DebugOutputCollision,
+            else => return err,
+        };
+        defer debug_dir_handle.close(io);
+        var debug_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const debug_path_len = try debug_dir_handle.realPath(io, &debug_path_buffer);
+        const resolved_debug_dir = debug_path_buffer[0..debug_path_len];
+        if (pathContains(resolved_debug_dir, resolved_output))
+            return error.DebugOutputCollision;
+        if (runtime_args_path) |path| {
+            try copyDebugFile(io, path, debug_dir_handle, "runtime-args.txt");
+        }
+        try copyDebugFile(io, initialized, debug_dir_handle, "initialized.wasm");
+        if (stripped) |path| try copyDebugFile(io, path, debug_dir_handle, "stripped.wasm");
+        if (embedded) |path| try copyDebugFile(io, path, debug_dir_handle, "embedded.wasm");
+        try copyDebugFile(io, candidate, debug_dir_handle, "component.wasm");
         if (runtime.bindings) |path| {
             try copyDebugFile(io, path, debug_dir_handle, "component-bindings.zig");
             try transaction.recordStoragePath(
@@ -3678,7 +3861,8 @@ fn execute(
                 "debug/component-bindings.zig",
             );
         }
-        if (runtime.aot_cache) |bundle| {
+        if (aot_snapshot) |snapshot| {
+            const bundle = snapshot.bundle;
             try copyDebugFile(io, bundle.manifest, debug_dir_handle, "aot-cache.manifest");
         }
         try copyDebugFile(io, command_log_path, debug_dir_handle, "commands.txt");
@@ -3741,6 +3925,12 @@ fn execute(
         diagnostic,
         &publication_locks,
     );
+    try Dir.renameAbsolute(candidate, output, io);
+    if (source) |source_path| {
+        std.debug.print("Componentized {s} into {s}\n", .{ source_path, output });
+    } else {
+        std.debug.print("Created runtime-eval component {s}\n", .{output});
+    }
 }
 
 fn externalRuntime(
@@ -3751,6 +3941,7 @@ fn externalRuntime(
     engine_override: []const u8,
     transaction: *Transaction,
     diagnostic: *diagnostics.Context,
+    needs_initialization: bool,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     if (config.disable_features.len != 0 or
@@ -3955,6 +4146,7 @@ fn externalRuntime(
         .build_tools = &.{},
         .build_root_digest = null,
         .aot_cache = if (config.aot)
+        .aot_cache = if (config.aot and needs_initialization)
             try resolveAotBundle(
                 allocator,
                 io,
@@ -4258,6 +4450,7 @@ fn buildRuntime(
     cache: *const EffectiveCache,
     diagnostic: *diagnostics.Context,
     transaction: *Transaction,
+    needs_initialization: bool,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     try cache.verifyCanonical(io);
@@ -4758,7 +4951,7 @@ fn buildRuntime(
         try resolvedFeatureAbi(allocator, config)
     else
         null;
-    const aot_bundle = if (config.aot)
+    const aot_bundle = if (config.aot and needs_initialization)
         try resolveAotBundle(
             allocator,
             io,
@@ -5296,6 +5489,8 @@ fn resolveTools(
     executable_dir: []const u8,
     config: *const cli.Config,
     transaction: *Transaction,
+    needs_wabt: bool,
+    needs_initialization: bool,
 ) !Tools {
     const transaction_dir = transaction.storage_path;
     const standalone_wizer = try std.fs.path.join(
@@ -5372,6 +5567,7 @@ fn resolveTools(
     )).snapshot;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
     const weval = if (!config.aot)
+    const weval = if (!config.aot or !needs_initialization)
         null
     else if (config.weval_bin) |path|
         try resolveExecutable(allocator, io, environ, cwd, path)
@@ -5434,6 +5630,45 @@ fn validateAotCache(
         bundle.manifest,
         bundle.expected_feature_abi,
     );
+}
+
+fn snapshotAotInputs(
+    allocator: Allocator,
+    io: Io,
+    transaction_dir: []const u8,
+    engine: []const u8,
+    weval: []const u8,
+    bundle: AotCache,
+) !AotSnapshot {
+    const snapshot_engine = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "validated-engine.wasm" },
+    );
+    const snapshot_weval = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "validated-weval" },
+    );
+    const snapshot_cache = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, aot_cache.cache_basename },
+    );
+    const snapshot_manifest = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, aot_cache.manifest_basename },
+    );
+    try Dir.copyFileAbsolute(engine, snapshot_engine, io, .{});
+    try Dir.copyFileAbsolute(weval, snapshot_weval, io, .{});
+    try Dir.copyFileAbsolute(bundle.cache, snapshot_cache, io, .{});
+    try Dir.copyFileAbsolute(bundle.manifest, snapshot_manifest, io, .{});
+    return .{
+        .engine = snapshot_engine,
+        .weval = snapshot_weval,
+        .bundle = .{
+            .cache = snapshot_cache,
+            .manifest = snapshot_manifest,
+            .expected_feature_abi = bundle.expected_feature_abi,
+        },
+    };
 }
 
 fn resolvedFeatureAbi(
