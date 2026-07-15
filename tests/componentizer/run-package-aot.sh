@@ -95,9 +95,19 @@ db.execute("""create table weval_cache(
     result blob not null,
     created_time integer not null
 )""")
-db.execute(
-    "insert into weval_cache values (?, ?, ?, unixepoch())",
-    (engine_hash, ("key-" + sys.argv[3]).encode(), b"result"),
+label = sys.argv[3].encode()
+db.executemany(
+    "insert into weval_cache values (?, ?, ?, ?)",
+    [
+        (engine_hash, b"key-" + label, b"result-" + label, 101),
+        (
+            engine_hash,
+            b"\x00\xfflarge-key-" + label,
+            bytes(range(256)) * 32 + label,
+            202,
+        ),
+        (engine_hash, b"", b"", 303),
+    ],
 )
 db.execute("create index idx on weval_cache(module_hash, key)")
 db.commit()
@@ -111,6 +121,43 @@ PY
     --primer "$PRIMER" \
     --feature-abi "package-race-$label" \
     --out "$bin/starling-ics.wevalcache.manifest"
+  "$bin/starling-aot-cache" seal \
+    --engine "$bin/starling-raw.wasm" \
+    --weval "$bin/weval" \
+    --cache "$bin/starling-ics.wevalcache.raw" \
+    --cache-out "$bin/starling-ics.wevalcache.repeat" \
+    --primer "$PRIMER" \
+    --feature-abi "package-race-$label" \
+    --out "$bin/starling-ics.wevalcache.repeat.manifest"
+  cmp "$bin/starling-ics.wevalcache" \
+    "$bin/starling-ics.wevalcache.repeat"
+  cmp "$bin/starling-ics.wevalcache.manifest" \
+    "$bin/starling-ics.wevalcache.repeat.manifest"
+  python3 - "$bin/starling-ics.wevalcache.raw" \
+    "$bin/starling-ics.wevalcache" <<'PY'
+import sqlite3
+import sys
+
+raw = sqlite3.connect(sys.argv[1])
+expected = [
+    (module_hash, key, result, 0)
+    for module_hash, key, result in raw.execute(
+        "select module_hash, key, result "
+        "from weval_cache order by module_hash, key, result"
+    )
+]
+raw.close()
+
+sealed = sqlite3.connect(sys.argv[2])
+actual = list(sealed.execute(
+    "select module_hash, key, result, created_time "
+    "from weval_cache order by module_hash, key, result"
+))
+assert len(actual) == 3
+assert actual == expected
+assert sealed.execute("pragma integrity_check").fetchone() == ("ok",)
+sealed.close()
+PY
 }
 
 make_bundle A

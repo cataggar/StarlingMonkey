@@ -38,8 +38,6 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-release
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-release
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-aot
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-aot
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -69,6 +67,7 @@ jobs:
           just mode=release builddir=build-release build starling
           just mode=relwithdebinfo builddir=build-debug build starling
           ./deps/build-deps.sh --all
+          just builddir=build-aot aot-build
 
       - name: Validate CMake host API release matrix
         env:
@@ -76,8 +75,6 @@ jobs:
         run: |
           zig build host-api-cmake-production-matrix-test \
             -Doptimize=ReleaseSmall
-          ./deps/build-deps.sh --aot
-          just builddir=build-aot aot-build
 
       - name: Prepare Artifacts
         run: |

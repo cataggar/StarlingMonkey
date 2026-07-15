@@ -301,6 +301,10 @@ const SqliteDb = opaque {};
 const SqliteStmt = opaque {};
 const SqliteDestructor = ?*const fn (?*anyopaque) callconv(.c) void;
 
+fn freeSqliteBlob(pointer: ?*anyopaque) callconv(.c) void {
+    std.c.free(pointer);
+}
+
 const Sqlite = struct {
     library: std.DynLib,
     open_v2: *const fn ([*:0]const u8, *?*SqliteDb, c_int, ?[*:0]const u8) callconv(.c) c_int,
@@ -495,17 +499,33 @@ fn writeCanonicalCache(
                         return error.InvalidCacheFormat;
                     const length = sqlite.column_bytes(rows, @intCast(column));
                     if (length < 0) return error.InvalidCacheFormat;
-                    var empty: [1]u8 = .{0};
-                    const bytes: *const anyopaque = sqlite.column_blob(
+                    const source_blob = sqlite.column_blob(
                         rows,
                         @intCast(column),
-                    ) orelse if (length == 0) @ptrCast(&empty) else return error.InvalidCacheFormat;
+                    );
+                    const allocation = std.c.malloc(@max(
+                        @as(usize, @intCast(length)),
+                        1,
+                    )) orelse return error.OutOfMemory;
+                    if (length > 0) {
+                        const bytes: [*]const u8 = @ptrCast(
+                            source_blob orelse {
+                                std.c.free(allocation);
+                                return error.InvalidCacheFormat;
+                            },
+                        );
+                        const copy: [*]u8 = @ptrCast(allocation);
+                        @memcpy(
+                            copy[0..@intCast(length)],
+                            bytes[0..@intCast(length)],
+                        );
+                    }
                     if (sqlite.bind_blob(
                         insert,
                         @intCast(column + 1),
-                        bytes,
+                        allocation,
                         length,
-                        null,
+                        freeSqliteBlob,
                     ) != sqlite_ok) return error.InvalidCacheFormat;
                 }
                 if (sqlite.step(insert) != sqlite_done)

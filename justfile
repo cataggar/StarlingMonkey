@@ -34,6 +34,10 @@ build target="all" *flags:
         esac
         '{{ zig }}' build "${zig_step[@]}" --prefix '{{ builddir }}' \
             -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
+        if [[ '{{ target }}' == starling ]]; then
+            '{{ builddir }}/bin/componentize.sh' \
+                --output '{{ builddir }}/starling.wasm'
+        fi
         exit
     fi
 
@@ -93,8 +97,8 @@ aot-build *flags:
 
 [group('aot')]
 aot-test: aot-build
-    just --justfile '{{ justdir }}/justfile' mode=weval \
-        builddir='{{ builddir }}' build starling-raw.wasm
+    {{ justdir }}/tests/componentizer/run-legacy-aot-targets.sh \
+        '{{ zig }}' '{{ builddir }}'
     '{{ zig }}' build componentizer-test --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true
     '{{ zig }}' build aot-engine-test --prefix '{{ builddir }}' \

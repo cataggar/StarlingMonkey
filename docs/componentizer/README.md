@@ -84,7 +84,7 @@ normal `deps/sm-obj-zig` archive is never relabeled as AOT. Build dependencies
 and a directly packaged AOT engine with:
 
 ```console
-./deps/build-deps.sh --aot
+./deps/build-deps.sh --all
 zig build -Doptimize=ReleaseSmall -Daot-engine=true
 ```
 

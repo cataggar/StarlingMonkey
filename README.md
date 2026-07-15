@@ -111,7 +111,7 @@ Weval AOT uses a distinct SpiderMonkey build and a sealed, engine-specific IC
 cache. Build that variant and select it explicitly:
 
 ```console
-./deps/build-deps.sh --aot
+./deps/build-deps.sh --all
 zig build -Doptimize=ReleaseSmall -Daot-engine=true
 zig-out/bin/starling-componentize --aot \
   --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
