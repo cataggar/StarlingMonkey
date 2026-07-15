@@ -1648,6 +1648,8 @@ rm -f "$FAKE_AOT_RUNTIME_ARGS_LOG"
 "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE" \
+  --weval-bin "$TOOLS/fake weval" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
@@ -1655,7 +1657,14 @@ rm -f "$FAKE_AOT_RUNTIME_ARGS_LOG"
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --output "$RUNTIME_ONLY_OUTPUT"
 cmp "$ENGINE" "$RUNTIME_ONLY_OUTPUT"
-test ! -e "$FAKE_AOT_RUNTIME_ARGS_LOG"
+test -e "$FAKE_AOT_RUNTIME_ARGS_LOG"
+test ! -s "$FAKE_AOT_RUNTIME_ARGS_LOG"
+python3 - "$FAKE_AOT_ARGV_LOG" <<'PY'
+import sys
+
+args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
+assert args[args.index("--init-func") + 1] == "starling-aot-runtime-initialize"
+PY
 
 export EXPECTED_RUST_MIN_STACK=123456
 PATH="$TOOLS:$PATH" RUST_MIN_STACK=999 "$COMPONENTIZER" \

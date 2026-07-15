@@ -100,6 +100,9 @@ starling_aot_cache_initialize() {
   wizen_impl(true);
 }
 
+extern "C" __attribute__((export_name("starling-aot-runtime-initialize"))) void
+starling_aot_runtime_initialize() {}
+
 WIZER_INIT(wizen);
 
 /**

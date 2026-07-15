@@ -2590,7 +2590,7 @@ fn execute(
         try validateArgument(resolved);
         break :blk resolved;
     } else null;
-    const needs_initialization = source != null;
+    const needs_initialization = source != null or config.aot;
     const initializer = if (config.initializer_script_path) |path|
         try resolveExistingFile(allocator, io, cwd, path)
     else
@@ -3099,7 +3099,7 @@ fn execute(
     try Dir.createDirAbsolute(io, transaction_dir, private_permissions);
     defer Dir.cwd().deleteTree(io, transaction_dir) catch {};
 
-    const aot_snapshot = if (config.aot and needs_initialization) blk: {
+    const aot_snapshot = if (config.aot) blk: {
         const bundle = runtime.aot_cache orelse return error.MissingAotCache;
         const snapshot = try snapshotAotInputs(
             allocator,
@@ -3183,13 +3183,16 @@ fn execute(
         wizer_args.appendSlice(allocator, &.{
             "--allow-wasi",
     var initialization_args: std.ArrayList([]const u8) = .empty;
-    if (config.aot and needs_initialization) {
+    if (config.aot) {
         initialization_args.appendSlice(allocator, &.{
             aot_snapshot.?.weval,
             "weval",
             "-w",
             "--init-func",
-            "wizer-initialize",
+            if (source != null)
+                "wizer-initialize"
+            else
+                "starling-aot-runtime-initialize",
             "--cache-ro",
             aot_snapshot.?.bundle.cache,
         }) catch @panic("out of memory");
@@ -3294,11 +3297,22 @@ fn execute(
             if (initializer) |initializer_path| {
                 const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
                 try addPreopen(allocator, &initialization_args, initializer_dir);
+    if (needs_initialization) {
+        if (source) |source_path| {
+            const source_dir = std.fs.path.dirname(source_path) orelse return error.InvalidPath;
+            if (!config.legacy_wrapper_preopen or config.preopen_dirs.len == 0) {
+                try addPreopen(allocator, &initialization_args, source_dir);
             }
-        }
-        for (config.preopen_dirs) |preopen| {
-            const preopen_abs = try absolutePath(allocator, cwd, preopen);
-            try addPreopen(allocator, &initialization_args, preopen_abs);
+            if (!config.legacy_wrapper_preopen) {
+                if (initializer) |initializer_path| {
+                    const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
+                    try addPreopen(allocator, &initialization_args, initializer_dir);
+                }
+            }
+            for (config.preopen_dirs) |preopen| {
+                const preopen_abs = try absolutePath(allocator, cwd, preopen);
+                try addPreopen(allocator, &initialization_args, preopen_abs);
+            }
         }
         initialization_args.appendSlice(
             allocator,
