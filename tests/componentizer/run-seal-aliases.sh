@@ -66,7 +66,8 @@ expect_collision() {
     echo "FAIL: $label seal collision unexpectedly succeeded" >&2
     exit 1
   fi
-  grep -Fq 'AOT cache seal path collision:' "$SCRATCH/$label.log"
+  grep -Eq 'AOT cache seal path collision:|InvalidDestinationKind' \
+    "$SCRATCH/$label.log"
   assert_inputs_unchanged
 }
 
@@ -131,6 +132,72 @@ expect_collision hardlink \
 test "$(stat -c '%d:%i' "$HARDLINK_MANIFEST")" = "$PRIMER_INODE"
 test ! -e "$HARDLINK_CACHE"
 
+KIND_MANIFEST="$WORK/kind manifest"
+DIRECTORY_OUTPUT="$WORK/directory output"
+mkdir "$DIRECTORY_OUTPUT"
+DIRECTORY_ID="$(stat -c '%d:%i:%f' "$DIRECTORY_OUTPUT")"
+expect_collision directory-output \
+  "$CACHE_TOOL" seal \
+  --engine "$ENGINE" \
+  --weval "$WEVAL" \
+  --cache "$SOURCE_CACHE" \
+  --cache-out "$DIRECTORY_OUTPUT" \
+  --primer "$PRIMER" \
+  --feature-abi seal-alias-test \
+  --out "$KIND_MANIFEST"
+test "$(stat -c '%d:%i:%f' "$DIRECTORY_OUTPUT")" = "$DIRECTORY_ID"
+test ! -e "$KIND_MANIFEST"
+
+FIFO_OUTPUT="$WORK/fifo output"
+mkfifo "$FIFO_OUTPUT"
+FIFO_ID="$(stat -c '%d:%i:%f' "$FIFO_OUTPUT")"
+expect_collision fifo-output \
+  "$CACHE_TOOL" seal \
+  --engine "$ENGINE" \
+  --weval "$WEVAL" \
+  --cache "$SOURCE_CACHE" \
+  --cache-out "$WORK/fifo cache" \
+  --primer "$PRIMER" \
+  --feature-abi seal-alias-test \
+  --out "$FIFO_OUTPUT"
+test "$(stat -c '%d:%i:%f' "$FIFO_OUTPUT")" = "$FIFO_ID"
+test ! -e "$WORK/fifo cache"
+
+SOCKET_OUTPUT="$WORK/socket output"
+python3 - "$SOCKET_OUTPUT" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+SOCKET_ID="$(stat -c '%d:%i:%f' "$SOCKET_OUTPUT")"
+expect_collision socket-output \
+  "$CACHE_TOOL" seal \
+  --engine "$ENGINE" \
+  --weval "$WEVAL" \
+  --cache "$SOURCE_CACHE" \
+  --cache-out "$WORK/socket cache" \
+  --primer "$PRIMER" \
+  --feature-abi seal-alias-test \
+  --out "$SOCKET_OUTPUT"
+test "$(stat -c '%d:%i:%f' "$SOCKET_OUTPUT")" = "$SOCKET_ID"
+test ! -e "$WORK/socket cache"
+
+DEVICE_ID="$(stat -c '%d:%i:%f' /dev/null)"
+expect_collision device-output \
+  "$CACHE_TOOL" seal \
+  --engine "$ENGINE" \
+  --weval "$WEVAL" \
+  --cache "$SOURCE_CACHE" \
+  --cache-out /dev/null \
+  --primer "$PRIMER" \
+  --feature-abi seal-alias-test \
+  --out "$WORK/device manifest"
+test "$(stat -c '%d:%i:%f' /dev/null)" = "$DEVICE_ID"
+test ! -e "$WORK/device manifest"
+
 mkdir -p "$WORK/normalized/nested"
 printf 'preserved-normalized-output\n' > "$WORK/normalized/cache"
 expect_collision normalized-relative \
@@ -163,6 +230,15 @@ SAFE_MANIFEST="$WORK/safe manifest"
   --cache "$SAFE_CACHE" \
   --manifest "$SAFE_MANIFEST" \
   --feature-abi seal-alias-test
+(
+  cd "$WORK"
+  "$CACHE_TOOL" validate \
+    --engine engine.wasm \
+    --weval "weval tool" \
+    --cache "safe canonical cache" \
+    --manifest "safe manifest" \
+    --feature-abi seal-alias-test
+)
 assert_inputs_unchanged
 
 IN_PLACE_CACHE="$WORK/in-place cache"

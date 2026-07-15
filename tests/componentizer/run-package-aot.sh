@@ -13,46 +13,13 @@ PACKAGE_SCRIPT="$(resolve_executable "$2")"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/tests/componentizer/.aot-package-race"
 BARRIER="$SCRATCH/validation barrier"
-MOVE_TOOLS="$SCRATCH/move tools"
 RELEASE="$SCRATCH/release"
 PRIMER="$SCRATCH/primer.js"
 
 rm -rf "$SCRATCH"
-mkdir -p "$BARRIER" "$MOVE_TOOLS" "$RELEASE"
-validator_pid=""
-cleanup() {
-  if [ -n "$validator_pid" ]; then
-    kill "$validator_pid" 2>/dev/null || true
-  fi
-  rm -rf "$SCRATCH"
-}
-trap cleanup EXIT
+mkdir -p "$BARRIER" "$RELEASE"
+trap 'rm -rf "$SCRATCH"' EXIT
 printf 'function main() {}\n' > "$PRIMER"
-real_mv="$(command -v mv)"
-cat > "$MOVE_TOOLS/mv" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-publishing=0
-for arg in "\$@"; do
-  case "\$arg" in
-    */.aot-package-*/*)
-      publishing=1
-      ;;
-  esac
-done
-if [ "\$publishing" -eq 1 ] &&
-  [ ! -e "$SCRATCH/publisher-\$PPID" ]; then
-  touch "$SCRATCH/publisher-\$PPID"
-  if ! mkdir "$SCRATCH/publication-active"; then
-    echo "concurrent AOT publications overlapped" >&2
-    exit 91
-  fi
-  trap 'rmdir "$SCRATCH/publication-active"' EXIT
-  sleep 1
-fi
-"$real_mv" "\$@"
-EOF
-chmod +x "$MOVE_TOOLS/mv"
 
 make_bundle() {
   local label="$1"
@@ -73,13 +40,6 @@ mkdir -p "$BARRIER/$label.ready"
 while [ ! -d "$BARRIER/A.ready" ] || [ ! -d "$BARRIER/B.ready" ]; do
   sleep 0.01
 done
-validation_parent="\${4%/*}"
-if [ -n "\${HOLD_POST_LOCK_VALIDATOR:-}" ] &&
-  [[ "\${validation_parent##*/}" != .aot-package-* ]]; then
-  printf '%s\n' "\$\$" > "\$HOLD_POST_LOCK_VALIDATOR.pid"
-  touch "\$HOLD_POST_LOCK_VALIDATOR"
-  sleep 30
-fi
 EOF
   chmod +x "$bin/weval" "$bin/wasm-tools"
   python3 - "$bin/starling-ics.wevalcache.raw" \
@@ -169,80 +129,187 @@ PREFIX_B="$SCRATCH/source B"
 test "$(sha256sum "$PREFIX_A/bin/starling-ics.wevalcache" | cut -d ' ' -f 1)" != \
   "$(sha256sum "$PREFIX_B/bin/starling-ics.wevalcache" | cut -d ' ' -f 1)"
 
-PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_A" "$RELEASE" \
-  > "$SCRATCH/package-A.log" 2>&1 &
+wait_for_hook() {
+  local ready="$1"
+  for _ in $(seq 1 10000); do
+    test -e "$ready" && return
+    sleep 0.001
+  done
+  echo "FAIL: timed out waiting for $ready" >&2
+  exit 1
+}
+
+assert_bundle() {
+  local target="$1" owner
+  if cmp -s "$target/starling-raw-weval.wasm" \
+    "$PREFIX_A/bin/starling-raw.wasm"; then
+    owner="$PREFIX_A"
+  elif cmp -s "$target/starling-raw-weval.wasm" \
+    "$PREFIX_B/bin/starling-raw.wasm"; then
+    owner="$PREFIX_B"
+  else
+    echo "FAIL: published engine belongs to neither source bundle" >&2
+    exit 1
+  fi
+  cmp "$target/starling-ics.wevalcache" \
+    "$owner/bin/starling-ics.wevalcache"
+  cmp "$target/starling-ics.wevalcache.manifest" \
+    "$owner/bin/starling-ics.wevalcache.manifest"
+  "$owner/bin/starling-aot-cache" validate \
+    --engine "$target/starling-raw-weval.wasm" \
+    --weval "$owner/bin/weval" \
+    --cache "$target/starling-ics.wevalcache" \
+    --manifest "$target/starling-ics.wevalcache.manifest"
+}
+
+HOOK_A="$SCRATCH/publisher-A-hook"
+HOOK_B="$SCRATCH/publisher-B-hook"
+mkdir "$HOOK_A" "$HOOK_B"
+mkdir -p "$BARRIER/A.ready" "$BARRIER/B.ready"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK_A" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-switch \
+  "$PACKAGE_SCRIPT" "$PREFIX_A" "$RELEASE" \
+    > "$SCRATCH/package-A.log" 2>&1 &
 pid_a=$!
-PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_B" "$RELEASE" \
-  > "$SCRATCH/package-B.log" 2>&1 &
+wait_for_hook "$HOOK_A/before-bundle-switch.ready"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK_B" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=bundle-prepared \
+  "$PACKAGE_SCRIPT" "$PREFIX_B" "$RELEASE" \
+    > "$SCRATCH/package-B.log" 2>&1 &
 pid_b=$!
-status_a=0
-status_b=0
-wait "$pid_a" || status_a=$?
-wait "$pid_b" || status_b=$?
-if [ "$status_a" -ne 0 ] || [ "$status_b" -ne 0 ]; then
-  cat "$SCRATCH/package-A.log" "$SCRATCH/package-B.log" >&2
-  exit 1
-fi
-test -d "$BARRIER/A.ready"
-test -d "$BARRIER/B.ready"
-test ! -e "$SCRATCH/publication-active"
+sleep 0.2
+test ! -e "$HOOK_B/bundle-prepared.ready"
+touch "$HOOK_A/before-bundle-switch.continue"
+wait "$pid_a"
+wait_for_hook "$HOOK_B/bundle-prepared.ready"
+touch "$HOOK_B/bundle-prepared.continue"
+wait "$pid_b"
+assert_bundle "$RELEASE"
+cmp "$RELEASE/starling-raw-weval.wasm" "$PREFIX_B/bin/starling-raw.wasm"
 
-if cmp -s "$RELEASE/starling-raw-weval.wasm" \
-  "$PREFIX_A/bin/starling-raw.wasm"; then
-  owner="$PREFIX_A"
-elif cmp -s "$RELEASE/starling-raw-weval.wasm" \
-  "$PREFIX_B/bin/starling-raw.wasm"; then
-  owner="$PREFIX_B"
-else
-  echo "FAIL: published engine belongs to neither source bundle" >&2
-  exit 1
-fi
+CRASH_RELEASE="$SCRATCH/crash release"
+mkdir "$CRASH_RELEASE"
+"$PACKAGE_SCRIPT" "$PREFIX_A" "$CRASH_RELEASE" \
+  > "$SCRATCH/crash-initial.log" 2>&1
 
-cmp "$RELEASE/starling-ics.wevalcache" \
-  "$owner/bin/starling-ics.wevalcache"
-cmp "$RELEASE/starling-ics.wevalcache.manifest" \
-  "$owner/bin/starling-ics.wevalcache.manifest"
-"$owner/bin/wasm-tools" validate --features all \
-  "$RELEASE/starling-raw-weval.wasm"
-"$owner/bin/starling-aot-cache" validate \
-  --engine "$RELEASE/starling-raw-weval.wasm" \
-  --weval "$owner/bin/weval" \
-  --cache "$RELEASE/starling-ics.wevalcache" \
-  --manifest "$RELEASE/starling-ics.wevalcache.manifest"
-test -z "$(find "$RELEASE" -maxdepth 1 -name '.aot-package-*' -print -quit)"
-
-ABNORMAL_RELEASE="$SCRATCH/abnormal release"
-VALIDATOR_MARKER="$SCRATCH/post-lock-validator"
-mkdir "$ABNORMAL_RELEASE"
-HOLD_POST_LOCK_VALIDATOR="$VALIDATOR_MARKER" \
-PATH="$MOVE_TOOLS:$PATH" "$PACKAGE_SCRIPT" "$PREFIX_A" "$ABNORMAL_RELEASE" \
-  > "$SCRATCH/abnormal-A.log" 2>&1 &
-controller_pid=$!
-for _ in {1..500}; do
-  [ -e "$VALIDATOR_MARKER" ] && break
-  sleep 0.01
+for phase in \
+  before-bundle-stage \
+  after-bundle-stage \
+  bundle-engine-staged \
+  bundle-cache-staged \
+  bundle-manifest-staged \
+  bundle-prepared \
+  before-bundle-switch \
+  after-bundle-switch \
+  bundle-committed \
+  before-bundle-cleanup \
+  after-bundle-cleanup
+do
+  hook="$SCRATCH/crash-$phase"
+  rm -rf "$hook"
+  mkdir "$hook"
+  STARLING_AOT_CACHE_TEST_HOOK_DIR="$hook" \
+  STARLING_AOT_CACHE_TEST_WAIT_AT="$phase" \
+    "$PREFIX_B/bin/starling-aot-cache" publish-bundle \
+      --target "$CRASH_RELEASE" \
+      --engine "$PREFIX_B/bin/starling-raw.wasm" \
+      --engine-name starling-raw-weval.wasm \
+      --weval "$PREFIX_B/bin/weval" \
+      --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
+      --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
+      > "$SCRATCH/crash-$phase.log" 2>&1 &
+  publisher_pid=$!
+  wait_for_hook "$hook/$phase.ready"
+  kill -KILL "$publisher_pid"
+  wait "$publisher_pid" 2>/dev/null || true
+  timeout 5s "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
+    --target "$CRASH_RELEASE"
+  assert_bundle "$CRASH_RELEASE"
+  test -z "$(find "$SCRATCH" -maxdepth 1 \
+    -name '.crash release.starling-aot-generation-*' -print -quit)"
 done
-if [ ! -e "$VALIDATOR_MARKER" ]; then
-  cat "$SCRATCH/abnormal-A.log" >&2
-  echo "post-lock validator did not start" >&2
-  exit 1
-fi
-validator_pid="$(cat "$VALIDATOR_MARKER.pid")"
-kill -KILL "$controller_pid"
-wait "$controller_pid" 2>/dev/null || true
 
-SECONDS=0
-if ! timeout 5s env PATH="$MOVE_TOOLS:$PATH" \
-  "$PACKAGE_SCRIPT" "$PREFIX_B" "$ABNORMAL_RELEASE" \
-  > "$SCRATCH/abnormal-B.log" 2>&1
-then
-  cat "$SCRATCH/abnormal-B.log" >&2
-  echo "replacement publisher did not acquire the released lock promptly" >&2
-  exit 1
-fi
-test "$SECONDS" -lt 5
-kill "$validator_pid" 2>/dev/null || true
-validator_pid=""
+ROLLBACK_RELEASE="$SCRATCH/rollback release"
+mkdir "$ROLLBACK_RELEASE"
+"$PACKAGE_SCRIPT" "$PREFIX_A" "$ROLLBACK_RELEASE" \
+  > "$SCRATCH/rollback-initial.log" 2>&1
+switch_hook="$SCRATCH/rollback-switch"
+mkdir "$switch_hook"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$switch_hook" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=after-bundle-switch \
+  "$PREFIX_B/bin/starling-aot-cache" publish-bundle \
+    --target "$ROLLBACK_RELEASE" \
+    --engine "$PREFIX_B/bin/starling-raw.wasm" \
+    --engine-name starling-raw-weval.wasm \
+    --weval "$PREFIX_B/bin/weval" \
+    --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
+    --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
+    > "$SCRATCH/rollback-switch.log" 2>&1 &
+publisher_pid=$!
+wait_for_hook "$switch_hook/after-bundle-switch.ready"
+kill -KILL "$publisher_pid"
+wait "$publisher_pid" 2>/dev/null || true
+rollback_hook="$SCRATCH/rollback-recovery"
+mkdir "$rollback_hook"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$rollback_hook" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-rollback \
+  "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
+    --target "$ROLLBACK_RELEASE" \
+    > "$SCRATCH/rollback-recovery.log" 2>&1 &
+recovery_pid=$!
+wait_for_hook "$rollback_hook/before-bundle-rollback.ready"
+kill -KILL "$recovery_pid"
+wait "$recovery_pid" 2>/dev/null || true
+timeout 5s "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
+  --target "$ROLLBACK_RELEASE"
+assert_bundle "$ROLLBACK_RELEASE"
+cmp "$ROLLBACK_RELEASE/starling-raw-weval.wasm" \
+  "$PREFIX_A/bin/starling-raw.wasm"
 
-echo "Concurrent AOT package publication passed"
-echo "Abnormal publication lock release passed"
+BUILD_PREFIX="$SCRATCH/existing build prefix"
+BUILD_BIN="$BUILD_PREFIX/bin"
+mkdir -p "$BUILD_BIN"
+"$PREFIX_A/bin/starling-aot-cache" publish-bundle \
+  --target "$BUILD_BIN" \
+  --engine "$PREFIX_A/bin/starling-raw.wasm" \
+  --engine-name starling-raw.wasm \
+  --weval "$PREFIX_A/bin/weval" \
+  --cache "$PREFIX_A/bin/starling-ics.wevalcache" \
+  --manifest "$PREFIX_A/bin/starling-ics.wevalcache.manifest"
+printf 'preserved installed tool\n' > "$BUILD_BIN/starling-componentize"
+for phase in \
+  before-bundle-stage \
+  after-bundle-stage \
+  bundle-engine-staged \
+  bundle-cache-staged \
+  bundle-manifest-staged \
+  bundle-prepared \
+  before-bundle-switch \
+  after-bundle-switch
+do
+  if STARLING_AOT_CACHE_TEST_FAIL="$phase" \
+    "$PREFIX_B/bin/starling-aot-cache" publish-bundle \
+      --target "$BUILD_BIN" \
+      --engine "$PREFIX_B/bin/starling-raw.wasm" \
+      --engine-name starling-raw.wasm \
+      --weval "$PREFIX_B/bin/weval" \
+      --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
+      --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
+      > "$SCRATCH/build-prefix-$phase.log" 2>&1
+  then
+    echo "FAIL: build-prefix $phase injection unexpectedly succeeded" >&2
+    exit 1
+  fi
+  "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
+    --target "$BUILD_BIN"
+  cmp "$BUILD_BIN/starling-raw.wasm" "$PREFIX_A/bin/starling-raw.wasm"
+  cmp "$BUILD_BIN/starling-ics.wevalcache" \
+    "$PREFIX_A/bin/starling-ics.wevalcache"
+  cmp "$BUILD_BIN/starling-ics.wevalcache.manifest" \
+    "$PREFIX_A/bin/starling-ics.wevalcache.manifest"
+  grep -Fq 'preserved installed tool' "$BUILD_BIN/starling-componentize"
+done
+
+echo "Serialized atomic-directory AOT package publication passed"
+echo "AOT package SIGKILL recovery matrix passed"
+echo "Transactional AOT build-prefix failure matrix passed"

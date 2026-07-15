@@ -5796,13 +5796,28 @@ fn createAotStagingDir(
         std.fs.path.dirname(weval) orelse return error.InvalidPath,
     ) catch @panic("out of memory");
     candidates.append(allocator, executable_dir) catch @panic("out of memory");
-    for ([_][]const u8{ "ZIG_GLOBAL_CACHE_DIR", "XDG_RUNTIME_DIR", "TMPDIR" }) |name| {
+    for ([_][]const u8{
+        "ZIG_GLOBAL_CACHE_DIR",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    }) |name| {
         if (environ.get(name)) |path| {
             candidates.append(
                 allocator,
                 try absolutePath(allocator, cwd, path),
             ) catch @panic("out of memory");
         }
+    }
+    if (environ.get("STARLING_AOT_CACHE_TEST_DEFAULT_TMPDIR")) |path| {
+        candidates.append(
+            allocator,
+            try absolutePath(allocator, cwd, path),
+        ) catch @panic("out of memory");
+    } else {
+        if (platformDefaultTempRoot()) |root|
+            candidates.append(allocator, root) catch @panic("out of memory");
     }
     candidates.append(allocator, cwd) catch @panic("out of memory");
 
@@ -5836,6 +5851,28 @@ fn createAotStagingDir(
         return path;
     }
     return error.InvalidPath;
+}
+
+fn platformDefaultTempRoot() ?[]const u8 {
+    return switch (builtin.os.tag) {
+        .dragonfly,
+        .driverkit,
+        .freebsd,
+        .haiku,
+        .hurd,
+        .illumos,
+        .ios,
+        .linux,
+        .macos,
+        .maccatalyst,
+        .netbsd,
+        .openbsd,
+        .tvos,
+        .visionos,
+        .watchos,
+        => "/tmp",
+        else => null,
+    };
 }
 
 fn probeExecutableStagingDir(
@@ -11813,6 +11850,31 @@ fn pathContains(parent: []const u8, child: []const u8) bool {
     if (!std.mem.startsWith(u8, child, parent)) return false;
     if (std.mem.endsWith(u8, parent, &.{std.fs.path.sep})) return true;
     return child.len > parent.len and child[parent.len] == std.fs.path.sep;
+}
+
+test "Unix AOT staging has a platform default temp root" {
+    switch (builtin.os.tag) {
+        .dragonfly,
+        .driverkit,
+        .freebsd,
+        .haiku,
+        .hurd,
+        .illumos,
+        .ios,
+        .linux,
+        .macos,
+        .maccatalyst,
+        .netbsd,
+        .openbsd,
+        .tvos,
+        .visionos,
+        .watchos,
+        => try std.testing.expectEqualStrings(
+            "/tmp",
+            platformDefaultTempRoot().?,
+        ),
+        else => try std.testing.expect(platformDefaultTempRoot() == null),
+    }
 }
 
 test "runtime arguments preserve paths with spaces" {

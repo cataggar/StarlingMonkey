@@ -324,6 +324,15 @@ if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
   test "$(stat -c %a "$(dirname "$0")")" = 500
   test "$(stat -c %a "$0")" = 500
 fi
+if [ -n "${EXPECT_AOT_EXEC_STAGE_ROOT:-}" ]; then
+  case "$0" in
+    "$EXPECT_AOT_EXEC_STAGE_ROOT"/*) ;;
+    *)
+      echo "AOT executable snapshot did not use the default temp root" >&2
+      exit 29
+      ;;
+  esac
+fi
 if [ "${FAKE_AOT_FAIL:-0}" = 1 ]; then
   exit 27
 fi
@@ -1615,7 +1624,7 @@ PY
 
 NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
 mkdir "$NOEXEC_OUTPUT_DIR"
-noexec_result="structural fallback"
+noexec_result="explicit executable-probe fallback"
 if command -v mount >/dev/null &&
   mount -t tmpfs -o noexec,mode=700,size=8m \
     starling-componentizer-noexec "$NOEXEC_OUTPUT_DIR" \
@@ -1640,6 +1649,38 @@ EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
   "$SOURCE"
 cmp "$ENGINE" "$NOEXEC_OUTPUT"
 test -z "$(find "$TOOLS" -maxdepth 1 -name '.starling-aot-exec-*' -print -quit)"
+
+DEFAULT_TEMP="$SCRATCH/platform default temp"
+READONLY_INSTALL="$SCRATCH/read-only install"
+mkdir "$DEFAULT_TEMP" "$READONLY_INSTALL"
+cp "$COMPONENTIZER" "$READONLY_INSTALL/starling-componentize"
+cp "$TOOLS/fake weval" "$READONLY_INSTALL/weval"
+chmod 500 "$READONLY_INSTALL/starling-componentize" "$READONLY_INSTALL/weval"
+chmod 500 "$READONLY_INSTALL"
+DEFAULT_TEMP_OUTPUT="$NOEXEC_OUTPUT_DIR/default temp aot component.wasm"
+(
+  cd "$NOEXEC_OUTPUT_DIR"
+  env -u ZIG_GLOBAL_CACHE_DIR -u XDG_RUNTIME_DIR -u TMPDIR -u TMP -u TEMP \
+    STARLING_AOT_CACHE_TEST_DEFAULT_TMPDIR="$DEFAULT_TEMP" \
+    EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
+    EXPECT_AOT_EXEC_STAGE_ROOT="$DEFAULT_TEMP" \
+    "$READONLY_INSTALL/starling-componentize" \
+      --aot \
+      --engine "$ENGINE" \
+      --aot-cache-dir "$AOT_BUNDLE" \
+      --weval-bin "$READONLY_INSTALL/weval" \
+      --preview2-adapter "$ADAPTER" \
+      --wit "$WIT" \
+      --world-name exports \
+      --wabt-bin "$TOOLS/fake wabt" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --out "$DEFAULT_TEMP_OUTPUT" \
+      "$SOURCE"
+)
+cmp "$ENGINE" "$DEFAULT_TEMP_OUTPUT"
+test -z "$(find "$DEFAULT_TEMP" -maxdepth 1 \
+  -name '.starling-aot-exec-*' -print -quit)"
+chmod 700 "$READONLY_INSTALL"
 if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
   umount "$NOEXEC_OUTPUT_DIR"
   NOEXEC_MOUNTED=0

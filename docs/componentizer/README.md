@@ -127,14 +127,23 @@ engine digest in `weval_cache.module_hash`. The canonical database is checked
 the same way before publication, and validation repeats those checks. Bytes in
 deleted or unrelated rows cannot bind a cache to an engine.
 
-Sealing retains no-follow handles for every input and canonical output
-directory. SQLite reads verified private snapshots populated from those
-handles; both output files are completely built and synced before publication.
-Handle-relative no-replace renames or atomic exchanges compare the displaced
-object with the transaction-start identity. If manifest publication fails,
-the cache exchange is rolled back to the exact original object; an
-identity-protected transaction journal and backups remain only when a raced
-replacement makes automatic rollback unsafe.
+Sealing retains no-follow handles for every input and the initially resolved
+output parents. SQLite parsing, hashing, integrity checks, schema checks, and
+live-row checks all consume those same handles. Publication uses a
+target-scoped kernel lock, private `0700` transaction directories, and a
+checksummed two-slot journal. The journal records both old and new
+inode/content identities and durably advances before and after each cache,
+manifest, and rollback namespace operation. `seal`, `validate`, and the
+explicit `starling-aot-cache recover` command recover an interrupted
+transaction before doing new work. Recovery either restores both exact old
+objects or accepts both exact new objects; an unrelated raced replacement is
+never deleted and keeps the journal/backups recoverable until its owner
+resolves the conflict.
+
+The lock, journal, and empty private transaction directories use hidden
+`.starling-aot-seal-*` names beside the cache. They are persistent control
+metadata, not package artifacts. Cache and manifest filenames and bytes remain
+unchanged and relocatable.
 
 `--aot-cache-dir` selects a read-only cache bundle containing the two
 `starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
@@ -148,6 +157,12 @@ The validated engine, Weval executable, cache, and manifest are copied into a
 private per-run snapshot. Weval consumes those same snapshot bytes, closing
 the validation/reopen replacement window, and the snapshot is removed on
 success or failure.
+
+Executable AOT snapshots are never placed under the output tree. Candidate
+roots are probed with an actual private executable before use. If explicit
+runtime/temp variables are absent, supported Unix hosts also try the platform
+default temporary directory (`/tmp`) before the current directory, so
+read-only installations and no-execute output mounts still work.
 
 `--aot-min-stack-size` sets Weval's `RUST_MIN_STACK`. The deterministic
 default is 8 MiB, and ambient `RUST_MIN_STACK` and `STARLINGMONKEY_CONFIG`
@@ -179,10 +194,16 @@ Its fixtures and cache/output paths include spaces.
 
 Release packaging must keep the cache and manifest together. The repository's
 packaging gate builds through Zig and validates both the engine module and the
-sealed SQLite bundle before publication. A target-scoped kernel lock serializes
-publishers and is automatically released on process termination, so a dead
-publisher cannot leave a stale lock. The final installed bundle is revalidated
-while the lock is still held:
+sealed SQLite bundle before publication. Build-prefix installation and release
+packaging share `starling-aot-cache publish-bundle`: it overlays the three
+validated files into a private complete generation directory, syncs it, and
+atomically exchanges the whole target directory. A sibling checksummed journal
+recovers abandoned staging, switching, rollback, and cleanup phases before a
+new publisher starts. A target-scoped kernel lock serializes publishers and is
+automatically released on process termination; no child process inherits it.
+The public package layout remains three ordinary files with the existing
+names. Hidden `.starling-aot-publish-*` lock/journal files live beside, rather
+than inside, the switched directory:
 
 ```console
 just builddir=build-aot aot-package release-artifacts

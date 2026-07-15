@@ -20,6 +20,7 @@ OUTPUTS="$SCRATCH/cache output"
 MANIFESTS="$SCRATCH/manifest output"
 CACHE_OUT="$OUTPUTS/starling.wevalcache"
 MANIFEST_OUT="$MANIFESTS/starling.wevalcache.manifest"
+HOOK="$SCRATCH/hook"
 
 rm -rf "$SCRATCH"
 mkdir -p "$INPUTS" "$OUTPUTS" "$MANIFESTS"
@@ -54,15 +55,19 @@ PY
 
 INPUT_HASHES="$(sha256sum "$ENGINE" "$WEVAL" "$SOURCE_CACHE" "$PRIMER")"
 
+SEAL_ARGS=(
+  seal
+  --engine "$ENGINE"
+  --weval "$WEVAL"
+  --cache "$SOURCE_CACHE"
+  --cache-out "$CACHE_OUT"
+  --primer "$PRIMER"
+  --feature-abi transaction-test
+  --out "$MANIFEST_OUT"
+)
+
 seal() {
-  "$CACHE_TOOL" seal \
-    --engine "$ENGINE" \
-    --weval "$WEVAL" \
-    --cache "$SOURCE_CACHE" \
-    --cache-out "$CACHE_OUT" \
-    --primer "$PRIMER" \
-    --feature-abi transaction-test \
-    --out "$MANIFEST_OUT"
+  "$CACHE_TOOL" "${SEAL_ARGS[@]}"
 }
 
 validate_pair() {
@@ -102,6 +107,117 @@ validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
 PAIR_HASHES="$(sha256sum "$CACHE_OUT" "$MANIFEST_OUT")"
 PAIR_INODES="$(stat -c '%d:%i' "$CACHE_OUT" "$MANIFEST_OUT")"
 
+for phase in \
+  after-preflight \
+  after-weval-hash \
+  after-primer-hash \
+  after-cache-hash \
+  after-manifest-stage \
+  journal-prepared \
+  before-cache-publish \
+  after-cache-publish \
+  before-manifest-publish \
+  after-manifest-publish \
+  committed
+do
+  rm -rf "$HOOK"
+  HOOK="$SCRATCH/crash-$phase"
+  mkdir "$HOOK"
+  cache_before="$(stat -c '%d:%i' "$CACHE_OUT")"
+  manifest_before="$(stat -c '%d:%i' "$MANIFEST_OUT")"
+  STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+  STARLING_AOT_CACHE_TEST_WAIT_AT="$phase" \
+    "$CACHE_TOOL" "${SEAL_ARGS[@]}" \
+      > "$SCRATCH/crash-$phase.log" 2>&1 &
+  seal_pid=$!
+  wait_for_hook "$HOOK/$phase.ready"
+  kill -KILL "$seal_pid"
+  wait "$seal_pid" 2>/dev/null || true
+  "$CACHE_TOOL" recover \
+    --cache "$CACHE_OUT" \
+    --manifest "$MANIFEST_OUT"
+  cache_after="$(stat -c '%d:%i' "$CACHE_OUT")"
+  manifest_after="$(stat -c '%d:%i' "$MANIFEST_OUT")"
+  if { [ "$cache_after" = "$cache_before" ] &&
+      [ "$manifest_after" != "$manifest_before" ]; } ||
+    { [ "$cache_after" != "$cache_before" ] &&
+      [ "$manifest_after" = "$manifest_before" ]; }
+  then
+    echo "FAIL: $phase recovery produced a mixed generation" >&2
+    exit 1
+  fi
+  validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
+  assert_inputs_unchanged
+  assert_no_transaction_files
+done
+
+for phase in before-cache-rollback after-cache-rollback; do
+  rm -rf "$HOOK"
+  HOOK="$SCRATCH/crash-$phase"
+  mkdir "$HOOK"
+  cache_before="$(stat -c '%d:%i' "$CACHE_OUT")"
+  manifest_before="$(stat -c '%d:%i' "$MANIFEST_OUT")"
+  STARLING_AOT_CACHE_TEST_FAIL=after-cache-publish \
+  STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+  STARLING_AOT_CACHE_TEST_WAIT_AT="$phase" \
+    "$CACHE_TOOL" "${SEAL_ARGS[@]}" \
+      > "$SCRATCH/crash-$phase.log" 2>&1 &
+  seal_pid=$!
+  wait_for_hook "$HOOK/$phase.ready"
+  kill -KILL "$seal_pid"
+  wait "$seal_pid" 2>/dev/null || true
+  "$CACHE_TOOL" recover \
+    --cache "$CACHE_OUT" \
+    --manifest "$MANIFEST_OUT"
+  test "$(stat -c '%d:%i' "$CACHE_OUT")" = "$cache_before"
+  test "$(stat -c '%d:%i' "$MANIFEST_OUT")" = "$manifest_before"
+  validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
+  assert_inputs_unchanged
+  assert_no_transaction_files
+done
+
+for phase in before-cache-rollback after-cache-rollback committed; do
+  rm -rf "$HOOK"
+  HOOK="$SCRATCH/replacement-$phase"
+  mkdir "$HOOK"
+  if [ "$phase" = committed ]; then
+    STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+    STARLING_AOT_CACHE_TEST_WAIT_AT="$phase" \
+      "$CACHE_TOOL" "${SEAL_ARGS[@]}" \
+        > "$SCRATCH/replacement-$phase.log" 2>&1 &
+  else
+    STARLING_AOT_CACHE_TEST_FAIL=after-cache-publish \
+    STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+    STARLING_AOT_CACHE_TEST_WAIT_AT="$phase" \
+      "$CACHE_TOOL" "${SEAL_ARGS[@]}" \
+        > "$SCRATCH/replacement-$phase.log" 2>&1 &
+  fi
+  seal_pid=$!
+  wait_for_hook "$HOOK/$phase.ready"
+  mv "$CACHE_OUT" "$SCRATCH/replacement-owned-$phase"
+  printf 'external replacement at %s\n' "$phase" > "$CACHE_OUT"
+  replacement_inode="$(stat -c '%d:%i' "$CACHE_OUT")"
+  touch "$HOOK/$phase.continue"
+  if wait "$seal_pid"; then
+    echo "FAIL: replacement at $phase unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -Fq TransactionRecoveryRequired \
+    "$SCRATCH/replacement-$phase.log"
+  test "$(stat -c '%d:%i' "$CACHE_OUT")" = "$replacement_inode"
+  grep -Fq "external replacement at $phase" "$CACHE_OUT"
+  rm "$CACHE_OUT"
+  mv "$SCRATCH/replacement-owned-$phase" "$CACHE_OUT"
+  "$CACHE_TOOL" recover \
+    --cache "$CACHE_OUT" \
+    --manifest "$MANIFEST_OUT"
+  validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
+  assert_inputs_unchanged
+  assert_no_transaction_files
+done
+
+PAIR_INODES="$(stat -c '%d:%i' "$CACHE_OUT" "$MANIFEST_OUT")"
+
 for phase in after-weval-hash after-primer-hash after-cache-hash after-manifest-stage; do
   if STARLING_AOT_CACHE_TEST_FAIL="$phase" seal \
       > "$SCRATCH/fail-$phase.log" 2>&1; then
@@ -123,6 +239,45 @@ fi
 grep -Fq AotCacheTestFailure "$SCRATCH/fail-after-first.log"
 test "$(sha256sum "$CACHE_OUT" "$MANIFEST_OUT")" = "$PAIR_HASHES"
 test "$(stat -c '%d:%i' "$CACHE_OUT" "$MANIFEST_OUT")" = "$PAIR_INODES"
+validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
+assert_inputs_unchanged
+assert_no_transaction_files
+
+LEGACY_JOURNAL="$OUTPUTS/.aot-transaction-abandoned"
+printf 'state=prepared\n' > "$LEGACY_JOURNAL"
+if validate_pair "$CACHE_OUT" "$MANIFEST_OUT" \
+    > "$SCRATCH/legacy-journal.log" 2>&1; then
+  echo "FAIL: validation ignored an unrecoverable legacy journal" >&2
+  exit 1
+fi
+grep -Fq InvalidRecoveryJournal "$SCRATCH/legacy-journal.log"
+rm "$LEGACY_JOURNAL"
+validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
+
+rm -rf "$HOOK"
+HOOK="$SCRATCH/validation-race"
+mkdir "$HOOK"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=validation-opened \
+  "$CACHE_TOOL" validate \
+    --engine "$ENGINE" \
+    --weval "$WEVAL" \
+    --cache "$CACHE_OUT" \
+    --manifest "$MANIFEST_OUT" \
+    --feature-abi transaction-test \
+    > "$SCRATCH/validation-race.log" 2>&1 &
+validator_pid=$!
+wait_for_hook "$HOOK/validation-opened.ready"
+mv "$CACHE_OUT" "$SCRATCH/validation-open-cache"
+mv "$MANIFEST_OUT" "$SCRATCH/validation-open-manifest"
+printf 'replacement cache\n' > "$CACHE_OUT"
+printf 'replacement manifest\n' > "$MANIFEST_OUT"
+touch "$HOOK/validation-opened.continue"
+wait "$validator_pid"
+grep -Fq 'Validated AOT cache' "$SCRATCH/validation-race.log"
+rm "$CACHE_OUT" "$MANIFEST_OUT"
+mv "$SCRATCH/validation-open-cache" "$CACHE_OUT"
+mv "$SCRATCH/validation-open-manifest" "$MANIFEST_OUT"
 validate_pair "$CACHE_OUT" "$MANIFEST_OUT"
 assert_inputs_unchanged
 assert_no_transaction_files
@@ -207,7 +362,7 @@ LINK_MANIFEST="$ORIGINAL_PARENT/manifest"
 rm -rf "$HOOK"
 mkdir "$HOOK"
 STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
-STARLING_AOT_CACHE_TEST_WAIT_AT=after-preflight \
+STARLING_AOT_CACHE_TEST_WAIT_AT=after-cache-parent-anchor \
   "$CACHE_TOOL" seal \
     --engine "$ENGINE" \
     --weval "$WEVAL" \
@@ -218,15 +373,47 @@ STARLING_AOT_CACHE_TEST_WAIT_AT=after-preflight \
     --out "$LINK_MANIFEST" \
     > "$SCRATCH/parent-race.log" 2>&1 &
 seal_pid=$!
-wait_for_hook "$HOOK/after-preflight.ready"
+wait_for_hook "$HOOK/after-cache-parent-anchor.ready"
 ln -sfn "$RETARGET_PARENT" "$PARENT_LINK"
-touch "$HOOK/after-preflight.continue"
+touch "$HOOK/after-cache-parent-anchor.continue"
 wait "$seal_pid"
 test -f "$ORIGINAL_PARENT/cache"
 test -f "$ORIGINAL_PARENT/manifest"
 test ! -e "$RETARGET_PARENT/cache"
 test ! -e "$RETARGET_PARENT/manifest"
 validate_pair "$ORIGINAL_PARENT/cache" "$ORIGINAL_PARENT/manifest"
+assert_inputs_unchanged
+assert_no_transaction_files
+
+REPLACED_CACHE="$OUTPUTS/input replacement cache"
+REPLACED_MANIFEST="$MANIFESTS/input replacement manifest"
+rm -rf "$HOOK"
+HOOK="$SCRATCH/input-path-race"
+mkdir "$HOOK"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=after-preflight \
+  "$CACHE_TOOL" seal \
+    --engine "$ENGINE" \
+    --weval "$WEVAL" \
+    --cache "$SOURCE_CACHE" \
+    --cache-out "$REPLACED_CACHE" \
+    --primer "$PRIMER" \
+    --feature-abi transaction-test \
+    --out "$REPLACED_MANIFEST" \
+    > "$SCRATCH/input-path-race.log" 2>&1 &
+seal_pid=$!
+wait_for_hook "$HOOK/after-preflight.ready"
+for input in "$ENGINE" "$WEVAL" "$SOURCE_CACHE" "$PRIMER"; do
+  mv "$input" "$input.opened"
+  printf 'raced replacement\n' > "$input"
+done
+touch "$HOOK/after-preflight.continue"
+wait "$seal_pid"
+for input in "$ENGINE" "$WEVAL" "$SOURCE_CACHE" "$PRIMER"; do
+  rm "$input"
+  mv "$input.opened" "$input"
+done
+validate_pair "$REPLACED_CACHE" "$REPLACED_MANIFEST"
 assert_inputs_unchanged
 assert_no_transaction_files
 

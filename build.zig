@@ -708,7 +708,8 @@ pub fn build(b: *std.Build) void {
     raw_wasm = provenanced_raw;
 
     const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
-    b.getInstallStep().dependOn(&install_raw.step);
+    var aot_bundle_publish: ?*std.Build.Step.Run = null;
+    if (!aot_engine) b.getInstallStep().dependOn(&install_raw.step);
 
     var tool_manifest: std.ArrayList(u8) = .empty;
     tool_manifest.appendSlice(
@@ -789,23 +790,29 @@ pub fn build(b: *std.Build) void {
         seal_cache.addArgs(&.{ "--feature-abi", feature_abi, "--out" });
         const manifest = seal_cache.addOutputFileArg("starling-ics.wevalcache.manifest");
 
-        const install_cache = b.addInstallBinFile(
-            sealed_cache,
-            "starling-ics.wevalcache",
+        const publish_bundle = b.addRunArtifact(aot_cache_tool);
+        publish_bundle.addArg("publish-bundle");
+        publish_bundle.addArg("--target");
+        publish_bundle.addDirectoryArg(
+            b.graph.path(.install_prefix, "bin"),
         );
-        const install_manifest = b.addInstallBinFile(
-            manifest,
-            "starling-ics.wevalcache.manifest",
-        );
-        b.getInstallStep().dependOn(&install_cache.step);
-        b.getInstallStep().dependOn(&install_manifest.step);
+        publish_bundle.addArg("--engine");
+        publish_bundle.addFileArg(raw_wasm);
+        publish_bundle.addArgs(&.{ "--engine-name", "starling-raw.wasm" });
+        publish_bundle.addArg("--weval");
+        publish_bundle.addFileArg(weval_dep.path("weval"));
+        publish_bundle.addArg("--cache");
+        publish_bundle.addFileArg(sealed_cache);
+        publish_bundle.addArg("--manifest");
+        publish_bundle.addFileArg(manifest);
+        publish_bundle.addArgs(&.{ "--feature-abi", feature_abi });
+        publish_bundle.has_side_effects = true;
+        aot_bundle_publish = publish_bundle;
         const aot_step = b.step(
             "aot-engine",
             "Build and install the AOT engine with its sealed Weval cache",
         );
-        aot_step.dependOn(&install_raw.step);
-        aot_step.dependOn(&install_cache.step);
-        aot_step.dependOn(&install_manifest.step);
+        aot_step.dependOn(&publish_bundle.step);
     }
 
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
@@ -1291,6 +1298,17 @@ pub fn build(b: *std.Build) void {
         const inst_shell = b.addInstallBinFile(shell_lib.getEmittedBin(), "starling-shell.wasm");
         inst_shell.step.dependOn(&shell_lib.step);
         shell_step.dependOn(&inst_shell.step);
+    }
+
+    if (aot_bundle_publish) |publisher| {
+        const install = b.getInstallStep();
+        const prior = b.allocator.dupe(
+            *std.Build.Step,
+            install.dependencies.items,
+        ) catch @panic("OOM");
+        install.dependencies.clearRetainingCapacity();
+        for (prior) |dependency| publisher.step.dependOn(dependency);
+        install.dependOn(&publisher.step);
     }
 }
 
