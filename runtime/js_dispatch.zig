@@ -133,6 +133,66 @@ extern fn starling_js_resource_validate(
 ) u32;
 
 extern fn starling_js_resource_transfer_many(tokens: [*]const ResourceToken, len: usize) u32;
+extern fn starling_js_exported_resource_commit_many(reps: [*]const i32, len: usize) u32;
+extern fn starling_js_exported_resource_select(
+    rep: i32,
+    provider_ptr: [*]const u8,
+    provider_len: usize,
+    name_ptr: [*]const u8,
+    name_len: usize,
+) u32;
+extern fn starling_js_exported_resource_prepare_own(
+    provider_ptr: [*]const u8,
+    provider_len: usize,
+    name_ptr: [*]const u8,
+    name_len: usize,
+    rep: i32,
+) u32;
+extern fn starling_js_resources_commit_many(
+    tokens: [*]const ResourceToken,
+    token_len: usize,
+    reps: [*]const i32,
+    rep_len: usize,
+) u32;
+extern fn starling_js_exported_resource_drop(
+    provider_ptr: [*]const u8,
+    provider_len: usize,
+    name_ptr: [*]const u8,
+    name_len: usize,
+    rep: i32,
+) u32;
+
+pub fn dropExportResource(
+    comptime provider: []const u8,
+    comptime resource_name: []const u8,
+    rep: i32,
+) void {
+    if (starling_js_exported_resource_drop(
+        provider.ptr,
+        provider.len,
+        resource_name.ptr,
+        resource_name.len,
+        rep,
+    ) != 0) {
+        @panic("native dispatch: exported resource drop failed");
+    }
+}
+
+pub fn prepareExportResourceOwn(
+    comptime provider: []const u8,
+    comptime resource_name: []const u8,
+    rep: i32,
+) void {
+    if (starling_js_exported_resource_prepare_own(
+        provider.ptr,
+        provider.len,
+        resource_name.ptr,
+        resource_name.len,
+        rep,
+    ) != 0) {
+        @panic("native dispatch: exported resource ownership transfer failed");
+    }
+}
 
 pub fn decodeResource(
     value: *const NativeValue,
@@ -146,16 +206,31 @@ pub fn decodeResource(
     if (value.tag != .resource or !ownership_matches) {
         @panic("native dispatch: resource identity or ownership mismatch");
     }
-    const provider_ptr = value.resource_provider_ptr orelse
-        @panic("native dispatch: resource provider is missing");
-    const name_ptr = value.resource_name_ptr orelse
-        @panic("native dispatch: resource name is missing");
-    if (!std.mem.eql(u8, provider_ptr[0..value.resource_provider_len], descriptor.provider) or
-        !std.mem.eql(u8, name_ptr[0..value.resource_name_len], descriptor.name))
-    {
-        @panic("native dispatch: resource identity or ownership mismatch");
+    const exported = value.resource_type_id == 0 and value.resource_generation == 0;
+    if (!builtin.is_test and exported) {
+        if (ownership != .own or
+            starling_js_exported_resource_select(
+                value.resource_handle,
+                descriptor.provider.ptr,
+                descriptor.provider.len,
+                descriptor.name.ptr,
+                descriptor.name.len,
+            ) != 0)
+        {
+            @panic("native dispatch: exported resource identity mismatch");
+        }
+    } else {
+        const provider_ptr = value.resource_provider_ptr orelse
+            @panic("native dispatch: resource provider is missing");
+        const name_ptr = value.resource_name_ptr orelse
+            @panic("native dispatch: resource name is missing");
+        if (!std.mem.eql(u8, provider_ptr[0..value.resource_provider_len], descriptor.provider) or
+            !std.mem.eql(u8, name_ptr[0..value.resource_name_len], descriptor.name))
+        {
+            @panic("native dispatch: resource identity or ownership mismatch");
+        }
     }
-    if (!builtin.is_test) {
+    if (!builtin.is_test and !exported) {
         if (value.resource_type_id == 0 or value.resource_generation == 0) {
             @panic("native dispatch: resource registry token is missing");
         }
@@ -1025,18 +1100,28 @@ fn collectOwnedResources(
     value: *const NativeValue,
     owned_resources: *std.ArrayListUnmanaged(ResourceToken),
     borrowed_owned_resources: *std.ArrayListUnmanaged(ResourceToken),
+    exported_resource_reps: *std.ArrayListUnmanaged(i32),
     allocator: std.mem.Allocator,
 ) void {
     if (comptime wit_types.resourceInfo(T)) |info| {
         if (info.ownership == .own) {
-            owned_resources.append(allocator, .{
-                .type_id = value.resource_type_id,
-                .handle = value.resource_handle,
-                .generation = value.resource_generation,
-                .ownership = .own,
-                .borrow_epoch = 0,
-            }) catch @panic("OOM");
-        } else if (value.resource_ownership == .own) {
+            if (value.resource_type_id == 0 and value.resource_generation == 0) {
+                exported_resource_reps.append(
+                    allocator,
+                    value.resource_handle,
+                ) catch @panic("OOM");
+            } else {
+                owned_resources.append(allocator, .{
+                    .type_id = value.resource_type_id,
+                    .handle = value.resource_handle,
+                    .generation = value.resource_generation,
+                    .ownership = .own,
+                    .borrow_epoch = 0,
+                }) catch @panic("OOM");
+            }
+        } else if (value.resource_ownership == .own and
+            value.resource_type_id != 0)
+        {
             borrowed_owned_resources.append(allocator, .{
                 .type_id = value.resource_type_id,
                 .handle = value.resource_handle,
@@ -1061,6 +1146,7 @@ fn collectOwnedResources(
                     native_item,
                     owned_resources,
                     borrowed_owned_resources,
+                    exported_resource_reps,
                     allocator,
                 );
             }
@@ -1081,6 +1167,7 @@ fn collectOwnedResources(
                 inner,
                 owned_resources,
                 borrowed_owned_resources,
+                exported_resource_reps,
                 allocator,
             );
         },
@@ -1096,6 +1183,7 @@ fn collectOwnedResources(
                         inner,
                         owned_resources,
                         borrowed_owned_resources,
+                        exported_resource_reps,
                         allocator,
                     );
                 }
@@ -1113,6 +1201,7 @@ fn collectOwnedResources(
                         &items[i],
                         owned_resources,
                         borrowed_owned_resources,
+                        exported_resource_reps,
                         allocator,
                     );
                 }
@@ -1128,6 +1217,7 @@ fn collectOwnedResources(
                     field_value,
                     owned_resources,
                     borrowed_owned_resources,
+                    exported_resource_reps,
                     allocator,
                 );
             }
@@ -1149,12 +1239,15 @@ pub fn commitNativeResources(
     defer owned_resources.deinit(allocator);
     var borrowed_owned_resources: std.ArrayListUnmanaged(ResourceToken) = .empty;
     defer borrowed_owned_resources.deinit(allocator);
+    var exported_resource_reps: std.ArrayListUnmanaged(i32) = .empty;
+    defer exported_resource_reps.deinit(allocator);
     collectOwnedResources(
         T,
         decoded,
         value,
         &owned_resources,
         &borrowed_owned_resources,
+        &exported_resource_reps,
         allocator,
     );
     for (owned_resources.items) |owned| {
@@ -1167,12 +1260,43 @@ pub fn commitNativeResources(
             }
         }
     }
-    if (owned_resources.items.len == 0 or builtin.is_test) return true;
-    return starling_js_resource_transfer_many(
+    if ((owned_resources.items.len == 0 and
+        exported_resource_reps.items.len == 0) or builtin.is_test)
+    {
+        return true;
+    }
+    return starling_js_resources_commit_many(
         owned_resources.items.ptr,
         owned_resources.items.len,
+        exported_resource_reps.items.ptr,
+        exported_resource_reps.items.len,
     ) == 0;
 }
+
+fn containsProvisionalExportedResource(value: *const NativeValue) bool {
+    if (value.tag == .resource) {
+        return value.resource_type_id == 0 and value.resource_generation == 0;
+    }
+    if (value.option_ptr) |child| {
+        if (containsProvisionalExportedResource(child)) return true;
+    }
+    if (value.list_ptr) |items| {
+        for (items[0..value.list_len]) |*item| {
+            if (containsProvisionalExportedResource(item)) return true;
+        }
+    }
+    if (value.fields_ptr) |fields| {
+        for (fields[0..value.fields_len]) |field| {
+            const child = field.value orelse continue;
+            if (containsProvisionalExportedResource(child)) return true;
+        }
+    }
+    return false;
+}
+
+var pending_native_result_arena: ?*anyopaque = null;
+var pending_native_result_value: NativeValue = .{ .tag = .undefined_ };
+var pending_native_result_status: u32 = 0;
 
 fn callNative(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
     var arg_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
@@ -1192,6 +1316,7 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
     // position (never for a *nested* result, e.g. inside a record/list).
     const is_wit_result = comptime isWitResultType(Result);
 
+    pending_native_result_arena = null;
     var out_result: NativeValue = .{ .tag = .bool_ };
     var out_arena: ?*anyopaque = null;
     const status = starling_js_dispatch_native(
@@ -1251,7 +1376,13 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
         }
         break :blk decodeNative(Result, &out_result, result_arena.allocator());
     };
-    if (is_wit_result) {
+    const has_provisional_exported_resource =
+        containsProvisionalExportedResource(&out_result);
+    if (has_provisional_exported_resource) {
+        pending_native_result_arena = out_arena;
+        pending_native_result_value = out_result;
+        pending_native_result_status = status;
+    } else if (is_wit_result) {
         const union_info = @typeInfo(Result).@"union";
         const OkType = union_info.field_types[0];
         const ErrType = union_info.field_types[1];
@@ -1289,10 +1420,50 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
             @panic("native dispatch: resource transfer transaction failed");
         }
     }
-    if (starling_js_dispatch_native_free(out_arena) != 0) {
+    if (!has_provisional_exported_resource and
+        starling_js_dispatch_native_free(out_arena) != 0)
+    {
         @panic("JavaScript resource drop failed");
     }
     return decoded;
+}
+
+pub fn completeNativeResult(comptime Result: type, decoded: Result) void {
+    const out_arena = pending_native_result_arena orelse return;
+    pending_native_result_arena = null;
+
+    const committed = if (comptime isWitResultType(Result)) blk: {
+        const union_info = @typeInfo(Result).@"union";
+        const OkType = union_info.field_types[0];
+        const ErrType = union_info.field_types[1];
+        if (pending_native_result_status == 2) {
+            break :blk ErrType == void or commitNativeResources(
+                ErrType,
+                decoded.err,
+                &pending_native_result_value,
+                result_arena.allocator(),
+            );
+        }
+        break :blk OkType == void or commitNativeResources(
+            OkType,
+            decoded.ok,
+            &pending_native_result_value,
+            result_arena.allocator(),
+        );
+    } else commitNativeResources(
+        Result,
+        decoded,
+        &pending_native_result_value,
+        result_arena.allocator(),
+    );
+
+    const freed = starling_js_dispatch_native_free(out_arena) == 0;
+    if (!committed) {
+        @panic("native dispatch: resource transfer transaction failed");
+    }
+    if (!freed) {
+        @panic("JavaScript resource drop failed");
+    }
 }
 
 pub fn call(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
@@ -1462,12 +1633,15 @@ test "resource metadata preserves provider, name, handle, and ownership" {
     defer transfers.deinit(arena.allocator());
     var borrowed_owned: std.ArrayListUnmanaged(ResourceToken) = .empty;
     defer borrowed_owned.deinit(arena.allocator());
+    var exported_reps: std.ArrayListUnmanaged(i32) = .empty;
+    defer exported_reps.deinit(arena.allocator());
     collectOwnedResources(
         Bundle,
         .{ .owned = .{ .handle = 1 }, .borrowed = .{ .handle = 1 } },
         &native_bundle,
         &transfers,
         &borrowed_owned,
+        &exported_reps,
         arena.allocator(),
     );
     try std.testing.expectEqual(@as(usize, 1), transfers.items.len);

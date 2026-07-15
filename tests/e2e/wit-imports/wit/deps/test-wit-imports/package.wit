@@ -209,6 +209,22 @@ interface api {
         y: u32,
     }
 
+    resource js-counter {
+        constructor(initial: s32);
+        increment: func(delta: s32);
+        value: func() -> s32;
+        from-double: static func(value: s32) -> js-counter;
+    }
+
+    resource alternate-counter {
+        constructor(initial: s32);
+        value: func() -> s32;
+    }
+
+    borrow-js-counter: func(value: borrow<js-counter>) -> s32;
+    take-js-counter: func(value: js-counter) -> s32;
+    round-trip-js-counter: func(value: js-counter) -> js-counter;
+
     run-add: func(a: s64, b: s64) -> s64;
     run-sum-list: func(xs: list<u64>) -> u64;
     run-greet: func(name: string) -> string;

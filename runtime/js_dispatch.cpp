@@ -35,7 +35,179 @@ struct JsonBuffer {
   std::string bytes;
 };
 
+enum class ExportResourceOperationKind {
+  Constructor,
+  Method,
+  Static,
+};
+
+struct ExportResourceClassBinding {
+  std::string provider;
+  std::string name;
+  std::string class_name;
+  std::unique_ptr<JS::PersistentRootedObject> constructor;
+  std::unique_ptr<JS::PersistentRootedObject> prototype;
+};
+
+struct ExportResourceOperationBinding {
+  ExportResourceOperationKind kind;
+  std::string dispatch_key;
+  std::string js_name;
+  ExportResourceClassBinding *resource;
+  std::unique_ptr<JS::PersistentRootedValue> function;
+};
+
+struct ExportedResourceEntry {
+  int32_t rep;
+  std::string provider;
+  std::string name;
+  std::vector<ExportResourceClassBinding *> candidates;
+  bool committed = false;
+  bool prepared_owned_argument = false;
+  bool canonical_dropped = false;
+  std::unique_ptr<JS::PersistentRootedObject> object;
+};
+
+std::vector<std::unique_ptr<ExportResourceClassBinding>>
+    export_resource_class_bindings;
+std::vector<std::unique_ptr<ExportResourceOperationBinding>>
+    export_resource_operation_bindings;
+std::vector<std::unique_ptr<ExportedResourceEntry>> exported_resource_entries;
+int32_t next_exported_resource_rep = 1;
+
+ExportResourceClassBinding *export_resource_class(std::string_view provider,
+                                                  std::string_view name) {
+  for (const auto &binding : export_resource_class_bindings) {
+    if (binding->provider == provider && binding->name == name) {
+      return binding.get();
+    }
+  }
+  return nullptr;
+}
+
+ExportResourceOperationBinding *
+export_resource_operation(std::string_view dispatch_key) {
+  for (const auto &binding : export_resource_operation_bindings) {
+    if (binding->dispatch_key == dispatch_key) {
+      return binding.get();
+    }
+  }
+  return nullptr;
+}
+
+ExportedResourceEntry *exported_resource_entry(std::string_view provider,
+                                               std::string_view name,
+                                               int32_t rep) {
+  for (const auto &entry : exported_resource_entries) {
+    if (entry->rep == rep && entry->provider == provider &&
+        entry->name == name) {
+      return entry.get();
+    }
+  }
+  return nullptr;
+}
+
+bool erase_exported_resource(std::string_view provider, std::string_view name,
+                             int32_t rep, bool require_committed) {
+  for (auto it = exported_resource_entries.begin();
+       it != exported_resource_entries.end(); ++it) {
+    const auto &entry = *it;
+    if (entry->rep == rep && entry->provider == provider &&
+        entry->name == name) {
+      if (require_committed && !entry->committed) {
+        return false;
+      }
+      if (require_committed && entry->prepared_owned_argument) {
+        entry->canonical_dropped = true;
+        return true;
+      }
+      exported_resource_entries.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+void rollback_exported_resource(int32_t rep) {
+  for (auto it = exported_resource_entries.begin();
+       it != exported_resource_entries.end(); ++it) {
+    if ((*it)->rep == rep && !(*it)->committed) {
+      exported_resource_entries.erase(it);
+      return;
+    }
+  }
+}
+
+bool allocate_exported_resource_rep(JSContext *cx,
+                                    const std::vector<ExportResourceClassBinding *> &candidates,
+                                    JS::HandleObject object, int32_t *out_rep) {
+  for (uint64_t attempts = 0;
+       attempts < static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+       ++attempts) {
+    const int32_t candidate = next_exported_resource_rep;
+    next_exported_resource_rep =
+        candidate == std::numeric_limits<int32_t>::max() ? 1 : candidate + 1;
+    bool used = false;
+    for (const auto &entry : exported_resource_entries) {
+      if (entry->rep == candidate) {
+        used = true;
+        break;
+      }
+    }
+    if (used) {
+      continue;
+    }
+
+    auto entry = std::make_unique<ExportedResourceEntry>();
+    entry->rep = candidate;
+    entry->candidates = candidates;
+    entry->object =
+        std::make_unique<JS::PersistentRootedObject>(cx, object);
+    exported_resource_entries.push_back(std::move(entry));
+    *out_rep = candidate;
+    return true;
+  }
+  JS_ReportErrorASCII(cx,
+                      "native dispatch: exhausted exported resource reps");
+  return false;
+}
+
+bool exported_resource_classes_for_instance(
+    JSContext *cx, JS::HandleObject object,
+    std::vector<ExportResourceClassBinding *> *out_bindings) {
+  JS::RootedValue value(cx, JS::ObjectValue(*object));
+  out_bindings->clear();
+  for (const auto &binding : export_resource_class_bindings) {
+    JS::RootedObject constructor(cx, binding->constructor->get());
+    bool matches = false;
+    if (!JS_HasInstance(cx, constructor, value, &matches)) {
+      return false;
+    }
+    if (matches) {
+      out_bindings->push_back(binding.get());
+    }
+  }
+  return true;
+}
+
 bool reclaim_pending_dispatch_arena();
+
+void finish_prepared_exported_arguments() {
+  for (auto it = exported_resource_entries.begin();
+       it != exported_resource_entries.end();) {
+    ExportedResourceEntry *entry = it->get();
+    if (!entry->prepared_owned_argument) {
+      ++it;
+      continue;
+    }
+    if (entry->canonical_dropped) {
+      it = exported_resource_entries.erase(it);
+    } else {
+      entry->prepared_owned_argument = false;
+      ++it;
+    }
+  }
+}
 
 bool write_json(const char16_t *chars, uint32_t len, void *data) {
   auto *output = static_cast<JsonBuffer *>(data);
@@ -99,6 +271,56 @@ bool resolve_property_lookup(JSContext *cx, JS::HandleObject object, std::string
   return JS_HasOwnProperty(cx, object, lookup_name->c_str(), has_property);
 }
 
+bool resolve_export_namespace(JSContext *cx, std::string_view interface_id,
+                              JS::MutableHandleObject out_namespace) {
+  JS::RootedValue module_namespace(cx, api::Engine::script_value());
+  if (!module_namespace.isObject()) {
+    JS_ReportErrorASCII(cx, "the top-level JavaScript module has no namespace");
+    return false;
+  }
+
+  size_t slash = interface_id.rfind('/');
+  std::string_view interface_name =
+      slash == std::string_view::npos ? interface_id
+                                      : interface_id.substr(slash + 1);
+  size_t version = interface_name.find('@');
+  if (version != std::string_view::npos) {
+    interface_name = interface_name.substr(0, version);
+  }
+  if (interface_name.empty()) {
+    JS_ReportErrorASCII(cx, "invalid JavaScript export interface name");
+    return false;
+  }
+
+  JS::RootedObject module(cx, &module_namespace.toObject());
+  std::string literal_name(interface_name);
+  std::string lookup_name;
+  bool exists = false;
+  if (!resolve_property_lookup(cx, module, interface_name, &lookup_name,
+                               &exists)) {
+    return false;
+  }
+  if (!exists) {
+    JS_ReportErrorUTF8(
+        cx, "JavaScript module does not export an '%s' interface namespace",
+        literal_name.c_str());
+    return false;
+  }
+
+  JS::RootedValue namespace_value(cx);
+  if (!JS_GetProperty(cx, module, lookup_name.c_str(), &namespace_value)) {
+    return false;
+  }
+  if (!namespace_value.isObject()) {
+    JS_ReportErrorUTF8(
+        cx, "JavaScript module export '%s' is not an interface namespace object",
+        lookup_name.c_str());
+    return false;
+  }
+  out_namespace.set(&namespace_value.toObject());
+  return true;
+}
+
 // Shared by both dispatch bridges. WABT names root-function exports with
 // their bare WIT name and interface functions as
 // `<package>/<interface>[@version]#<function>`. Root functions are resolved
@@ -125,46 +347,15 @@ bool resolve_export_function(JSContext *cx, JS::MutableHandleValue out_function,
   JS::RootedObject namespace_object(cx, &module_namespace.toObject());
   if (separator != std::string_view::npos) {
     std::string_view interface_id = export_name.substr(0, separator);
-    size_t slash = interface_id.rfind('/');
-    std::string_view interface_name =
-        slash == std::string_view::npos ? interface_id : interface_id.substr(slash + 1);
-    size_t version = interface_name.find('@');
-    if (version != std::string_view::npos) {
-      interface_name = interface_name.substr(0, version);
-    }
-    if (interface_name.empty() || function_name.empty()) {
+    if (function_name.empty()) {
       JS_ReportErrorASCII(cx, "invalid qualified JavaScript export name");
       *error_context = "parsing a qualified JavaScript module export";
       return false;
     }
-
-    std::string literal_interface_name(interface_name);
-    std::string interface_lookup;
-    bool has_interface = false;
-    if (!resolve_property_lookup(cx, namespace_object, interface_name, &interface_lookup,
-                                 &has_interface)) {
+    if (!resolve_export_namespace(cx, interface_id, &namespace_object)) {
       *error_context = "resolving a JavaScript interface namespace";
       return false;
     }
-    if (!has_interface) {
-      JS_ReportErrorUTF8(cx, "JavaScript module does not export an '%s' interface namespace",
-                         literal_interface_name.c_str());
-      *error_context = "resolving a JavaScript interface namespace";
-      return false;
-    }
-
-    JS::RootedValue interface_value(cx);
-    if (!JS_GetProperty(cx, namespace_object, interface_lookup.c_str(), &interface_value)) {
-      *error_context = "resolving a JavaScript interface namespace";
-      return false;
-    }
-    if (!interface_value.isObject()) {
-      JS_ReportErrorUTF8(cx, "JavaScript module export '%s' is not an interface namespace object",
-                         interface_lookup.c_str());
-      *error_context = "resolving a JavaScript interface namespace";
-      return false;
-    }
-    namespace_object = &interface_value.toObject();
   }
 
   std::string lookup_name;
@@ -326,6 +517,20 @@ extern "C" __attribute__((weak)) const uint8_t *starling_js_exports_manifest(siz
   return nullptr;
 }
 
+std::vector<std::string_view> split_manifest_fields(std::string_view line) {
+  std::vector<std::string_view> fields;
+  size_t pos = 0;
+  while (true) {
+    const size_t tab = line.find('\t', pos);
+    fields.push_back(line.substr(
+        pos, tab == std::string_view::npos ? line.size() - pos : tab - pos));
+    if (tab == std::string_view::npos) {
+      return fields;
+    }
+    pos = tab + 1;
+  }
+}
+
 bool starling_validate_required_exports() {
   size_t manifest_len = 0;
   const uint8_t *manifest_ptr = starling_js_exports_manifest(&manifest_len);
@@ -340,6 +545,87 @@ bool starling_validate_required_exports() {
   JSAutoRealm realm(cx, api::Engine::global());
   std::string_view manifest(reinterpret_cast<const char *>(manifest_ptr), manifest_len);
 
+  export_resource_operation_bindings.clear();
+  export_resource_class_bindings.clear();
+  exported_resource_entries.clear();
+  next_exported_resource_rep = 1;
+
+  size_t resource_pos = 0;
+  while (resource_pos < manifest.size()) {
+    const size_t newline = manifest.find('\n', resource_pos);
+    if (newline == std::string_view::npos) {
+      JS_ReportErrorASCII(cx,
+                          "malformed JavaScript export manifest: unterminated entry");
+      return false;
+    }
+    const std::string_view line =
+        manifest.substr(resource_pos, newline - resource_pos);
+    resource_pos = newline + 1;
+    const auto fields = split_manifest_fields(line);
+    if (fields.empty() || fields[0] != "ER") {
+      continue;
+    }
+    if (fields.size() != 4 || fields[1].empty() || fields[2].empty() ||
+        fields[3].empty() || export_resource_class(fields[1], fields[2])) {
+      JS_ReportErrorUTF8(cx,
+                         "malformed or duplicate JavaScript exported resource "
+                         "manifest entry '%.*s'",
+                         static_cast<int>(line.size()), line.data());
+      return false;
+    }
+
+    JS::RootedObject interface_namespace(cx);
+    if (!resolve_export_namespace(cx, fields[1], &interface_namespace)) {
+      return false;
+    }
+    std::string class_name(fields[3]);
+    bool exists = false;
+    if (!JS_HasOwnProperty(cx, interface_namespace, class_name.c_str(),
+                           &exists)) {
+      return false;
+    }
+    if (!exists) {
+      JS_ReportErrorUTF8(
+          cx, "JavaScript interface does not export resource class '%s'",
+          class_name.c_str());
+      return false;
+    }
+
+    JS::RootedValue constructor_value(cx);
+    if (!JS_GetProperty(cx, interface_namespace, class_name.c_str(),
+                        &constructor_value)) {
+      return false;
+    }
+    if (!constructor_value.isObject() ||
+        !JS::IsConstructor(&constructor_value.toObject())) {
+      JS_ReportErrorUTF8(cx,
+                         "JavaScript resource export '%s' is not a constructor",
+                         class_name.c_str());
+      return false;
+    }
+    JS::RootedObject constructor(cx, &constructor_value.toObject());
+    JS::RootedValue prototype_value(cx);
+    if (!JS_GetProperty(cx, constructor, "prototype", &prototype_value)) {
+      return false;
+    }
+    if (!prototype_value.isObject()) {
+      JS_ReportErrorUTF8(
+          cx, "JavaScript resource export '%s' has no prototype object",
+          class_name.c_str());
+      return false;
+    }
+
+    auto binding = std::make_unique<ExportResourceClassBinding>();
+    binding->provider = fields[1];
+    binding->name = fields[2];
+    binding->class_name = std::move(class_name);
+    binding->constructor =
+        std::make_unique<JS::PersistentRootedObject>(cx, constructor);
+    binding->prototype = std::make_unique<JS::PersistentRootedObject>(
+        cx, &prototype_value.toObject());
+    export_resource_class_bindings.push_back(std::move(binding));
+  }
+
   size_t pos = 0;
   while (pos < manifest.size()) {
     size_t newline = manifest.find('\n', pos);
@@ -349,7 +635,84 @@ bool starling_validate_required_exports() {
     }
     std::string_view line = manifest.substr(pos, newline - pos);
     pos = newline + 1;
-    if (line.size() < 3 || line[1] != '\t' || (line[0] != 'I' && line[0] != 'R')) {
+    const auto fields = split_manifest_fields(line);
+    if (!fields.empty() && fields[0] == "ER") {
+      continue;
+    }
+    if (!fields.empty() &&
+        (fields[0] == "EC" || fields[0] == "EM" ||
+         fields[0] == "ES")) {
+      if (fields.size() != 6 || fields[1].empty() || fields[2].empty() ||
+          fields[3].empty() || fields[4].empty() || fields[5].empty()) {
+        JS_ReportErrorUTF8(cx,
+                           "malformed JavaScript exported resource operation "
+                           "manifest entry '%.*s'",
+                           static_cast<int>(line.size()), line.data());
+        return false;
+      }
+      ExportResourceClassBinding *resource =
+          export_resource_class(fields[1], fields[2]);
+      if (!resource || export_resource_operation(fields[4])) {
+        JS_ReportErrorUTF8(
+            cx,
+            "unknown resource or duplicate JavaScript exported resource "
+            "operation '%.*s'",
+            static_cast<int>(fields[4].size()), fields[4].data());
+        return false;
+      }
+
+      const ExportResourceOperationKind kind =
+          fields[0] == "EC"
+              ? ExportResourceOperationKind::Constructor
+              : fields[0] == "EM" ? ExportResourceOperationKind::Method
+                                    : ExportResourceOperationKind::Static;
+      JS::RootedValue function(cx);
+      if (kind == ExportResourceOperationKind::Constructor) {
+        function.setObject(*resource->constructor->get());
+      } else {
+        JS::RootedObject target(
+            cx, kind == ExportResourceOperationKind::Method
+                    ? resource->prototype->get()
+                    : resource->constructor->get());
+        std::string js_name(fields[3]);
+        bool exists = false;
+        if (!JS_HasOwnProperty(cx, target, js_name.c_str(), &exists)) {
+          return false;
+        }
+        if (!exists ||
+            !JS_GetProperty(cx, target, js_name.c_str(), &function) ||
+            !function.isObject() ||
+            !JS::IsCallable(&function.toObject())) {
+          JS_ReportErrorUTF8(
+              cx, "JavaScript resource member '%s.%s' is not callable",
+              resource->class_name.c_str(), js_name.c_str());
+          return false;
+        }
+      }
+
+      auto operation = std::make_unique<ExportResourceOperationBinding>();
+      operation->kind = kind;
+      operation->dispatch_key = fields[4];
+      operation->js_name = fields[3];
+      operation->resource = resource;
+      operation->function =
+          std::make_unique<JS::PersistentRootedValue>(cx, function);
+      export_resource_operation_bindings.push_back(std::move(operation));
+      continue;
+    }
+    if (!fields.empty() && fields[0] == "ED") {
+      if (fields.size() != 4 || !export_resource_class(fields[1], fields[2]) ||
+          fields[3].empty()) {
+        JS_ReportErrorUTF8(
+            cx, "malformed JavaScript exported resource destructor manifest "
+                "entry '%.*s'",
+            static_cast<int>(line.size()), line.data());
+        return false;
+      }
+      continue;
+    }
+    if (line.size() < 3 || line[1] != '\t' ||
+        (line[0] != 'I' && line[0] != 'R')) {
       JS_ReportErrorUTF8(cx, "malformed JavaScript export manifest entry '%.*s'",
                          static_cast<int>(line.size()), line.data());
       return false;
@@ -387,12 +750,22 @@ static uint32_t dispatch_json_impl(const uint8_t *export_name_ptr, size_t export
   }
   JSAutoRealm realm(cx, api::Engine::global());
 
+  const std::string_view dispatch_key(
+      reinterpret_cast<const char *>(export_name_ptr), export_name_len);
+  ExportResourceOperationBinding *resource_operation =
+      export_resource_operation(dispatch_key);
   JS::RootedValue function(cx);
   const char *error_context = "resolving a JavaScript module export";
   std::string function_name;
-  if (!resolve_export_function(cx, &function, export_name_ptr, export_name_len,
-                               &error_context, &function_name)) {
-    return dispatch_error(cx, error_context);
+  if (resource_operation) {
+    function.set(resource_operation->function->get());
+    function_name = resource_operation->js_name;
+  } else {
+    if (!resolve_export_function(cx, &function, export_name_ptr,
+                                 export_name_len, &error_context,
+                                 &function_name)) {
+      return dispatch_error(cx, error_context);
+    }
   }
 
   JS::RootedString args_json(
@@ -435,7 +808,35 @@ static uint32_t dispatch_json_impl(const uint8_t *export_name_ptr, size_t export
   }
 
   JS::RootedValue return_value(cx);
-  if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
+  bool call_succeeded = false;
+  if (!resource_operation) {
+    call_succeeded =
+        JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value);
+  } else if (resource_operation->kind ==
+             ExportResourceOperationKind::Constructor) {
+    JS::RootedObject instance(cx);
+    call_succeeded = JS::Construct(cx, function, argv, &instance);
+    if (call_succeeded) {
+      return_value.setObject(*instance);
+    }
+  } else if (resource_operation->kind ==
+             ExportResourceOperationKind::Method) {
+    if (argv.empty() || !argv[0].isObject()) {
+      JS_ReportErrorASCII(
+          cx, "native dispatch: exported resource method has no receiver");
+      return dispatch_error(cx, "calling a JavaScript resource method");
+    }
+    const JS::HandleValueArray all_args(argv);
+    const JS::HandleValueArray method_args = JS::HandleValueArray::subarray(
+        all_args, 1, all_args.length() - 1);
+    call_succeeded =
+        JS::Call(cx, argv[0], function, method_args, &return_value);
+  } else {
+    JS::RootedValue receiver(
+        cx, JS::ObjectValue(*resource_operation->resource->constructor->get()));
+    call_succeeded = JS::Call(cx, receiver, function, argv, &return_value);
+  }
+  if (!call_succeeded) {
     return dispatch_error(cx, "calling a JavaScript module export");
   }
   // The JSON bridge never carries a top-level WIT `result<T, E>` export (see
@@ -512,8 +913,15 @@ struct NativeArena {
   std::vector<std::unique_ptr<uint8_t[]>> byte_buffers;
   std::vector<std::unique_ptr<StarlingJsValue[]>> list_arrays;
   std::vector<std::unique_ptr<JS::PersistentRootedObject>> resource_roots;
+  std::vector<int32_t> pending_exported_resource_reps;
   api::Engine *dispatch_engine = nullptr;
   bool owns_dispatch_scope = false;
+
+  ~NativeArena() {
+    for (int32_t rep : pending_exported_resource_reps) {
+      rollback_exported_resource(rep);
+    }
+  }
 
   const StarlingJsValue *box(StarlingJsValue v) {
     boxed_values.push_back(std::make_unique<StarlingJsValue>(v));
@@ -707,6 +1115,21 @@ bool encode_resource_to_js(JSContext *cx, const StarlingJsValue &value,
       value.resource_provider_len);
   const std::string_view name(reinterpret_cast<const char *>(value.resource_name_ptr),
                               value.resource_name_len);
+  if (export_resource_class(provider, name)) {
+    ExportedResourceEntry *entry =
+        exported_resource_entry(provider, name, value.resource_handle);
+    if (!entry || !entry->committed) {
+      JS_ReportErrorUTF8(
+          cx,
+          "native dispatch: exported resource '%.*s/%.*s' has a stale or "
+          "unknown representation",
+          static_cast<int>(provider.size()), provider.data(),
+          static_cast<int>(name.size()), name.data());
+      return false;
+    }
+    out.setObject(*entry->object->get());
+    return true;
+  }
   JS::RootedObject proto(cx, resource_prototype(provider, name));
   JS::RootedObject obj(
       cx, JS_NewObjectWithGivenProto(cx, &resource_object_class, proto));
@@ -967,6 +1390,31 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
       return true;
     }
 
+    std::vector<ExportResourceClassBinding *> exported_classes;
+    if (!exported_resource_classes_for_instance(cx, obj, &exported_classes)) {
+      return false;
+    }
+    if (!exported_classes.empty()) {
+      int32_t rep = 0;
+      if (!allocate_exported_resource_rep(cx, exported_classes, obj, &rep)) {
+        return false;
+      }
+      arena.pending_exported_resource_reps.push_back(rep);
+      *out = {
+          .tag = STARLING_JS_RESOURCE,
+          .resource_provider_ptr = nullptr,
+          .resource_provider_len = 0,
+          .resource_name_ptr = nullptr,
+          .resource_name_len = 0,
+          .resource_type_id = 0,
+          .resource_handle = rep,
+          .resource_ownership = STARLING_JS_RESOURCE_OWN,
+          .resource_generation = 0,
+          .resource_borrow_epoch = 0,
+      };
+      return true;
+    }
+
     // A `Uint8Array` must be detected before both the Array check and the
     // generic own-property-keys walk below: it is not itself a JS Array
     // (`JS::IsArrayObject` is false for it), so it would otherwise fall
@@ -1068,12 +1516,22 @@ static uint32_t dispatch_native_impl(const uint8_t *export_name_ptr, size_t expo
   }
   JSAutoRealm realm(cx, api::Engine::global());
 
+  const std::string_view dispatch_key(
+      reinterpret_cast<const char *>(export_name_ptr), export_name_len);
+  ExportResourceOperationBinding *resource_operation =
+      export_resource_operation(dispatch_key);
   JS::RootedValue function(cx);
   const char *error_context = "resolving a JavaScript module export";
   std::string function_name;
-  if (!resolve_export_function(cx, &function, export_name_ptr, export_name_len,
-                               &error_context, &function_name)) {
-    return dispatch_error(cx, error_context);
+  if (resource_operation) {
+    function.set(resource_operation->function->get());
+    function_name = resource_operation->js_name;
+  } else {
+    if (!resolve_export_function(cx, &function, export_name_ptr,
+                                 export_name_len, &error_context,
+                                 &function_name)) {
+      return dispatch_error(cx, error_context);
+    }
   }
 
   JS::RootedValueVector argv(cx);
@@ -1089,7 +1547,35 @@ static uint32_t dispatch_native_impl(const uint8_t *export_name_ptr, size_t expo
   }
 
   JS::RootedValue return_value(cx);
-  if (!JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value)) {
+  bool call_succeeded = false;
+  if (!resource_operation) {
+    call_succeeded =
+        JS::Call(cx, JS::UndefinedHandleValue, function, argv, &return_value);
+  } else if (resource_operation->kind ==
+             ExportResourceOperationKind::Constructor) {
+    JS::RootedObject instance(cx);
+    call_succeeded = JS::Construct(cx, function, argv, &instance);
+    if (call_succeeded) {
+      return_value.setObject(*instance);
+    }
+  } else if (resource_operation->kind ==
+             ExportResourceOperationKind::Method) {
+    if (argv.empty() || !argv[0].isObject()) {
+      JS_ReportErrorASCII(
+          cx, "native dispatch: exported resource method has no receiver");
+      return dispatch_error(cx, "calling a JavaScript resource method");
+    }
+    const JS::HandleValueArray all_args(argv);
+    const JS::HandleValueArray method_args = JS::HandleValueArray::subarray(
+        all_args, 1, all_args.length() - 1);
+    call_succeeded =
+        JS::Call(cx, argv[0], function, method_args, &return_value);
+  } else {
+    JS::RootedValue receiver(
+        cx, JS::ObjectValue(*resource_operation->resource->constructor->get()));
+    call_succeeded = JS::Call(cx, receiver, function, argv, &return_value);
+  }
+  if (!call_succeeded) {
     // ComponentizeJS convention for an export whose own result type is a WIT
     // `result<T, E>`: a thrown value signals `err` (see js_dispatch.h). Only
     // take this path for a plain, still-pending JS exception -- not for the
@@ -1148,18 +1634,24 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
                                                 StarlingJsValue *out_result, void **out_arena) {
   JSContext *cx = api::Engine::cx();
   if (!cx) {
+    finish_prepared_exported_arguments();
     return 1;
   }
   auto *engine = api::Engine::get(cx);
   auto &registry = engine->resource_registry();
-  if (!reclaim_pending_dispatch_arena()) return 1;
+  if (!reclaim_pending_dispatch_arena()) {
+    finish_prepared_exported_arguments();
+    return 1;
+  }
   if (registry.dispatch_depth() == 0 && !starling::drain_resource_drops(engine)) {
+    finish_prepared_exported_arguments();
     return 1;
   }
   registry.enter_dispatch();
   const uint32_t result =
       dispatch_native_impl(export_name_ptr, export_name_len, args_ptr, args_len,
                            result_is_wit_result, out_result, out_arena);
+  finish_prepared_exported_arguments();
   if ((result == 0 || result == 2) && *out_arena) {
     auto *arena = static_cast<NativeArena *>(*out_arena);
     arena->dispatch_engine = engine;
@@ -1207,6 +1699,154 @@ starling_js_resource_transfer_many(const starling::ResourceToken *tokens, size_t
   auto &registry = api::Engine::get(cx)->resource_registry();
   return static_cast<uint32_t>(
       registry.transfer_owned_many(std::span<const starling::ResourceToken>(tokens, len)));
+}
+
+extern "C" uint32_t starling_js_exported_resource_select(
+    int32_t rep, const uint8_t *provider_ptr, size_t provider_len,
+    const uint8_t *name_ptr, size_t name_len) {
+  if (!provider_ptr || !name_ptr) {
+    return 1;
+  }
+  const std::string_view provider(
+      reinterpret_cast<const char *>(provider_ptr), provider_len);
+  const std::string_view name(reinterpret_cast<const char *>(name_ptr),
+                              name_len);
+  for (const auto &entry : exported_resource_entries) {
+    if (entry->rep != rep || entry->committed) {
+      continue;
+    }
+    if (!entry->provider.empty() || !entry->name.empty()) {
+      return entry->provider == provider && entry->name == name ? 0 : 1;
+    }
+    for (ExportResourceClassBinding *candidate : entry->candidates) {
+      if (candidate->provider == provider && candidate->name == name) {
+        entry->provider = candidate->provider;
+        entry->name = candidate->name;
+        return 0;
+      }
+    }
+    return 1;
+  }
+  return 1;
+}
+
+extern "C" uint32_t starling_js_exported_resource_prepare_own(
+    const uint8_t *provider_ptr, size_t provider_len,
+    const uint8_t *name_ptr, size_t name_len, int32_t rep) {
+  if (!provider_ptr || !name_ptr) {
+    return 1;
+  }
+  const std::string_view provider(
+      reinterpret_cast<const char *>(provider_ptr), provider_len);
+  const std::string_view name(reinterpret_cast<const char *>(name_ptr),
+                              name_len);
+  ExportedResourceEntry *entry =
+      exported_resource_entry(provider, name, rep);
+  if (!entry || !entry->committed || entry->prepared_owned_argument) {
+    return 1;
+  }
+  entry->prepared_owned_argument = true;
+  entry->canonical_dropped = false;
+  return 0;
+}
+
+extern "C" uint32_t
+starling_js_exported_resource_commit_many(const int32_t *reps, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    ExportedResourceEntry *entry = nullptr;
+    for (const auto &candidate : exported_resource_entries) {
+      if (candidate->rep == reps[i]) {
+        entry = candidate.get();
+        break;
+      }
+    }
+    if (!entry || entry->committed) {
+      return 1;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (reps[j] == reps[i]) {
+        return 1;
+      }
+    }
+  }
+  for (size_t i = 0; i < len; ++i) {
+    for (const auto &entry : exported_resource_entries) {
+      if (entry->rep == reps[i]) {
+        entry->committed = true;
+        break;
+      }
+    }
+  }
+  return 0;
+}
+
+extern "C" uint32_t starling_js_resources_commit_many(
+    const starling::ResourceToken *tokens, size_t token_len,
+    const int32_t *reps, size_t rep_len) {
+  JSContext *cx = api::Engine::cx();
+  if (!cx) {
+    return 1;
+  }
+  auto &registry = api::Engine::get(cx)->resource_registry();
+  for (size_t i = 0; i < token_len; ++i) {
+    if (tokens[i].ownership != starling::ResourceOwnership::Own ||
+        registry.validate(tokens[i]) != starling::ResourceError::None) {
+      return 1;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (tokens[j].type_id == tokens[i].type_id &&
+          tokens[j].handle == tokens[i].handle &&
+          tokens[j].generation == tokens[i].generation) {
+        return 1;
+      }
+    }
+  }
+  for (size_t i = 0; i < rep_len; ++i) {
+    ExportedResourceEntry *entry = nullptr;
+    for (const auto &candidate : exported_resource_entries) {
+      if (candidate->rep == reps[i]) {
+        entry = candidate.get();
+        break;
+      }
+    }
+    if (!entry || entry->committed || entry->provider.empty() ||
+        entry->name.empty()) {
+      return 1;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (reps[j] == reps[i]) {
+        return 1;
+      }
+    }
+  }
+
+  if (registry.transfer_owned_many(
+          std::span<const starling::ResourceToken>(tokens, token_len)) !=
+      starling::ResourceError::None) {
+    return 1;
+  }
+  for (size_t i = 0; i < rep_len; ++i) {
+    for (const auto &entry : exported_resource_entries) {
+      if (entry->rep == reps[i]) {
+        entry->committed = true;
+        break;
+      }
+    }
+  }
+  return 0;
+}
+
+extern "C" uint32_t starling_js_exported_resource_drop(
+    const uint8_t *provider_ptr, size_t provider_len, const uint8_t *name_ptr,
+    size_t name_len, int32_t rep) {
+  if (!provider_ptr || !name_ptr) {
+    return 1;
+  }
+  const std::string_view provider(
+      reinterpret_cast<const char *>(provider_ptr), provider_len);
+  const std::string_view name(reinterpret_cast<const char *>(name_ptr),
+                              name_len);
+  return erase_exported_resource(provider, name, rep, true) ? 0 : 1;
 }
 
 extern "C" __attribute__((weak)) uint32_t starling_js_resource_drop(

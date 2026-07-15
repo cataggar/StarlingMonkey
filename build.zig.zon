@@ -34,8 +34,8 @@
         // A portable git+https pin (not a local sibling-worktree `.path`), so
         // a clean clone builds without any `/work` sibling directories present.
         .wasip3 = .{
-            .url = "git+https://github.com/cataggar/wabt#b192d8c653d8b14448fefd5368a24f4fcff06a74",
-            .hash = "wasip3-0.3.0-Kmwy2vpVCABccKDkaiS4SOXnf89NAc_6LlxGIn7Ztb0a",
+            .url = "git+https://github.com/cataggar/wabt#fe934942084b783a43c7657431187062542f671d",
+            .hash = "wasip3-0.3.0-Kmwy2rz-CACpDUUsBKXQvBRPBnqX8_LoWwe1Khp6RcCg",
         },
         .wabt = .{
             .url = "git+https://github.com/cataggar/wabt#5f76ef1fec40d0e0c08b2a53a4b75d3f3485d2ab",

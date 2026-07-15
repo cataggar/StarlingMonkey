@@ -404,6 +404,34 @@ OUTPUT_JSON="$PREFIX/output.json"
 echo "[wit-imports e2e] instantiating with 'boom' host import OMITTED (missing-import diagnostics)"
 EMPTY_CALLS_JSON="$PREFIX/calls_empty.json"
 echo '[]' > "$EMPTY_CALLS_JSON"
+
+echo "[wit-imports e2e] exercising JavaScript-backed exported resources"
+RESOURCE_OUTPUT_JSON="$PREFIX/exported-resources.json"
+"$INVOKER" --check-exported-resources "$COMPONENT" "$EMPTY_CALLS_JSON" \
+  > "$RESOURCE_OUTPUT_JSON"
+if python3 - "$RESOURCE_OUTPUT_JSON" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+expected = [{
+    "ok": True,
+    "exportedResources": {
+        "method": 15,
+        "borrow": 15,
+        "consumed": 14,
+        "roundTrip": 15,
+        "alternate": 22,
+    },
+}]
+raise SystemExit(0 if data == expected else 1)
+PYEOF
+then
+  echo "PASS JavaScript-backed exported resource lifecycle"
+else
+  echo "FAIL JavaScript-backed exported resource lifecycle: $(cat "$RESOURCE_OUTPUT_JSON")"
+  fail=1
+fi
+
 if OMIT_OUTPUT=$("$INVOKER" --omit-boom "$COMPONENT" "$EMPTY_CALLS_JSON" 2>&1); then
   echo "FAIL missing-import diagnostics: expected instantiation to fail, but it succeeded: $OMIT_OUTPUT"
   fail=1

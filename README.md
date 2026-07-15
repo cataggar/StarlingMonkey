@@ -153,7 +153,7 @@ arguments or `STARLINGMONKEY_CONFIG`. Values must be whole MiB in the range
 1–4095.
 
 The JavaScript bridge supports synchronous WIT exports covering every value
-shape ComponentizeJS itself supports except resources, streams, and futures:
+shape ComponentizeJS itself supports except streams and futures:
 JSON-representable primitives, exact-precision s64/u64 (as JS `BigInt`, via a
 native, non-JSON dispatch path), f32/f64, strings, `char`, `list<u8>` (a
 JS `Uint8Array`, kept distinct from a generic `list<T>`), records, options,
@@ -169,6 +169,11 @@ like a synchronous throw (`Err(reason)` if the reason's JS shape matches `E`,
 a trap otherwise) -- and, either way, a Promise that never settles at all
 (no progress possible on the job/task queues) always traps deterministically
 rather than hanging, never silently becoming `Err(...)`.
+
+Exported WIT resources are ordinary JavaScript classes. Constructors, methods,
+statics, borrows, owned transfers, same-object round trips, and canonical
+destructors preserve provider-qualified identity and root each object exactly
+while a canonical handle owns it.
 
 See `tests/compat/README.md` for a data-driven manifest and two Node-free test
 harness modes tracking this bridge's compatibility with a pinned ComponentizeJS
@@ -242,7 +247,10 @@ skipped). Root-level function imports are also generated as default ES module
 imports and use the same typed bridge. Imported resources are exposed as
 provider-qualified JavaScript classes with constructors, prototype methods,
 statics, own/borrow parameters and results, atomic ownership transfer, and
-deferred canonical drops. Canonical async imports remain unsupported; the WABT
+deferred canonical drops. Exported resource classes use the reverse mapping:
+JavaScript objects become canonical component resources with transactional
+result lowering and exactly-once destructors. Canonical async imports remain
+unsupported; the WABT
 bindgen fork used by this build (`cataggar/wabt`, see `build.zig.zon`'s
 `.wasip3` dependency) rejects them with a build-time diagnostic rather than
 silently omitting them.

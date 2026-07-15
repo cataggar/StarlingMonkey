@@ -332,6 +332,204 @@ fn resolve_func(
         .with_context(|| format!("export '{interface}#{name}' is not a function"))
 }
 
+fn call_resource_operation(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<Host>,
+    component: &Component,
+    engine: &Engine,
+    name: &str,
+    params: &[Val],
+) -> Result<Vec<Val>> {
+    let func = resolve_func(
+        instance,
+        store,
+        component,
+        engine,
+        Some(API_INTERFACE),
+        name,
+    )?;
+    let result_count = func.ty(&*store).results().count();
+    let mut results = vec![Val::Bool(false); result_count];
+    func.call(&mut *store, params, &mut results)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("calling exported resource operation '{name}'"))?;
+    Ok(results)
+}
+
+fn take_owned_resource(
+    mut results: Vec<Val>,
+    operation: &str,
+) -> Result<wasmtime::component::ResourceAny> {
+    if results.len() != 1 {
+        anyhow::bail!(
+            "{operation} returned {} values, expected one",
+            results.len()
+        );
+    }
+    match results.remove(0) {
+        Val::Resource(resource) if resource.owned() => Ok(resource),
+        other => anyhow::bail!("{operation} returned {other:?}, expected an owned resource"),
+    }
+}
+
+fn take_s32(mut results: Vec<Val>, operation: &str) -> Result<i32> {
+    if results.len() != 1 {
+        anyhow::bail!(
+            "{operation} returned {} values, expected one",
+            results.len()
+        );
+    }
+    match results.remove(0) {
+        Val::S32(value) => Ok(value),
+        other => anyhow::bail!("{operation} returned {other:?}, expected s32"),
+    }
+}
+
+fn check_exported_resources(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<Host>,
+    component: &Component,
+    engine: &Engine,
+) -> Result<serde_json::Value> {
+    let counter = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[constructor]js-counter",
+            &[Val::S32(10)],
+        )?,
+        "js-counter constructor",
+    )?;
+    let alternate = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[constructor]alternate-counter",
+            &[Val::S32(22)],
+        )?,
+        "alternate-counter constructor",
+    )?;
+    let alternate_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[method]alternate-counter.value",
+            &[Val::Resource(alternate)],
+        )?,
+        "alternate-counter.value",
+    )?;
+    alternate
+        .resource_drop(&mut *store)
+        .map_err(anyhow::Error::from)
+        .context("dropping alternate-counter")?;
+    call_resource_operation(
+        instance,
+        store,
+        component,
+        engine,
+        "[method]js-counter.increment",
+        &[Val::Resource(counter), Val::S32(5)],
+    )?;
+    let method_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[method]js-counter.value",
+            &[Val::Resource(counter)],
+        )?,
+        "js-counter.value",
+    )?;
+    let borrowed_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "borrow-js-counter",
+            &[Val::Resource(counter)],
+        )?,
+        "borrow-js-counter",
+    )?;
+
+    let doubled = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[static]js-counter.from-double",
+            &[Val::S32(7)],
+        )?,
+        "js-counter.from-double",
+    )?;
+    let consumed_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "take-js-counter",
+            &[Val::Resource(doubled)],
+        )?,
+        "take-js-counter",
+    )?;
+
+    let replacement = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "round-trip-js-counter",
+            &[Val::Resource(counter)],
+        )?,
+        "round-trip-js-counter",
+    )?;
+    let replacement_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[method]js-counter.value",
+            &[Val::Resource(replacement)],
+        )?,
+        "round-tripped js-counter.value",
+    )?;
+    replacement
+        .resource_drop(&mut *store)
+        .map_err(anyhow::Error::from)
+        .context("dropping round-tripped js-counter")?;
+    if call_resource_operation(
+        instance,
+        store,
+        component,
+        engine,
+        "[method]js-counter.value",
+        &[Val::Resource(counter)],
+    )
+    .is_ok()
+    {
+        anyhow::bail!("consumed js-counter handle remained usable");
+    }
+
+    Ok(serde_json::json!({
+        "method": method_value,
+        "borrow": borrowed_value,
+        "consumed": consumed_value,
+        "roundTrip": replacement_value,
+        "alternate": alternate_value,
+    }))
+}
+
 fn call_and_finalize<T>(
     func: &wasmtime::component::Func,
     store: &mut Store<T>,
@@ -1145,6 +1343,13 @@ fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> 
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let check_resources =
+        if let Some(pos) = args.iter().position(|a| a == "--check-exported-resources") {
+            args.remove(pos);
+            true
+        } else {
+            false
+        };
     let omit_boom = if let Some(pos) = args.iter().position(|a| a == "--omit-boom") {
         args.remove(pos);
         true
@@ -1254,6 +1459,14 @@ fn main() -> Result<()> {
             call_and_finalize(&func, &mut store, &params, &mut results, &stderr_pipe, stderr_pos);
         stderr_pos = new_stderr_pos;
         out.push(record);
+    }
+
+    if check_resources {
+        let value = check_exported_resources(&instance, &mut store, &component, &engine)?;
+        out.push(serde_json::json!({
+            "ok": true,
+            "exportedResources": value,
+        }));
     }
 
     let captured_stdout = stdout_pipe.contents();

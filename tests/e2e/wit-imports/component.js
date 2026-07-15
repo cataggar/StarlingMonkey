@@ -77,6 +77,24 @@ import rootBoom from "root-boom";
 import rootTransform from "root-transform";
 import rootChain from "root-chain";
 
+class JsCounter {
+  constructor(initial) {
+    this.current = initial;
+  }
+
+  static fromDouble(value) {
+    return new JsCounter(value * 2);
+  }
+
+  increment(delta) {
+    this.current += delta;
+  }
+
+  value() {
+    return this.current;
+  }
+}
+
 export function runAdd(a, b) {
   return add(a, b);
 }
@@ -359,6 +377,11 @@ export const incomingHandler = {
 };
 
 export const api = {
+  JsCounter,
+  AlternateCounter: JsCounter,
+  "borrow-js-counter": (value) => value.value(),
+  "take-js-counter": (value) => value.value(),
+  "round-trip-js-counter": (value) => value,
   "run-add": runAdd,
   "run-sum-list": runSumList,
   "run-greet": runGreet,

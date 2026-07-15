@@ -188,6 +188,39 @@ extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_resource_validate(
 extern "C" STARLING_ENGINE_EXPORT uint32_t
 starling_js_resource_transfer_many(const starling::ResourceToken *tokens, size_t len);
 
+// Selects the expected provider-qualified resource class for a provisional
+// JavaScript object result. This makes decoding type-directed when one
+// constructor satisfies more than one exported resource declaration.
+extern "C" STARLING_ENGINE_EXPORT uint32_t
+starling_js_exported_resource_select(
+    int32_t rep, const uint8_t *provider_ptr, size_t provider_len,
+    const uint8_t *name_ptr, size_t name_len);
+
+// Pins an owned exported-resource argument across its canonical drop and the
+// ensuing JavaScript call. Dispatch cleanup releases the pin on both success
+// and failure.
+extern "C" STARLING_ENGINE_EXPORT uint32_t
+starling_js_exported_resource_prepare_own(
+    const uint8_t *provider_ptr, size_t provider_len,
+    const uint8_t *name_ptr, size_t name_len, int32_t rep);
+
+// Commits JavaScript objects returned as guest-exported resources after the
+// complete typed result has decoded and canonical handles have been created.
+// Imported transfers and exported reps validate together before either set is
+// mutated.
+extern "C" STARLING_ENGINE_EXPORT uint32_t
+starling_js_exported_resource_commit_many(const int32_t *reps, size_t len);
+extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_resources_commit_many(
+    const starling::ResourceToken *tokens, size_t token_len,
+    const int32_t *reps, size_t rep_len);
+
+// Releases the JavaScript object rooted for one guest-exported resource rep.
+// Generated `[dtor]resource` exports call this after the canonical host drops
+// its last owned handle.
+extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_exported_resource_drop(
+    const uint8_t *provider_ptr, size_t provider_len, const uint8_t *name_ptr,
+    size_t name_len, int32_t rep);
+
 // Drains all JavaScript-owned WIT resources at a depth-zero embedding
 // lifecycle checkpoint. The wasm export uses the corresponding kebab-case
 // name so component worlds can expose it directly when needed.
