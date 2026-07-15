@@ -168,6 +168,15 @@ endif()
 
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")
+set(WAC_BIN "${CMAKE_CURRENT_BINARY_DIR}/wac")
+set(WAC_URL "https://github.com/bytecodealliance/wac/releases/download/v0.10.1/wac-cli-x86_64-unknown-linux-musl")
+set(WAC_SHA256 "250c11762916ba733c7d22b62487580f21270ec9dde4f13460ea69d300e25406")
+execute_process(
+    COMMAND
+        bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/download-wac.sh"
+        "${WAC_URL}" "${WAC_SHA256}" "${WAC_BIN}"
+    COMMAND_ERROR_IS_FATAL ANY
+)
 if(DEFINED ENV{ZIG})
     set(ZIG_PROGRAM "$ENV{ZIG}")
 else()
@@ -287,6 +296,7 @@ install(
         "${CMAKE_CURRENT_BINARY_DIR}/wasm-tools"
         "${CMAKE_CURRENT_BINARY_DIR}/wasmtime"
         "${CMAKE_CURRENT_BINARY_DIR}/weval"
+        "${WAC_BIN}"
     DESTINATION bin
 )
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${ADAPTER_FILE}" DESTINATION bin)

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
-  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter>" >&2
+if [ "$#" -ne 7 ]; then
+  echo "usage: $0 <componentizer> <zig> <wac> <wasmtime> <wasm-tools> <wabt> <adapter>" >&2
   exit 2
 fi
 
 COMPONENTIZER="$1"
 ZIG="$2"
-WASMTIME="$3"
-WASM_TOOLS="$4"
-WABT="$5"
-ADAPTER="$6"
+WAC="$3"
+WASMTIME="$4"
+WASM_TOOLS="$5"
+WABT="$6"
+ADAPTER="$7"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="$ROOT/tests/componentizer/.real-cache"
 WORK="$CACHE/work with spaces"
@@ -52,6 +53,7 @@ componentize() {
     --component-world-name "$component_world" \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
+    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     "${metadata_args[@]}" \
@@ -69,6 +71,7 @@ WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
   --component-world-name js-dispatch \
   --wasmtime-bin "$WASMTIME" \
   --wabt-bin "$WABT" \
+  --wac-bin "$WAC" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --preview2-adapter "$ADAPTER" \
   --debug-dir "$DEBUG_DIR" \
@@ -302,6 +305,7 @@ surface_case() {
     --component-world-name js-dispatch \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
+    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     "${feature_args[@]}" \
@@ -325,6 +329,12 @@ surface_case() {
     "$oracle_case" \
     "starling:js/api,wasi:cli/run@0.2.10,wasi:http/incoming-handler@0.2.10" \
     "$native_wit" "$shell_wit"
+  if [ "$name" = pure ]; then
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$native_output" -- --invalid-if-visible
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$shell_output" -- --invalid-if-visible
+  fi
 }
 
 surface_case defaults defaults ""

@@ -8,6 +8,9 @@ const RuntimeBuildTool = struct {
     executable: std.Build.LazyPath,
 };
 
+const wac_url = "https://github.com/bytecodealliance/wac/releases/download/v0.10.1/wac-cli-x86_64-unknown-linux-musl";
+const wac_sha256 = "250c11762916ba733c7d22b62487580f21270ec9dde4f13460ea69d300e25406";
+
 fn dependencyExecutable(
     dependency: *std.Build.Dependency,
     name: []const u8,
@@ -158,6 +161,14 @@ pub fn build(b: *std.Build) void {
         @panic("StarlingMonkey v0.4 requires Zig " ++ required_zig_version);
     }
     const optimize = b.standardOptimizeOption(.{});
+    const download_wac = b.addSystemCommand(&.{
+        "bash",
+        "tools/download-wac.sh",
+        wac_url,
+        wac_sha256,
+    });
+    const wac = download_wac.addOutputFileArg("wac");
+    b.getInstallStep().dependOn(&b.addInstallBinFile(wac, "wac").step);
 
     // Native, Node-free driver for the monolithic Zig/WABT componentization
     // pipeline. It is a host tool even though the runtime it builds targets
@@ -248,6 +259,7 @@ pub fn build(b: *std.Build) void {
     );
     componentizer_e2e.addArtifactArg(componentizer);
     componentizer_e2e.addArg(b.graph.zig_exe);
+    componentizer_e2e.addFileArg(wac);
     if (b.lazyDependency("wasmtime", .{})) |dep| {
         componentizer_e2e.addFileArg(dep.path("wasmtime"));
     }
@@ -256,7 +268,7 @@ pub fn build(b: *std.Build) void {
     }
     componentizer_e2e.addArtifactArg(wabt);
     componentizer_e2e.addFileArg(
-        b.path("host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+        b.path("host-apis/wasi-0.2.10/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
     );
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
@@ -593,7 +605,7 @@ pub fn build(b: *std.Build) void {
     const adapter = if (preview1_adapter) |path|
         inputPath(b, path)
     else
-        b.path(b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
+        b.path(b.pathJoin(&.{ ctx.host_api_dir, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
     b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
     const installed_component_wit = component_wit orelse
         b.pathJoin(&.{ ctx.host_api_dir, "wit" });
@@ -748,6 +760,27 @@ pub fn build(b: *std.Build) void {
         b.step("resource-registry-test", "Run resource ownership and lifetime registry tests");
     resource_registry_test_step.dependOn(&run_resource_registry_tests.step);
     test_step.dependOn(resource_registry_test_step);
+    const task_selection_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    task_selection_test_mod.addIncludePath(b.path("host-apis/wasi-0.2.0"));
+    task_selection_test_mod.addCSourceFile(.{
+        .file = b.path("tests/task-selection.cpp"),
+        .flags = &.{ "-std=gnu++23", "-Wall", "-Wextra", "-Werror" },
+        .language = .cpp,
+    });
+    const task_selection_tests = b.addExecutable(.{
+        .name = "task-selection-tests",
+        .root_module = task_selection_test_mod,
+    });
+    const run_task_selection_tests = b.addRunArtifact(task_selection_tests);
+    const task_selection_test_step =
+        b.step("task-selection-test", "Run oldest-ready task selection tests");
+    task_selection_test_step.dependOn(&run_task_selection_tests.step);
+    test_step.dependOn(task_selection_test_step);
     const heap_limit_tests = b.addSystemCommand(&.{ "bash", "tests/js-heap-limit/run.sh" });
     heap_limit_tests.addArg(b.graph.zig_exe);
     if (b.lazyDependency("wasmtime", .{})) |d|
@@ -847,6 +880,15 @@ pub fn build(b: *std.Build) void {
     const feature_selection_runtime_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-runtime-tests.sh" });
     feature_selection_runtime_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_runtime_test_step.dependOn(&feature_selection_runtime_run.step);
+    const host_api_matrix_step = b.step(
+        "host-api-production-matrix-test",
+        "Run version-matched pure production component tests for every host API",
+    );
+    const host_api_matrix_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix.sh", "zig" },
+    );
+    host_api_matrix_run.addArg(b.graph.zig_exe);
+    host_api_matrix_step.dependOn(&host_api_matrix_run.step);
     // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
     // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
     // reactor against a fixture-specific WIT world that additionally

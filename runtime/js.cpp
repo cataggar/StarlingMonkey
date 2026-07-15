@@ -84,21 +84,17 @@ WIZER_INIT(wizen);
  * The main entry function for the runtime.
  *
  * The runtime will be initialized with a configuration derived in the following way:
- * 1. If a command line is provided, it will be parsed and used.
- * 2. Otherwise, the env var `STARLINGMONKEY_CONFIG` will be split into a command line and used.
- * 3. Otherwise, a default configuration is used. In particular, the runtime will attempt to
- *    load the file `./index.js` and run it as the top-level module script.
+ * Runtime configuration is captured while the component is initialized. A
+ * resumed `run` reuses that initialized engine rather than consulting preview2
+ * arguments or environment again. An unsnapshotted runtime uses the default
+ * configuration. This keeps a surfaced zero-import component self-contained
+ * and gives internalized CLI environment calls empty/default semantics.
  */
 extern "C" bool exports_wasi_cli_run_run() {
-  auto arg_strings = host_api::environment_get_arguments();
-  std::vector<std::string_view> args;
-  args.reserve(arg_strings.size());
-  for (auto& arg : arg_strings) { args.push_back(arg);
-}
-
-  auto config_parser = starling::ConfigParser();
-  config_parser.apply_env()->apply_args(args);
-  ENGINE = new api::Engine(config_parser.take());
+  if (!ENGINE) {
+    auto config_parser = starling::ConfigParser();
+    ENGINE = new api::Engine(config_parser.take());
+  }
   return starling::shutdown_resources(ENGINE);
 }
 

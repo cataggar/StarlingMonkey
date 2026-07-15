@@ -23,10 +23,12 @@ E2E=(
 INTEGRATION=( blob btoa crypto event fetch performance timers )
 
 pass=0; fail=0; failed=()
+case_log="$BIN/.suite-$$.log"
+server_log="$BIN/.suite-server-$$.log"
 
 run() { # <label> <test.sh args...>
   local label="$1"; shift
-  if timeout 120 bash "$ROOT/tests/test.sh" "$@" >/tmp/suite-$$.log 2>&1; then
+  if timeout 120 bash "$ROOT/tests/test.sh" "$@" >"$case_log" 2>&1; then
     pass=$((pass + 1)); echo "PASS $label"
   else
     fail=$((fail + 1)); failed+=("$label"); echo "FAIL $label"
@@ -39,13 +41,13 @@ for t in "${E2E[@]}"; do run "e2e/$t" "$BIN" "$ROOT/tests/e2e/$t"; done
 echo "== integration =="
 # The integration suite serves a shared test-server component; componentize it once.
 server="$BIN/test-server.wasm"
-if PREOPEN_DIR="$ROOT/tests" "$BIN/componentize.sh" "$ROOT/tests/integration/test-server.js" -o "$server" >/tmp/suite-srv-$$.log 2>&1; then
+if PREOPEN_DIR="$ROOT/tests" "$BIN/componentize.sh" "$ROOT/tests/integration/test-server.js" -o "$server" >"$server_log" 2>&1; then
   for t in "${INTEGRATION[@]}"; do run "integration/$t" "$BIN" "$ROOT/tests/integration/$t" "$server" "$t"; done
 else
   echo "FAIL integration/test-server (componentize)"; fail=$((fail + 1)); failed+=("integration/test-server")
 fi
 
-rm -f /tmp/suite-$$.log /tmp/suite-srv-$$.log
+rm -f "$case_log" "$server_log"
 echo
 echo "== summary: $pass passed, $fail failed =="
 if [ $fail -ne 0 ]; then

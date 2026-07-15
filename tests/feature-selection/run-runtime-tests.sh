@@ -310,6 +310,15 @@ check_combo() {
       else
         fail_case "$name/validate" "component validation failed"
       fi
+      if STARLINGMONKEY_CONFIG=--invalid-if-visible \
+          "$bin/wasmtime" run -S cli -S inherit-env "$bin/probe.wasm" \
+            -- --invalid-if-visible \
+            >"$bin/probe.run.out.log" 2>"$bin/probe.run.err.log"; then
+        pass_case "$name/run uses empty/default internal CLI environment"
+      else
+        fail_case "$name/run" \
+          "zero-import wasi:cli/run trapped or observed host arguments/environment: $(cat "$bin/probe.run.err.log")"
+      fi
       ;;
 
     *)

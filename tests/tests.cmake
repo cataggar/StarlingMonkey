@@ -12,6 +12,15 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_include_directories(resource-registry-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_features(resource-registry-tests PRIVATE cxx_std_23)
     add_test(NAME resource-registry COMMAND resource-registry-tests)
+
+    add_executable(task-selection-tests
+        ${CMAKE_SOURCE_DIR}/tests/task-selection.cpp
+    )
+    target_include_directories(
+        task-selection-tests PRIVATE ${CMAKE_SOURCE_DIR}/host-apis/wasi-0.2.0
+    )
+    target_compile_features(task-selection-tests PRIVATE cxx_std_23)
+    add_test(NAME task-selection COMMAND task-selection-tests)
 endif()
 
 add_test(

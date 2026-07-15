@@ -11,7 +11,8 @@ command string):
 2. Pre-initialize the JavaScript module with Wizer.
 3. Strip and embed the selected component world with `wasm-tools`.
 4. Adapt the reactor into a component.
-5. Generate and compose feature-surface providers so disabled/runtime-only
+5. Generate and plug feature-surface providers with WAC so
+   disabled/runtime-only
    WASI interfaces do not leak into the caller's world.
 6. Add standard `language=JavaScript` and
    `processed-by=starling-componentize` producers metadata.
@@ -61,12 +62,13 @@ zig-out/bin/starling-componentize --version
 zig build componentizer-test -Doptimize=ReleaseSmall
 ```
 
-The default install places the CLI beside `wasmtime`, `wasm-tools`,
+The default install places the CLI beside `wasmtime`, `wasm-tools`, WAC,
 `wabt`, `preview1-adapter.wasm`, and `starling-raw.wasm`.
 `starling-feature-surface` and the selected `feature-wit` closure are installed
 beside them and shared with the shell componentizer.
-The bundled preview1 adapters are built against that same WASI 0.2.10 closure,
-so adapting preview1 does not introduce a second, older WASI import surface.
+The installed preview1 adapter and feature-provider WIT closure match the
+selected host API version, so componentization does not mix interface or
+resource identities across WASI releases.
 The componentizer test target is the required gate: it runs unit and fake-tool
 coverage plus real `wasm-tools`/Wizer relinks for two distinct WIT worlds.
 

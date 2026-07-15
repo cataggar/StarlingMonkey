@@ -21,6 +21,7 @@ pub const Features = struct {
 };
 
 pub const Options = struct {
+    wac: []const u8,
     wasm_tools: []const u8,
     platform_wit: []const u8,
     component: []const u8,
@@ -191,11 +192,11 @@ pub fn apply(
             options,
             "feature surface: compose provider",
             &.{
-                options.wasm_tools,
-                "compose",
-                consumer,
-                "--definitions",
+                options.wac,
+                "plug",
+                "--plug",
                 provider,
+                consumer,
                 "-o",
                 output,
             },
@@ -218,54 +219,16 @@ fn buildProvider(
     if (depth == 8) return error.FeatureProviderCycle;
     const provider_dir = try passPath(allocator, options.work_dir, depth, "provider-wit");
     try Dir.cwd().createDirPath(io, provider_dir);
-    const platform_core = try passPath(allocator, options.work_dir, depth, "provider-platform-core.wasm");
-    const platform_component = try passPath(
-        allocator,
-        options.work_dir,
-        depth,
-        "provider-platform.wasm",
-    );
     try runCommand(
         allocator,
         io,
         options,
-        "feature surface: generate provider platform core",
-        &.{
-            options.wasm_tools,
-            "component",
-            "embed",
-            options.platform_wit,
-            "--world",
-            "bindings",
-            "--dummy",
-            "-o",
-            platform_core,
-        },
-    );
-    try runCommand(
-        allocator,
-        io,
-        options,
-        "feature surface: generate provider platform component",
-        &.{
-            options.wasm_tools,
-            "component",
-            "new",
-            platform_core,
-            "-o",
-            platform_component,
-        },
-    );
-    try runCommand(
-        allocator,
-        io,
-        options,
-        "feature surface: resolve provider WIT",
+        "feature surface: resolve exact candidate WIT",
         &.{
             options.wasm_tools,
             "component",
             "wit",
-            platform_component,
+            options.component,
             "--out-dir",
             provider_dir,
         },

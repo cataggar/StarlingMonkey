@@ -2225,6 +2225,7 @@ const WizerTool = struct {
 const Tools = struct {
     wizer: WizerTool,
     wabt: ?Snapshot,
+    wac: Snapshot,
     wasm_tools: Snapshot,
 };
 
@@ -2997,6 +2998,7 @@ fn execute(
         "surfaced.wasm",
     );
     try feature_surface.apply(allocator, io, .{
+        .wac = tools.wac.path,
         .wasm_tools = tools.wasm_tools.path,
         .platform_wit = runtime.platform_wit,
         .component = candidate.path,
@@ -4462,6 +4464,12 @@ fn resolveTools(
             "wasm-tools",
             "wasm-tools",
         );
+    const wac_source = if (config.wac_bin) |path|
+        try absolutePath(allocator, cwd, path)
+    else if (environ.get("WAC_BIN")) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        try siblingOrName(allocator, io, executable_dir, "wac", "wac");
     const wabt_source = if (!needs_wabt)
         null
     else if (config.wabt_bin) |path|
@@ -4489,6 +4497,14 @@ fn resolveTools(
         transaction,
         "wasm-tools",
     )).snapshot;
+    const wac = (try captureInputFile(
+        allocator,
+        io,
+        try resolveExecutable(allocator, io, environ, wac_source),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "wac" }),
+        transaction,
+        "wac",
+    )).snapshot;
     const wabt = if (wabt_source) |path|
         (try captureInputFile(
             allocator,
@@ -4500,7 +4516,7 @@ fn resolveTools(
         )).snapshot
     else
         null;
-    return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
+    return .{ .wizer = wizer, .wabt = wabt, .wac = wac, .wasm_tools = wasm_tools };
 }
 
 fn discoverBuildRoot(

@@ -91,15 +91,48 @@ echo "[wit-imports e2e] building dispatch-enabled runtime into $PREFIX"
   -Ddispatch-world=js-exports
 
 BIN="$PREFIX/bin"
-COMPONENT="$PREFIX/wit-imports.wasm"
+SHELL_COMPONENT="$PREFIX/wit-imports-shell.wasm"
+COMPONENT="$SHELL_COMPONENT"
+NATIVE_COMPONENT="$PREFIX/wit-imports-native.wasm"
+SHELL_BEFORE="$PREFIX/wit-imports-shell-before.wasm"
+NATIVE_DEBUG="$PREFIX/native-debug"
 
-echo "[wit-imports e2e] componentizing tests/e2e/wit-imports/component.js"
+echo "[wit-imports e2e] componentizing through the installed shell"
+FEATURE_SURFACE_BEFORE="$SHELL_BEFORE" \
 WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
 WASM_TOOLS_BIN="$BIN/wasm-tools" \
   "$BIN/componentize.sh" tests/e2e/wit-imports/component.js -o "$COMPONENT"
 
-echo "[wit-imports e2e] validating component"
-"$BIN/wasm-tools" validate --features all "$COMPONENT"
+echo "[wit-imports e2e] componentizing through the native production CLI"
+"$BIN/starling-componentize" \
+  --engine "$BIN/starling-raw.wasm" \
+  --wit "$REPO_ROOT/tests/e2e/wit-imports/wit/deps/test-wit-imports" \
+  --world-name js-exports \
+  --component-wit "$REPO_ROOT/tests/e2e/wit-imports/wit" \
+  --component-world-name js-dispatch \
+  --preview2-adapter "$BIN/preview1-adapter.wasm" \
+  --wasmtime-bin "$BIN/wasmtime" \
+  --wabt-bin "$BIN/wabt" \
+  --wac-bin "$BIN/wac" \
+  --wasm-tools-bin "$BIN/wasm-tools" \
+  --debug-dir "$NATIVE_DEBUG" \
+  --out "$NATIVE_COMPONENT" \
+  tests/e2e/wit-imports/component.js
+
+echo "[wit-imports e2e] validating both production components and exact before/after topology"
+for production in shell native; do
+  component_var="${production^^}_COMPONENT"
+  component="${!component_var}"
+  before="$SHELL_BEFORE"
+  if [ "$production" = native ]; then
+    before="$NATIVE_DEBUG/component-before-feature-surface.wasm"
+  fi
+  "$BIN/wasm-tools" validate --features all "$component"
+  "$BIN/wasm-tools" component wit "$before" -o "$PREFIX/$production-before.wit"
+  "$BIN/wasm-tools" component wit "$component" -o "$PREFIX/$production-after.wit"
+  python3 "$SCRIPT_DIR/check-surface.py" \
+    "$PREFIX/$production-before.wit" "$PREFIX/$production-after.wit"
+done
 
 echo "[wit-imports e2e] confirming test:wit-imports/host@1.2.3 is a real component-level import"
 "$BIN/wasm-tools" component wit "$COMPONENT" | grep -q 'import test:wit-imports/host@1.2.3;' || {
@@ -342,6 +375,29 @@ assert_field "repeated resource shutdown does not duplicate the canonical drop" 
 assert_field "run-boom host trap propagates" 54 "rec['ok']" "False"
 assert_field "run-boom trap message names the deliberate host error" 54 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
+
+echo "[wit-imports e2e] invoking native topology and resource lifecycle"
+NATIVE_CALLS_JSON="$PREFIX/native_calls.json"
+cat > "$NATIVE_CALLS_JSON" <<'EOF'
+[
+  {"function": "run-add", "args": [40, 2]},
+  {"function": "run-root-transform", "args": [{"coordinate": {"x": 5, "y": 8}, "labels": ["alpha", "beta"]}]},
+  {"function": "run-counter", "args": [40]},
+  {"function": "starling-js-shutdown-resources", "args": [], "interface": null},
+  {"function": "run-counter-drop-count", "args": []}
+]
+EOF
+NATIVE_OUTPUT_JSON="$PREFIX/native_output.json"
+"$INVOKER" "$NATIVE_COMPONENT" "$NATIVE_CALLS_JSON" > "$NATIVE_OUTPUT_JSON"
+OUTPUT_JSON="$NATIVE_OUTPUT_JSON"
+assert_field "native interface import invocation" 0 "rec['value']" "42"
+assert_field "native root alias lifecycle invocation" 1 \
+  "rec['value']" "{'tag': 'accepted', 'val': {'coordinate': {'x': 6, 'y': 10}, 'labels': ['beta', 'alpha', 'host']}}"
+assert_field "native imported resource invocation" 2 \
+  "rec['value']" "[42, 42, 42, 80, 80, 10, 12]"
+assert_field "native resource shutdown" 3 "rec['ok']" "True"
+assert_field "native canonical resource drop" 4 "rec['value']" "1"
+OUTPUT_JSON="$PREFIX/output.json"
 
 echo "[wit-imports e2e] invoking root-boom in a fresh instance"
 ROOT_TRAP_CALLS_JSON="$PREFIX/root_trap_calls.json"

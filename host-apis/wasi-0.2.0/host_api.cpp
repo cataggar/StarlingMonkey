@@ -2,6 +2,7 @@
 #include "bindings/bindings.h"
 #include "handles.h"
 #include "feature-defaults.h"
+#include "task-selection.h"
 
 #if STARLING_FEATURE_CLOCKS
 static std::optional<wasi_clocks_monotonic_clock_own_pollable_t> immediately_ready;
@@ -45,7 +46,9 @@ size_t api::AsyncTask::select(std::vector<RefPtr<AsyncTask>> &tasks) {
           return ready_index;
         }
 #else
-        return idx;
+        return oldest_ready_or_immediate(idx, [&handles](size_t ready_index) {
+          return wasi_io_poll_method_pollable_ready(handles[ready_index]);
+        });
 #endif
       }
       return idx;
@@ -186,16 +189,6 @@ void MonotonicClock::unsubscribe(const int32_t handle_id) {
 #else
   (void)handle_id;
 #endif
-}
-
-vector<std::string> environment_get_arguments() {
-  bindings_list_string_t raw_args = {};
-  wasi_cli_environment_get_arguments(&raw_args);
-  std::vector<std::string> args = {};
-  for (int i = 0; i < raw_args.len; i++) {
-    args.push_back(std::string(reinterpret_cast<char *>(raw_args.ptr[i].ptr), raw_args.ptr[i].len));
-  }
-  return args;
 }
 
 HttpHeaders::HttpHeaders(std::unique_ptr<HandleState> state)

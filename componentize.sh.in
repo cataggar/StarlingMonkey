@@ -11,6 +11,7 @@ fi
 wasm_tools="${WASM_TOOLS:-$script_dir/wasm-tools}"
 weval="${WEVAL:-$script_dir/weval}"
 feature_surface="${FEATURE_SURFACE:-$script_dir/starling-feature-surface}"
+wac="${WAC:-$script_dir/wac}"
 component_world="@COMPONENT_WORLD@"
 component_wit="$script_dir/component-wit"
 surface_target_world="@SURFACE_TARGET_WORLD@"
@@ -166,7 +167,12 @@ else
   "$wasm_tools" component new -v --adapt "wasi_snapshot_preview1=$script_dir/preview1-adapter.wasm" --output "$component" "$OUT_FILE"
 fi
 
+if [[ -n "${FEATURE_SURFACE_BEFORE:-}" ]]; then
+  cp "$component" "$FEATURE_SURFACE_BEFORE"
+fi
+
 surface_args=(
+  --wac "$wac"
   --wasm-tools "$wasm_tools"
   --platform-wit "$script_dir/feature-wit"
   --component "$component"
