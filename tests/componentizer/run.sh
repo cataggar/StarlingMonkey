@@ -62,6 +62,19 @@ if [ -n "${FAKE_ASSERT_SNAPSHOT_NAMES:-}" ]; then
   test -f \
     "$snapshot/.looks.starling-componentize-directory/nested-module.js"
 fi
+if [ -n "${FAKE_ASSERT_CACHE_SNAPSHOT:-}" ]; then
+  snapshot=""
+  for arg in "$@"; do
+    case "$arg" in
+      *::*)
+        snapshot="${arg%%::*}"
+        break
+        ;;
+    esac
+  done
+  test ! -e "$snapshot/$FAKE_EXCLUDED_CACHE_RELATIVE"
+  test -f "$snapshot/$FAKE_CACHE_LOOKALIKE_RELATIVE"
+fi
 cat > "$FAKE_RUNTIME_ARGS_LOG"
 if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-source\n' > "$FAKE_REPLACE_SOURCE"
@@ -208,6 +221,10 @@ if [ "${1:-}" = "env" ]; then
   exit 0
 fi
 if [ "${FAKE_FAIL_STAGE:-}" = "zig build" ]; then
+  if [ -n "${FAKE_ECHO_RUNTIME_PATHS:-}" ]; then
+    printf 'runtime stdout executable=%s argv=%s\n' "$0" "$*"
+    printf 'runtime stderr executable=%s argv=%s\n' "$0" "$*" >&2
+  fi
   echo "injected zig build failure" >&2
   exit 23
 fi
@@ -980,33 +997,77 @@ fi
 test ! -e "$UNAVAILABLE_OUTPUT"
 test ! -e "$UNAVAILABLE_METADATA"
 
-RUNTIME_FAILURE="$WORK/runtime-build-failure.wasm"
-RUNTIME_ERROR="$SCRATCH/runtime-build-error.log"
-if FAKE_FAIL_STAGE="zig build" "$COMPONENTIZER" \
-  --json-diagnostics \
-  --build-root "$ROOT" \
-  --cache-dir "$WORK/failing runtime cache" \
-  --zig-bin "$TOOLS/fake zig" \
-  --wit "$WIT" \
-  --world-name exports \
-  --wizer-bin "$TOOLS/fake wizer" \
-  --wabt-bin "$TOOLS/fake wabt" \
-  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
-  --out "$RUNTIME_FAILURE" \
-  "$SOURCE" >/dev/null 2> "$RUNTIME_ERROR"
-then
-  echo "FAIL: injected runtime build failure unexpectedly succeeded" >&2
-  exit 1
-fi
-python3 - "$RUNTIME_ERROR" <<'PY'
+RUNTIME_FAILURE_ROOT_A="$SCRATCH/runtime failure root a"
+RUNTIME_FAILURE_ROOT_B="$SCRATCH/runtime failure root b"
+RUNTIME_CACHE="$WORK/failing runtime cache"
+RUNTIME_ERROR_A="$SCRATCH/runtime-build-error-a.jsonl"
+RUNTIME_ERROR_B="$SCRATCH/runtime-build-error-b.jsonl"
+mkdir "$RUNTIME_FAILURE_ROOT_A" "$RUNTIME_FAILURE_ROOT_B"
+for runtime_root in "$RUNTIME_FAILURE_ROOT_A" "$RUNTIME_FAILURE_ROOT_B"; do
+  runtime_error="$RUNTIME_ERROR_A"
+  if [ "$runtime_root" = "$RUNTIME_FAILURE_ROOT_B" ]; then
+    runtime_error="$RUNTIME_ERROR_B"
+  fi
+  if FAKE_FAIL_STAGE="zig build" FAKE_ECHO_RUNTIME_PATHS=1 "$COMPONENTIZER" \
+    --json-diagnostics \
+    --build-root "$ROOT" \
+    --cache-dir "$RUNTIME_CACHE" \
+    --zig-bin "$TOOLS/fake zig" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$runtime_root/runtime-build-failure.wasm" \
+    "$SOURCE" > "$runtime_root/stdout" 2> "$runtime_error"
+  then
+    echo "FAIL: injected runtime build failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  test ! -s "$runtime_root/stdout"
+  test ! -e "$runtime_root/runtime-build-failure.wasm"
+done
+cmp "$RUNTIME_ERROR_A" "$RUNTIME_ERROR_B"
+python3 - "$RUNTIME_ERROR_A" "$RUNTIME_CACHE" <<'PY'
 import json, sys
 diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
 assert diagnostic["code"] == "SMC2001"
 assert diagnostic["phase"] == "runtime_build"
 assert diagnostic["command"] == "zig build runtime"
 assert diagnostic["exit_code"] == 23
+assert "<transaction>" in diagnostic["detail"], diagnostic
+assert ".starling-componentize-" not in diagnostic["detail"], diagnostic
+assert sys.argv[2] in diagnostic["detail"], diagnostic
 PY
-test ! -e "$RUNTIME_FAILURE"
+
+RUNTIME_HUMAN_ROOT="$SCRATCH/runtime human root"
+RUNTIME_HUMAN_STDOUT="$SCRATCH/runtime-human.stdout"
+RUNTIME_HUMAN_STDERR="$SCRATCH/runtime-human.stderr"
+mkdir "$RUNTIME_HUMAN_ROOT"
+if FAKE_FAIL_STAGE="zig build" FAKE_ECHO_RUNTIME_PATHS=1 "$COMPONENTIZER" \
+  --verbose \
+  --build-root "$ROOT" \
+  --cache-dir "$RUNTIME_CACHE" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$RUNTIME_HUMAN_ROOT/runtime-build-failure.wasm" \
+  "$SOURCE" > "$RUNTIME_HUMAN_STDOUT" 2> "$RUNTIME_HUMAN_STDERR"
+then
+  echo "FAIL: human runtime build failure unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -Fq '<transaction>' "$RUNTIME_HUMAN_STDOUT"
+grep -Fq '<transaction>' "$RUNTIME_HUMAN_STDERR"
+grep -Fq "$RUNTIME_CACHE" "$RUNTIME_HUMAN_STDERR"
+if grep -Fq '.starling-componentize-' \
+  "$RUNTIME_HUMAN_STDOUT" "$RUNTIME_HUMAN_STDERR"; then
+  echo "FAIL: runtime build diagnostic leaked a transaction path" >&2
+  exit 1
+fi
 
 if find "$WORK" -maxdepth 1 -name '.*.starling-componentize-*' | grep -q .; then
   echo "FAIL: a negative stage left transaction artifacts" >&2
@@ -1123,6 +1184,81 @@ PY
 if find "$PUBLICATION_A" "$PUBLICATION_B" \
   -name '.*.starling-componentize-*' | grep -q .; then
   echo "FAIL: parent-symlink retarget left transaction artifacts" >&2
+  exit 1
+fi
+
+RENAMED_PUBLICATION="$SCRATCH/renamed publication"
+MOVED_PUBLICATION="$SCRATCH/renamed publication moved"
+RENAMED_OUTPUT="$RENAMED_PUBLICATION/component.wasm"
+RENAMED_METADATA="$RENAMED_PUBLICATION/component.json"
+RENAMED_DEBUG="$RENAMED_PUBLICATION/component.debug"
+RENAMED_ERROR="$SCRATCH/renamed-publication-error.jsonl"
+mkdir "$RENAMED_PUBLICATION" "$RENAMED_DEBUG"
+printf 'original-renamed-component\n' > "$RENAMED_OUTPUT"
+printf 'original-renamed-metadata\n' > "$RENAMED_METADATA"
+python3 - "$RENAMED_DEBUG" <<'PY'
+import os, sys
+for index in range(4000):
+    with open(os.path.join(sys.argv[1], f"unrelated-{index}"), "w") as entry:
+        entry.write(f"preserve-{index}\n")
+PY
+python3 - "$RENAMED_PUBLICATION" "$MOVED_PUBLICATION" \
+  "$RENAMED_OUTPUT" <<'PY' &
+import os, sys, time
+publication, moved, output = sys.argv[1:]
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    if not os.path.exists(output):
+        os.rename(publication, moved)
+        os.mkdir(publication)
+        with open(os.path.join(publication, "replacement-sentinel"), "w") as entry:
+            entry.write("preserve-replacement-directory\n")
+        with open(output, "w") as entry:
+            entry.write("preserve-replacement-component\n")
+        break
+    time.sleep(0.0001)
+else:
+    raise SystemExit("failed to synchronize publication-directory rename")
+PY
+renamed_publication_racer=$!
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$RENAMED_METADATA" \
+  --debug-dir "$RENAMED_DEBUG" \
+  --out "$RENAMED_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$RENAMED_ERROR"
+then
+  wait "$renamed_publication_racer" 2>/dev/null || true
+  echo "FAIL: renamed publication directory reported false success" >&2
+  exit 1
+fi
+wait "$renamed_publication_racer"
+test "$(cat "$MOVED_PUBLICATION/component.wasm")" = \
+  "original-renamed-component"
+test "$(cat "$MOVED_PUBLICATION/component.json")" = \
+  "original-renamed-metadata"
+test "$(cat "$MOVED_PUBLICATION/component.debug/unrelated-3999")" = \
+  "preserve-3999"
+test "$(cat "$RENAMED_OUTPUT")" = "preserve-replacement-component"
+test "$(cat "$RENAMED_PUBLICATION/replacement-sentinel")" = \
+  "preserve-replacement-directory"
+python3 - "$RENAMED_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "PublicationDirectoryChanged", diagnostic
+assert diagnostic["message"] == \
+    "the canonical publication directory changed before commit", diagnostic
+assert "original publication was restored" in diagnostic["hint"], diagnostic
+PY
+if find "$RENAMED_PUBLICATION" "$MOVED_PUBLICATION" -maxdepth 1 \
+  -name '.*.starling-componentize-*' | grep -q .; then
+  echo "FAIL: rolled-back directory rename retained a transaction" >&2
   exit 1
 fi
 
@@ -1590,7 +1726,7 @@ done
 cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
 cmp "$ENGINE" "$WORK/concurrent output 2.wasm"
 while IFS='|' read -r local_cache global_cache zig_lib; do
-  test "$local_cache" = "unset"
+  test "$local_cache" = "$CACHE/zig-local-cache"
   test "$global_cache" = "$CACHE/zig-global-cache"
   case "$zig_lib" in
     */zig-install/lib) ;;
@@ -1603,5 +1739,64 @@ done < "$FAKE_ZIG_ENV_LOG"
 cmp "$ENGINE" "$BUILD_OUTPUT_1"
 cmp "$ENGINE" "$BUILD_OUTPUT_2"
 cmp "$ENGINE" "$BUILD_OUTPUT_3"
+
+DEFAULT_SOURCE_PARENT="$SCRATCH/default cache source parent"
+DEFAULT_BUILD_ROOT="$DEFAULT_SOURCE_PARENT/build root with spaces"
+DEFAULT_SOURCE="$DEFAULT_SOURCE_PARENT/source module.js"
+DEFAULT_CACHE="$DEFAULT_BUILD_ROOT/.zig-cache/starling-componentizer"
+DEFAULT_CACHE_RELATIVE="build root with spaces/.zig-cache/starling-componentizer"
+DEFAULT_LOOKALIKE_RELATIVE="build root with spaces/.zig-cache/starling-componentizer-user/cache module.js"
+mkdir -p "$DEFAULT_BUILD_ROOT/runtime" \
+  "$DEFAULT_BUILD_ROOT/tools/componentizer" \
+  "$DEFAULT_BUILD_ROOT/.zig-cache/starling-componentizer-user"
+touch "$DEFAULT_BUILD_ROOT/build.zig" "$DEFAULT_BUILD_ROOT/build.zig.zon" \
+  "$DEFAULT_BUILD_ROOT/runtime/js.cpp" \
+  "$DEFAULT_BUILD_ROOT/tools/componentizer/main.zig"
+printf 'export const defaultCache = true;\n' > "$DEFAULT_SOURCE"
+printf 'export const userCacheModule = 1;\n' > \
+  "$DEFAULT_SOURCE_PARENT/$DEFAULT_LOOKALIKE_RELATIVE"
+default_cache_run() {
+  local suffix="$1"
+  FAKE_ASSERT_CACHE_SNAPSHOT=1 \
+  FAKE_EXCLUDED_CACHE_RELATIVE="$DEFAULT_CACHE_RELATIVE" \
+  FAKE_CACHE_LOOKALIKE_RELATIVE="$DEFAULT_LOOKALIKE_RELATIVE" \
+  "$COMPONENTIZER" \
+    --build-root "$DEFAULT_BUILD_ROOT" \
+    --zig-bin "$TOOLS/fake zig" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --metadata-out "$WORK/default cache $suffix.json" \
+    --out "$WORK/default cache $suffix.wasm" \
+    "$DEFAULT_SOURCE"
+}
+default_cache_run first
+default_cache_run second
+printf 'export const userCacheModule = 2;\n' > \
+  "$DEFAULT_SOURCE_PARENT/$DEFAULT_LOOKALIKE_RELATIVE"
+default_cache_run lookalike-changed
+python3 - "$WORK/default cache first.json" \
+  "$WORK/default cache second.json" \
+  "$WORK/default cache lookalike-changed.json" <<'PY'
+import json, sys
+digests = [
+    json.load(open(path, encoding="utf-8"))["provenance"]["inputs"]
+    ["source_tree"]["sha256"]
+    for path in sys.argv[1:]
+]
+assert digests[0] == digests[1], digests
+assert digests[1] != digests[2], digests
+PY
+tail -n 3 "$FAKE_ZIG_ENV_LOG" |
+while IFS='|' read -r local_cache global_cache zig_lib; do
+  test "$local_cache" = "$DEFAULT_CACHE/zig-local-cache"
+  test "$global_cache" = "$DEFAULT_CACHE/zig-global-cache"
+  case "$zig_lib" in
+    */zig-install/lib) ;;
+    *) exit 1 ;;
+  esac
+done
 
 echo "native componentizer fake-tool tests passed"

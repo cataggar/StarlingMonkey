@@ -20,7 +20,10 @@ Any failure leaves existing component and metadata outputs unchanged and never
 publishes a partial debug directory. The temporary transaction directory is
 created beside the output through a held handle to its canonical parent.
 Backup, publication, rollback, and cleanup stay relative to that handle and
-check recorded no-follow identities. Cleanup removes only pre-recorded entries,
+check recorded no-follow identities. Immediately before success and backup
+finalization, the canonical parent path must still identify the held directory;
+otherwise publication is rolled back through the handle without touching a
+replacement at the stale path. Cleanup removes only pre-recorded entries,
 aborts on additions or replacements, and never recursively removes an
 unrecognized tree. Optional metadata and debug destinations must use that same
 parent so publication and rollback cannot cross filesystems.
@@ -71,6 +74,10 @@ monolithic relink a fast cache hit. JavaScript source is deliberately excluded
 from the runtime key. Per-input and per-runtime advisory locks make concurrent
 uses of one cache safe, and the runtime lock remains held until componentization
 has finished consuming the cached engine, adapter, and generated bindings.
+The effective default or explicit componentizer cache is canonicalized before
+source snapshotting. Runtime outputs and Zig local/global caches all remain
+beneath it, and only that exact directory identity is excluded if it is nested
+inside a snapshotted source tree.
 
 Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
 and feature selection. Build-changing feature/debug options are rejected with
@@ -102,7 +109,10 @@ and `signal` process fields; a successful run emits `SMC0000`. Child output is
 captured in this mode, so the diagnostic stream is not mixed with ad hoc
 subprocess text. Capture is bounded per stream; failed commands retain at most
 16 KiB of final stderr and include an explicit truncation marker. Human mode
-streams child stdout and stderr while retaining the same bounded failure tail.
+streams ordinary child stdout and stderr while retaining the same bounded
+failure tail. Runtime-build output and verbose arguments are bounded, buffered,
+and redact transaction snapshot paths before display; canonical build and cache
+paths remain visible.
 Filesystem paths must be valid UTF-8. Invalid source, initializer, output, WIT,
 tool, or traversed tree paths fail during input diagnostics with
 `InvalidUtf8Path`, ensuring every public diagnostic path remains a JSON string.
@@ -151,9 +161,10 @@ Source-tree traversal order, permissions, timestamps, and absolute root
 location do not affect tree hashes. Relative symlinks that remain within the
 staged tree are preserved and hashed by target; absolute or escaping symlinks
 are rejected so a child cannot consume mutable files outside its snapshot.
-Only the current transaction directory is excluded, after no-follow identity
-verification; unrelated names that resemble transaction names remain ordinary
-hashed and staged source entries.
+The current transaction directory and, when nested, the exact effective cache
+directory are excluded after no-follow identity verification; unrelated names
+that resemble transaction or cache names remain ordinary hashed and staged
+source entries.
 Source and initializer snapshots are mapped to their original logical paths for
 Wizer, and the runtime-argument hash covers the exact stable byte stream
 supplied to Wizer.

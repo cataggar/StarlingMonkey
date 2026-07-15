@@ -317,6 +317,7 @@ fn errorMessage(err: anyerror, phase: Phase) []const u8 {
         error.MissingWitFiles => "the selected WIT layout contains no .wit files",
         error.UnsupportedWitEntry => "the selected WIT layout contains a non-file, non-directory entry",
         error.MissingBuildArtifact => "a required runtime or tool artifact is missing",
+        error.PublicationDirectoryChanged => "the canonical publication directory changed before commit",
         else => phaseMessage(phase),
     };
 }
@@ -335,6 +336,7 @@ fn errorHint(err: anyerror) ?[]const u8 {
         error.EmptyRuntimeArgument, error.UnrepresentableRuntimeArgument => "use --runtime-arg only for values accepted by the runtime string parser",
         error.MissingWitFiles, error.UnsupportedWitEntry => "provide a regular WIT directory containing only directories and .wit files",
         error.MissingBuildArtifact => "verify tool overrides and native runtime build outputs",
+        error.PublicationDirectoryChanged => "the original publication was restored; retry only after the canonical output directory is stable",
         else => null,
     };
 }

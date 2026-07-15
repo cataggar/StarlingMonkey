@@ -23,6 +23,7 @@ const PipelineError = error{
     MetadataUnavailable,
     MissingBuildArtifact,
     MissingWitFiles,
+    PublicationDirectoryChanged,
     RollbackIncomplete,
     UnrepresentableRuntimeArgument,
     UnsupportedWitEntry,
@@ -78,13 +79,30 @@ const OwnedEntry = struct {
     identity: EntryIdentity,
 };
 
+const EffectiveCache = struct {
+    path: []const u8,
+    identity: EntryIdentity,
+};
+
+const InputExclusion = struct {
+    path: []const u8,
+    identity: ?EntryIdentity = null,
+
+    fn matches(self: InputExclusion, path: []const u8, stat: File.Stat) bool {
+        if (!std.mem.eql(u8, self.path, path)) return false;
+        return if (self.identity) |identity| identity.matches(stat) else true;
+    }
+};
+
 const Transaction = struct {
     name: []const u8,
     cleanup_name: []const u8,
     storage_path: []const u8,
+    publication_path: []const u8,
     publication: Dir,
     root: Dir,
     storage: Dir,
+    publication_identity: EntryIdentity,
     root_identity: EntryIdentity,
     storage_identity: EntryIdentity,
     owner_identity: EntryIdentity,
@@ -98,6 +116,12 @@ const Transaction = struct {
         name: []const u8,
         owner: []const u8,
     ) !Transaction {
+        const publication_identity = EntryIdentity.fromStat(
+            try publication.stat(io),
+        );
+        if (publication_identity.kind != .directory) {
+            return error.PublicationDirectoryChanged;
+        }
         try publication.createDir(io, name, .fromMode(0o700));
         var root = try publication.openDir(
             io,
@@ -133,9 +157,11 @@ const Transaction = struct {
                 allocator,
                 &.{ publication_path, name, "data" },
             ),
+            .publication_path = publication_path,
             .publication = publication,
             .root = root,
             .storage = storage,
+            .publication_identity = publication_identity,
             .root_identity = root_identity,
             .storage_identity = storage_identity,
             .owner_identity = owner_identity,
@@ -322,6 +348,23 @@ const Transaction = struct {
         )) return error.TransactionChanged;
         if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) {
             return error.TransactionChanged;
+        }
+    }
+
+    fn verifyCanonicalPublication(self: *const Transaction, io: Io) !void {
+        if (!self.publication_identity.matches(try self.publication.stat(io))) {
+            return error.PublicationDirectoryChanged;
+        }
+        const canonical = Dir.cwd().statFile(
+            io,
+            self.publication_path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.PublicationDirectoryChanged,
+            else => return err,
+        };
+        if (!self.publication_identity.matches(canonical)) {
+            return error.PublicationDirectoryChanged;
         }
     }
 
@@ -665,6 +708,26 @@ fn execute(
         break :blk resolved;
     } else null;
 
+    diagnostic.begin(.inputs);
+    const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
+    const build_root = if (config.engine == null)
+        try discoverBuildRoot(allocator, io, environ, cwd, executable_dir, config.build_root)
+    else if (config.build_root) |root|
+        try resolveAndValidateRoot(allocator, io, cwd, root)
+    else
+        null;
+    const effective_cache: ?EffectiveCache =
+        if (config.cache_dir != null or config.engine == null)
+            try resolveEffectiveCache(
+                allocator,
+                io,
+                cwd,
+                build_root,
+                config.cache_dir,
+            )
+        else
+            null;
+
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
     const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -690,31 +753,41 @@ fn execute(
         io,
         transaction_safe_to_remove,
     );
-    var input_exclusions: std.ArrayList([]const u8) = .empty;
-    if (config.cache_dir) |path| {
-        input_exclusions.append(
-            allocator,
-            try absolutePath(allocator, cwd, path),
-        ) catch @panic("out of memory");
-    }
-    input_exclusions.append(allocator, resolved_output) catch
-        @panic("out of memory");
-    if (metadata_output) |path| {
-        input_exclusions.append(allocator, path) catch @panic("out of memory");
-    }
-    if (debug_dir) |path| {
-        input_exclusions.append(allocator, path) catch @panic("out of memory");
-    }
+    var input_exclusions: std.ArrayList(InputExclusion) = .empty;
     const source_parent = std.fs.path.dirname(source).?;
     const initializer_parent = if (initializer) |path|
         std.fs.path.dirname(path).?
     else
         null;
+    if (effective_cache) |cache| {
+        if (pathContains(source_parent, cache.path) or
+            (initializer_parent != null and
+                pathContains(initializer_parent.?, cache.path)))
+        {
+            input_exclusions.append(allocator, .{
+                .path = cache.path,
+                .identity = cache.identity,
+            }) catch @panic("out of memory");
+        }
+    }
+    input_exclusions.append(allocator, .{ .path = resolved_output }) catch
+        @panic("out of memory");
+    if (metadata_output) |path| {
+        input_exclusions.append(allocator, .{ .path = path }) catch
+            @panic("out of memory");
+    }
+    if (debug_dir) |path| {
+        input_exclusions.append(allocator, .{ .path = path }) catch
+            @panic("out of memory");
+    }
     if (!std.mem.eql(u8, publication_parent, source_parent) and
         (initializer_parent == null or
             !std.mem.eql(u8, publication_parent, initializer_parent.?)))
     {
-        input_exclusions.append(allocator, publication_parent) catch
+        input_exclusions.append(
+            allocator,
+            .{ .path = publication_parent },
+        ) catch
             @panic("out of memory");
     }
 
@@ -730,15 +803,6 @@ fn execute(
     );
     const source_snapshot = input_snapshots.source;
     const initializer_snapshot = input_snapshots.initializer;
-
-    diagnostic.begin(.inputs);
-    const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
-    const build_root = if (config.engine == null)
-        try discoverBuildRoot(allocator, io, environ, cwd, executable_dir, config.build_root)
-    else if (config.build_root) |root|
-        try resolveAndValidateRoot(allocator, io, cwd, root)
-    else
-        null;
 
     diagnostic.begin(.runtime_build);
     const runtime = if (config.engine) |engine_override|
@@ -760,6 +824,7 @@ fn execute(
             build_root.?,
             executable_dir,
             config,
+            effective_cache.?.path,
             diagnostic,
             &transaction,
         );
@@ -1203,8 +1268,10 @@ fn execute(
         debug_staged,
         if (debug_dir) |path| std.fs.path.basename(path) else null,
         &transaction_safe_to_remove,
+        source,
+        resolved_output,
+        diagnostic,
     );
-    diagnostic.reportSuccess(source, resolved_output);
 }
 
 fn externalRuntime(
@@ -1296,18 +1363,11 @@ fn buildRuntime(
     build_root: []const u8,
     executable_dir: []const u8,
     config: *const cli.Config,
+    cache_dir: []const u8,
     diagnostic: *diagnostics.Context,
     transaction: *Transaction,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
-    const cache_dir = if (config.cache_dir) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try std.fs.path.join(
-            allocator,
-            &.{ build_root, ".zig-cache", "starling-componentizer" },
-        );
-    try Dir.cwd().createDirPath(io, cache_dir);
 
     var dispatch_wit: ?StagedWit = null;
     var component_wit: ?StagedWit = null;
@@ -1426,12 +1486,17 @@ fn buildRuntime(
         allocator,
         &.{ cache_dir, "zig-global-cache" },
     );
+    const zig_local_cache = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "zig-local-cache" },
+    );
     try Dir.cwd().createDirPath(io, zig_global_cache);
+    try Dir.cwd().createDirPath(io, zig_local_cache);
     var build_env = std.process.Environ.Map.init(allocator);
     try copyEnvironment(&build_env, environ);
     try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_cache);
+    try build_env.put("ZIG_LOCAL_CACHE_DIR", zig_local_cache);
     try build_env.put("ZIG_LIB_DIR", zig_install.lib_dir);
-    _ = build_env.swapRemove("ZIG_LOCAL_CACHE_DIR");
     var command_log: std.ArrayList(u8) = .empty;
     try runCommand(
         allocator,
@@ -1444,7 +1509,7 @@ fn buildRuntime(
         config.verbose,
         &command_log,
         diagnostic,
-        null,
+        transaction_dir,
     );
 
     const engine_built = try std.fs.path.join(
@@ -2235,7 +2300,7 @@ fn snapshotInputs(
     source_identity: SourceIdentity,
     initializer: ?[]const u8,
     initializer_identity: ?SourceIdentity,
-    excluded_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
     transaction: *Transaction,
 ) !struct { source: InputSnapshot, initializer: ?InputSnapshot } {
     if (!source_identity.matches(try Dir.cwd().statFile(
@@ -2440,7 +2505,7 @@ fn snapshotInputTree(
     source_path: []const u8,
     destination_path: []const u8,
     entry_name: []const u8,
-    excluded_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
     transaction: *Transaction,
 ) !TreeSnapshot {
     var source_dir = try Dir.openDirAbsolute(
@@ -2559,7 +2624,7 @@ fn copyInputDirectory(
     relative: []const u8,
     destination_relative: []const u8,
     digest_entry: []const u8,
-    excluded_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
     transaction: *Transaction,
     tree_hasher: *std.crypto.hash.sha2.Sha256,
 ) !?[]const u8 {
@@ -2585,7 +2650,7 @@ fn copyInputDirectory(
             continue;
         }
         for (excluded_paths) |excluded| {
-            if (std.mem.eql(u8, child_source_path, excluded)) break;
+            if (excluded.matches(child_source_path, stat)) break;
         } else {
             entries.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
@@ -2778,7 +2843,7 @@ fn copyInputDirectory(
             continue;
         }
         for (excluded_paths) |excluded| {
-            if (std.mem.eql(u8, child_source_path, excluded)) break;
+            if (excluded.matches(child_source_path, stat)) break;
         } else {
             var matched = false;
             for (entries.items) |initial| {
@@ -2975,6 +3040,9 @@ fn publishArtifacts(
     debug_staged: ?[]const u8,
     debug_output: ?[]const u8,
     transaction_safe_to_remove: *bool,
+    source: []const u8,
+    resolved_output: []const u8,
+    diagnostic: *diagnostics.Context,
 ) !void {
     _ = component_staged;
     var component = ArtifactState{
@@ -3014,6 +3082,22 @@ fn publishArtifacts(
         };
         return publish_error;
     };
+
+    transaction.verifyCanonicalPublication(io) catch |path_error| {
+        rollbackPublication(
+            allocator,
+            io,
+            transaction,
+            component,
+            metadata_state,
+            debug_state,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+            return error.RollbackIncomplete;
+        };
+        return path_error;
+    };
+    diagnostic.reportSuccess(source, resolved_output);
 
     if (component.backup) |identity| {
         removeExactEntry(
@@ -3774,6 +3858,7 @@ fn validateRuntimeText(text: []const u8) !void {
 }
 
 const child_output_limit = 16 * 1024;
+const child_capture_limit = child_output_limit + std.fs.max_path_bytes;
 
 const BoundedChildOutput = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -3788,18 +3873,18 @@ const BoundedChildOutput = struct {
         allocator: Allocator,
         chunk: []const u8,
     ) !void {
-        if (chunk.len >= child_output_limit) {
+        if (chunk.len >= child_capture_limit) {
             self.bytes.clearRetainingCapacity();
             try self.bytes.appendSlice(
                 allocator,
-                chunk[chunk.len - child_output_limit ..],
+                chunk[chunk.len - child_capture_limit ..],
             );
             self.truncated = true;
             return;
         }
         const overflow = self.bytes.items.len + chunk.len;
-        if (overflow > child_output_limit) {
-            const remove = overflow - child_output_limit;
+        if (overflow > child_capture_limit) {
+            const remove = overflow - child_capture_limit;
             @memmove(
                 self.bytes.items[0 .. self.bytes.items.len - remove],
                 self.bytes.items[remove..],
@@ -3814,8 +3899,20 @@ const BoundedChildOutput = struct {
         self: *const BoundedChildOutput,
         allocator: Allocator,
         stream_name: []const u8,
+        redact_path: ?[]const u8,
     ) ![]const u8 {
-        if (!self.truncated) return allocator.dupe(u8, self.bytes.items);
+        const stable = if (redact_path) |path|
+            try std.mem.replaceOwned(
+                u8,
+                allocator,
+                self.bytes.items,
+                path,
+                "<transaction>",
+            )
+        else
+            try allocator.dupe(u8, self.bytes.items);
+        if (!self.truncated and stable.len <= child_output_limit) return stable;
+        defer allocator.free(stable);
         const marker = try std.fmt.allocPrint(
             allocator,
             "[child {s} truncated; showing final output]\n",
@@ -3823,7 +3920,7 @@ const BoundedChildOutput = struct {
         );
         defer allocator.free(marker);
         const tail_len = @min(
-            self.bytes.items.len,
+            stable.len,
             child_output_limit - marker.len,
         );
         return std.mem.concat(
@@ -3831,7 +3928,7 @@ const BoundedChildOutput = struct {
             u8,
             &.{
                 marker,
-                self.bytes.items[self.bytes.items.len - tail_len ..],
+                stable[stable.len - tail_len ..],
             },
         );
     }
@@ -3861,7 +3958,21 @@ fn runCommand(
         const header = try std.fmt.allocPrint(allocator, "[{s}]\n", .{stage});
         try File.stderr().writeStreamingAll(io, header);
         for (argv) |arg| {
-            const line = try std.fmt.allocPrint(allocator, "  {s}\n", .{arg});
+            const stable_arg = if (redact_path) |path|
+                try std.mem.replaceOwned(
+                    u8,
+                    allocator,
+                    arg,
+                    path,
+                    "<transaction>",
+                )
+            else
+                arg;
+            const line = try std.fmt.allocPrint(
+                allocator,
+                "  {s}\n",
+                .{stable_arg},
+            );
             try File.stderr().writeStreamingAll(io, line);
         }
     }
@@ -3907,7 +4018,7 @@ fn runCommand(
         const stderr = multi_reader.reader(1);
         const stdout_chunk = stdout.buffered();
         const stderr_chunk = stderr.buffered();
-        if (diagnostic.format == .human) {
+        if (diagnostic.format == .human and redact_path == null) {
             if (stdout_chunk.len != 0) {
                 try File.stdout().writeStreamingAll(io, stdout_chunk);
             }
@@ -3922,9 +4033,33 @@ fn runCommand(
     }
     try multi_reader.checkAnyError();
     const term = try child.wait(io);
+    if (diagnostic.format == .human and redact_path != null) {
+        const stdout = try stdout_capture.render(
+            allocator,
+            "stdout",
+            redact_path,
+        );
+        if (stdout.len != 0) {
+            try File.stdout().writeStreamingAll(io, stdout);
+        }
+        if (termSucceeded(term)) {
+            const stderr = try stderr_capture.render(
+                allocator,
+                "stderr",
+                redact_path,
+            );
+            if (stderr.len != 0) {
+                try File.stderr().writeStreamingAll(io, stderr);
+            }
+        }
+    }
     if (!termSucceeded(term)) {
-        const stderr = try stderr_capture.render(allocator, "stderr");
-        diagnostic.commandFailed(stage, term, stderr, redact_path);
+        const stderr = try stderr_capture.render(
+            allocator,
+            "stderr",
+            redact_path,
+        );
+        diagnostic.commandFailed(stage, term, stderr, null);
         return error.CommandFailed;
     }
 }
@@ -4131,6 +4266,34 @@ fn resolveOrCreateDirectory(
     };
 }
 
+fn resolveEffectiveCache(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    build_root: ?[]const u8,
+    configured: ?[]const u8,
+) !EffectiveCache {
+    const requested = if (configured) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        try std.fs.path.join(
+            allocator,
+            &.{ build_root.?, ".zig-cache", "starling-componentizer" },
+        );
+    try Dir.cwd().createDirPath(io, requested);
+    const resolved = try Dir.realPathFileAbsoluteAlloc(io, requested, allocator);
+    const stat = try Dir.cwd().statFile(
+        io,
+        resolved,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .directory) return error.InvalidPath;
+    return .{
+        .path = resolved,
+        .identity = EntryIdentity.fromStat(stat),
+    };
+}
+
 fn pathContains(parent: []const u8, child: []const u8) bool {
     if (std.mem.eql(u8, parent, child)) return true;
     if (!std.mem.startsWith(u8, child, parent)) return false;
@@ -4232,13 +4395,17 @@ test "child output capture retains a bounded marked tail" {
     defer capture.deinit(std.testing.allocator);
     const chunk = "0123456789abcdef";
     var index: usize = 0;
-    while (index < child_output_limit / chunk.len + 2) : (index += 1) {
+    while (index < child_capture_limit / chunk.len + 2) : (index += 1) {
         try capture.append(std.testing.allocator, chunk);
     }
-    try std.testing.expectEqual(child_output_limit, capture.bytes.items.len);
+    try std.testing.expectEqual(child_capture_limit, capture.bytes.items.len);
     try std.testing.expect(capture.truncated);
 
-    const rendered = try capture.render(std.testing.allocator, "stderr");
+    const rendered = try capture.render(
+        std.testing.allocator,
+        "stderr",
+        null,
+    );
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(rendered.len <= child_output_limit);
     try std.testing.expect(std.mem.startsWith(
