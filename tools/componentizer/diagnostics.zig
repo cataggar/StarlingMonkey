@@ -62,7 +62,7 @@ pub const Context = struct {
         }
 
         const trimmed = std.mem.trim(u8, stderr, " \t\r\n");
-        const limited = trimmed[0..@min(trimmed.len, 16 * 1024)];
+        const limited = sanitizeStderr(self.allocator, trimmed, 16 * 1024);
         const safe_stderr = if (redact_path) |path|
             std.mem.replaceOwned(
                 u8,
@@ -224,6 +224,34 @@ pub const Context = struct {
     }
 };
 
+fn sanitizeStderr(
+    allocator: Allocator,
+    input: []const u8,
+    limit: usize,
+) []const u8 {
+    var output: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < input.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(input[index]) catch {
+            if (output.items.len + 3 > limit) break;
+            output.appendSlice(allocator, "\xef\xbf\xbd") catch break;
+            index += 1;
+            continue;
+        };
+        const end = index + sequence_len;
+        if (end > input.len or !std.unicode.utf8ValidateSlice(input[index..end])) {
+            if (output.items.len + 3 > limit) break;
+            output.appendSlice(allocator, "\xef\xbf\xbd") catch break;
+            index += 1;
+            continue;
+        }
+        if (output.items.len + sequence_len > limit) break;
+        output.appendSlice(allocator, input[index..end]) catch break;
+        index = end;
+    }
+    return output.toOwnedSlice(allocator) catch "";
+}
+
 fn terminationText(
     allocator: Allocator,
     term: std.process.Child.Term,
@@ -268,7 +296,7 @@ fn errorMessage(err: anyerror, phase: Phase) []const u8 {
     return switch (err) {
         error.InputOutputCollision => "the component output resolves to an input file",
         error.InvalidMetadataDestination => "the metadata destination collides with another artifact or is not beside the component",
-        error.DebugOutputCollision => "the debug destination already exists, contains an artifact, or is not beside the component",
+        error.DebugOutputCollision => "the debug destination collides with an artifact or cannot be replaced safely",
         error.IncompatibleEngineOptions => "--engine cannot be combined with feature selection or --use-debug-build",
         error.MetadataUnavailable => "public imports metadata requires generated bindings from a native runtime build",
         error.InvalidBindingsManifest => "the generated bindings contain an invalid JavaScript imports manifest",
@@ -285,7 +313,7 @@ fn errorHint(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.InputOutputCollision => "choose an output that does not resolve to the source or initializer",
         error.InvalidMetadataDestination => "choose a regular metadata file in the component output directory",
-        error.DebugOutputCollision => "choose a new, non-existent debug directory beside the component output",
+        error.DebugOutputCollision => "use a real directory beside the component and keep generated names free of directories",
         error.IncompatibleEngineOptions => "build a matching runtime natively or remove the build-changing options",
         error.MetadataUnavailable => "omit --engine so the CLI can retain and inspect generated bindings",
         error.InvalidBindingsManifest => "rebuild with the repository-pinned binding generator",
@@ -323,7 +351,7 @@ fn phaseHint(phase: Phase) []const u8 {
         .adapt => "verify the preview1 adapter matches the reactor and component tool",
         .metadata => "verify wasm-tools supports metadata add and that generated import bindings are available",
         .validate => "inspect the preceding component construction stages and selected adapter",
-        .debug => "choose a new debug directory that does not already exist or contain an output",
+        .debug => "use a real debug directory that does not contain an input or output",
         .publish => "check destination permissions and keep component, metadata, and debug outputs collision-free",
     };
 }
@@ -341,4 +369,23 @@ test "known failures retain actionable messages" {
         errorMessage(error.MetadataUnavailable, .metadata),
     );
     try std.testing.expect(errorHint(error.DebugOutputCollision) != null);
+}
+
+test "stderr sanitization replaces invalid bytes and truncates at codepoint boundaries" {
+    const invalid = sanitizeStderr(
+        std.testing.allocator,
+        "ok\xff\xe2\x82broken",
+        1024,
+    );
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(invalid));
+    try std.testing.expectEqualStrings("ok���broken", invalid);
+
+    const truncated = sanitizeStderr(
+        std.testing.allocator,
+        "1234€",
+        6,
+    );
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expectEqualStrings("1234", truncated);
 }

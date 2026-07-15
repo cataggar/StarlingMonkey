@@ -108,16 +108,23 @@ canonical dispatch keys, resource classes, and constructor/method/static
 operations without requiring consumers to parse runtime TSV or stderr.
 `imports_complete` distinguishes a verified empty list from debug metadata
 produced with an external engine whose generated bindings are unavailable.
+External engines also report `features` and `features_sha256` as `null`:
+feature-selection options are rejected for those engines, so their actual
+compiled feature state cannot be asserted authoritatively.
 
 The `provenance` object records the selected dispatch and component worlds,
 content hashes of both complete WIT layouts, the resolved feature booleans,
-SHA-256 hashes of every invoked tool, source/initializer/runtime-argument
+SHA-256 hashes of every invoked tool (including nested runtime-build tools
+such as `wasip3-bindgen` and `wasm-opt`), source/initializer/runtime-argument
 hashes, engine/adapter hashes, and the exact published component hash.
 Canonical aggregate hashes cover worlds, features, and tools. It contains no
 timestamps, random transaction names, or host paths, so its provenance fields
 are deterministic even if an underlying snapshot tool emits byte-distinct
-components. The component itself also receives standard WebAssembly producers
-metadata compatible with `wasm-tools metadata show`.
+components. Files, WIT trees, and executables are copied to immutable
+per-run snapshots before use; hashes are computed while creating those
+snapshots, and every child executes or consumes the corresponding snapshot.
+The component itself also receives standard WebAssembly producers metadata
+compatible with `wasm-tools metadata show`.
 
 ## Runtime and tool options
 
@@ -145,9 +152,12 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized
 command log, and each pipeline intermediate in `<output>.debug`. `--debug-dir`
-chooses another directory and also enables the dump. For collision safety the
-destination must not already exist and cannot contain an input or output; the
-complete staged directory is published only after validation.
+chooses another directory and also enables the dump. The destination cannot
+contain an input or output. Routine reruns transactionally replace only the
+known generated files while preserving unrelated files, symlinks, and
+directory trees; a directory at a generated filename is rejected rather than
+removed recursively. The complete merged directory is published only after
+validation, with rollback on any publication failure.
 
 The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
 them explicitly. Weval execution and cache controls belong to the separate

@@ -18,6 +18,7 @@ const PipelineError = error{
     InvalidBindingsManifest,
     InvalidMetadataDestination,
     InvalidPath,
+    InvalidToolManifest,
     MetadataUnavailable,
     MissingBuildArtifact,
     MissingWitFiles,
@@ -27,31 +28,37 @@ const PipelineError = error{
 
 const StagedWit = struct {
     absolute: []const u8,
-    relative: []const u8,
+    digest: []const u8,
+};
+
+const Snapshot = struct {
+    path: []const u8,
     digest: []const u8,
 };
 
 const Runtime = struct {
-    engine: []const u8,
-    adapter: []const u8,
+    engine: Snapshot,
+    adapter: Snapshot,
     component_wit: ?[]const u8,
     component_world: ?[]const u8,
     bindings: ?[]const u8,
     dispatch_wit_digest: ?[]const u8,
     component_wit_digest: ?[]const u8,
-    zig: ?[]const u8,
+    features_known: bool,
+    zig: ?Snapshot,
+    build_tools: []const metadata.Tool,
     cache_lock: ?File,
 };
 
 const WizerTool = struct {
-    executable: []const u8,
+    executable: Snapshot,
     wasmtime_subcommand: bool,
 };
 
 const Tools = struct {
     wizer: WizerTool,
-    wabt: ?[]const u8,
-    wasm_tools: []const u8,
+    wabt: ?Snapshot,
+    wasm_tools: Snapshot,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -174,10 +181,12 @@ fn execute(
         const parent = std.fs.path.dirname(destination) orelse
             return error.DebugOutputCollision;
         try Dir.cwd().createDirPath(io, parent);
+        if (try pathKindNoFollow(io, destination)) |kind| {
+            if (kind != .directory) return error.DebugOutputCollision;
+        }
         const resolved_parent = try Dir.realPathFileAbsoluteAlloc(io, parent, allocator);
         const resolved = try resolveDestination(allocator, io, destination);
-        if (pathExists(io, destination) or
-            pathContains(resolved, resolved_output) or
+        if (pathContains(resolved, resolved_output) or
             pathContains(resolved, source) or
             (initializer != null and pathContains(resolved, initializer.?)) or
             (metadata_output != null and pathContains(resolved, metadata_output.?)) or
@@ -187,6 +196,40 @@ fn execute(
         }
         break :blk destination;
     } else null;
+
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    const transaction_name = try std.fmt.allocPrint(
+        allocator,
+        ".{s}.starling-componentize-{s}",
+        .{ std.fs.path.basename(output), &random_hex },
+    );
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ output_parent, transaction_name },
+    );
+    try Dir.createDirAbsolute(io, transaction_dir, .default_dir);
+    var transaction_safe_to_remove = true;
+    defer if (transaction_safe_to_remove) {
+        Dir.cwd().deleteTree(io, transaction_dir) catch {};
+    };
+
+    const source_snapshot = try snapshotAdjacent(
+        allocator,
+        io,
+        source,
+        "source",
+        &random_hex,
+    );
+    defer Dir.deleteFileAbsolute(io, source_snapshot.path) catch {};
+    const initializer_snapshot = if (initializer) |path|
+        try snapshotAdjacent(allocator, io, path, "initializer", &random_hex)
+    else
+        null;
+    defer if (initializer_snapshot) |snapshot| {
+        Dir.deleteFileAbsolute(io, snapshot.path) catch {};
+    };
 
     diagnostic.begin(.inputs);
     const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
@@ -206,6 +249,7 @@ fn execute(
             executable_dir,
             config,
             engine_override,
+            transaction_dir,
         )
     else
         try buildRuntime(
@@ -217,6 +261,7 @@ fn execute(
             executable_dir,
             config,
             diagnostic,
+            transaction_dir,
         );
     defer if (runtime.cache_lock) |lock| {
         lock.unlock(io);
@@ -232,32 +277,25 @@ fn execute(
         executable_dir,
         config,
         runtime.component_wit != null,
+        transaction_dir,
     );
-
-    var random_bytes: [8]u8 = undefined;
-    io.random(&random_bytes);
-    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-    const transaction_name = try std.fmt.allocPrint(
-        allocator,
-        ".{s}.starling-componentize-{s}",
-        .{ std.fs.path.basename(output), &random_hex },
-    );
-    const transaction_dir = try std.fs.path.join(
-        allocator,
-        &.{ output_parent, transaction_name },
-    );
-    try Dir.createDirAbsolute(io, transaction_dir, .default_dir);
-    defer Dir.cwd().deleteTree(io, transaction_dir) catch {};
 
     const runtime_args_path = try std.fs.path.join(
         allocator,
         &.{ transaction_dir, "runtime-args.txt" },
     );
-    const runtime_args = try renderRuntimeArgs(
+    const provenance_runtime_args = try renderRuntimeArgs(
         allocator,
         cwd,
         source,
         initializer,
+        config,
+    );
+    const runtime_args = try renderRuntimeArgs(
+        allocator,
+        cwd,
+        source_snapshot.path,
+        if (initializer_snapshot) |snapshot| snapshot.path else null,
         config,
     );
     try Dir.cwd().writeFile(io, .{
@@ -271,7 +309,7 @@ fn execute(
         &.{ transaction_dir, "initialized.wasm" },
     );
     var wizer_args: std.ArrayList([]const u8) = .empty;
-    wizer_args.append(allocator, tools.wizer.executable) catch @panic("out of memory");
+    wizer_args.append(allocator, tools.wizer.executable.path) catch @panic("out of memory");
     if (tools.wizer.wasmtime_subcommand) {
         wizer_args.append(allocator, "wizer") catch @panic("out of memory");
         wizer_args.appendSlice(allocator, &.{
@@ -296,9 +334,10 @@ fn execute(
         }) catch @panic("out of memory");
     }
 
-    const source_dir = std.fs.path.dirname(source) orelse return error.InvalidPath;
+    const source_dir = std.fs.path.dirname(source_snapshot.path) orelse return error.InvalidPath;
     try addPreopen(allocator, &wizer_args, source_dir);
-    if (initializer) |initializer_path| {
+    if (initializer_snapshot) |snapshot| {
+        const initializer_path = snapshot.path;
         const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
         try addPreopen(allocator, &wizer_args, initializer_dir);
     }
@@ -306,11 +345,11 @@ fn execute(
         const preopen_abs = try absolutePath(allocator, cwd, preopen);
         try addPreopen(allocator, &wizer_args, preopen_abs);
     }
-    wizer_args.appendSlice(allocator, &.{ "-o", initialized, runtime.engine }) catch
+    wizer_args.appendSlice(allocator, &.{ "-o", initialized, runtime.engine.path }) catch
         @panic("out of memory");
 
     var pipeline_env = std.process.Environ.Map.init(allocator);
-    try pipeline_env.putAll(environ);
+    try copyEnvironment(&pipeline_env, environ);
     try pipeline_env.put("WASMTIME_BACKTRACE_DETAILS", "1");
     _ = pipeline_env.swapRemove("STARLINGMONKEY_CONFIG");
     diagnostic.begin(.initialize);
@@ -335,7 +374,7 @@ fn execute(
         &.{ transaction_dir, "candidate.wasm" },
     );
     if (runtime.component_wit) |component_wit| {
-        const wabt = tools.wabt.?;
+        const wabt = tools.wabt.?.path;
         stripped = try std.fs.path.join(
             allocator,
             &.{ transaction_dir, "stripped.wasm" },
@@ -385,7 +424,7 @@ fn execute(
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
             "wasi_snapshot_preview1={s}",
-            .{runtime.adapter},
+            .{runtime.adapter.path},
         );
         diagnostic.begin(.adapt);
         try runCommand(
@@ -414,7 +453,7 @@ fn execute(
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
             "wasi_snapshot_preview1={s}",
-            .{runtime.adapter},
+            .{runtime.adapter.path},
         );
         diagnostic.begin(.adapt);
         try runCommand(
@@ -422,7 +461,7 @@ fn execute(
             io,
             "wasm-tools component new",
             &.{
-                tools.wasm_tools,
+                tools.wasm_tools.path,
                 "component",
                 "new",
                 "--adapt",
@@ -456,7 +495,7 @@ fn execute(
         io,
         "wasm-tools metadata add",
         &.{
-            tools.wasm_tools,
+            tools.wasm_tools.path,
             "metadata",
             "add",
             "--language",
@@ -481,7 +520,7 @@ fn execute(
         allocator,
         io,
         "wasm-tools validate",
-        &.{ tools.wasm_tools, "validate", "--features", "all", processed },
+        &.{ tools.wasm_tools.path, "validate", "--features", "all", processed },
         cwd,
         null,
         null,
@@ -517,11 +556,10 @@ fn execute(
         const document = try buildMetadataDocument(
             allocator,
             io,
-            environ,
             config,
-            source,
-            initializer,
-            runtime_args,
+            source_snapshot,
+            initializer_snapshot,
+            provenance_runtime_args,
             runtime,
             tools,
             processed,
@@ -612,6 +650,7 @@ fn execute(
         metadata_output,
         debug_staged,
         debug_dir,
+        &transaction_safe_to_remove,
     );
     diagnostic.reportSuccess(source, output);
 }
@@ -623,6 +662,7 @@ fn externalRuntime(
     executable_dir: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
+    transaction_dir: []const u8,
 ) !Runtime {
     if (config.disable_features.len != 0 or
         config.enable_features.len != 0 or
@@ -630,41 +670,63 @@ fn externalRuntime(
     {
         return error.IncompatibleEngineOptions;
     }
-    const engine = try absolutePath(allocator, cwd, engine_override);
-    try requireFile(io, engine);
-    const adapter = if (config.preview2_adapter) |path|
+    const engine_source = try absolutePath(allocator, cwd, engine_override);
+    const engine = try snapshotFile(
+        allocator,
+        io,
+        engine_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
+    );
+    const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
     else
         try siblingOrName(allocator, io, executable_dir, "preview1-adapter.wasm", "preview1-adapter.wasm");
-    try requireFile(io, adapter);
-    const component_wit = if (config.component_wit orelse config.wit) |path|
+    const adapter = try snapshotFile(
+        allocator,
+        io,
+        adapter_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
+    );
+    const component_wit_source = if (config.component_wit orelse config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
         null;
-    const dispatch_wit_path = if (config.wit) |path|
+    const dispatch_wit_source = if (config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
         null;
-    const dispatch_wit_digest = if (dispatch_wit_path) |path|
-        try digestWitDirectory(allocator, io, path)
+    const dispatch_wit = if (dispatch_wit_source) |path|
+        try stageWit(
+            allocator,
+            io,
+            path,
+            try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+        )
     else
         null;
-    const component_wit_digest = if (component_wit) |path|
-        if (dispatch_wit_path != null and std.mem.eql(u8, path, dispatch_wit_path.?))
-            dispatch_wit_digest
+    const component_wit = if (component_wit_source) |path|
+        if (dispatch_wit_source != null and std.mem.eql(u8, path, dispatch_wit_source.?))
+            dispatch_wit
         else
-            try digestWitDirectory(allocator, io, path)
+            try stageWit(
+                allocator,
+                io,
+                path,
+                try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+            )
     else
         null;
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = component_wit,
+        .component_wit = if (component_wit) |wit| wit.absolute else null,
         .component_world = config.component_world_name orelse config.world_name,
         .bindings = null,
-        .dispatch_wit_digest = dispatch_wit_digest,
-        .component_wit_digest = component_wit_digest,
+        .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
+        .component_wit_digest = if (component_wit) |wit| wit.digest else null,
+        .features_known = false,
         .zig = null,
+        .build_tools = &.{},
         .cache_lock = null,
     };
 }
@@ -678,6 +740,7 @@ fn buildRuntime(
     executable_dir: []const u8,
     config: *const cli.Config,
     diagnostic: *diagnostics.Context,
+    transaction_dir: []const u8,
 ) !Runtime {
     const cache_dir = if (config.cache_dir) |path|
         try absolutePath(allocator, cwd, path)
@@ -691,9 +754,27 @@ fn buildRuntime(
     var dispatch_wit: ?StagedWit = null;
     var component_wit: ?StagedWit = null;
     if (config.wit) |path| {
-        dispatch_wit = try stageWit(allocator, io, cwd, build_root, path);
+        const dispatch_source = try absolutePath(allocator, cwd, path);
+        dispatch_wit = try stageWit(
+            allocator,
+            io,
+            dispatch_source,
+            try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+        );
         component_wit = if (config.component_wit) |component_path|
-            try stageWit(allocator, io, cwd, build_root, component_path)
+            if (std.mem.eql(
+                u8,
+                dispatch_source,
+                try absolutePath(allocator, cwd, component_path),
+            ))
+                dispatch_wit
+            else
+                try stageWit(
+                    allocator,
+                    io,
+                    try absolutePath(allocator, cwd, component_path),
+                    try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+                )
         else
             dispatch_wit;
     }
@@ -719,16 +800,23 @@ fn buildRuntime(
     try lock_file.lock(io, .exclusive);
     errdefer lock_file.unlock(io);
 
-    const zig = if (config.zig_bin) |path|
+    const zig_source = if (config.zig_bin) |path|
         try absolutePath(allocator, cwd, path)
     else if (environ.get("ZIG")) |path|
         try absolutePath(allocator, cwd, path)
     else
         build_options.zig_exe;
+    const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
+    const zig = try snapshotFile(
+        allocator,
+        io,
+        zig_resolved,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "zig" }),
+    );
 
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(allocator, &.{
-        zig,
+        zig.path,
         "build",
         "--prefix",
         prefix,
@@ -736,11 +824,11 @@ fn buildRuntime(
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
         argv.appendSlice(allocator, &.{
-            try std.fmt.allocPrint(allocator, "-Dcomponent-wit={s}", .{component_wit.?.relative}),
+            try std.fmt.allocPrint(allocator, "-Dcomponent-wit={s}", .{component_wit.?.absolute}),
             try std.fmt.allocPrint(allocator, "-Dcomponent-world={s}", .{
                 config.component_world_name orelse config.world_name.?,
             }),
-            try std.fmt.allocPrint(allocator, "-Ddispatch-wit={s}", .{wit.relative}),
+            try std.fmt.allocPrint(allocator, "-Ddispatch-wit={s}", .{wit.absolute}),
             try std.fmt.allocPrint(allocator, "-Ddispatch-world={s}", .{config.world_name.?}),
         }) catch @panic("out of memory");
     }
@@ -777,9 +865,20 @@ fn buildRuntime(
     );
     try Dir.cwd().createDirPath(io, zig_global_cache);
     var build_env = std.process.Environ.Map.init(allocator);
-    try build_env.putAll(environ);
+    try copyEnvironment(&build_env, environ);
     try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_cache);
     _ = build_env.swapRemove("ZIG_LOCAL_CACHE_DIR");
+    if (environ.get("ZIG_LIB_DIR") == null) {
+        const zig_parent = std.fs.path.dirname(zig_resolved) orelse
+            return error.MissingBuildArtifact;
+        const zig_lib_dir = try std.fs.path.join(
+            allocator,
+            &.{ zig_parent, "lib" },
+        );
+        if (try pathKindNoFollow(io, zig_lib_dir) == .directory) {
+            try build_env.put("ZIG_LIB_DIR", zig_lib_dir);
+        }
+    }
     var command_log: std.ArrayList(u8) = .empty;
     try runCommand(
         allocator,
@@ -795,12 +894,17 @@ fn buildRuntime(
         null,
     );
 
-    const engine = try std.fs.path.join(
+    const engine_built = try std.fs.path.join(
         allocator,
         &.{ prefix, "bin", "starling-raw.wasm" },
     );
-    try requireFile(io, engine);
-    const adapter = if (config.preview2_adapter) |path|
+    const engine = try snapshotFile(
+        allocator,
+        io,
+        engine_built,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
+    );
+    const adapter_built = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
     else blk: {
         const installed = try std.fs.path.join(
@@ -816,15 +920,33 @@ fn buildRuntime(
             "preview1-adapter.wasm",
         );
     };
-    try requireFile(io, adapter);
+    const adapter = try snapshotFile(
+        allocator,
+        io,
+        adapter_built,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
+    );
     const bindings = if (needs_bindings) blk: {
         const path = try std.fs.path.join(
             allocator,
             &.{ prefix, "bin", "component-bindings.zig" },
         );
-        try requireFile(io, path);
-        break :blk path;
+        break :blk (try snapshotFile(
+            allocator,
+            io,
+            path,
+            try std.fs.path.join(allocator, &.{ transaction_dir, "component-bindings.zig" }),
+        )).path;
     } else null;
+    const build_tools = try readBuildToolManifest(
+        allocator,
+        io,
+        try std.fs.path.join(
+            allocator,
+            &.{ prefix, "bin", "runtime-build-tools.json" },
+        ),
+        transaction_dir,
+    );
 
     return .{
         .engine = engine,
@@ -834,9 +956,21 @@ fn buildRuntime(
         .bindings = bindings,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
         .component_wit_digest = if (component_wit) |wit| wit.digest else null,
+        .features_known = true,
         .zig = zig,
+        .build_tools = build_tools,
         .cache_lock = lock_file,
     };
+}
+
+fn copyEnvironment(
+    destination: *std.process.Environ.Map,
+    source: *const std.process.Environ.Map,
+) !void {
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| {
+        try destination.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
 }
 
 fn resolveTools(
@@ -847,50 +981,36 @@ fn resolveTools(
     executable_dir: []const u8,
     config: *const cli.Config,
     needs_wabt: bool,
+    transaction_dir: []const u8,
 ) !Tools {
-    const wizer = if (config.wizer_bin) |path|
-        WizerTool{
-            .executable = try absolutePath(allocator, cwd, path),
-            .wasmtime_subcommand = false,
-        }
+    const standalone_wizer = try std.fs.path.join(
+        allocator,
+        &.{ executable_dir, "wizer" },
+    );
+    const wizer_is_wasmtime = config.wizer_bin == null and
+        (config.wasmtime_bin != null or
+            (environ.get("WIZER_BIN") == null and
+                (environ.get("WASMTIME_BIN") != null or
+                    !pathExists(io, standalone_wizer))));
+    const wizer_executable = if (config.wizer_bin) |path|
+        try absolutePath(allocator, cwd, path)
     else if (config.wasmtime_bin) |path|
-        WizerTool{
-            .executable = try absolutePath(allocator, cwd, path),
-            .wasmtime_subcommand = true,
-        }
+        try absolutePath(allocator, cwd, path)
     else if (environ.get("WIZER_BIN")) |path|
-        WizerTool{
-            .executable = try absolutePath(allocator, cwd, path),
-            .wasmtime_subcommand = false,
-        }
+        try absolutePath(allocator, cwd, path)
     else if (environ.get("WASMTIME_BIN")) |path|
-        WizerTool{
-            .executable = try absolutePath(allocator, cwd, path),
-            .wasmtime_subcommand = true,
-        }
+        try absolutePath(allocator, cwd, path)
     else blk: {
-        const standalone = try std.fs.path.join(
+        if (pathExists(io, standalone_wizer)) break :blk standalone_wizer;
+        break :blk try siblingOrName(
             allocator,
-            &.{ executable_dir, "wizer" },
+            io,
+            executable_dir,
+            "wasmtime",
+            "wasmtime",
         );
-        if (pathExists(io, standalone)) {
-            break :blk WizerTool{
-                .executable = standalone,
-                .wasmtime_subcommand = false,
-            };
-        }
-        break :blk WizerTool{
-            .executable = try siblingOrName(
-                allocator,
-                io,
-                executable_dir,
-                "wasmtime",
-                "wasmtime",
-            ),
-            .wasmtime_subcommand = true,
-        };
     };
-    const wasm_tools = if (config.wasm_tools_bin) |path|
+    const wasm_tools_source = if (config.wasm_tools_bin) |path|
         try absolutePath(allocator, cwd, path)
     else if (environ.get("WASM_TOOLS_BIN")) |path|
         try absolutePath(allocator, cwd, path)
@@ -902,7 +1022,7 @@ fn resolveTools(
             "wasm-tools",
             "wasm-tools",
         );
-    const wabt = if (!needs_wabt)
+    const wabt_source = if (!needs_wabt)
         null
     else if (config.wabt_bin) |path|
         try absolutePath(allocator, cwd, path)
@@ -910,6 +1030,30 @@ fn resolveTools(
         try absolutePath(allocator, cwd, path)
     else
         try siblingOrName(allocator, io, executable_dir, "wabt", "wabt");
+    const wizer = WizerTool{
+        .executable = try snapshotFile(
+            allocator,
+            io,
+            try resolveExecutable(allocator, io, environ, wizer_executable),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "wizer" }),
+        ),
+        .wasmtime_subcommand = wizer_is_wasmtime,
+    };
+    const wasm_tools = try snapshotFile(
+        allocator,
+        io,
+        try resolveExecutable(allocator, io, environ, wasm_tools_source),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "wasm-tools" }),
+    );
+    const wabt = if (wabt_source) |path|
+        try snapshotFile(
+            allocator,
+            io,
+            try resolveExecutable(allocator, io, environ, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
+        )
+    else
+        null;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
 }
 
@@ -975,11 +1119,9 @@ fn isBuildRoot(allocator: Allocator, io: Io, candidate: []const u8) bool {
 fn stageWit(
     allocator: Allocator,
     io: Io,
-    cwd: []const u8,
-    build_root: []const u8,
-    input_path: []const u8,
+    source_path: []const u8,
+    stage_path: []const u8,
 ) !StagedWit {
-    const source_path = try absolutePath(allocator, cwd, input_path);
     var source_dir = try Dir.openDirAbsolute(io, source_path, .{ .iterate = true });
     defer source_dir.close(io);
     var walker = try source_dir.walk(allocator);
@@ -1022,60 +1164,19 @@ fn stageWit(
     hasher.final(&digest_bytes);
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     const digest = try allocator.dupe(u8, &digest_hex);
-    const stage_path = try std.fs.path.join(
-        allocator,
-        &.{
-            build_root,
-            ".zig-cache",
-            "starling-componentizer",
-            "inputs",
-            digest,
-        },
-    );
-    const marker = try std.fs.path.join(allocator, &.{ stage_path, ".complete" });
-    const input_lock_dir = try std.fs.path.join(
-        allocator,
-        &.{
-            build_root,
-            ".zig-cache",
-            "starling-componentizer",
-            "input-locks",
-        },
-    );
-    try Dir.cwd().createDirPath(io, input_lock_dir);
-    const input_lock_path = try std.fs.path.join(
-        allocator,
-        &.{ input_lock_dir, try std.fmt.allocPrint(allocator, "{s}.lock", .{digest}) },
-    );
-    const input_lock = try Dir.createFileAbsolute(io, input_lock_path, .{ .truncate = false });
-    defer input_lock.close(io);
-    try input_lock.lock(io, .exclusive);
-    defer input_lock.unlock(io);
-    if (!pathExists(io, marker)) {
-        try Dir.cwd().deleteTree(io, stage_path);
-        try Dir.cwd().createDirPath(io, stage_path);
-        for (files.items, contents.items) |relative, data| {
-            const destination = try std.fs.path.join(allocator, &.{ stage_path, relative });
-            const destination_parent = std.fs.path.dirname(destination) orelse
-                return error.InvalidPath;
-            try Dir.cwd().createDirPath(io, destination_parent);
-            try Dir.cwd().writeFile(io, .{
-                .sub_path = destination,
-                .data = data,
-            });
-        }
-        try Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = digest });
+    try Dir.cwd().createDirPath(io, stage_path);
+    for (files.items, contents.items) |relative, data| {
+        const destination = try std.fs.path.join(allocator, &.{ stage_path, relative });
+        const destination_parent = std.fs.path.dirname(destination) orelse
+            return error.InvalidPath;
+        try Dir.cwd().createDirPath(io, destination_parent);
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = destination,
+            .data = data,
+        });
     }
-    const relative_stage = try std.fs.path.relative(
-        allocator,
-        build_root,
-        null,
-        build_root,
-        stage_path,
-    );
     return .{
         .absolute = stage_path,
-        .relative = relative_stage,
         .digest = digest,
     };
 }
@@ -1113,60 +1214,12 @@ fn hashField(
     hasher.update(&.{0xff});
 }
 
-fn digestWitDirectory(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
-) ![]const u8 {
-    var source_dir = try Dir.openDirAbsolute(io, path, .{ .iterate = true });
-    defer source_dir.close(io);
-    var walker = try source_dir.walk(allocator);
-    defer walker.deinit();
-    var files: std.ArrayList([]const u8) = .empty;
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => {},
-            .file => {
-                if (!std.mem.endsWith(u8, entry.path, ".wit")) continue;
-                files.append(allocator, try allocator.dupe(u8, entry.path)) catch
-                    @panic("out of memory");
-            },
-            else => return error.UnsupportedWitEntry,
-        }
-    }
-    if (files.items.len == 0) return error.MissingWitFiles;
-    std.mem.sort([]const u8, files.items, {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.order(u8, lhs, rhs) == .lt;
-        }
-    }.lessThan);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    for (files.items) |relative| {
-        hasher.update(relative);
-        hasher.update(&.{0});
-        const data = try source_dir.readFileAlloc(
-            io,
-            relative,
-            allocator,
-            .unlimited,
-        );
-        hasher.update(data);
-        hasher.update(&.{0xff});
-    }
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    const encoded = std.fmt.bytesToHex(digest, .lower);
-    return allocator.dupe(u8, &encoded);
-}
-
 fn buildMetadataDocument(
     allocator: Allocator,
     io: Io,
-    environ: *std.process.Environ.Map,
     config: *const cli.Config,
-    source: []const u8,
-    initializer: ?[]const u8,
+    source: Snapshot,
+    initializer: ?Snapshot,
     runtime_args: []const u8,
     runtime: Runtime,
     tools: Tools,
@@ -1175,22 +1228,31 @@ fn buildMetadataDocument(
 ) !metadata.Document {
     var features: std.ArrayList(metadata.Feature) = .empty;
     var feature_fields: std.ArrayList([2][]const u8) = .empty;
-    for (cli.feature_names) |name| {
-        var enabled = true;
-        for (config.disable_features) |disabled| {
-            if (std.mem.eql(u8, name, disabled)) enabled = false;
+    if (runtime.features_known) {
+        for (cli.feature_names) |name| {
+            var enabled = true;
+            for (config.disable_features) |disabled| {
+                if (std.mem.eql(u8, name, disabled)) enabled = false;
+            }
+            for (config.enable_features) |explicitly_enabled| {
+                if (std.mem.eql(u8, name, explicitly_enabled)) enabled = true;
+            }
+            features.append(allocator, .{ .name = name, .enabled = enabled }) catch
+                @panic("out of memory");
+            feature_fields.append(
+                allocator,
+                .{ name, if (enabled) "1" else "0" },
+            ) catch @panic("out of memory");
         }
-        for (config.enable_features) |explicitly_enabled| {
-            if (std.mem.eql(u8, name, explicitly_enabled)) enabled = true;
-        }
-        features.append(allocator, .{ .name = name, .enabled = enabled }) catch
-            @panic("out of memory");
-        feature_fields.append(
-            allocator,
-            .{ name, if (enabled) "1" else "0" },
-        ) catch @panic("out of memory");
     }
-    const features_hash = try metadata.hashFields(allocator, feature_fields.items);
+    const feature_values: ?[]const metadata.Feature = if (runtime.features_known)
+        features.toOwnedSlice(allocator) catch @panic("out of memory")
+    else
+        null;
+    const features_hash: ?[]const u8 = if (runtime.features_known)
+        try metadata.hashFields(allocator, feature_fields.items)
+    else
+        null;
 
     const dispatch_world = metadata.World{
         .name = config.world_name,
@@ -1210,40 +1272,37 @@ fn buildMetadataDocument(
     var tool_values: std.ArrayList(metadata.Tool) = .empty;
     var tool_fields: std.ArrayList([2][]const u8) = .empty;
     if (runtime.zig) |zig| {
-        try appendToolHash(
+        try appendToolSnapshot(
             allocator,
-            io,
-            environ,
             &tool_values,
             &tool_fields,
             "zig",
             zig,
         );
     }
-    try appendToolHash(
+    for (runtime.build_tools) |tool| {
+        tool_values.append(allocator, tool) catch @panic("out of memory");
+        tool_fields.append(allocator, .{ tool.name, tool.sha256 }) catch
+            @panic("out of memory");
+    }
+    try appendToolSnapshot(
         allocator,
-        io,
-        environ,
         &tool_values,
         &tool_fields,
         if (tools.wizer.wasmtime_subcommand) "wasmtime-wizer" else "wizer",
         tools.wizer.executable,
     );
     if (tools.wabt) |wabt| {
-        try appendToolHash(
+        try appendToolSnapshot(
             allocator,
-            io,
-            environ,
             &tool_values,
             &tool_fields,
             "wabt",
             wabt,
         );
     }
-    try appendToolHash(
+    try appendToolSnapshot(
         allocator,
-        io,
-        environ,
         &tool_values,
         &tool_fields,
         "wasm-tools",
@@ -1260,49 +1319,37 @@ fn buildMetadataDocument(
             .dispatch_world = dispatch_world,
             .component_world = component_world,
             .worlds_sha256 = try metadata.hashFields(allocator, &world_fields),
-            .features = features.toOwnedSlice(allocator) catch @panic("out of memory"),
+            .features = feature_values,
             .features_sha256 = features_hash,
             .tools = tool_values.toOwnedSlice(allocator) catch @panic("out of memory"),
             .tools_sha256 = try metadata.hashFields(allocator, tool_fields.items),
             .inputs = .{
-                .source_sha256 = try metadata.sha256File(allocator, io, source),
-                .initializer_sha256 = if (initializer) |path|
-                    try metadata.sha256File(allocator, io, path)
+                .source_sha256 = source.digest,
+                .initializer_sha256 = if (initializer) |snapshot|
+                    snapshot.digest
                 else
                     null,
                 .runtime_arguments_sha256 = try metadata.sha256Bytes(
                     allocator,
                     runtime_args,
                 ),
-                .engine_sha256 = try metadata.sha256File(
-                    allocator,
-                    io,
-                    runtime.engine,
-                ),
-                .preview2_adapter_sha256 = try metadata.sha256File(
-                    allocator,
-                    io,
-                    runtime.adapter,
-                ),
+                .engine_sha256 = runtime.engine.digest,
+                .preview2_adapter_sha256 = runtime.adapter.digest,
             },
         },
     };
 }
 
-fn appendToolHash(
+fn appendToolSnapshot(
     allocator: Allocator,
-    io: Io,
-    environ: *std.process.Environ.Map,
     tools: *std.ArrayList(metadata.Tool),
     fields: *std.ArrayList([2][]const u8),
     name: []const u8,
-    executable: []const u8,
+    executable: Snapshot,
 ) !void {
-    const path = try resolveExecutable(allocator, io, environ, executable);
-    const digest = try metadata.sha256File(allocator, io, path);
-    tools.append(allocator, .{ .name = name, .sha256 = digest }) catch
+    tools.append(allocator, .{ .name = name, .sha256 = executable.digest }) catch
         @panic("out of memory");
-    fields.append(allocator, .{ name, digest }) catch @panic("out of memory");
+    fields.append(allocator, .{ name, executable.digest }) catch @panic("out of memory");
 }
 
 fn resolveExecutable(
@@ -1331,6 +1378,162 @@ fn resolveExecutable(
     return error.MissingBuildArtifact;
 }
 
+const BuildToolManifest = struct {
+    schema: []const u8,
+    tools: []const Entry,
+
+    const Entry = struct {
+        name: []const u8,
+        path: []const u8,
+    };
+};
+
+fn readBuildToolManifest(
+    allocator: Allocator,
+    io: Io,
+    manifest_path: []const u8,
+    transaction_dir: []const u8,
+) ![]const metadata.Tool {
+    const manifest_snapshot = try snapshotFile(
+        allocator,
+        io,
+        manifest_path,
+        try std.fs.path.join(
+            allocator,
+            &.{ transaction_dir, "runtime-build-tools.json" },
+        ),
+    );
+    const source = try Dir.cwd().readFileAlloc(
+        io,
+        manifest_snapshot.path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    const manifest = std.json.parseFromSliceLeaky(
+        BuildToolManifest,
+        allocator,
+        source,
+        .{},
+    ) catch return error.InvalidToolManifest;
+    if (!std.mem.eql(
+        u8,
+        manifest.schema,
+        "starling-componentize-build-tools/v1",
+    )) return error.InvalidToolManifest;
+
+    const manifest_dir = std.fs.path.dirname(manifest_path) orelse
+        return error.InvalidToolManifest;
+    var tools: std.ArrayList(metadata.Tool) = .empty;
+    for (manifest.tools) |entry| {
+        if (entry.name.len == 0 or
+            std.mem.indexOfAny(u8, entry.name, "/\\\x00\r\n") != null or
+            std.fs.path.isAbsolute(entry.path))
+        {
+            return error.InvalidToolManifest;
+        }
+        for (tools.items) |existing| {
+            if (std.mem.eql(u8, existing.name, entry.name)) {
+                return error.InvalidToolManifest;
+            }
+        }
+        const source_path = try std.fs.path.resolve(
+            allocator,
+            &.{ manifest_dir, entry.path },
+        );
+        if (!pathContains(manifest_dir, source_path)) return error.InvalidToolManifest;
+        const snapshot = try snapshotFile(
+            allocator,
+            io,
+            source_path,
+            try std.fs.path.join(
+                allocator,
+                &.{
+                    transaction_dir,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "runtime-build-tool-{s}",
+                        .{entry.name},
+                    ),
+                },
+            ),
+        );
+        tools.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .sha256 = snapshot.digest,
+        }) catch @panic("out of memory");
+    }
+    return tools.toOwnedSlice(allocator) catch @panic("out of memory");
+}
+
+fn snapshotAdjacent(
+    allocator: Allocator,
+    io: Io,
+    source: []const u8,
+    label: []const u8,
+    random_hex: []const u8,
+) !Snapshot {
+    const parent = std.fs.path.dirname(source) orelse return error.InvalidPath;
+    const basename = std.fs.path.basename(source);
+    const extension = std.fs.path.extension(basename);
+    const stem = basename[0 .. basename.len - extension.len];
+    const snapshot_name = try std.fmt.allocPrint(
+        allocator,
+        ".{s}.starling-componentize-{s}-{s}{s}",
+        .{ stem, label, random_hex, extension },
+    );
+    return snapshotFile(
+        allocator,
+        io,
+        source,
+        try std.fs.path.join(allocator, &.{ parent, snapshot_name }),
+    );
+}
+
+fn snapshotFile(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+) !Snapshot {
+    var source = try Dir.openFileAbsolute(
+        io,
+        source_path,
+        .{ .follow_symlinks = false },
+    );
+    defer source.close(io);
+    const source_stat = try source.stat(io);
+    if (source_stat.kind != .file) return error.MissingBuildArtifact;
+
+    var destination = try Dir.createFileAbsolute(
+        io,
+        destination_path,
+        .{ .exclusive = true },
+    );
+    errdefer Dir.deleteFileAbsolute(io, destination_path) catch {};
+    defer destination.close(io);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = source.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (count == 0) continue;
+        hasher.update(buffer[0..count]);
+        try destination.writeStreamingAll(io, buffer[0..count]);
+    }
+    try destination.setPermissions(io, source_stat.permissions);
+    try destination.sync(io);
+    var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest_bytes);
+    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    return .{
+        .path = destination_path,
+        .digest = try allocator.dupe(u8, &digest_hex),
+    };
+}
+
 fn publishArtifacts(
     allocator: Allocator,
     io: Io,
@@ -1341,6 +1544,7 @@ fn publishArtifacts(
     metadata_output: ?[]const u8,
     debug_staged: ?[]const u8,
     debug_output: ?[]const u8,
+    transaction_safe_to_remove: *bool,
 ) !void {
     const component_backup = try std.fs.path.join(
         allocator,
@@ -1350,15 +1554,38 @@ fn publishArtifacts(
         allocator,
         &.{ transaction_dir, "previous-metadata" },
     );
+    const debug_backup = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "previous-debug" },
+    );
+    const old_debug_generated = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "previous-debug-generated" },
+    );
     var component_backed_up = false;
     var metadata_backed_up = false;
+    var debug_backed_up = false;
     var component_published = false;
     var metadata_published = false;
     var debug_published = false;
 
     errdefer {
         if (debug_published) {
-            Dir.cwd().deleteTree(io, debug_output.?) catch {};
+            Dir.renameAbsolute(debug_output.?, debug_staged.?, io) catch {
+                transaction_safe_to_remove.* = false;
+            };
+        }
+        if (debug_backed_up) {
+            restoreDebugDestination(
+                allocator,
+                io,
+                debug_staged.?,
+                debug_backup,
+                old_debug_generated,
+                debug_output.?,
+            ) catch {
+                transaction_safe_to_remove.* = false;
+            };
         }
         if (metadata_published) {
             Dir.cwd().deleteFile(io, metadata_output.?) catch {};
@@ -1367,22 +1594,43 @@ fn publishArtifacts(
             Dir.cwd().deleteFile(io, component_output) catch {};
         }
         if (metadata_backed_up) {
-            Dir.renameAbsolute(metadata_backup, metadata_output.?, io) catch {};
+            Dir.renameAbsolute(metadata_backup, metadata_output.?, io) catch {
+                transaction_safe_to_remove.* = false;
+            };
         }
         if (component_backed_up) {
-            Dir.renameAbsolute(component_backup, component_output, io) catch {};
+            Dir.renameAbsolute(component_backup, component_output, io) catch {
+                transaction_safe_to_remove.* = false;
+            };
         }
     }
 
-    if (pathExists(io, component_output)) {
-        try Dir.renameAbsolute(component_output, component_backup, io);
-        component_backed_up = true;
-    }
+    component_backed_up = try backupRegularDestination(
+        io,
+        component_output,
+        component_backup,
+        error.InvalidPath,
+        transaction_safe_to_remove,
+    );
     if (metadata_output) |path| {
-        if (pathExists(io, path)) {
-            try Dir.renameAbsolute(path, metadata_backup, io);
-            metadata_backed_up = true;
-        }
+        metadata_backed_up = try backupRegularDestination(
+            io,
+            path,
+            metadata_backup,
+            error.InvalidMetadataDestination,
+            transaction_safe_to_remove,
+        );
+    }
+    if (debug_staged) |staged| {
+        debug_backed_up = try prepareDebugDestination(
+            allocator,
+            io,
+            staged,
+            debug_output.?,
+            debug_backup,
+            old_debug_generated,
+            transaction_safe_to_remove,
+        );
     }
 
     try Dir.renameAbsolute(component_staged, component_output, io);
@@ -1394,6 +1642,172 @@ fn publishArtifacts(
     if (debug_staged) |path| {
         try Dir.renameAbsolute(path, debug_output.?, io);
         debug_published = true;
+    }
+
+    if (component_backed_up) Dir.deleteFileAbsolute(io, component_backup) catch {};
+    if (metadata_backed_up) Dir.deleteFileAbsolute(io, metadata_backup) catch {};
+    if (debug_backed_up) {
+        removeOldGeneratedFiles(allocator, io, old_debug_generated) catch {};
+        Dir.deleteDirAbsolute(io, old_debug_generated) catch {};
+        Dir.deleteDirAbsolute(io, debug_backup) catch {};
+    }
+}
+
+const debug_generated_names = [_][]const u8{
+    "runtime-args.txt",
+    "initialized.wasm",
+    "stripped.wasm",
+    "embedded.wasm",
+    "component.wasm",
+    "component-bindings.zig",
+    "commands.txt",
+    "metadata.json",
+    "imports.json",
+};
+
+fn isGeneratedDebugName(name: []const u8) bool {
+    for (debug_generated_names) |generated| {
+        if (std.mem.eql(u8, name, generated)) return true;
+    }
+    return false;
+}
+
+fn backupRegularDestination(
+    io: Io,
+    destination: []const u8,
+    backup: []const u8,
+    invalid_error: anyerror,
+    transaction_safe_to_remove: *bool,
+) !bool {
+    if (try pathKindNoFollow(io, destination) == null) return false;
+    try Dir.renameAbsolute(destination, backup, io);
+    var valid_backup = false;
+    errdefer if (!valid_backup) {
+        Dir.renameAbsolute(backup, destination, io) catch {
+            transaction_safe_to_remove.* = false;
+        };
+    };
+    const kind = try pathKindNoFollow(io, backup);
+    if (kind == .file) {
+        valid_backup = true;
+        return true;
+    }
+    return invalid_error;
+}
+
+fn prepareDebugDestination(
+    allocator: Allocator,
+    io: Io,
+    staged: []const u8,
+    destination: []const u8,
+    backup: []const u8,
+    old_generated: []const u8,
+    transaction_safe_to_remove: *bool,
+) !bool {
+    if (try pathKindNoFollow(io, destination) == null) return false;
+    try Dir.renameAbsolute(destination, backup, io);
+    var prepared = false;
+    errdefer if (!prepared) {
+        restoreDebugDestination(
+            allocator,
+            io,
+            staged,
+            backup,
+            old_generated,
+            destination,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+        };
+    };
+    if (try pathKindNoFollow(io, backup) != .directory) {
+        return error.DebugOutputCollision;
+    }
+    try Dir.createDirAbsolute(io, old_generated, .default_dir);
+
+    var backup_dir = try Dir.openDirAbsolute(
+        io,
+        backup,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer backup_dir.close(io);
+    var iterator = backup_dir.iterate();
+    var names: std.ArrayList([]const u8) = .empty;
+    while (try iterator.next(io)) |entry| {
+        names.append(allocator, try allocator.dupe(u8, entry.name)) catch
+            @panic("out of memory");
+        if (isGeneratedDebugName(entry.name) and
+            entry.kind != .file and entry.kind != .sym_link)
+        {
+            return error.DebugOutputCollision;
+        }
+    }
+
+    for (names.items) |name| {
+        const source = try std.fs.path.join(allocator, &.{ backup, name });
+        const target_parent = if (isGeneratedDebugName(name)) old_generated else staged;
+        const target = try std.fs.path.join(allocator, &.{ target_parent, name });
+        try Dir.renameAbsolute(source, target, io);
+    }
+    prepared = true;
+    return true;
+}
+
+fn restoreDebugDestination(
+    allocator: Allocator,
+    io: Io,
+    staged: []const u8,
+    backup: []const u8,
+    old_generated: []const u8,
+    destination: []const u8,
+) !void {
+    try moveDebugEntries(allocator, io, staged, backup, false);
+    try moveDebugEntries(allocator, io, old_generated, backup, true);
+    Dir.deleteDirAbsolute(io, old_generated) catch {};
+    try Dir.renameAbsolute(backup, destination, io);
+}
+
+fn moveDebugEntries(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    generated_only: bool,
+) !void {
+    var source = Dir.openDirAbsolute(
+        io,
+        source_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer source.close(io);
+    var iterator = source.iterate();
+    var names: std.ArrayList([]const u8) = .empty;
+    while (try iterator.next(io)) |entry| {
+        if (generated_only != isGeneratedDebugName(entry.name)) continue;
+        names.append(allocator, try allocator.dupe(u8, entry.name)) catch
+            @panic("out of memory");
+    }
+    for (names.items) |name| {
+        try Dir.renameAbsolute(
+            try std.fs.path.join(allocator, &.{ source_path, name }),
+            try std.fs.path.join(allocator, &.{ destination_path, name }),
+            io,
+        );
+    }
+}
+
+fn removeOldGeneratedFiles(
+    allocator: Allocator,
+    io: Io,
+    directory: []const u8,
+) !void {
+    for (debug_generated_names) |name| {
+        const path = try std.fs.path.join(allocator, &.{ directory, name });
+        if (try pathKindNoFollow(io, path) != null) {
+            try Dir.deleteFileAbsolute(io, path);
+        }
     }
 }
 
@@ -1537,7 +1951,7 @@ fn runCommand(
     const term = try child.wait(io);
     const stdout = try multi_reader.toOwnedSlice(0);
     const stderr = try multi_reader.toOwnedSlice(1);
-    if (!term.success()) {
+    if (!termSucceeded(term)) {
         diagnostic.commandFailed(stage, term, stderr, redact_path);
         return error.CommandFailed;
     }
@@ -1545,6 +1959,13 @@ fn runCommand(
         try File.stdout().writeStreamingAll(io, stdout);
         try File.stderr().writeStreamingAll(io, stderr);
     }
+}
+
+fn termSucceeded(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn addPreopen(
@@ -1609,6 +2030,18 @@ fn pathExists(io: Io, path: []const u8) bool {
     return true;
 }
 
+fn pathKindNoFollow(io: Io, path: []const u8) !?File.Kind {
+    const stat = Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return stat.kind;
+}
+
 fn requireFile(io: Io, path: []const u8) !void {
     const stat = Dir.cwd().statFile(io, path, .{}) catch return error.MissingBuildArtifact;
     if (stat.kind != .file) return error.MissingBuildArtifact;
@@ -1619,7 +2052,11 @@ fn requireDestinationFileOrMissing(
     path: []const u8,
     invalid_error: anyerror,
 ) !void {
-    const stat = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+    const stat = Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };

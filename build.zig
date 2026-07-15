@@ -1,5 +1,10 @@
 const std = @import("std");
 
+const RuntimeBuildTool = struct {
+    name: []const u8,
+    executable: std.Build.LazyPath,
+};
+
 fn dependencyExecutable(
     dependency: *std.Build.Dependency,
     name: []const u8,
@@ -10,6 +15,13 @@ fn dependencyExecutable(
             return install.artifact;
     }
     @panic("dependency executable not found");
+}
+
+fn inputPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(path))
+        .{ .cwd_relative = path }
+    else
+        b.path(path);
 }
 
 // StarlingMonkey build (Zig 0.17 port of the CMake build).
@@ -260,6 +272,7 @@ pub fn build(b: *std.Build) void {
 
     const is_debug = optimize == .Debug;
     const gpa = b.allocator;
+    var runtime_build_tools: std.ArrayList(RuntimeBuildTool) = .empty;
 
     // ---- Common compile flags (port of cmake/compile-flags.cmake) ----
     // Differences from the wasi-sdk build:
@@ -396,9 +409,18 @@ pub fn build(b: *std.Build) void {
     if (dispatch_wit) |wit_dir| {
         const dep = b.dependency("wasip3", .{});
         wasip3_dep = dep;
-        const bindgen = b.addRunArtifact(dep.artifact("wasip3-bindgen"));
+        const bindgen_snapshot = b.addWriteFiles().addCopyFile(
+            dep.artifact("wasip3-bindgen").getEmittedBin(),
+            "wasip3-bindgen",
+        );
+        runtime_build_tools.append(gpa, .{
+            .name = "wasip3-bindgen",
+            .executable = bindgen_snapshot,
+        }) catch @panic("OOM");
+        const bindgen = std.Build.Step.Run.create(b, "wasip3-bindgen");
+        bindgen.addFileArg(bindgen_snapshot);
         bindgen.addArg("--wit");
-        addWitArg(b, bindgen, b.path(wit_dir));
+        addWitArg(b, bindgen, inputPath(b, wit_dir));
         bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "--js-imports", "-o" });
         generated_bindings = bindgen.addOutputFileArg("component_bindings.zig");
     }
@@ -461,8 +483,16 @@ pub fn build(b: *std.Build) void {
     var raw_wasm: std.Build.LazyPath = exe.getEmittedBin();
     if (use_wasm_opt and !is_debug) {
         if (b.lazyDependency("binaryen", .{})) |bin_dep| {
+            const wasm_opt_snapshot = b.addWriteFiles().addCopyFile(
+                bin_dep.path("bin/wasm-opt"),
+                "wasm-opt",
+            );
+            runtime_build_tools.append(gpa, .{
+                .name = "wasm-opt",
+                .executable = wasm_opt_snapshot,
+            }) catch @panic("OOM");
             const wo = std.Build.Step.Run.create(b, "wasm-opt");
-            wo.addFileArg(bin_dep.path("bin/wasm-opt"));
+            wo.addFileArg(wasm_opt_snapshot);
             wo.addArgs(&.{
                 "--strip-debug",                     "-O3",
                 "--enable-bulk-memory",              "--enable-bulk-memory-opt",
@@ -479,6 +509,41 @@ pub fn build(b: *std.Build) void {
     const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
     b.getInstallStep().dependOn(&install_raw.step);
 
+    var tool_manifest: std.ArrayList(u8) = .empty;
+    tool_manifest.appendSlice(
+        gpa,
+        "{\n  \"schema\": \"starling-componentize-build-tools/v1\",\n  \"tools\": [",
+    ) catch @panic("OOM");
+    for (runtime_build_tools.items, 0..) |tool, index| {
+        tool_manifest.appendSlice(
+            gpa,
+            if (index == 0) "\n" else ",\n",
+        ) catch @panic("OOM");
+        tool_manifest.appendSlice(gpa, b.fmt(
+            "    {{\"name\": \"{s}\", \"path\": \"runtime-build-tools/{s}\"}}",
+            .{ tool.name, tool.name },
+        )) catch @panic("OOM");
+        const install_tool = b.addInstallBinFile(
+            tool.executable,
+            b.fmt("runtime-build-tools/{s}", .{tool.name}),
+        );
+        b.getInstallStep().dependOn(&install_tool.step);
+    }
+    tool_manifest.appendSlice(
+        gpa,
+        if (runtime_build_tools.items.len == 0) "]\n}\n" else "\n  ]\n}\n",
+    ) catch @panic("OOM");
+    const tool_manifest_file = b.addWriteFiles().add(
+        "runtime-build-tools.json",
+        tool_manifest.items,
+    );
+    b.getInstallStep().dependOn(
+        &b.addInstallBinFile(
+            tool_manifest_file,
+            "runtime-build-tools.json",
+        ).step,
+    );
+
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
     // Install the preview1 adapter and a generated componentize.sh next to
     // starling-raw.wasm so the runtime can be turned into a component.
@@ -486,7 +551,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(adapter), "preview1-adapter.wasm").step);
     if (component_wit) |wit_dir| {
         const install_wit = b.addInstallDirectory(.{
-            .source_dir = b.path(wit_dir),
+            .source_dir = inputPath(b, wit_dir),
             .install_dir = .bin,
             .install_subdir = "component-wit",
             .include_extensions = &.{".wit"},
