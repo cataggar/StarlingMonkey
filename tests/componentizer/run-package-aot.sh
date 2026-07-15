@@ -6,9 +6,11 @@ if [ "$#" -ne 2 ]; then
   exit 2
 fi
 
-CACHE_TOOL="$(realpath "$1")"
-PACKAGE_SCRIPT="$(realpath "$2")"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/harness-helpers.sh"
+CACHE_TOOL="$(resolve_executable "$1")"
+PACKAGE_SCRIPT="$(resolve_executable "$2")"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/tests/componentizer/.aot-package-race"
 BARRIER="$SCRATCH/validation barrier"
 MOVE_TOOLS="$SCRATCH/move tools"

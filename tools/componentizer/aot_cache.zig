@@ -22,6 +22,7 @@ pub const Error = error{
     InvalidCacheSchema,
     InvalidManifest,
     MissingCacheArtifact,
+    SealPathAlias,
     SqliteUnavailable,
     StaleEngine,
     StaleFeatureAbi,
@@ -82,19 +83,28 @@ pub fn seal(
     manifest_path: []const u8,
 ) !void {
     try validateValue(feature_abi);
-    const engine_sha = try hashFileHex(allocator, io, engine_path);
-    try verifyCacheDatabase(allocator, cache_path, engine_sha);
-    const sealed_cache_path = canonical_cache_path orelse cache_path;
+    const paths = try resolveSealPaths(
+        allocator,
+        io,
+        engine_path,
+        weval_path,
+        cache_path,
+        canonical_cache_path,
+        primer_path,
+        manifest_path,
+    );
+    const engine_sha = try hashFileHex(allocator, io, paths.engine);
+    try verifyCacheDatabase(allocator, paths.source_cache, engine_sha);
     try canonicalizeCacheDatabase(
         allocator,
         io,
-        cache_path,
-        sealed_cache_path,
+        paths.source_cache,
+        paths.canonical_cache,
         engine_sha,
     );
-    const weval_sha = try hashFileHex(allocator, io, weval_path);
-    const cache_sha = try hashFileHex(allocator, io, sealed_cache_path);
-    const primer_sha = try hashFileHex(allocator, io, primer_path);
+    const weval_sha = try hashFileHex(allocator, io, paths.weval);
+    const cache_sha = try hashFileHex(allocator, io, paths.canonical_cache);
+    const primer_sha = try hashFileHex(allocator, io, paths.primer);
     const key = try cacheKey(
         allocator,
         engine_sha,
@@ -127,7 +137,212 @@ pub fn seal(
             primer_sha,
         },
     );
-    try Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = contents });
+    try Dir.cwd().writeFile(io, .{ .sub_path = paths.manifest, .data = contents });
+}
+
+const SealPath = struct {
+    role: []const u8,
+    supplied: []const u8,
+    absolute: []const u8,
+    resolved: []const u8,
+    inode: ?File.INode,
+    nlink: ?File.NLink,
+    size: ?u64,
+    mtime: ?i96,
+    ctime: ?i96,
+};
+
+const SealPaths = struct {
+    engine: []const u8,
+    weval: []const u8,
+    source_cache: []const u8,
+    canonical_cache: []const u8,
+    primer: []const u8,
+    manifest: []const u8,
+};
+
+fn resolveSealPaths(
+    allocator: Allocator,
+    io: Io,
+    engine_path: []const u8,
+    weval_path: []const u8,
+    cache_path: []const u8,
+    canonical_cache_path: ?[]const u8,
+    primer_path: []const u8,
+    manifest_path: []const u8,
+) !SealPaths {
+    const engine = try resolveSealPath(allocator, io, "engine", engine_path);
+    const weval = try resolveSealPath(allocator, io, "Weval binary", weval_path);
+    const source_cache = try resolveSealPath(
+        allocator,
+        io,
+        "source cache",
+        cache_path,
+    );
+    const primer = try resolveSealPath(allocator, io, "primer", primer_path);
+    const manifest = try resolveSealPath(
+        allocator,
+        io,
+        "manifest output",
+        manifest_path,
+    );
+
+    if (canonical_cache_path) |output_path| {
+        const canonical_cache = try resolveSealPath(
+            allocator,
+            io,
+            "canonical cache output",
+            output_path,
+        );
+        const all = [_]SealPath{
+            engine,
+            weval,
+            source_cache,
+            canonical_cache,
+            primer,
+            manifest,
+        };
+        try rejectSealPathAliases(&all);
+        return .{
+            .engine = engine.absolute,
+            .weval = weval.absolute,
+            .source_cache = source_cache.absolute,
+            .canonical_cache = canonical_cache.absolute,
+            .primer = primer.absolute,
+            .manifest = manifest.absolute,
+        };
+    }
+
+    const all = [_]SealPath{ engine, weval, source_cache, primer, manifest };
+    try rejectSealPathAliases(&all);
+    return .{
+        .engine = engine.absolute,
+        .weval = weval.absolute,
+        .source_cache = source_cache.absolute,
+        .canonical_cache = source_cache.absolute,
+        .primer = primer.absolute,
+        .manifest = manifest.absolute,
+    };
+}
+
+fn resolveSealPath(
+    allocator: Allocator,
+    io: Io,
+    role: []const u8,
+    supplied: []const u8,
+) !SealPath {
+    if (supplied.len == 0 or std.mem.indexOfScalar(u8, supplied, 0) != null)
+        return error.InvalidManifest;
+    const cwd = try Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const absolute = if (std.fs.path.isAbsolute(supplied))
+        try allocator.dupe(u8, supplied)
+    else
+        try joinUnresolved(allocator, cwd, supplied);
+    const resolved = try resolveSealDestination(allocator, io, absolute, 0);
+    const stat = Dir.cwd().statFile(io, absolute, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    return .{
+        .role = role,
+        .supplied = supplied,
+        .absolute = absolute,
+        .resolved = resolved,
+        .inode = if (stat) |value| value.inode else null,
+        .nlink = if (stat) |value| value.nlink else null,
+        .size = if (stat) |value| value.size else null,
+        .mtime = if (stat) |value| value.mtime.nanoseconds else null,
+        .ctime = if (stat) |value| value.ctime.nanoseconds else null,
+    };
+}
+
+fn resolveSealDestination(
+    allocator: Allocator,
+    io: Io,
+    absolute: []const u8,
+    depth: usize,
+) ![]const u8 {
+    if (depth == 40) return error.InvalidManifest;
+    return Dir.realPathFileAbsoluteAlloc(io, absolute, allocator) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(absolute) orelse
+                return error.InvalidManifest;
+            if (std.mem.eql(u8, parent, absolute)) return err;
+            const link_stat = Dir.cwd().statFile(
+                io,
+                absolute,
+                .{ .follow_symlinks = false },
+            ) catch |stat_err| switch (stat_err) {
+                error.FileNotFound => null,
+                else => return stat_err,
+            };
+            if (link_stat != null and link_stat.?.kind == .sym_link) {
+                var buffer: [Dir.max_path_bytes]u8 = undefined;
+                const length = try Dir.readLinkAbsolute(io, absolute, &buffer);
+                const target = buffer[0..length];
+                const target_absolute = if (std.fs.path.isAbsolute(target))
+                    try allocator.dupe(u8, target)
+                else
+                    try joinUnresolved(allocator, parent, target);
+                return resolveSealDestination(
+                    allocator,
+                    io,
+                    target_absolute,
+                    depth + 1,
+                );
+            }
+            const resolved_parent = try resolveSealDestination(
+                allocator,
+                io,
+                parent,
+                depth + 1,
+            );
+            return std.fs.path.join(
+                allocator,
+                &.{ resolved_parent, std.fs.path.basename(absolute) },
+            );
+        },
+        else => return err,
+    };
+}
+
+fn joinUnresolved(
+    allocator: Allocator,
+    parent: []const u8,
+    child: []const u8,
+) ![]const u8 {
+    if (std.mem.endsWith(u8, parent, &.{std.fs.path.sep}))
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ parent, child });
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}",
+        .{ parent, std.fs.path.sep, child },
+    );
+}
+
+fn rejectSealPathAliases(paths: []const SealPath) Error!void {
+    for (paths, 0..) |left, left_index| {
+        for (paths[left_index + 1 ..]) |right| {
+            const same_resolved_path = std.mem.eql(u8, left.resolved, right.resolved);
+            const same_inode = if (left.inode) |left_inode|
+                if (right.inode) |right_inode|
+                    left_inode == right_inode and
+                        left.nlink.? > 1 and right.nlink.? > 1 and
+                        left.size.? == right.size.? and
+                        left.mtime.? == right.mtime.? and
+                        left.ctime.? == right.ctime.?
+                else
+                    false
+            else
+                false;
+            if (!same_resolved_path and !same_inode) continue;
+            std.debug.print(
+                "error: AOT cache seal path collision: {s} '{s}' aliases {s} '{s}'\n",
+                .{ left.role, left.supplied, right.role, right.supplied },
+            );
+            return error.SealPathAlias;
+        }
+    }
 }
 
 pub fn validate(

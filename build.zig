@@ -275,6 +275,25 @@ pub fn build(b: *std.Build) void {
     aot_package_test.addFileArg(b.path("scripts/package-aot-release.sh"));
     aot_package_test_step.dependOn(&aot_package_test.step);
     componentizer_test_step.dependOn(aot_package_test_step);
+    const aot_seal_alias_test_step = b.step(
+        "aot-seal-alias-test",
+        "Reject all AOT seal input/output filesystem aliases",
+    );
+    const aot_seal_alias_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-seal-aliases.sh" },
+    );
+    aot_seal_alias_test.addArtifactArg(aot_cache_tool);
+    aot_seal_alias_test_step.dependOn(&aot_seal_alias_test.step);
+    componentizer_test_step.dependOn(aot_seal_alias_test_step);
+    const aot_shell_test_step = b.step(
+        "aot-shell-test",
+        "Test AOT shell tool resolution and recursive Zig forwarding",
+    );
+    const aot_shell_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot-shell-regressions.sh" },
+    );
+    aot_shell_test_step.dependOn(&aot_shell_test.step);
+    componentizer_test_step.dependOn(aot_shell_test_step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );

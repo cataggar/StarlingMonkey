@@ -32,7 +32,7 @@ build target="all" *flags:
                 zig_step=('{{ target }}')
                 ;;
         esac
-        '{{ zig }}' build "${zig_step[@]}" --prefix '{{ builddir }}' \
+        {{ quote(zig) }} build "${zig_step[@]}" --prefix '{{ builddir }}' \
             -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
         if [[ '{{ target }}' == starling ]]; then
             '{{ builddir }}/bin/componentize.sh' \
@@ -92,16 +92,16 @@ format *ARGS:
 # Build and test the sealed Zig AOT runtime
 [group('aot')]
 aot-build *flags:
-    '{{ zig }}' build --prefix '{{ builddir }}' \
+    {{ quote(zig) }} build --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
 
 [group('aot')]
 aot-test: aot-build
     {{ justdir }}/tests/componentizer/run-legacy-aot-targets.sh \
-        '{{ zig }}' '{{ builddir }}'
-    '{{ zig }}' build componentizer-test --prefix '{{ builddir }}' \
+        {{ quote(zig) }} '{{ builddir }}'
+    {{ quote(zig) }} build componentizer-test --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true
-    '{{ zig }}' build aot-engine-test --prefix '{{ builddir }}' \
+    {{ quote(zig) }} build aot-engine-test --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true
 
 [group('aot')]
@@ -113,11 +113,12 @@ test regex="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ '{{ mode }}' == weval ]]; then
-        just --justfile '{{ justdir }}/justfile' builddir='{{ builddir }}' aot-test
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} \
+            builddir='{{ builddir }}' aot-test
     else
-        just --justfile '{{ justdir }}/justfile' mode='{{ mode }}' \
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} mode='{{ mode }}' \
             builddir='{{ builddir }}' build integration-test-server
-        just --justfile '{{ justdir }}/justfile' mode='{{ mode }}' \
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} mode='{{ mode }}' \
             builddir='{{ builddir }}' build wpt-runtime
         ctest --test-dir '{{ builddir }}' -j '{{ ncpus }}' --output-on-failure \
             {{ if regex == "" { regex } else { "-R " + regex } }}

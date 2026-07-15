@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: $0 <starling-componentize> <host-api>" >&2
-  echo "usage: $0 <starling-componentize> <starling-aot-cache>" >&2
+if [ "$#" -ne 3 ]; then
+  echo "usage: $0 <starling-componentize> <host-api> <starling-aot-cache>" >&2
   exit 2
 fi
 
-COMPONENTIZER="$(realpath "$1")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/harness-helpers.sh"
+COMPONENTIZER="$(resolve_executable "$1")"
 EXPECTED_HOST_API="$2"
-CACHE_TOOL="$(realpath "$2")"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CACHE_TOOL="$(resolve_executable "$3")"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 BARRIERS="$SCRATCH/test barriers"
 TOOLS="$SCRATCH/fake tools"

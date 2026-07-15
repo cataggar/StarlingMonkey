@@ -6,9 +6,11 @@ if [ "$#" -ne 2 ]; then
   exit 2
 fi
 
-ZIG="$(realpath "$1")"
-PREFIX="$(realpath "$2")"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/harness-helpers.sh"
+ZIG="$(resolve_executable "$1")"
+PREFIX="$(realpath -- "$2")"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JUSTFILE="$ROOT/justfile"
 
 rm -f "$PREFIX/bin/starling-raw.wasm"
