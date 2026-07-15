@@ -671,7 +671,26 @@ done
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasip3-bindgen"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasm-opt"
+
+cat > "$TOOLS/fake wasmtime" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = wizer
+shift
+cat > "$FAKE_RUNTIME_ARGS_LOG"
+out=""
+for ((i = 1; i <= $#; i++)); do
+  if [ "${!i}" = "-o" ]; then
+    j=$((i + 1))
+    out="${!j}"
+  fi
+done
+cp "${!#}" "$out"
+EOF
 chmod +x "$TOOLS"/*
+for tool in zig wizer wasmtime wabt wasm-tools weval; do
+  ln -s "fake $tool" "$TOOLS/path-$tool"
+done
 
 WRAPPER_DIR="$SCRATCH/wrapper with spaces"
 mkdir -p "$WRAPPER_DIR"
@@ -710,6 +729,16 @@ assert "--legacy-wrapper-preopen" in args
 preopen = args.index("--preopen-dir")
 assert args[preopen + 1] == sys.argv[2]
 assert args[-3:] == ["--output", sys.argv[3], sys.argv[4]]
+PY
+WASM_TOOLS=path-wasm-tools WABT=path-wabt WEVAL=path-weval \
+  "$WRAPPER_DIR/componentize.sh" --output "$WORK/wrapper path output.wasm" "$SOURCE"
+python3 - "$WRAPPER_LOG" <<'PY'
+import sys
+
+args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
+assert args[args.index("--wasm-tools-bin") + 1] == "path-wasm-tools"
+assert args[args.index("--wabt-bin") + 1] == "path-wabt"
+assert args[args.index("--weval-bin") + 1] == "path-weval"
 PY
 "$WRAPPER_DIR/componentize.sh" "$SOURCE" "$WORK/positional output.wasm"
 python3 - "$WRAPPER_LOG" "$SOURCE" "$WORK/positional output.wasm" <<'PY'
@@ -753,6 +782,51 @@ pub const js_import_manifest: []const u8 =
     "";
 EOF
 EXPECTED_ZIG_GLOBAL_CACHE="${ZIG_GLOBAL_CACHE_DIR:-}"
+
+PATH_OVERRIDE_OUTPUT="$WORK/path override output.wasm"
+PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin path-wizer \
+  --wabt-bin path-wabt \
+  --wasm-tools-bin path-wasm-tools \
+  --out "$PATH_OVERRIDE_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
+
+PATH_ENV_OUTPUT="$WORK/path environment output.wasm"
+env PATH="$TOOLS:$PATH" \
+  WIZER_BIN=path-wizer WABT=path-wabt WASM_TOOLS_BIN=path-wasm-tools \
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --out "$PATH_ENV_OUTPUT" \
+    "$SOURCE"
+cmp "$ENGINE" "$PATH_ENV_OUTPUT"
+
+PATH_WASMTIME_OUTPUT="$WORK/path wasmtime output.wasm"
+PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wasmtime-bin path-wasmtime \
+  --wasm-tools-bin path-wasm-tools \
+  --out "$PATH_WASMTIME_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$PATH_WASMTIME_OUTPUT"
+
+PATH_WASMTIME_ENV_OUTPUT="$WORK/path wasmtime environment output.wasm"
+env PATH="$TOOLS:$PATH" \
+  WASMTIME_BIN=path-wasmtime WASM_TOOLS_BIN=path-wasm-tools \
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --out "$PATH_WASMTIME_ENV_OUTPUT" \
+    "$SOURCE"
+cmp "$ENGINE" "$PATH_WASMTIME_ENV_OUTPUT"
 
 OUTPUT="$WORK/output component.wasm"
 DEBUG_DIR="$WORK/debug output"
@@ -1481,6 +1555,12 @@ PY
   --primer "$SOURCE" \
   --feature-abi 'starling-features-v1;fake=1' \
   --out "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+"$CACHE_TOOL" validate \
+  --engine "$ENGINE" \
+  --weval "$TOOLS/fake weval" \
+  --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
+  --manifest "$AOT_BUNDLE/starling-ics.wevalcache.manifest" \
+  --feature-abi 'starling-features-v1;fake=1'
 
 expect_seal_failure() {
   local cache="$1" label="$2"
@@ -1578,17 +1658,17 @@ cmp "$ENGINE" "$RUNTIME_ONLY_OUTPUT"
 test ! -e "$FAKE_AOT_RUNTIME_ARGS_LOG"
 
 export EXPECTED_RUST_MIN_STACK=123456
-RUST_MIN_STACK=999 "$COMPONENTIZER" \
+PATH="$TOOLS:$PATH" RUST_MIN_STACK=999 "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
   --aot-min-stack-size "$EXPECTED_RUST_MIN_STACK" \
-  --weval-bin "$TOOLS/fake weval" \
+  --weval-bin path-weval \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
-  --wabt-bin "$TOOLS/fake wabt" \
-  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --wabt-bin path-wabt \
+  --wasm-tools-bin path-wasm-tools \
   --out "$AOT_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$AOT_OUTPUT"
@@ -1598,18 +1678,17 @@ LEGACY_PREOPEN="$SCRATCH/legacy preopen"
 LEGACY_PREOPEN_OUTPUT="$WORK/legacy preopen output.wasm"
 mkdir -p "$LEGACY_PREOPEN"
 export EXPECTED_RUST_MIN_STACK=8388608
-"$COMPONENTIZER" \
+env PATH="$TOOLS:$PATH" \
+  WEVAL_BIN=path-weval WABT=path-wabt WASM_TOOLS_BIN=path-wasm-tools \
+  "$COMPONENTIZER" \
   --aot \
   --legacy-wrapper-preopen \
   --preopen-dir "$LEGACY_PREOPEN" \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
-  --weval-bin "$TOOLS/fake weval" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
-  --wabt-bin "$TOOLS/fake wabt" \
-  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$LEGACY_PREOPEN_OUTPUT" \
   "$SOURCE"
 python3 - "$FAKE_AOT_ARGV_LOG" "$LEGACY_PREOPEN" <<'PY'
@@ -3686,6 +3765,11 @@ run_retained_cache_selection_race() {
     --build-root "$FAKE_BUILD_ROOT" \
     --cache-dir "$configured_cache" \
     --zig-bin "$TOOLS/fake zig" \
+  local output="$1" zig_bin="${2:-$TOOLS/fake zig}"
+  "$COMPONENTIZER" \
+    --build-root "$ROOT" \
+    --cache-dir "$CACHE" \
+    --zig-bin "$zig_bin" \
     --wit "$WIT" \
     --world-name exports \
     --wizer-bin "$TOOLS/fake wizer" \
@@ -4572,6 +4656,21 @@ test ! -e "$INVALID_ZIG_OUTPUT"
 
 build_with_fake_zig "$BUILD_OUTPUT_1"
 build_with_fake_zig "$BUILD_OUTPUT_2"
+build_with_env_tools() {
+  local output="$1"
+  env PATH="$TOOLS:$PATH" \
+    ZIG=path-zig WIZER_BIN=path-wizer WABT=path-wabt \
+    WASM_TOOLS_BIN=path-wasm-tools \
+    "$COMPONENTIZER" \
+      --build-root "$ROOT" \
+      --cache-dir "$CACHE" \
+      --wit "$WIT" \
+      --world-name exports \
+      --out "$output" \
+      "$SOURCE"
+}
+PATH="$TOOLS:$PATH" build_with_fake_zig "$BUILD_OUTPUT_1" path-zig
+build_with_env_tools "$BUILD_OUTPUT_2"
 printf '\n// cache invalidation\n' >> "$WIT/world.wit"
 build_with_fake_zig "$BUILD_OUTPUT_3"
 cp "$WIT/world.wit" "$ENGINE_BUNDLE/component-wit/world.wit"

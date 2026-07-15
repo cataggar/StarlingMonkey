@@ -4,7 +4,10 @@ const aot_cache = @import("aot_cache.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len != 14 or !std.mem.eql(u8, args[1], "seal")) usage();
+    if (args.len < 2) usage();
+    const sealing = std.mem.eql(u8, args[1], "seal");
+    const validating = std.mem.eql(u8, args[1], "validate");
+    if (!sealing and !validating) usage();
 
     var engine: ?[]const u8 = null;
     var weval: ?[]const u8 = null;
@@ -12,6 +15,7 @@ pub fn main(init: std.process.Init) !void {
     var primer: ?[]const u8 = null;
     var feature_abi: ?[]const u8 = null;
     var output: ?[]const u8 = null;
+    var manifest: ?[]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) usage();
@@ -27,26 +31,45 @@ pub fn main(init: std.process.Init) !void {
             feature_abi = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--out")) {
             output = args[i + 1];
+        } else if (std.mem.eql(u8, args[i], "--manifest")) {
+            manifest = args[i + 1];
         } else {
             usage();
         }
     }
-    aot_cache.seal(
-        allocator,
-        init.io,
-        engine orelse usage(),
-        weval orelse usage(),
-        cache orelse usage(),
-        primer orelse usage(),
-        feature_abi orelse usage(),
-        output orelse usage(),
-    ) catch |err| std.process.fatal("failed to seal AOT cache: {t}", .{err});
+    if (sealing) {
+        if (manifest != null) usage();
+        aot_cache.seal(
+            allocator,
+            init.io,
+            engine orelse usage(),
+            weval orelse usage(),
+            cache orelse usage(),
+            primer orelse usage(),
+            feature_abi orelse usage(),
+            output orelse usage(),
+        ) catch |err| std.process.fatal("failed to seal AOT cache: {t}", .{err});
+    } else {
+        if (primer != null or output != null) usage();
+        const validated = aot_cache.validate(
+            allocator,
+            init.io,
+            engine orelse usage(),
+            weval orelse usage(),
+            cache orelse usage(),
+            manifest orelse usage(),
+            feature_abi,
+        ) catch |err| std.process.fatal("failed to validate AOT cache: {t}", .{err});
+        std.debug.print("Validated AOT cache {s}\n", .{validated.key});
+    }
 }
 
 fn usage() noreturn {
     std.process.fatal(
         "usage: starling-aot-cache seal --engine <wasm> --weval <bin> " ++
-            "--cache <sqlite> --primer <js> --feature-abi <abi> --out <manifest>",
+            "--cache <sqlite> --primer <js> --feature-abi <abi> --out <manifest>\n" ++
+            "       starling-aot-cache validate --engine <wasm> --weval <bin> " ++
+            "--cache <sqlite> --manifest <manifest> [--feature-abi <abi>]",
         .{},
     );
 }

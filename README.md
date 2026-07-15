@@ -123,6 +123,18 @@ zig-out/bin/starling-componentize --aot \
 
 CMake intentionally rejects `WEVAL=ON`; only the Zig AOT path creates and
 validates the sealed cache required for no-fallback AOT componentization.
+The `just` AOT recipes use that same path (legacy `mode=weval` builds are
+routed to Zig rather than CMake):
+
+```console
+just builddir=build-aot aot-test
+just builddir=build-aot aot-package release-artifacts
+```
+
+The package recipe validates the AOT engine and its sealed cache before
+publishing `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
+`starling-ics.wevalcache.manifest`. Non-AOT `just build` modes continue to use
+CMake.
 
 See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT
 cache controls, integrity/ABI keys, custom-engine packaging, deterministic

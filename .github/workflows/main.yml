@@ -40,6 +40,7 @@ jobs:
       with:
         version: 0.17.0-dev.902+7255f3e72
 
+
     - name: Check if SpiderMonkey Release Exists
       id: check-sm-release
       if: github.base_ref != 'zig17'
@@ -71,7 +72,7 @@ jobs:
         tree spidermonkey-dist-${{ matrix.build }}
         echo "SPIDERMONKEY_BINARIES=$(pwd)/spidermonkey-dist-${{ matrix.build }}" >> $GITHUB_ENV
 
-    - uses: actions/setup-node@v2
+    - uses: actions/setup-node@v4
       with:
         node-version: 'lts/*'
 
@@ -132,6 +133,12 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-feature-surface
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-feature-surface
+  test-aot:
+    name: Test sealed Zig AOT
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-aot
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-aot
     steps:
     - uses: actions/checkout@v4
 
@@ -152,6 +159,8 @@ jobs:
 
     - name: Validate release workflow recipes
       run: python3 tests/workflows/check-just-recipes.py .github/workflows/release-please.yml justfile
+    - name: Install Just
+      uses: taiki-e/install-action@just
 
     - name: Install Rust WASI target
       run: rustup target add wasm32-wasip1
@@ -166,6 +175,23 @@ jobs:
       run: |
         "$GITHUB_WORKSPACE/.ci-tools/zig/zig" build host-api-production-matrix-test \
           -Doptimize=ReleaseSmall
+    - name: Build AOT dependencies
+      run: ./deps/build-deps.sh --aot
+
+    - name: Build and test sealed AOT runtime
+      run: just builddir=zig-out-aot aot-test
+
+    - name: Validate AOT package assembly
+      run: just builddir=zig-out-aot aot-package release-artifacts
+
+    - name: Upload validated AOT package
+      uses: actions/upload-artifact@v4
+      with:
+        name: starling-aot
+        path: |
+          release-artifacts/starling-raw-weval.wasm
+          release-artifacts/starling-ics.wevalcache
+          release-artifacts/starling-ics.wevalcache.manifest
 
   release-spidermonkey:
     needs: [test, feature-surface-acceptance]

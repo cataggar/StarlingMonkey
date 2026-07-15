@@ -1,16 +1,12 @@
 cmake_minimum_required(VERSION 3.27)
 
+option(WEVAL "Build with a SpiderMonkey variant that supports weval-based AOT compilation" OFF)
 if(WEVAL)
     message(FATAL_ERROR
         "CMake WEVAL builds are no longer supported. "
         "Use the sealed Zig AOT path: "
         "zig build -Doptimize=ReleaseSmall -Daot-engine=true."
     )
-option(WEVAL "Build with a SpiderMonkey variant that supports weval-based AOT compilation" OFF)
-if(WEVAL)
-    message(FATAL_ERROR
-        "CMake WEVAL=ON is disabled because it cannot produce the sealed, validated AOT cache. "
-        "Use `zig build -Doptimize=ReleaseSmall -Daot-engine=true` instead.")
 endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

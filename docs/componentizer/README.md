@@ -161,6 +161,24 @@ The second builds both real engine variants, validates both components, and
 invokes the same typed JavaScript exports through Wasmtime to prove Wizer/AOT
 behavioral equivalence. Its fixtures and cache/output paths include spaces.
 
+Release packaging must keep the cache and manifest together. The repository's
+packaging gate builds through Zig and validates both the engine module and the
+sealed SQLite bundle before moving any AOT files into the release directory:
+
+```console
+just builddir=build-aot aot-package release-artifacts
+```
+
+For an already assembled bundle, run the same seal validation directly:
+
+```console
+build-aot/bin/starling-aot-cache validate \
+  --engine release-artifacts/starling-raw-weval.wasm \
+  --weval build-aot/bin/weval \
+  --cache release-artifacts/starling-ics.wevalcache \
+  --manifest release-artifacts/starling-ics.wevalcache.manifest
+```
+
 ## Per-run WIT worlds
 
 The monolithic runtime needs two related WIT views:
@@ -436,6 +454,9 @@ Every top-level and nested build requires exactly Zig
 their retained executable and rejected during input preflight when the version
 differs. The broader `build.zig.zon` minimum remains only a package parser
 floor.
+`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options. Executable
+overrides may be absolute paths, relative paths containing a separator, or
+bare names resolved through `PATH`.
 
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized

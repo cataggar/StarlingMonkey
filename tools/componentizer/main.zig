@@ -4528,8 +4528,31 @@ fn buildRuntime(
 
     const zig_source = if (config.zig_bin) |path|
         try absolutePath(allocator, cwd, path)
+    const key = try runtimeKey(
+        allocator,
+        config,
+        if (dispatch_wit) |wit| wit.digest else null,
+        if (component_wit) |wit| wit.digest else null,
+    );
+    const prefix = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "runtimes", key },
+    );
+    const lock_dir = try std.fs.path.join(allocator, &.{ cache_dir, "locks" });
+    try Dir.cwd().createDirPath(io, lock_dir);
+    const lock_path = try std.fs.path.join(
+        allocator,
+        &.{ lock_dir, try std.fmt.allocPrint(allocator, "{s}.lock", .{key}) },
+    );
+    const lock_file = try Dir.createFileAbsolute(io, lock_path, .{ .truncate = false });
+    errdefer lock_file.close(io);
+    try lock_file.lock(io, .exclusive);
+    errdefer lock_file.unlock(io);
+
+    const zig = if (config.zig_bin) |path|
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("ZIG")) |path|
-        try absolutePath(allocator, cwd, path)
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else
         build_options.zig_exe;
     const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
@@ -5510,6 +5533,26 @@ fn resolveTools(
         try absolutePath(allocator, cwd, path)
     else if (environ.get("WASMTIME_BIN")) |path|
         try absolutePath(allocator, cwd, path)
+    const wizer = if (config.wizer_bin) |path|
+        WizerTool{
+            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .wasmtime_subcommand = false,
+        }
+    else if (config.wasmtime_bin) |path|
+        WizerTool{
+            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .wasmtime_subcommand = true,
+        }
+    else if (environ.get("WIZER_BIN")) |path|
+        WizerTool{
+            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .wasmtime_subcommand = false,
+        }
+    else if (environ.get("WASMTIME_BIN")) |path|
+        WizerTool{
+            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .wasmtime_subcommand = true,
+        }
     else blk: {
         if (pathExists(io, standalone_wizer)) break :blk standalone_wizer;
         break :blk try siblingOrName(
@@ -5522,8 +5565,10 @@ fn resolveTools(
     };
     const wasm_tools_source = if (config.wasm_tools_bin) |path|
         try absolutePath(allocator, cwd, path)
+    const wasm_tools = if (config.wasm_tools_bin) |path|
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("WASM_TOOLS_BIN")) |path|
-        try absolutePath(allocator, cwd, path)
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else
         try siblingOrName(
             allocator,
@@ -5534,8 +5579,12 @@ fn resolveTools(
         );
     const wabt_source = if (config.wabt_bin) |path|
         try absolutePath(allocator, cwd, path)
+    const wabt = if (!needs_wabt)
+        null
+    else if (config.wabt_bin) |path|
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("WABT")) |path|
-        try absolutePath(allocator, cwd, path)
+        try resolveExecutable(allocator, io, environ, cwd, path)
     else
         try siblingOrName(allocator, io, executable_dir, "wabt", "wabt");
     const wizer = WizerTool{
