@@ -56,26 +56,35 @@ const EntryIdentity = struct {
     }
 };
 
-const Transaction = struct {
+const OwnedEntry = struct {
     path: []const u8,
-    cleanup_path: []const u8,
+    identity: EntryIdentity,
+};
+
+const Transaction = struct {
+    name: []const u8,
+    cleanup_name: []const u8,
     storage_path: []const u8,
+    publication: Dir,
     root: Dir,
     storage: Dir,
     root_identity: EntryIdentity,
     storage_identity: EntryIdentity,
     owner_identity: EntryIdentity,
+    owned: std.ArrayList(OwnedEntry) = .empty,
 
     fn create(
         allocator: Allocator,
         io: Io,
-        path: []const u8,
+        publication: Dir,
+        publication_path: []const u8,
+        name: []const u8,
         owner: []const u8,
     ) !Transaction {
-        try Dir.createDirAbsolute(io, path, .fromMode(0o700));
-        var root = try Dir.openDirAbsolute(
+        try publication.createDir(io, name, .fromMode(0o700));
+        var root = try publication.openDir(
             io,
-            path,
+            name,
             .{ .iterate = true, .follow_symlinks = false },
         );
         errdefer root.close(io);
@@ -97,13 +106,17 @@ const Transaction = struct {
         const storage_identity = EntryIdentity.fromStat(try storage.stat(io));
 
         return .{
-            .path = path,
-            .cleanup_path = try std.fmt.allocPrint(
+            .name = name,
+            .cleanup_name = try std.fmt.allocPrint(
                 allocator,
                 "{s}.cleanup",
-                .{path},
+                .{name},
             ),
-            .storage_path = try std.fs.path.join(allocator, &.{ path, "data" }),
+            .storage_path = try std.fs.path.join(
+                allocator,
+                &.{ publication_path, name, "data" },
+            ),
+            .publication = publication,
             .root = root,
             .storage = storage,
             .root_identity = root_identity,
@@ -121,10 +134,17 @@ const Transaction = struct {
         if (safe_to_remove) self.cleanup(allocator, io) catch {};
         self.storage.close(io);
         self.root.close(io);
+        self.publication.close(io);
+        self.owned.deinit(allocator);
     }
 
     fn cleanup(self: *Transaction, allocator: Allocator, io: Io) !void {
-        if (!try self.pathHasIdentity(io, self.path, self.root_identity)) return;
+        if (!try entryHasIdentity(
+            self.publication,
+            io,
+            self.name,
+            self.root_identity,
+        )) return;
         if (!try self.rootEntryHasIdentity(io, ".owner", self.owner_identity)) return;
         if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) return;
 
@@ -136,54 +156,274 @@ const Transaction = struct {
                 return;
             }
         }
-        var storage_iterator = self.storage.iterate();
-        while (try storage_iterator.next(io)) |entry| {
-            if (!isOwnedTransactionEntry(entry.name)) return;
-        }
+        try self.verifyOwnedDirectory(allocator, io, self.storage, "");
 
-        Dir.renamePreserve(
-            .cwd(),
-            self.path,
-            .cwd(),
-            self.cleanup_path,
+        self.publication.renamePreserve(
+            self.name,
+            self.publication,
+            self.cleanup_name,
             io,
         ) catch return;
-        if (!try self.pathHasIdentity(io, self.cleanup_path, self.root_identity)) {
-            Dir.renamePreserve(
-                .cwd(),
-                self.cleanup_path,
-                .cwd(),
-                self.path,
+        if (!try entryHasIdentity(
+            self.publication,
+            io,
+            self.cleanup_name,
+            self.root_identity,
+        )) {
+            self.publication.renamePreserve(
+                self.cleanup_name,
+                self.publication,
+                self.name,
                 io,
             ) catch {};
             return;
         }
 
-        try removeOwnedContents(allocator, io, self.storage);
+        try self.removeOwnedDirectory(allocator, io, self.storage, "");
         if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) return;
-        try self.root.deleteDir(io, "data");
+        try removeExactEntry(io, self.root, "data", self.storage_identity);
         if (!try self.rootEntryHasIdentity(io, ".owner", self.owner_identity)) return;
-        try self.root.deleteFile(io, ".owner");
-        if (!try self.pathHasIdentity(io, self.cleanup_path, self.root_identity)) return;
-        try Dir.deleteDirAbsolute(io, self.cleanup_path);
+        try removeExactEntry(io, self.root, ".owner", self.owner_identity);
+        var final_iterator = self.root.iterate();
+        if (try final_iterator.next(io) != null) return error.TransactionChanged;
+        if (!try entryHasIdentity(
+            self.publication,
+            io,
+            self.cleanup_name,
+            self.root_identity,
+        )) return;
+        try removeExactEntry(
+            io,
+            self.publication,
+            self.cleanup_name,
+            self.root_identity,
+        );
     }
 
-    fn pathHasIdentity(
-        self: *const Transaction,
+    fn recordStoragePath(
+        self: *Transaction,
+        allocator: Allocator,
         io: Io,
         path: []const u8,
-        identity: EntryIdentity,
-    ) !bool {
-        _ = self;
-        const stat = Dir.cwd().statFile(
+    ) !void {
+        const stat = try self.storage.statFile(
             io,
             path,
             .{ .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
+        );
+        if (stat.kind != .file and
+            stat.kind != .directory and
+            stat.kind != .sym_link)
+        {
+            return error.TransactionChanged;
+        }
+        const identity = EntryIdentity.fromStat(stat);
+        for (self.owned.items) |entry| {
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            if (!entry.identity.matches(stat)) return error.TransactionChanged;
+            return;
+        }
+        self.owned.append(allocator, .{
+            .path = try allocator.dupe(u8, path),
+            .identity = identity,
+        }) catch @panic("out of memory");
+    }
+
+    fn recordStorageAbsolute(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !void {
+        if (!pathContains(self.storage_path, path) or
+            path.len <= self.storage_path.len)
+        {
+            return error.InvalidPath;
+        }
+        const relative_start = self.storage_path.len +
+            @intFromBool(!std.mem.endsWith(
+                u8,
+                self.storage_path,
+                &.{std.fs.path.sep},
+            ));
+        try self.recordStoragePath(allocator, io, path[relative_start..]);
+    }
+
+    fn createStorageDir(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+        permissions: File.Permissions,
+    ) !void {
+        try self.storage.createDir(io, path, permissions);
+        try self.recordStoragePath(allocator, io, path);
+    }
+
+    fn ensureStorageDirPath(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !void {
+        var current: []const u8 = "";
+        var components = std.mem.splitScalar(u8, path, std.fs.path.sep);
+        while (components.next()) |component| {
+            if (component.len == 0) continue;
+            if (std.mem.eql(u8, component, ".") or
+                std.mem.eql(u8, component, ".."))
+            {
+                return error.InvalidPath;
+            }
+            current = if (current.len == 0)
+                try allocator.dupe(u8, component)
+            else
+                try std.fs.path.join(allocator, &.{ current, component });
+            const stat = self.storage.statFile(
+                io,
+                current,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try self.storage.createDir(io, current, .fromMode(0o700));
+                    try self.recordStoragePath(allocator, io, current);
+                    continue;
+                },
+                else => return err,
+            };
+            if (stat.kind != .directory) return error.TransactionChanged;
+            try self.recordStoragePath(allocator, io, current);
+        }
+    }
+
+    fn verifyAttached(self: *const Transaction, io: Io) !void {
+        if (!try entryHasIdentity(
+            self.publication,
+            io,
+            self.name,
+            self.root_identity,
+        )) return error.TransactionChanged;
+        if (!try self.rootEntryHasIdentity(io, "data", self.storage_identity)) {
+            return error.TransactionChanged;
+        }
+    }
+
+    fn ownedIdentity(
+        self: *const Transaction,
+        path: []const u8,
+    ) ?EntryIdentity {
+        for (self.owned.items) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) return entry.identity;
+        }
+        return null;
+    }
+
+    fn verifyOwnedDirectory(
+        self: *const Transaction,
+        allocator: Allocator,
+        io: Io,
+        directory: Dir,
+        relative: []const u8,
+    ) !void {
+        var iterator = directory.iterate();
+        while (try iterator.next(io)) |entry| {
+            const child_path = if (relative.len == 0)
+                try allocator.dupe(u8, entry.name)
+            else
+                try std.fs.path.join(allocator, &.{ relative, entry.name });
+            const identity = self.ownedIdentity(child_path) orelse
+                return error.TransactionChanged;
+            const stat = try directory.statFile(
+                io,
+                entry.name,
+                .{ .follow_symlinks = false },
+            );
+            if (!identity.matches(stat)) return error.TransactionChanged;
+            if (identity.kind == .directory) {
+                var child = try directory.openDir(
+                    io,
+                    entry.name,
+                    .{ .iterate = true, .follow_symlinks = false },
+                );
+                defer child.close(io);
+                if (!identity.matches(try child.stat(io))) {
+                    return error.TransactionChanged;
+                }
+                try self.verifyOwnedDirectory(
+                    allocator,
+                    io,
+                    child,
+                    child_path,
+                );
+            }
+        }
+    }
+
+    fn removeOwnedDirectory(
+        self: *const Transaction,
+        allocator: Allocator,
+        io: Io,
+        directory: Dir,
+        relative: []const u8,
+    ) !void {
+        const Child = struct {
+            name: []const u8,
+            path: []const u8,
+            identity: EntryIdentity,
         };
-        return identity.matches(stat);
+        var children: std.ArrayList(Child) = .empty;
+        defer children.deinit(allocator);
+        var iterator = directory.iterate();
+        while (try iterator.next(io)) |entry| {
+            const child_path = if (relative.len == 0)
+                try allocator.dupe(u8, entry.name)
+            else
+                try std.fs.path.join(allocator, &.{ relative, entry.name });
+            const identity = self.ownedIdentity(child_path) orelse
+                return error.TransactionChanged;
+            const stat = try directory.statFile(
+                io,
+                entry.name,
+                .{ .follow_symlinks = false },
+            );
+            if (!identity.matches(stat)) return error.TransactionChanged;
+            children.append(allocator, .{
+                .name = try allocator.dupe(u8, entry.name),
+                .path = child_path,
+                .identity = identity,
+            }) catch @panic("out of memory");
+        }
+
+        for (children.items) |child_entry| {
+            if (child_entry.identity.kind == .directory) {
+                var child = try directory.openDir(
+                    io,
+                    child_entry.name,
+                    .{ .iterate = true, .follow_symlinks = false },
+                );
+                if (!child_entry.identity.matches(try child.stat(io))) {
+                    child.close(io);
+                    return error.TransactionChanged;
+                }
+                try child.setPermissions(io, .fromMode(0o700));
+                try self.removeOwnedDirectory(
+                    allocator,
+                    io,
+                    child,
+                    child_entry.path,
+                );
+                child.close(io);
+            }
+            try removeExactEntry(
+                io,
+                directory,
+                child_entry.name,
+                child_entry.identity,
+            );
+        }
+
+        var final_iterator = directory.iterate();
+        if (try final_iterator.next(io) != null) return error.TransactionChanged;
     }
 
     fn rootEntryHasIdentity(
@@ -289,9 +529,14 @@ fn execute(
     const cwd = try std.process.currentPathAlloc(io, allocator);
     const source_argument = try absolutePath(allocator, cwd, config.source);
     const source = try resolveExistingFile(allocator, io, cwd, config.source);
+    const source_identity = try sourceFileIdentity(io, source);
     try validateArgument(source);
-    const initializer = if (config.initializer_script_path) |path|
-        try resolveExistingFile(allocator, io, cwd, path)
+    const initializer = if (config.initializer_script_path) |path| blk: {
+        const resolved = try resolveExistingFile(allocator, io, cwd, path);
+        break :blk resolved;
+    } else null;
+    const initializer_identity = if (initializer) |path|
+        try sourceFileIdentity(io, path)
     else
         null;
 
@@ -301,14 +546,29 @@ fn execute(
         try defaultOutputPath(allocator, cwd, source_argument);
     try validateArgument(output);
     const output_parent = std.fs.path.dirname(output) orelse return error.InvalidPath;
-    try Dir.cwd().createDirPath(io, output_parent);
-    const publication_parent = try Dir.realPathFileAbsoluteAlloc(
+    const publication_parent = try resolveOrCreateDirectory(
+        allocator,
         io,
         output_parent,
-        allocator,
     );
-    try requireDestinationFileOrMissing(io, output, error.InvalidPath);
-    const resolved_output = try resolveDestination(allocator, io, output);
+    var publication_directory = try Dir.openDirAbsolute(
+        io,
+        publication_parent,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    var publication_transferred = false;
+    defer if (!publication_transferred) publication_directory.close(io);
+    const output_name = std.fs.path.basename(output);
+    const resolved_output = try std.fs.path.join(
+        allocator,
+        &.{ publication_parent, output_name },
+    );
+    try requireDestinationFileOrMissingAt(
+        publication_directory,
+        io,
+        output_name,
+        error.InvalidPath,
+    );
     if (std.mem.eql(u8, source, resolved_output) or
         (initializer != null and std.mem.eql(u8, initializer.?, resolved_output)))
     {
@@ -320,24 +580,27 @@ fn execute(
         const destination = try absolutePath(allocator, cwd, path);
         const parent = std.fs.path.dirname(destination) orelse
             return error.InvalidMetadataDestination;
-        try Dir.cwd().createDirPath(io, parent);
-        try requireDestinationFileOrMissing(
+        const resolved_parent = try resolveOrCreateDirectory(allocator, io, parent);
+        if (!std.mem.eql(u8, resolved_parent, publication_parent)) {
+            return error.InvalidMetadataDestination;
+        }
+        const resolved = try std.fs.path.join(
+            allocator,
+            &.{ publication_parent, std.fs.path.basename(destination) },
+        );
+        try requireDestinationFileOrMissingAt(
+            publication_directory,
             io,
-            destination,
+            std.fs.path.basename(destination),
             error.InvalidMetadataDestination,
         );
-        const resolved_parent = try Dir.realPathFileAbsoluteAlloc(io, parent, allocator);
-        const resolved = try resolveDestination(allocator, io, destination);
         if (std.mem.eql(u8, resolved, resolved_output) or
             std.mem.eql(u8, resolved, source) or
             (initializer != null and std.mem.eql(u8, resolved, initializer.?)))
         {
             return error.InvalidMetadataDestination;
         }
-        if (!std.mem.eql(u8, resolved_parent, publication_parent)) {
-            return error.InvalidMetadataDestination;
-        }
-        break :blk destination;
+        break :blk resolved;
     } else null;
 
     if (config.debug_bindings) diagnostic.begin(.debug);
@@ -348,21 +611,29 @@ fn execute(
             try std.fmt.allocPrint(allocator, "{s}.debug", .{output});
         const parent = std.fs.path.dirname(destination) orelse
             return error.DebugOutputCollision;
-        try Dir.cwd().createDirPath(io, parent);
-        if (try pathKindNoFollow(io, destination)) |kind| {
+        const resolved_parent = try resolveOrCreateDirectory(allocator, io, parent);
+        if (!std.mem.eql(u8, resolved_parent, publication_parent)) {
+            return error.DebugOutputCollision;
+        }
+        const resolved = try std.fs.path.join(
+            allocator,
+            &.{ publication_parent, std.fs.path.basename(destination) },
+        );
+        if (try pathKindNoFollowAt(
+            publication_directory,
+            io,
+            std.fs.path.basename(destination),
+        )) |kind| {
             if (kind != .directory) return error.DebugOutputCollision;
         }
-        const resolved_parent = try Dir.realPathFileAbsoluteAlloc(io, parent, allocator);
-        const resolved = try resolveDestination(allocator, io, destination);
         if (pathContains(resolved, resolved_output) or
             pathContains(resolved, source) or
             (initializer != null and pathContains(resolved, initializer.?)) or
-            (metadata_output != null and pathContains(resolved, metadata_output.?)) or
-            !std.mem.eql(u8, resolved_parent, publication_parent))
+            (metadata_output != null and pathContains(resolved, metadata_output.?)))
         {
             return error.DebugOutputCollision;
         }
-        break :blk destination;
+        break :blk resolved;
     } else null;
 
     var random_bytes: [8]u8 = undefined;
@@ -373,16 +644,16 @@ fn execute(
         ".{s}.starling-componentize-{s}",
         .{ std.fs.path.basename(output), &random_hex },
     );
-    const transaction_dir = try std.fs.path.join(
-        allocator,
-        &.{ output_parent, transaction_name },
-    );
+    diagnostic.begin(.inputs);
     var transaction = try Transaction.create(
         allocator,
         io,
-        transaction_dir,
+        publication_directory,
+        publication_parent,
+        transaction_name,
         &random_hex,
     );
+    publication_transferred = true;
     const transaction_storage = transaction.storage_path;
     var transaction_safe_to_remove = true;
     defer transaction.deinit(
@@ -390,13 +661,35 @@ fn execute(
         io,
         transaction_safe_to_remove,
     );
+    var input_exclusions: std.ArrayList([]const u8) = .empty;
+    if (config.cache_dir) |path| {
+        input_exclusions.append(
+            allocator,
+            try absolutePath(allocator, cwd, path),
+        ) catch @panic("out of memory");
+    }
+    const source_parent = std.fs.path.dirname(source).?;
+    const initializer_parent = if (initializer) |path|
+        std.fs.path.dirname(path).?
+    else
+        null;
+    if (!std.mem.eql(u8, publication_parent, source_parent) and
+        (initializer_parent == null or
+            !std.mem.eql(u8, publication_parent, initializer_parent.?)))
+    {
+        input_exclusions.append(allocator, publication_parent) catch
+            @panic("out of memory");
+    }
 
     const input_snapshots = try snapshotInputs(
         allocator,
         io,
         source,
+        source_identity,
         initializer,
-        transaction_storage,
+        initializer_identity,
+        input_exclusions.items,
+        &transaction,
     );
     const source_snapshot = input_snapshots.source;
     const initializer_snapshot = input_snapshots.initializer;
@@ -419,7 +712,7 @@ fn execute(
             executable_dir,
             config,
             engine_override,
-            transaction_storage,
+            &transaction,
         )
     else
         try buildRuntime(
@@ -431,7 +724,7 @@ fn execute(
             executable_dir,
             config,
             diagnostic,
-            transaction_storage,
+            &transaction,
         );
     defer if (runtime.cache_lock) |lock| {
         lock.unlock(io);
@@ -447,7 +740,7 @@ fn execute(
         executable_dir,
         config,
         runtime.component_wit != null,
-        transaction_storage,
+        &transaction,
     );
 
     const runtime_args_path = try std.fs.path.join(
@@ -465,6 +758,7 @@ fn execute(
         .sub_path = runtime_args_path,
         .data = runtime_args,
     });
+    try transaction.recordStorageAbsolute(allocator, io, runtime_args_path);
 
     var command_log: std.ArrayList(u8) = .empty;
     const initialized = try std.fs.path.join(
@@ -538,6 +832,7 @@ fn execute(
         diagnostic,
         transaction_storage,
     );
+    try transaction.recordStorageAbsolute(allocator, io, initialized);
 
     var stripped: ?[]const u8 = null;
     var embedded: ?[]const u8 = null;
@@ -569,6 +864,7 @@ fn execute(
             diagnostic,
             transaction_storage,
         );
+        try transaction.recordStorageAbsolute(allocator, io, stripped.?);
         diagnostic.begin(.embed);
         try runCommand(
             allocator,
@@ -593,6 +889,7 @@ fn execute(
             diagnostic,
             transaction_storage,
         );
+        try transaction.recordStorageAbsolute(allocator, io, embedded.?);
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
             "wasi_snapshot_preview1={s}",
@@ -651,6 +948,7 @@ fn execute(
             transaction_storage,
         );
     }
+    try transaction.recordStorageAbsolute(allocator, io, candidate);
 
     const processed = try std.fs.path.join(
         allocator,
@@ -686,6 +984,7 @@ fn execute(
         diagnostic,
         transaction_storage,
     );
+    try transaction.recordStorageAbsolute(allocator, io, processed);
 
     diagnostic.begin(.validate);
     try runCommand(
@@ -749,6 +1048,7 @@ fn execute(
             .sub_path = path,
             .data = metadata_json.?,
         });
+        try transaction.recordStorageAbsolute(allocator, io, path);
         break :blk path;
     } else null;
 
@@ -758,7 +1058,12 @@ fn execute(
             allocator,
             &.{ transaction_storage, "debug" },
         );
-        try Dir.cwd().createDirPath(io, directory);
+        try transaction.createStorageDir(
+            allocator,
+            io,
+            "debug",
+            .fromMode(0o700),
+        );
         var debug_dir_handle = try Dir.openDirAbsolute(
             io,
             directory,
@@ -780,24 +1085,42 @@ fn execute(
             .sub_path = command_log_path,
             .data = stable_command_log,
         });
+        try transaction.recordStorageAbsolute(allocator, io, command_log_path);
         try copyDebugFile(io, runtime_args_path, debug_dir_handle, "runtime-args.txt");
+        try transaction.recordStoragePath(allocator, io, "debug/runtime-args.txt");
         try copyDebugFile(io, initialized, debug_dir_handle, "initialized.wasm");
-        if (stripped) |path| try copyDebugFile(io, path, debug_dir_handle, "stripped.wasm");
-        if (embedded) |path| try copyDebugFile(io, path, debug_dir_handle, "embedded.wasm");
+        try transaction.recordStoragePath(allocator, io, "debug/initialized.wasm");
+        if (stripped) |path| {
+            try copyDebugFile(io, path, debug_dir_handle, "stripped.wasm");
+            try transaction.recordStoragePath(allocator, io, "debug/stripped.wasm");
+        }
+        if (embedded) |path| {
+            try copyDebugFile(io, path, debug_dir_handle, "embedded.wasm");
+            try transaction.recordStoragePath(allocator, io, "debug/embedded.wasm");
+        }
         try copyDebugFile(io, processed, debug_dir_handle, "component.wasm");
+        try transaction.recordStoragePath(allocator, io, "debug/component.wasm");
         if (runtime.bindings) |path| {
             try copyDebugFile(io, path, debug_dir_handle, "component-bindings.zig");
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/component-bindings.zig",
+            );
         }
         try copyDebugFile(io, command_log_path, debug_dir_handle, "commands.txt");
+        try transaction.recordStoragePath(allocator, io, "debug/commands.txt");
         if (metadata_json) |json| {
             try debug_dir_handle.writeFile(io, .{
                 .sub_path = "metadata.json",
                 .data = json,
             });
+            try transaction.recordStoragePath(allocator, io, "debug/metadata.json");
             try debug_dir_handle.writeFile(io, .{
                 .sub_path = "imports.json",
                 .data = try metadata.renderImports(allocator, imports),
             });
+            try transaction.recordStoragePath(allocator, io, "debug/imports.json");
         }
         break :blk directory;
     } else null;
@@ -815,13 +1138,13 @@ fn execute(
     try publishArtifacts(
         allocator,
         io,
-        transaction_storage,
+        &transaction,
         processed,
-        output,
+        output_name,
         metadata_staged,
-        metadata_output,
+        if (metadata_output) |path| std.fs.path.basename(path) else null,
         debug_staged,
-        debug_dir,
+        if (debug_dir) |path| std.fs.path.basename(path) else null,
         &transaction_safe_to_remove,
     );
     diagnostic.reportSuccess(source, output);
@@ -834,8 +1157,9 @@ fn externalRuntime(
     executable_dir: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
-    transaction_dir: []const u8,
+    transaction: *Transaction,
 ) !Runtime {
+    const transaction_dir = transaction.storage_path;
     if (config.disable_features.len != 0 or
         config.enable_features.len != 0 or
         config.use_debug_build)
@@ -848,6 +1172,7 @@ fn externalRuntime(
         io,
         engine_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
+        transaction,
     );
     const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
@@ -858,6 +1183,7 @@ fn externalRuntime(
         io,
         adapter_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
+        transaction,
     );
     const component_wit_source = if (config.component_wit orelse config.wit) |path|
         try absolutePath(allocator, cwd, path)
@@ -873,6 +1199,7 @@ fn externalRuntime(
             io,
             path,
             try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+            transaction,
         )
     else
         null;
@@ -885,6 +1212,7 @@ fn externalRuntime(
                 io,
                 path,
                 try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+                transaction,
             )
     else
         null;
@@ -912,8 +1240,9 @@ fn buildRuntime(
     executable_dir: []const u8,
     config: *const cli.Config,
     diagnostic: *diagnostics.Context,
-    transaction_dir: []const u8,
+    transaction: *Transaction,
 ) !Runtime {
+    const transaction_dir = transaction.storage_path;
     const cache_dir = if (config.cache_dir) |path|
         try absolutePath(allocator, cwd, path)
     else
@@ -932,6 +1261,7 @@ fn buildRuntime(
             io,
             dispatch_source,
             try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+            transaction,
         );
         component_wit = if (config.component_wit) |component_path|
             if (std.mem.eql(
@@ -946,6 +1276,7 @@ fn buildRuntime(
                     io,
                     try absolutePath(allocator, cwd, component_path),
                     try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+                    transaction,
                 )
         else
             dispatch_wit;
@@ -984,6 +1315,7 @@ fn buildRuntime(
         io,
         zig_resolved,
         try std.fs.path.join(allocator, &.{ transaction_dir, "zig" }),
+        transaction,
     );
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1075,6 +1407,7 @@ fn buildRuntime(
         io,
         engine_built,
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
+        transaction,
     );
     const adapter_built = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
@@ -1097,6 +1430,7 @@ fn buildRuntime(
         io,
         adapter_built,
         try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
+        transaction,
     );
     const bindings = if (needs_bindings) blk: {
         const path = try std.fs.path.join(
@@ -1108,6 +1442,7 @@ fn buildRuntime(
             io,
             path,
             try std.fs.path.join(allocator, &.{ transaction_dir, "component-bindings.zig" }),
+            transaction,
         )).path;
     } else null;
     const build_tools = try readBuildToolManifest(
@@ -1117,7 +1452,7 @@ fn buildRuntime(
             allocator,
             &.{ prefix, "bin", "runtime-build-tools.json" },
         ),
-        transaction_dir,
+        transaction,
     );
 
     return .{
@@ -1153,8 +1488,9 @@ fn resolveTools(
     executable_dir: []const u8,
     config: *const cli.Config,
     needs_wabt: bool,
-    transaction_dir: []const u8,
+    transaction: *Transaction,
 ) !Tools {
+    const transaction_dir = transaction.storage_path;
     const standalone_wizer = try std.fs.path.join(
         allocator,
         &.{ executable_dir, "wizer" },
@@ -1208,6 +1544,7 @@ fn resolveTools(
             io,
             try resolveExecutable(allocator, io, environ, wizer_executable),
             try std.fs.path.join(allocator, &.{ transaction_dir, "wizer" }),
+            transaction,
         ),
         .wasmtime_subcommand = wizer_is_wasmtime,
     };
@@ -1216,6 +1553,7 @@ fn resolveTools(
         io,
         try resolveExecutable(allocator, io, environ, wasm_tools_source),
         try std.fs.path.join(allocator, &.{ transaction_dir, "wasm-tools" }),
+        transaction,
     );
     const wabt = if (wabt_source) |path|
         try snapshotFile(
@@ -1223,6 +1561,7 @@ fn resolveTools(
             io,
             try resolveExecutable(allocator, io, environ, path),
             try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
+            transaction,
         )
     else
         null;
@@ -1293,6 +1632,7 @@ fn stageWit(
     io: Io,
     source_path: []const u8,
     stage_path: []const u8,
+    transaction: *Transaction,
 ) !StagedWit {
     var source_dir = try Dir.openDirAbsolute(io, source_path, .{ .iterate = true });
     defer source_dir.close(io);
@@ -1336,16 +1676,24 @@ fn stageWit(
     hasher.final(&digest_bytes);
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     const digest = try allocator.dupe(u8, &digest_hex);
-    try Dir.cwd().createDirPath(io, stage_path);
+    const stage_relative = std.fs.path.basename(stage_path);
+    try transaction.ensureStorageDirPath(allocator, io, stage_relative);
     for (files.items, contents.items) |relative, data| {
         const destination = try std.fs.path.join(allocator, &.{ stage_path, relative });
-        const destination_parent = std.fs.path.dirname(destination) orelse
-            return error.InvalidPath;
-        try Dir.cwd().createDirPath(io, destination_parent);
+        if (std.fs.path.dirname(destination) == null) return error.InvalidPath;
+        const relative_parent = std.fs.path.dirname(relative);
+        if (relative_parent) |parent| {
+            try transaction.ensureStorageDirPath(
+                allocator,
+                io,
+                try std.fs.path.join(allocator, &.{ stage_relative, parent }),
+            );
+        }
         try Dir.cwd().writeFile(io, .{
             .sub_path = destination,
             .data = data,
         });
+        try transaction.recordStorageAbsolute(allocator, io, destination);
     }
     return .{
         .absolute = stage_path,
@@ -1564,8 +1912,9 @@ fn readBuildToolManifest(
     allocator: Allocator,
     io: Io,
     manifest_path: []const u8,
-    transaction_dir: []const u8,
+    transaction: *Transaction,
 ) ![]const metadata.Tool {
+    const transaction_dir = transaction.storage_path;
     const manifest_snapshot = try snapshotFile(
         allocator,
         io,
@@ -1574,6 +1923,7 @@ fn readBuildToolManifest(
             allocator,
             &.{ transaction_dir, "runtime-build-tools.json" },
         ),
+        transaction,
     );
     const source = try Dir.cwd().readFileAlloc(
         io,
@@ -1628,6 +1978,7 @@ fn readBuildToolManifest(
                     ),
                 },
             ),
+            transaction,
         );
         tools.append(allocator, .{
             .name = try allocator.dupe(u8, entry.name),
@@ -1637,135 +1988,28 @@ fn readBuildToolManifest(
     return tools.toOwnedSlice(allocator) catch @panic("out of memory");
 }
 
-fn removeOwnedContents(
-    allocator: Allocator,
-    io: Io,
-    directory: Dir,
-) !void {
-    const Entry = struct {
-        name: []const u8,
-        identity: EntryIdentity,
-    };
-    var entries: std.ArrayList(Entry) = .empty;
-    defer {
-        for (entries.items) |entry| allocator.free(entry.name);
-        entries.deinit(allocator);
-    }
-
-    var iterator = directory.iterate();
-    while (try iterator.next(io)) |entry| {
-        entries.append(allocator, .{
-            .name = try allocator.dupe(u8, entry.name),
-            .identity = .{ .inode = entry.inode, .kind = entry.kind },
-        }) catch @panic("out of memory");
-    }
-
-    for (entries.items) |entry| {
-        const initial = try directory.statFile(
-            io,
-            entry.name,
-            .{ .follow_symlinks = false },
-        );
-        if (!entry.identity.matches(initial)) return error.TransactionChanged;
-        var random_bytes: [8]u8 = undefined;
-        io.random(&random_bytes);
-        const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        var cleanup_name_buffer: [".cleanup-".len + random_hex.len]u8 = undefined;
-        const cleanup_name = try std.fmt.bufPrint(
-            &cleanup_name_buffer,
-            ".cleanup-{s}",
-            .{&random_hex},
-        );
-        try directory.renamePreserve(
-            entry.name,
-            directory,
-            cleanup_name,
-            io,
-        );
-        const moved = try directory.statFile(
-            io,
-            cleanup_name,
-            .{ .follow_symlinks = false },
-        );
-        if (!entry.identity.matches(moved)) {
-            directory.renamePreserve(
-                cleanup_name,
-                directory,
-                entry.name,
-                io,
-            ) catch {};
-            return error.TransactionChanged;
-        }
-        if (entry.identity.kind == .directory) {
-            var child = try directory.openDir(
-                io,
-                cleanup_name,
-                .{ .iterate = true, .follow_symlinks = false },
-            );
-            defer child.close(io);
-            if (!entry.identity.matches(try child.stat(io))) {
-                return error.TransactionChanged;
-            }
-            try removeOwnedContents(allocator, io, child);
-            const final = try directory.statFile(
-                io,
-                cleanup_name,
-                .{ .follow_symlinks = false },
-            );
-            if (!entry.identity.matches(final)) return error.TransactionChanged;
-            try directory.deleteDir(io, cleanup_name);
-        } else {
-            const final = try directory.statFile(
-                io,
-                cleanup_name,
-                .{ .follow_symlinks = false },
-            );
-            if (!entry.identity.matches(final)) return error.TransactionChanged;
-            try directory.deleteFile(io, cleanup_name);
-        }
-    }
-}
-
-fn isOwnedTransactionEntry(name: []const u8) bool {
-    const names = [_][]const u8{
-        "inputs",
-        "dispatch-wit",
-        "component-wit",
-        "engine.wasm",
-        "preview2-adapter.wasm",
-        "zig",
-        "wizer",
-        "wasm-tools",
-        "wabt",
-        "runtime-build-tools.json",
-        "runtime-args.txt",
-        "initialized.wasm",
-        "candidate.wasm",
-        "stripped.wasm",
-        "embedded.wasm",
-        "component.wasm",
-        "component-bindings.zig",
-        "metadata.json",
-        "debug",
-        "commands.txt",
-        "previous-component",
-        "previous-metadata",
-        "previous-debug",
-        "previous-debug-generated",
-    };
-    for (names) |owned| {
-        if (std.mem.eql(u8, name, owned)) return true;
-    }
-    return std.mem.startsWith(u8, name, "runtime-build-tool-");
-}
-
 fn snapshotInputs(
     allocator: Allocator,
     io: Io,
     source: []const u8,
+    source_identity: SourceIdentity,
     initializer: ?[]const u8,
-    transaction_dir: []const u8,
+    initializer_identity: ?SourceIdentity,
+    excluded_paths: []const []const u8,
+    transaction: *Transaction,
 ) !struct { source: InputSnapshot, initializer: ?InputSnapshot } {
+    if (!source_identity.matches(try Dir.cwd().statFile(
+        io,
+        source,
+        .{ .follow_symlinks = false },
+    ))) return error.InputChanged;
+    if (initializer) |path| {
+        if (!initializer_identity.?.matches(try Dir.cwd().statFile(
+            io,
+            path,
+            .{ .follow_symlinks = false },
+        ))) return error.InputChanged;
+    }
     const source_parent = std.fs.path.dirname(source) orelse return error.InvalidPath;
     const initializer_parent = if (initializer) |path|
         std.fs.path.dirname(path) orelse return error.InvalidPath
@@ -1773,24 +2017,34 @@ fn snapshotInputs(
         null;
     const shared_parent = initializer_parent != null and
         std.mem.eql(u8, source_parent, initializer_parent.?);
-    const inputs_dir = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "inputs" },
-    );
-    try Dir.createDirAbsolute(io, inputs_dir, .fromMode(0o700));
-    const source_host = try std.fs.path.join(
-        allocator,
-        &.{ inputs_dir, if (shared_parent) "shared" else "source" },
-    );
-    try Dir.createDirAbsolute(io, source_host, .fromMode(0o700));
-    const source_file = try snapshotFile(
+    try transaction.createStorageDir(
         allocator,
         io,
-        source,
-        try std.fs.path.join(
-            allocator,
-            &.{ source_host, std.fs.path.basename(source) },
-        ),
+        "inputs",
+        .fromMode(0o700),
+    );
+    const source_tree_name = if (shared_parent)
+        "inputs/shared"
+    else
+        "inputs/source";
+    try transaction.createStorageDir(
+        allocator,
+        io,
+        source_tree_name,
+        .fromMode(0o700),
+    );
+    const source_host = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, source_tree_name },
+    );
+    const source_file = try snapshotInputTree(
+        allocator,
+        io,
+        source_parent,
+        source_host,
+        std.fs.path.basename(source),
+        excluded_paths,
+        transaction,
     );
     const source_snapshot = InputSnapshot{
         .file = source_file,
@@ -1804,30 +2058,374 @@ fn snapshotInputs(
         const host = if (shared_parent)
             source_host
         else
-            try std.fs.path.join(allocator, &.{ inputs_dir, "initializer" });
+            try std.fs.path.join(
+                allocator,
+                &.{ transaction.storage_path, "inputs", "initializer" },
+            );
         if (!shared_parent) {
-            try Dir.createDirAbsolute(io, host, .fromMode(0o700));
-        }
-        break :blk .{
-            .file = try snapshotFile(
+            try transaction.createStorageDir(
                 allocator,
                 io,
-                path,
-                try std.fs.path.join(
+                "inputs/initializer",
+                .fromMode(0o700),
+            );
+        }
+        break :blk .{
+            .file = if (shared_parent)
+                Snapshot{
+                    .path = try std.fs.path.join(
+                        allocator,
+                        &.{ host, std.fs.path.basename(path) },
+                    ),
+                    .digest = try metadata.sha256File(
+                        allocator,
+                        io,
+                        try std.fs.path.join(
+                            allocator,
+                            &.{ host, std.fs.path.basename(path) },
+                        ),
+                    ),
+                }
+            else
+                try snapshotInputTree(
                     allocator,
-                    &.{ host, std.fs.path.basename(path) },
+                    io,
+                    initializer_parent.?,
+                    host,
+                    std.fs.path.basename(path),
+                    excluded_paths,
+                    transaction,
                 ),
-            ),
             .logical_path = path,
             .host_dir = host,
             .guest_dir = initializer_parent.?,
         };
     } else null;
 
+    if (!source_identity.matches(try Dir.cwd().statFile(
+        io,
+        source,
+        .{ .follow_symlinks = false },
+    ))) return error.InputChanged;
+    if (initializer) |path| {
+        if (!initializer_identity.?.matches(try Dir.cwd().statFile(
+            io,
+            path,
+            .{ .follow_symlinks = false },
+        ))) return error.InputChanged;
+    }
     return .{
         .source = source_snapshot,
         .initializer = initializer_snapshot,
     };
+}
+
+const SourceIdentity = struct {
+    entry: EntryIdentity,
+    size: u64,
+    mtime: Io.Timestamp,
+    ctime: Io.Timestamp,
+
+    fn fromStat(stat: File.Stat) SourceIdentity {
+        return .{
+            .entry = EntryIdentity.fromStat(stat),
+            .size = stat.size,
+            .mtime = stat.mtime,
+            .ctime = stat.ctime,
+        };
+    }
+
+    fn matches(self: SourceIdentity, stat: File.Stat) bool {
+        return self.entry.matches(stat) and
+            self.size == stat.size and
+            self.mtime.nanoseconds == stat.mtime.nanoseconds and
+            self.ctime.nanoseconds == stat.ctime.nanoseconds;
+    }
+};
+
+fn sourceFileIdentity(io: Io, path: []const u8) !SourceIdentity {
+    const stat = try Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .file) return error.MissingBuildArtifact;
+    return SourceIdentity.fromStat(stat);
+}
+
+fn snapshotInputTree(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    entry_name: []const u8,
+    excluded_paths: []const []const u8,
+    transaction: *Transaction,
+) !Snapshot {
+    var source_dir = try Dir.openDirAbsolute(
+        io,
+        source_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source_dir.close(io);
+    var destination_dir = try Dir.openDirAbsolute(
+        io,
+        destination_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer destination_dir.close(io);
+    const destination_relative = try std.fs.path.relative(
+        allocator,
+        transaction.storage_path,
+        null,
+        transaction.storage_path,
+        destination_path,
+    );
+    const digest = try copyInputDirectory(
+        allocator,
+        io,
+        source_dir,
+        destination_dir,
+        source_path,
+        "",
+        destination_relative,
+        entry_name,
+        excluded_paths,
+        transaction,
+    );
+    return .{
+        .path = try std.fs.path.join(
+            allocator,
+            &.{ destination_path, entry_name },
+        ),
+        .digest = digest orelse return error.MissingBuildArtifact,
+    };
+}
+
+fn copyInputDirectory(
+    allocator: Allocator,
+    io: Io,
+    source: Dir,
+    destination: Dir,
+    source_path: []const u8,
+    relative: []const u8,
+    destination_relative: []const u8,
+    digest_entry: []const u8,
+    excluded_paths: []const []const u8,
+    transaction: *Transaction,
+) !?[]const u8 {
+    const SourceEntry = struct {
+        name: []const u8,
+        identity: SourceIdentity,
+    };
+    var entries: std.ArrayList(SourceEntry) = .empty;
+    defer entries.deinit(allocator);
+    var iterator = source.iterate();
+    while (try iterator.next(io)) |entry| {
+        const stat = try source.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (transaction.root_identity.matches(stat) or
+            isTransactionDirectoryName(entry.name))
+        {
+            continue;
+        }
+        const child_source_path = try std.fs.path.join(
+            allocator,
+            &.{ source_path, entry.name },
+        );
+        for (excluded_paths) |excluded| {
+            if (std.mem.eql(u8, child_source_path, excluded)) break;
+        } else {
+            entries.append(allocator, .{
+                .name = try allocator.dupe(u8, entry.name),
+                .identity = SourceIdentity.fromStat(stat),
+            }) catch @panic("out of memory");
+        }
+    }
+
+    var selected_digest: ?[]const u8 = null;
+    for (entries.items) |entry| {
+        const child_relative = if (relative.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fs.path.join(allocator, &.{ relative, entry.name });
+        const child_source_path = try std.fs.path.join(
+            allocator,
+            &.{ source_path, entry.name },
+        );
+        const owned_path = try std.fs.path.join(
+            allocator,
+            &.{ destination_relative, entry.name },
+        );
+        switch (entry.identity.entry.kind) {
+            .file => {
+                var source_file = try source.openFile(io, entry.name, .{});
+                defer source_file.close(io);
+                if (!entry.identity.matches(try source_file.stat(io))) {
+                    return error.InputChanged;
+                }
+                var destination_file = try destination.createFile(
+                    io,
+                    entry.name,
+                    .{ .exclusive = true },
+                );
+                defer destination_file.close(io);
+                try transaction.recordStoragePath(
+                    allocator,
+                    io,
+                    owned_path,
+                );
+                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                var buffer: [64 * 1024]u8 = undefined;
+                while (true) {
+                    const count = source_file.readStreaming(
+                        io,
+                        &.{&buffer},
+                    ) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
+                    if (count == 0) continue;
+                    if (relative.len == 0 and
+                        std.mem.eql(u8, entry.name, digest_entry))
+                    {
+                        hasher.update(buffer[0..count]);
+                    }
+                    try destination_file.writeStreamingAll(io, buffer[0..count]);
+                }
+                if (!entry.identity.matches(try source_file.stat(io))) {
+                    return error.InputChanged;
+                }
+                try destination_file.setPermissions(
+                    io,
+                    (try source_file.stat(io)).permissions,
+                );
+                try destination_file.sync(io);
+                if (relative.len == 0 and
+                    std.mem.eql(u8, entry.name, digest_entry))
+                {
+                    var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+                        undefined;
+                    hasher.final(&digest_bytes);
+                    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+                    selected_digest = try allocator.dupe(u8, &digest_hex);
+                }
+            },
+            .directory => {
+                try destination.createDir(io, entry.name, .fromMode(0o700));
+                const destination_absolute = try destination.realPathFileAlloc(
+                    io,
+                    entry.name,
+                    allocator,
+                );
+                try transaction.recordStorageAbsolute(
+                    allocator,
+                    io,
+                    destination_absolute,
+                );
+                var source_child = try source.openDir(
+                    io,
+                    entry.name,
+                    .{ .iterate = true, .follow_symlinks = false },
+                );
+                defer source_child.close(io);
+                if (!entry.identity.entry.matches(try source_child.stat(io))) {
+                    return error.InputChanged;
+                }
+                var destination_child = try destination.openDir(
+                    io,
+                    entry.name,
+                    .{ .iterate = true, .follow_symlinks = false },
+                );
+                defer destination_child.close(io);
+                _ = try copyInputDirectory(
+                    allocator,
+                    io,
+                    source_child,
+                    destination_child,
+                    child_source_path,
+                    child_relative,
+                    owned_path,
+                    digest_entry,
+                    excluded_paths,
+                    transaction,
+                );
+                if (!entry.identity.entry.matches(try source_child.stat(io))) {
+                    return error.InputChanged;
+                }
+                try destination_child.setPermissions(
+                    io,
+                    (try source_child.stat(io)).permissions,
+                );
+            },
+            .sym_link => {
+                var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const link_len = try source.readLink(io, entry.name, &link_buffer);
+                if (!entry.identity.matches(try source.statFile(
+                    io,
+                    entry.name,
+                    .{ .follow_symlinks = false },
+                ))) return error.InputChanged;
+                try destination.symLink(
+                    io,
+                    link_buffer[0..link_len],
+                    entry.name,
+                    .{},
+                );
+                try transaction.recordStorageAbsolute(
+                    allocator,
+                    io,
+                    try std.fs.path.join(
+                        allocator,
+                        &.{ transaction.storage_path, owned_path },
+                    ),
+                );
+            },
+            else => return error.UnsupportedInputEntry,
+        }
+    }
+
+    var seen: usize = 0;
+    var final_iterator = source.iterate();
+    while (try final_iterator.next(io)) |entry| {
+        const stat = try source.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (transaction.root_identity.matches(stat) or
+            isTransactionDirectoryName(entry.name))
+        {
+            continue;
+        }
+        const child_source_path = try std.fs.path.join(
+            allocator,
+            &.{ source_path, entry.name },
+        );
+        for (excluded_paths) |excluded| {
+            if (std.mem.eql(u8, child_source_path, excluded)) break;
+        } else {
+            var matched = false;
+            for (entries.items) |initial| {
+                if (!std.mem.eql(u8, initial.name, entry.name)) continue;
+                if (!initial.identity.matches(stat)) return error.InputChanged;
+                matched = true;
+                break;
+            }
+            if (!matched) continue;
+            seen += 1;
+        }
+    }
+    if (seen != entries.items.len) return error.InputChanged;
+    return selected_digest;
+}
+
+fn isTransactionDirectoryName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, ".") and
+        std.mem.indexOf(u8, name, ".starling-componentize-") != null;
 }
 
 fn snapshotFile(
@@ -1835,6 +2433,7 @@ fn snapshotFile(
     io: Io,
     source_path: []const u8,
     destination_path: []const u8,
+    transaction: *Transaction,
 ) !Snapshot {
     var source = try Dir.openFileAbsolute(
         io,
@@ -1844,13 +2443,21 @@ fn snapshotFile(
     defer source.close(io);
     const source_stat = try source.stat(io);
     if (source_stat.kind != .file) return error.MissingBuildArtifact;
+    const source_identity = SourceIdentity.fromStat(source_stat);
 
     var destination = try Dir.createFileAbsolute(
         io,
         destination_path,
         .{ .exclusive = true },
     );
-    errdefer Dir.deleteFileAbsolute(io, destination_path) catch {};
+    const destination_identity = EntryIdentity.fromStat(try destination.stat(io));
+    try transaction.recordStorageAbsolute(allocator, io, destination_path);
+    errdefer removeExactEntry(
+        io,
+        transaction.storage,
+        std.fs.path.basename(destination_path),
+        destination_identity,
+    ) catch {};
     defer destination.close(io);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1864,6 +2471,7 @@ fn snapshotFile(
         hasher.update(buffer[0..count]);
         try destination.writeStreamingAll(io, buffer[0..count]);
     }
+    if (!source_identity.matches(try source.stat(io))) return error.InputChanged;
     try destination.setPermissions(io, source_stat.permissions);
     try destination.sync(io);
     var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -1875,10 +2483,92 @@ fn snapshotFile(
     };
 }
 
+fn statEntry(directory: Dir, io: Io, name: []const u8) !?File.Stat {
+    return directory.statFile(
+        io,
+        name,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn entryHasIdentity(
+    directory: Dir,
+    io: Io,
+    name: []const u8,
+    identity: EntryIdentity,
+) !bool {
+    const stat = try statEntry(directory, io, name) orelse return false;
+    return identity.matches(stat);
+}
+
+fn removeExactEntry(
+    io: Io,
+    directory: Dir,
+    name: []const u8,
+    identity: EntryIdentity,
+) !void {
+    if (!try entryHasIdentity(directory, io, name, identity)) {
+        return error.TransactionChanged;
+    }
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    var cleanup_name_buffer: [".cleanup-".len + random_hex.len]u8 = undefined;
+    const cleanup_name = try std.fmt.bufPrint(
+        &cleanup_name_buffer,
+        ".cleanup-{s}",
+        .{&random_hex},
+    );
+    try directory.renamePreserve(name, directory, cleanup_name, io);
+    if (!try entryHasIdentity(directory, io, cleanup_name, identity)) {
+        directory.renamePreserve(
+            cleanup_name,
+            directory,
+            name,
+            io,
+        ) catch {};
+        return error.TransactionChanged;
+    }
+    if (identity.kind == .directory) {
+        try directory.deleteDir(io, cleanup_name);
+    } else {
+        try directory.deleteFile(io, cleanup_name);
+    }
+}
+
+fn verifyDirectoryEntries(
+    io: Io,
+    directory: Dir,
+    expected: anytype,
+) !void {
+    var seen: usize = 0;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        var matched = false;
+        for (expected) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, entry.name)) continue;
+            if (!try entryHasIdentity(
+                directory,
+                io,
+                entry.name,
+                candidate.identity,
+            )) return error.TransactionChanged;
+            matched = true;
+            break;
+        }
+        if (!matched) return error.TransactionChanged;
+        seen += 1;
+    }
+    if (seen != expected.len) return error.TransactionChanged;
+}
+
 fn publishArtifacts(
     allocator: Allocator,
     io: Io,
-    transaction_dir: []const u8,
+    transaction: *Transaction,
     component_staged: []const u8,
     component_output: []const u8,
     metadata_staged: ?[]const u8,
@@ -1887,110 +2577,122 @@ fn publishArtifacts(
     debug_output: ?[]const u8,
     transaction_safe_to_remove: *bool,
 ) !void {
-    const component_backup = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "previous-component" },
-    );
-    const metadata_backup = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "previous-metadata" },
-    );
-    const debug_backup = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "previous-debug" },
-    );
-    const old_debug_generated = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "previous-debug-generated" },
-    );
-    var component_backed_up = false;
-    var metadata_backed_up = false;
-    var debug_backed_up = false;
-    var component_published = false;
-    var metadata_published = false;
-    var debug_published = false;
+    _ = component_staged;
+    const ArtifactState = struct {
+        destination: []const u8,
+        staged: []const u8,
+        backup_name: []const u8,
+        backup: ?EntryIdentity = null,
+        published: ?EntryIdentity = null,
+    };
+    var component = ArtifactState{
+        .destination = component_output,
+        .staged = "component.wasm",
+        .backup_name = "previous-component",
+    };
+    var metadata_state: ?ArtifactState = if (metadata_staged != null) .{
+        .destination = metadata_output.?,
+        .staged = "metadata.json",
+        .backup_name = "previous-metadata",
+    } else null;
+    var debug_state = DebugPublication{
+        .destination = debug_output,
+        .staged = if (debug_staged != null) "debug" else null,
+    };
 
-    errdefer {
-        if (debug_published) {
-            Dir.renameAbsolute(debug_output.?, debug_staged.?, io) catch {
-                transaction_safe_to_remove.* = false;
-            };
-        }
-        if (debug_backed_up) {
-            restoreDebugDestination(
-                allocator,
+    errdefer rollbackPublication(
+        allocator,
+        io,
+        transaction,
+        component,
+        metadata_state,
+        debug_state,
+    ) catch {
+        transaction_safe_to_remove.* = false;
+    };
+
+    try transaction.verifyAttached(io);
+    component.backup = try backupRegularDestination(
+        allocator,
+        io,
+        transaction,
+        component.destination,
+        component.backup_name,
+        error.InvalidPath,
+    );
+    if (metadata_state) |*state| {
+        state.backup = try backupRegularDestination(
+            allocator,
+            io,
+            transaction,
+            state.destination,
+            state.backup_name,
+            error.InvalidMetadataDestination,
+        );
+    }
+    if (debug_state.staged != null) {
+        debug_state.backup = try prepareDebugDestination(
+            allocator,
+            io,
+            transaction,
+            debug_state.destination.?,
+            transaction_safe_to_remove,
+        );
+    }
+
+    component.published = try publishEntry(
+        io,
+        transaction,
+        component.staged,
+        component.destination,
+    );
+    if (metadata_state) |*state| {
+        state.published = try publishEntry(
+            io,
+            transaction,
+            state.staged,
+            state.destination,
+        );
+    }
+    if (debug_state.staged) |staged| {
+        debug_state.published = try publishEntry(
+            io,
+            transaction,
+            staged,
+            debug_state.destination.?,
+        );
+    }
+
+    if (component.backup) |identity| {
+        removeExactEntry(
+            io,
+            transaction.storage,
+            component.backup_name,
+            identity,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+        };
+    }
+    if (metadata_state) |state| {
+        if (state.backup) |identity| {
+            removeExactEntry(
                 io,
-                debug_staged.?,
-                debug_backup,
-                old_debug_generated,
-                debug_output.?,
+                transaction.storage,
+                state.backup_name,
+                identity,
             ) catch {
                 transaction_safe_to_remove.* = false;
             };
         }
-        if (metadata_published) {
-            Dir.cwd().deleteFile(io, metadata_output.?) catch {};
-        }
-        if (component_published) {
-            Dir.cwd().deleteFile(io, component_output) catch {};
-        }
-        if (metadata_backed_up) {
-            Dir.renameAbsolute(metadata_backup, metadata_output.?, io) catch {
-                transaction_safe_to_remove.* = false;
-            };
-        }
-        if (component_backed_up) {
-            Dir.renameAbsolute(component_backup, component_output, io) catch {
-                transaction_safe_to_remove.* = false;
-            };
-        }
     }
-
-    component_backed_up = try backupRegularDestination(
-        io,
-        component_output,
-        component_backup,
-        error.InvalidPath,
-        transaction_safe_to_remove,
-    );
-    if (metadata_output) |path| {
-        metadata_backed_up = try backupRegularDestination(
+    if (debug_state.backup) |backup| {
+        finalizeDebugBackup(
             io,
-            path,
-            metadata_backup,
-            error.InvalidMetadataDestination,
-            transaction_safe_to_remove,
-        );
-    }
-    if (debug_staged) |staged| {
-        debug_backed_up = try prepareDebugDestination(
-            allocator,
-            io,
-            staged,
-            debug_output.?,
-            debug_backup,
-            old_debug_generated,
-            transaction_safe_to_remove,
-        );
-    }
-
-    try Dir.renameAbsolute(component_staged, component_output, io);
-    component_published = true;
-    if (metadata_staged) |path| {
-        try Dir.renameAbsolute(path, metadata_output.?, io);
-        metadata_published = true;
-    }
-    if (debug_staged) |path| {
-        try Dir.renameAbsolute(path, debug_output.?, io);
-        debug_published = true;
-    }
-
-    if (component_backed_up) Dir.deleteFileAbsolute(io, component_backup) catch {};
-    if (metadata_backed_up) Dir.deleteFileAbsolute(io, metadata_backup) catch {};
-    if (debug_backed_up) {
-        removeOldGeneratedFiles(allocator, io, old_debug_generated) catch {};
-        Dir.deleteDirAbsolute(io, old_debug_generated) catch {};
-        Dir.deleteDirAbsolute(io, debug_backup) catch {};
+            transaction,
+            backup,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+        };
     }
 }
 
@@ -2013,143 +2715,544 @@ fn isGeneratedDebugName(name: []const u8) bool {
     return false;
 }
 
+const DebugMovedEntry = struct {
+    name: []const u8,
+    identity: EntryIdentity,
+    generated: bool,
+};
+
+const DebugBackup = struct {
+    identity: EntryIdentity,
+    old_generated_identity: EntryIdentity,
+    moved: []const DebugMovedEntry,
+};
+
+const DebugPublication = struct {
+    destination: ?[]const u8,
+    staged: ?[]const u8,
+    backup: ?DebugBackup = null,
+    published: ?EntryIdentity = null,
+};
+
 fn backupRegularDestination(
+    allocator: Allocator,
     io: Io,
+    transaction: *Transaction,
     destination: []const u8,
     backup: []const u8,
     invalid_error: anyerror,
-    transaction_safe_to_remove: *bool,
-) !bool {
-    if (try pathKindNoFollow(io, destination) == null) return false;
-    try Dir.renameAbsolute(destination, backup, io);
-    var valid_backup = false;
-    errdefer if (!valid_backup) {
-        Dir.renameAbsolute(backup, destination, io) catch {
-            transaction_safe_to_remove.* = false;
-        };
-    };
-    const kind = try pathKindNoFollow(io, backup);
-    if (kind == .file) {
-        valid_backup = true;
-        return true;
+) !?EntryIdentity {
+    const stat = try statEntry(transaction.publication, io, destination) orelse
+        return null;
+    if (stat.kind != .file) return invalid_error;
+    const identity = EntryIdentity.fromStat(stat);
+    try transaction.publication.renamePreserve(
+        destination,
+        transaction.storage,
+        backup,
+        io,
+    );
+    const moved = try transaction.storage.statFile(
+        io,
+        backup,
+        .{ .follow_symlinks = false },
+    );
+    if (!identity.matches(moved)) {
+        transaction.storage.renamePreserve(
+            backup,
+            transaction.publication,
+            destination,
+            io,
+        ) catch {};
+        return error.TransactionChanged;
     }
-    return invalid_error;
+    try transaction.recordStoragePath(allocator, io, backup);
+    return identity;
 }
 
 fn prepareDebugDestination(
     allocator: Allocator,
     io: Io,
-    staged: []const u8,
+    transaction: *Transaction,
     destination: []const u8,
-    backup: []const u8,
-    old_generated: []const u8,
     transaction_safe_to_remove: *bool,
-) !bool {
-    if (try pathKindNoFollow(io, destination) == null) return false;
-    try Dir.renameAbsolute(destination, backup, io);
+) !?DebugBackup {
+    const initial = try statEntry(
+        transaction.publication,
+        io,
+        destination,
+    ) orelse return null;
+    if (initial.kind != .directory) return error.DebugOutputCollision;
+    const backup_identity = EntryIdentity.fromStat(initial);
+    try transaction.publication.renamePreserve(
+        destination,
+        transaction.storage,
+        "previous-debug",
+        io,
+    );
+    const moved_backup = try transaction.storage.statFile(
+        io,
+        "previous-debug",
+        .{ .follow_symlinks = false },
+    );
+    if (!backup_identity.matches(moved_backup)) {
+        transaction.storage.renamePreserve(
+            "previous-debug",
+            transaction.publication,
+            destination,
+            io,
+        ) catch {};
+        return error.TransactionChanged;
+    }
+    try transaction.recordStoragePath(allocator, io, "previous-debug");
+    try transaction.createStorageDir(
+        allocator,
+        io,
+        "previous-debug-generated",
+        .fromMode(0o700),
+    );
+    const old_generated_identity = transaction.ownedIdentity(
+        "previous-debug-generated",
+    ).?;
+
+    var backup_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer backup_dir.close(io);
+    var staged_dir = try transaction.storage.openDir(
+        io,
+        "debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer staged_dir.close(io);
+    var old_generated_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug-generated",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer old_generated_dir.close(io);
+
+    var iterator = backup_dir.iterate();
+    var moved: std.ArrayList(DebugMovedEntry) = .empty;
+    var moved_count: usize = 0;
     var prepared = false;
     errdefer if (!prepared) {
-        restoreDebugDestination(
-            allocator,
+        undoDebugPreparation(
             io,
-            staged,
-            backup,
-            old_generated,
+            transaction,
             destination,
+            backup_identity,
+            old_generated_identity,
+            moved.items[0..moved_count],
         ) catch {
             transaction_safe_to_remove.* = false;
         };
     };
-    if (try pathKindNoFollow(io, backup) != .directory) {
-        return error.DebugOutputCollision;
+    while (try iterator.next(io)) |entry| {
+        const stat = try backup_dir.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        const generated = isGeneratedDebugName(entry.name);
+        if (generated and stat.kind != .file and stat.kind != .sym_link) {
+            return error.DebugOutputCollision;
+        }
+        moved.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .identity = EntryIdentity.fromStat(stat),
+            .generated = generated,
+        }) catch @panic("out of memory");
     }
-    try Dir.createDirAbsolute(io, old_generated, .default_dir);
 
-    var backup_dir = try Dir.openDirAbsolute(
+    try verifyDirectoryEntries(io, backup_dir, moved.items);
+    for (moved.items) |entry| {
+        const target = if (entry.generated)
+            old_generated_dir
+        else
+            staged_dir;
+        try backup_dir.renamePreserve(entry.name, target, entry.name, io);
+        const moved_stat = try target.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (!entry.identity.matches(moved_stat)) {
+            target.renamePreserve(
+                entry.name,
+                backup_dir,
+                entry.name,
+                io,
+            ) catch {};
+            return error.TransactionChanged;
+        }
+        moved_count += 1;
+        try transaction.recordStoragePath(
+            allocator,
+            io,
+            try std.fs.path.join(
+                allocator,
+                &.{
+                    if (entry.generated)
+                        "previous-debug-generated"
+                    else
+                        "debug",
+                    entry.name,
+                },
+            ),
+        );
+    }
+    var final_iterator = backup_dir.iterate();
+    if (try final_iterator.next(io) != null) return error.TransactionChanged;
+    prepared = true;
+    return .{
+        .identity = backup_identity,
+        .old_generated_identity = old_generated_identity,
+        .moved = moved.toOwnedSlice(allocator) catch @panic("out of memory"),
+    };
+}
+
+fn undoDebugPreparation(
+    io: Io,
+    transaction: *Transaction,
+    destination: []const u8,
+    backup_identity: EntryIdentity,
+    old_generated_identity: EntryIdentity,
+    moved: []const DebugMovedEntry,
+) !void {
+    var backup_dir = try transaction.storage.openDir(
         io,
-        backup,
+        "previous-debug",
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer backup_dir.close(io);
-    var iterator = backup_dir.iterate();
-    var names: std.ArrayList([]const u8) = .empty;
-    while (try iterator.next(io)) |entry| {
-        names.append(allocator, try allocator.dupe(u8, entry.name)) catch
-            @panic("out of memory");
-        if (isGeneratedDebugName(entry.name) and
-            entry.kind != .file and entry.kind != .sym_link)
-        {
-            return error.DebugOutputCollision;
+    var staged_dir = try transaction.storage.openDir(
+        io,
+        "debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer staged_dir.close(io);
+    var old_generated_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug-generated",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer old_generated_dir.close(io);
+    var index = moved.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = moved[index];
+        const source = if (entry.generated) old_generated_dir else staged_dir;
+        if (!try entryHasIdentity(source, io, entry.name, entry.identity)) {
+            return error.TransactionChanged;
+        }
+        try source.renamePreserve(entry.name, backup_dir, entry.name, io);
+        if (!try entryHasIdentity(
+            backup_dir,
+            io,
+            entry.name,
+            entry.identity,
+        )) return error.TransactionChanged;
+    }
+    var old_generated_iterator = old_generated_dir.iterate();
+    if (try old_generated_iterator.next(io) != null) {
+        return error.TransactionChanged;
+    }
+    try removeExactEntry(
+        io,
+        transaction.storage,
+        "previous-debug-generated",
+        old_generated_identity,
+    );
+    try restoreBackup(
+        io,
+        transaction,
+        destination,
+        "previous-debug",
+        backup_identity,
+    );
+}
+
+fn publishEntry(
+    io: Io,
+    transaction: *Transaction,
+    staged: []const u8,
+    destination: []const u8,
+) !EntryIdentity {
+    const stat = try transaction.storage.statFile(
+        io,
+        staged,
+        .{ .follow_symlinks = false },
+    );
+    const identity = transaction.ownedIdentity(staged) orelse
+        return error.TransactionChanged;
+    if (!identity.matches(stat)) return error.TransactionChanged;
+    try transaction.storage.renamePreserve(
+        staged,
+        transaction.publication,
+        destination,
+        io,
+    );
+    const published = try transaction.publication.statFile(
+        io,
+        destination,
+        .{ .follow_symlinks = false },
+    );
+    if (!identity.matches(published)) {
+        transaction.publication.renamePreserve(
+            destination,
+            transaction.storage,
+            staged,
+            io,
+        ) catch {};
+        return error.TransactionChanged;
+    }
+    return identity;
+}
+
+fn rollbackPublication(
+    allocator: Allocator,
+    io: Io,
+    transaction: *Transaction,
+    component: anytype,
+    metadata_state: anytype,
+    debug_state: DebugPublication,
+) !void {
+    if (debug_state.published) |identity| {
+        try returnPublishedEntry(
+            io,
+            transaction,
+            debug_state.destination.?,
+            debug_state.staged.?,
+            identity,
+        );
+    }
+    if (metadata_state) |state| {
+        if (state.published) |identity| {
+            try returnPublishedEntry(
+                io,
+                transaction,
+                state.destination,
+                state.staged,
+                identity,
+            );
         }
     }
-
-    for (names.items) |name| {
-        const source = try std.fs.path.join(allocator, &.{ backup, name });
-        const target_parent = if (isGeneratedDebugName(name)) old_generated else staged;
-        const target = try std.fs.path.join(allocator, &.{ target_parent, name });
-        try Dir.renameAbsolute(source, target, io);
-    }
-    prepared = true;
-    return true;
-}
-
-fn restoreDebugDestination(
-    allocator: Allocator,
-    io: Io,
-    staged: []const u8,
-    backup: []const u8,
-    old_generated: []const u8,
-    destination: []const u8,
-) !void {
-    try moveDebugEntries(allocator, io, staged, backup, false);
-    try moveDebugEntries(allocator, io, old_generated, backup, true);
-    Dir.deleteDirAbsolute(io, old_generated) catch {};
-    try Dir.renameAbsolute(backup, destination, io);
-}
-
-fn moveDebugEntries(
-    allocator: Allocator,
-    io: Io,
-    source_path: []const u8,
-    destination_path: []const u8,
-    generated_only: bool,
-) !void {
-    var source = Dir.openDirAbsolute(
-        io,
-        source_path,
-        .{ .iterate = true, .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer source.close(io);
-    var iterator = source.iterate();
-    var names: std.ArrayList([]const u8) = .empty;
-    while (try iterator.next(io)) |entry| {
-        if (generated_only != isGeneratedDebugName(entry.name)) continue;
-        names.append(allocator, try allocator.dupe(u8, entry.name)) catch
-            @panic("out of memory");
-    }
-    for (names.items) |name| {
-        try Dir.renameAbsolute(
-            try std.fs.path.join(allocator, &.{ source_path, name }),
-            try std.fs.path.join(allocator, &.{ destination_path, name }),
+    if (component.published) |identity| {
+        try returnPublishedEntry(
             io,
+            transaction,
+            component.destination,
+            component.staged,
+            identity,
+        );
+    }
+
+    if (debug_state.backup) |backup| {
+        try restoreDebugBackup(
+            allocator,
+            io,
+            transaction,
+            debug_state.destination.?,
+            backup,
+        );
+    }
+    if (metadata_state) |state| {
+        if (state.backup) |identity| {
+            try restoreBackup(
+                io,
+                transaction,
+                state.destination,
+                state.backup_name,
+                identity,
+            );
+        }
+    }
+    if (component.backup) |identity| {
+        try restoreBackup(
+            io,
+            transaction,
+            component.destination,
+            component.backup_name,
+            identity,
         );
     }
 }
 
-fn removeOldGeneratedFiles(
+fn returnPublishedEntry(
+    io: Io,
+    transaction: *Transaction,
+    destination: []const u8,
+    staged: []const u8,
+    identity: EntryIdentity,
+) !void {
+    if (!try entryHasIdentity(
+        transaction.publication,
+        io,
+        destination,
+        identity,
+    )) return error.TransactionChanged;
+    try transaction.publication.renamePreserve(
+        destination,
+        transaction.storage,
+        staged,
+        io,
+    );
+    if (!try entryHasIdentity(
+        transaction.storage,
+        io,
+        staged,
+        identity,
+    )) {
+        transaction.storage.renamePreserve(
+            staged,
+            transaction.publication,
+            destination,
+            io,
+        ) catch {};
+        return error.TransactionChanged;
+    }
+}
+
+fn restoreBackup(
+    io: Io,
+    transaction: *Transaction,
+    destination: []const u8,
+    backup: []const u8,
+    identity: EntryIdentity,
+) !void {
+    if (try statEntry(transaction.publication, io, destination) != null) {
+        return error.TransactionChanged;
+    }
+    if (!try entryHasIdentity(
+        transaction.storage,
+        io,
+        backup,
+        identity,
+    )) return error.TransactionChanged;
+    try transaction.storage.renamePreserve(
+        backup,
+        transaction.publication,
+        destination,
+        io,
+    );
+    if (!try entryHasIdentity(
+        transaction.publication,
+        io,
+        destination,
+        identity,
+    )) return error.TransactionChanged;
+}
+
+fn restoreDebugBackup(
     allocator: Allocator,
     io: Io,
-    directory: []const u8,
+    transaction: *Transaction,
+    destination: []const u8,
+    backup: DebugBackup,
 ) !void {
-    for (debug_generated_names) |name| {
-        const path = try std.fs.path.join(allocator, &.{ directory, name });
-        if (try pathKindNoFollow(io, path) != null) {
-            try Dir.deleteFileAbsolute(io, path);
-        }
+    var backup_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer backup_dir.close(io);
+    if (!backup.identity.matches(try backup_dir.stat(io))) {
+        return error.TransactionChanged;
     }
+    var staged_dir = try transaction.storage.openDir(
+        io,
+        "debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer staged_dir.close(io);
+    var old_generated_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug-generated",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer old_generated_dir.close(io);
+    for (backup.moved) |entry| {
+        const source = if (entry.generated) old_generated_dir else staged_dir;
+        if (!try entryHasIdentity(source, io, entry.name, entry.identity)) {
+            return error.TransactionChanged;
+        }
+        try source.renamePreserve(entry.name, backup_dir, entry.name, io);
+        if (!try entryHasIdentity(
+            backup_dir,
+            io,
+            entry.name,
+            entry.identity,
+        )) return error.TransactionChanged;
+    }
+    _ = allocator;
+    try restoreBackup(
+        io,
+        transaction,
+        destination,
+        "previous-debug",
+        backup.identity,
+    );
+}
+
+fn finalizeDebugBackup(
+    io: Io,
+    transaction: *Transaction,
+    backup: DebugBackup,
+) !void {
+    var backup_dir = try transaction.storage.openDir(
+        io,
+        "previous-debug",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer backup_dir.close(io);
+    if (!backup.identity.matches(try backup_dir.stat(io))) {
+        return error.TransactionChanged;
+    }
+    var backup_iterator = backup_dir.iterate();
+    if (try backup_iterator.next(io) != null) return error.TransactionChanged;
+
+    var old_generated = try transaction.storage.openDir(
+        io,
+        "previous-debug-generated",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer old_generated.close(io);
+    if (!backup.old_generated_identity.matches(try old_generated.stat(io))) {
+        return error.TransactionChanged;
+    }
+    for (backup.moved) |entry| {
+        if (!entry.generated) continue;
+        try removeExactEntry(io, old_generated, entry.name, entry.identity);
+    }
+    var final_iterator = old_generated.iterate();
+    if (try final_iterator.next(io) != null) return error.TransactionChanged;
+    if (!try entryHasIdentity(
+        transaction.storage,
+        io,
+        "previous-debug-generated",
+        backup.old_generated_identity,
+    )) return error.TransactionChanged;
+    try removeExactEntry(
+        io,
+        transaction.storage,
+        "previous-debug-generated",
+        backup.old_generated_identity,
+    );
+    if (!try entryHasIdentity(
+        transaction.storage,
+        io,
+        "previous-debug",
+        backup.identity,
+    )) return error.TransactionChanged;
+    try removeExactEntry(
+        io,
+        transaction.storage,
+        "previous-debug",
+        backup.identity,
+    );
 }
 
 fn renderRuntimeArgs(
@@ -2388,7 +3491,11 @@ fn pathExists(io: Io, path: []const u8) bool {
 }
 
 fn pathKindNoFollow(io: Io, path: []const u8) !?File.Kind {
-    const stat = Dir.cwd().statFile(
+    return pathKindNoFollowAt(.cwd(), io, path);
+}
+
+fn pathKindNoFollowAt(directory: Dir, io: Io, path: []const u8) !?File.Kind {
+    const stat = directory.statFile(
         io,
         path,
         .{ .follow_symlinks = false },
@@ -2409,7 +3516,21 @@ fn requireDestinationFileOrMissing(
     path: []const u8,
     invalid_error: anyerror,
 ) !void {
-    const stat = Dir.cwd().statFile(
+    return requireDestinationFileOrMissingAt(
+        .cwd(),
+        io,
+        path,
+        invalid_error,
+    );
+}
+
+fn requireDestinationFileOrMissingAt(
+    directory: Dir,
+    io: Io,
+    path: []const u8,
+    invalid_error: anyerror,
+) !void {
+    const stat = directory.statFile(
         io,
         path,
         .{ .follow_symlinks = false },
@@ -2440,17 +3561,15 @@ fn copyDebugFile(
     try Dir.cwd().copyFile(source, debug_dir, basename, io, .{});
 }
 
-fn resolveDestination(
+fn resolveOrCreateDirectory(
     allocator: Allocator,
     io: Io,
     path: []const u8,
 ) ![]const u8 {
     return Dir.realPathFileAbsoluteAlloc(io, path, allocator) catch |err| switch (err) {
         error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
-            const basename = std.fs.path.basename(path);
-            const resolved_parent = try Dir.realPathFileAbsoluteAlloc(io, parent, allocator);
-            return std.fs.path.join(allocator, &.{ resolved_parent, basename });
+            try Dir.cwd().createDirPath(io, path);
+            return Dir.realPathFileAbsoluteAlloc(io, path, allocator);
         },
         else => return err,
     };

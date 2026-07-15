@@ -83,6 +83,28 @@ grep -Fq 'JavaScript' "$WORK/embedded metadata.txt"
 grep -Fq 'processed-by' "$WORK/embedded metadata.txt"
 grep -Fq 'starling-componentize' "$WORK/embedded metadata.txt"
 
+RELATIVE_DIR="$WORK/read only relative modules"
+RELATIVE_SOURCE="$RELATIVE_DIR/main.js"
+RELATIVE_OUTPUT="$WORK/relative import component.wasm"
+mkdir "$RELATIVE_DIR"
+cat > "$RELATIVE_DIR/sibling.js" <<'EOF'
+export function add(a, b) {
+  return a + b;
+}
+EOF
+{
+  printf 'import { add } from "./sibling.js";\n\n'
+  tail -n +5 "$ROOT/tests/fixtures/js-dispatch.js"
+} > "$RELATIVE_SOURCE"
+chmod 444 "$RELATIVE_SOURCE" "$RELATIVE_DIR/sibling.js"
+chmod 555 "$RELATIVE_DIR"
+componentize "$RELATIVE_SOURCE" "$RELATIVE_OUTPUT"
+"$WASM_TOOLS" validate --features all "$RELATIVE_OUTPUT"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
+  "$RELATIVE_OUTPUT")" = 5
+chmod 755 "$RELATIVE_DIR"
+chmod 644 "$RELATIVE_SOURCE" "$RELATIVE_DIR/sibling.js"
+
 # A second identical WIT selection reuses the same monolithic Zig cache entry.
 "$COMPONENTIZER" \
   --build-root "$ROOT" \

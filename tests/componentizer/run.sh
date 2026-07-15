@@ -131,7 +131,31 @@ if [ "$1" = "validate" ] && [ -n "${FAKE_REPLACED_TRANSACTION:-}" ]; then
 fi
 if [ "$1" = "validate" ] && [ -n "${FAKE_ADD_TRANSACTION_ENTRY:-}" ]; then
   storage="$(dirname "${!#}")"
-  printf 'preserve-unowned\n' > "$storage/unowned-sentinel"
+  mkdir "$storage/inputs/late-unowned-tree"
+  printf 'preserve-unowned\n' > \
+    "$storage/inputs/late-unowned-tree/sentinel"
+fi
+if [ "$1" = "validate" ] && \
+   [ -n "${FAKE_REPLACE_TRANSACTION_INPUTS:-}" ]; then
+  storage="$(dirname "${!#}")"
+  mv "$storage/inputs" "$FAKE_REPLACE_TRANSACTION_INPUTS"
+  mkdir "$storage/inputs"
+  printf 'preserve-owned-replacement\n' > "$storage/inputs/sentinel"
+fi
+if [ "$1" = "validate" ] && [ -n "${FAKE_RETARGET_PARENT_LINK:-}" ]; then
+  rm "$FAKE_RETARGET_PARENT_LINK"
+  ln -s "$FAKE_RETARGET_PARENT_TARGET" "$FAKE_RETARGET_PARENT_LINK"
+fi
+if [ "$1" = "validate" ] && \
+   [ -n "${FAKE_REPLACE_COMPONENT_BACKUP:-}" ]; then
+  storage="$(dirname "${!#}")"
+  (
+    while [ ! -e "$storage/previous-component" ]; do
+      sleep 0.001
+    done
+    mv "$storage/previous-component" "$FAKE_REPLACED_COMPONENT_BACKUP"
+    printf 'preserve-backup-replacement\n' > "$storage/previous-component"
+  ) </dev/null >/dev/null 2>&1 &
 fi
 if [ "$1 $2" = "component new" ]; then
   out=""
@@ -411,6 +435,73 @@ grep -Fq -- "\"$READ_ONLY_SOURCE\"" "$FAKE_RUNTIME_ARGS_LOG"
 grep -Fq -- "\"$READ_ONLY_INITIALIZER\"" "$FAKE_RUNTIME_ARGS_LOG"
 cmp "$ENGINE" "$READ_ONLY_OUTPUT"
 
+UNREADABLE_SOURCE="$WORK/unreadable source.js"
+UNREADABLE_ERROR="$SCRATCH/unreadable-source.jsonl"
+printf 'export const unreadable = true;\n' > "$UNREADABLE_SOURCE"
+chmod 000 "$UNREADABLE_SOURCE"
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WORK/unreadable source.wasm" \
+  "$UNREADABLE_SOURCE" >/dev/null 2> "$UNREADABLE_ERROR"
+then
+  echo "FAIL: unreadable source unexpectedly componentized" >&2
+  exit 1
+fi
+chmod 644 "$UNREADABLE_SOURCE"
+python3 - "$UNREADABLE_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+PY
+test ! -e "$WORK/unreadable source.wasm"
+
+RACED_SOURCE="$WORK/raced source.js"
+RACED_ORIGINAL="$SCRATCH/raced source original.js"
+RACED_ERROR="$SCRATCH/raced-source.jsonl"
+python3 - "$RACED_SOURCE" <<'PY'
+import sys
+with open(sys.argv[1], "w", encoding="utf-8") as source:
+    source.write("// immutable input race padding\n" * 500000)
+    source.write("export const raced = true;\n")
+PY
+python3 - "$WORK" "$RACED_SOURCE" "$RACED_ORIGINAL" <<'PY' &
+import os, sys, time
+work, source, original = sys.argv[1:]
+prefix = ".raced source.wasm.starling-componentize-"
+while not any(name.startswith(prefix) for name in os.listdir(work)):
+    time.sleep(0.0001)
+os.rename(source, original)
+with open(source, "w", encoding="utf-8") as replacement:
+    replacement.write("export const replacement = true;\n")
+PY
+racer=$!
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WORK/raced source.wasm" \
+  "$RACED_SOURCE" >/dev/null 2> "$RACED_ERROR"
+then
+  echo "FAIL: raced source unexpectedly componentized" >&2
+  exit 1
+fi
+wait "$racer"
+python3 - "$RACED_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+PY
+test "$(cat "$RACED_SOURCE")" = "export const replacement = true;"
+test ! -e "$WORK/raced source.wasm"
+
 SOURCE_CONTENT="$(cat "$SOURCE")"
 if "$COMPONENTIZER" \
   --engine "$ENGINE" \
@@ -662,9 +753,95 @@ FAKE_ADD_TRANSACTION_ENTRY=1 "$COMPONENTIZER" \
 IDENTITY_ROOT="$(find "$WORK" -maxdepth 1 -type d \
   -name '.identity cleanup.wasm.starling-componentize-*' -print -quit)"
 test -n "$IDENTITY_ROOT"
-test "$(cat "$IDENTITY_ROOT/data/unowned-sentinel")" = "preserve-unowned"
+test "$(cat "$IDENTITY_ROOT/data/inputs/late-unowned-tree/sentinel")" = \
+  "preserve-unowned"
 cmp "$ENGINE" "$IDENTITY_OUTPUT"
 rm -rf "$IDENTITY_ROOT"
+
+CHANGED_INPUT_OUTPUT="$WORK/changed owned input.wasm"
+CHANGED_INPUT_SAVED="$SCRATCH/changed-owned-input-original"
+FAKE_REPLACE_TRANSACTION_INPUTS="$CHANGED_INPUT_SAVED" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$CHANGED_INPUT_OUTPUT" \
+  "$SOURCE"
+CHANGED_INPUT_ROOT="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.changed owned input.wasm.starling-componentize-*' -print -quit)"
+test -n "$CHANGED_INPUT_ROOT"
+test "$(cat "$CHANGED_INPUT_ROOT/data/inputs/sentinel")" = \
+  "preserve-owned-replacement"
+test -f "$CHANGED_INPUT_SAVED/source/source module.js"
+cmp "$ENGINE" "$CHANGED_INPUT_OUTPUT"
+rm -rf "$CHANGED_INPUT_ROOT" "$CHANGED_INPUT_SAVED"
+
+PUBLICATION_A="$WORK/publication-a"
+PUBLICATION_B="$WORK/publication-b"
+PUBLICATION_LINK="$WORK/publication-link"
+mkdir "$PUBLICATION_A" "$PUBLICATION_B"
+ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
+printf 'unrelated-a\n' > "$PUBLICATION_A/unrelated"
+printf 'unrelated-b\n' > "$PUBLICATION_B/unrelated"
+FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
+FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$PUBLICATION_LINK/retarget-safe.wasm" \
+  "$SOURCE"
+test "$(readlink "$PUBLICATION_LINK")" = "$PUBLICATION_B"
+cmp "$ENGINE" "$PUBLICATION_A/retarget-safe.wasm"
+test ! -e "$PUBLICATION_B/retarget-safe.wasm"
+test "$(cat "$PUBLICATION_A/unrelated")" = "unrelated-a"
+test "$(cat "$PUBLICATION_B/unrelated")" = "unrelated-b"
+if find "$PUBLICATION_A" "$PUBLICATION_B" \
+  -name '.*.starling-componentize-*' | grep -q .; then
+  echo "FAIL: parent-symlink retarget left transaction artifacts" >&2
+  exit 1
+fi
+
+BACKUP_RACE_OUTPUT="$WORK/backup identity race.wasm"
+BACKUP_RACE_DEBUG="$WORK/backup identity race.debug"
+BACKUP_RACE_SAVED="$SCRATCH/original component backup"
+printf 'original-component-backup\n' > "$BACKUP_RACE_OUTPUT"
+mkdir "$BACKUP_RACE_DEBUG"
+python3 - "$BACKUP_RACE_DEBUG" <<'PY'
+import os, sys
+for index in range(4000):
+    with open(os.path.join(sys.argv[1], f"unrelated-{index}"), "w") as entry:
+        entry.write(f"preserve-{index}\n")
+os.mkdir(os.path.join(sys.argv[1], "commands.txt"))
+with open(os.path.join(sys.argv[1], "commands.txt", "sentinel"), "w") as entry:
+    entry.write("preserve-generated-tree\n")
+PY
+if FAKE_REPLACE_COMPONENT_BACKUP=1 \
+  FAKE_REPLACED_COMPONENT_BACKUP="$BACKUP_RACE_SAVED" \
+  "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --debug-dir "$BACKUP_RACE_DEBUG" \
+  --out "$BACKUP_RACE_OUTPUT" \
+  "$SOURCE" >/dev/null 2>&1
+then
+  echo "FAIL: replaced component backup unexpectedly published" >&2
+  exit 1
+fi
+BACKUP_RACE_ROOT="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.backup identity race.wasm.starling-componentize-*' -print -quit)"
+test -n "$BACKUP_RACE_ROOT"
+test "$(cat "$BACKUP_RACE_SAVED")" = "original-component-backup"
+test "$(cat "$BACKUP_RACE_ROOT/data/previous-component")" = \
+  "preserve-backup-replacement"
+test "$(cat "$BACKUP_RACE_DEBUG/commands.txt/sentinel")" = \
+  "preserve-generated-tree"
+test "$(cat "$BACKUP_RACE_DEBUG/unrelated-3999")" = "preserve-3999"
+test ! -e "$BACKUP_RACE_OUTPUT"
+rm -rf "$BACKUP_RACE_ROOT" "$BACKUP_RACE_DEBUG"
 
 RACE_OUTPUT="$WORK/publish-race.wasm"
 RACE_METADATA="$WORK/publish-race.json"
