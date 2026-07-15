@@ -1,6 +1,7 @@
 #include "event_loop.h"
 
 #include "host_api.h"
+#include "js_dispatch.h"
 #include "js/Promise.h"
 #include "jsapi.h"
 #include "jsfriendapi.h"
@@ -66,6 +67,10 @@ bool EventLoop::run_event_loop(api::Engine *engine, double total_compute) {
   while (true) {
     // Run a microtask checkpoint
     js::RunJobs(cx);
+    if (!starling::drain_resource_drops(engine)) {
+      exit_event_loop();
+      return false;
+    }
 
     if (JS_IsExceptionPending(cx)) {
       exit_event_loop();
@@ -91,7 +96,7 @@ bool EventLoop::run_event_loop(api::Engine *engine, double total_compute) {
     auto task = tasks->at(task_idx);
     tasks->erase(tasks->begin() + task_idx);
     bool success = task->run(engine);
-    if (!success) {
+    if (!starling::drain_resource_drops(engine) || !success) {
       exit_event_loop();
       return false;
     }
@@ -115,6 +120,10 @@ PromisePumpResult EventLoop::pump_until_promise_settled(api::Engine *engine,
     // microtask-driven promise (including one that's already settled by the
     // time we get here) never needs to touch the async task queue below.
     js::RunJobs(cx);
+    if (!starling::drain_resource_drops(engine)) {
+      result = PromisePumpResult::JSException;
+      break;
+    }
 
     if (JS_IsExceptionPending(cx)) {
       result = PromisePumpResult::JSException;
@@ -142,7 +151,7 @@ PromisePumpResult EventLoop::pump_until_promise_settled(api::Engine *engine,
     auto task = tasks->at(task_idx);
     tasks->erase(tasks->begin() + task_idx);
     bool success = task->run(engine);
-    if (!success) {
+    if (!starling::drain_resource_drops(engine) || !success) {
       result = PromisePumpResult::JSException;
       break;
     }

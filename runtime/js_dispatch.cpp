@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <print>
 #include <string>
 #include <string_view>
@@ -31,6 +32,8 @@ struct JsonBuffer {
   JSContext *cx;
   std::string bytes;
 };
+
+bool reclaim_pending_dispatch_arena();
 
 bool write_json(const char16_t *chars, uint32_t len, void *data) {
   auto *output = static_cast<JsonBuffer *>(data);
@@ -370,11 +373,9 @@ bool starling_validate_required_exports() {
   return true;
 }
 
-extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
-                                         size_t export_name_len,
-                                         const uint8_t *args_json_ptr,
-                                         size_t args_json_len,
-                                         StarlingJSDispatchResult *result) {
+static uint32_t dispatch_json_impl(const uint8_t *export_name_ptr, size_t export_name_len,
+                                   const uint8_t *args_json_ptr, size_t args_json_len,
+                                   StarlingJSDispatchResult *result) {
   result->ptr = nullptr;
   result->len = 0;
 
@@ -464,6 +465,33 @@ extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
   return 0;
 }
 
+extern "C" uint32_t starling_js_dispatch(const uint8_t *export_name_ptr,
+                                         size_t export_name_len,
+                                         const uint8_t *args_json_ptr,
+                                         size_t args_json_len,
+                                         StarlingJSDispatchResult *result) {
+  result->ptr = nullptr;
+  result->len = 0;
+  JSContext *cx = api::Engine::cx();
+  if (!cx || !reclaim_pending_dispatch_arena()) {
+    return 1;
+  }
+  auto *engine = api::Engine::get(cx);
+  auto &registry = engine->resource_registry();
+  if (registry.dispatch_depth() == 0 && !starling::drain_resource_drops(engine)) {
+    return 1;
+  }
+  const uint32_t status =
+      dispatch_json_impl(export_name_ptr, export_name_len, args_json_ptr, args_json_len, result);
+  if (registry.dispatch_depth() == 0 && !starling::drain_resource_drops(engine)) {
+    std::free(result->ptr);
+    result->ptr = nullptr;
+    result->len = 0;
+    return 1;
+  }
+  return status;
+}
+
 extern "C" void starling_dispatch_result_free(void *ptr) { std::free(ptr); }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +509,9 @@ struct NativeArena {
   std::vector<std::unique_ptr<StarlingJsField[]>> field_arrays;
   std::vector<std::unique_ptr<uint8_t[]>> byte_buffers;
   std::vector<std::unique_ptr<StarlingJsValue[]>> list_arrays;
+  std::vector<std::unique_ptr<JS::PersistentRootedObject>> resource_roots;
+  api::Engine *dispatch_engine = nullptr;
+  bool owns_dispatch_scope = false;
 
   const StarlingJsValue *box(StarlingJsValue v) {
     boxed_values.push_back(std::make_unique<StarlingJsValue>(v));
@@ -504,7 +535,168 @@ struct NativeArena {
     list_arrays.push_back(std::make_unique<StarlingJsValue[]>(n));
     return list_arrays.back().get();
   }
+  void root_resource(JSContext *cx, JS::HandleObject obj) {
+    resource_roots.push_back(std::make_unique<JS::PersistentRootedObject>(cx, obj));
+  }
 };
+
+NativeArena *pending_dispatch_arena = nullptr;
+
+bool finish_native_arena(NativeArena *arena) {
+  if (!arena) {
+    return true;
+  }
+  if (pending_dispatch_arena == arena) {
+    pending_dispatch_arena = nullptr;
+  }
+  api::Engine *engine = arena->dispatch_engine;
+  const bool owns_scope = arena->owns_dispatch_scope;
+  delete arena;
+  if (!owns_scope) {
+    return true;
+  }
+  const bool outermost = engine->resource_registry().leave_dispatch();
+  return !outermost || starling::drain_resource_drops(engine);
+}
+
+bool reclaim_pending_dispatch_arena() {
+  NativeArena *stale = pending_dispatch_arena;
+  return !stale || finish_native_arena(stale);
+}
+
+struct ResourceObjectData {
+  starling::ResourceRegistry *registry;
+  starling::ResourceToken token;
+};
+
+enum class ResourceObjectSlot : uint32_t {
+  Data,
+  Count,
+};
+
+void finalize_resource_object(JS::GCContext *, JSObject *obj) {
+  auto *data = static_cast<ResourceObjectData *>(
+      JS::GetReservedSlot(obj, std::to_underlying(ResourceObjectSlot::Data)).toPrivate());
+  if (!data) {
+    return;
+  }
+  if (data->token.ownership == starling::ResourceOwnership::Own) {
+    // This only changes registry state. Host/Zig drop code runs later at a
+    // depth-zero safe point, never from SpiderMonkey finalization.
+    (void)data->registry->queue_drop(data->token);
+  }
+  delete data;
+}
+
+static constexpr JSClassOps resource_object_class_ops{
+    .finalize = finalize_resource_object,
+};
+
+static constexpr JSClass resource_object_class{
+    "WITResource",
+    JSCLASS_HAS_RESERVED_SLOTS(std::to_underlying(ResourceObjectSlot::Count)) |
+        JSCLASS_FOREGROUND_FINALIZE,
+    &resource_object_class_ops,
+};
+
+const char *resource_error_message(starling::ResourceError error) {
+  switch (error) {
+  case starling::ResourceError::None:
+    return "none";
+  case starling::ResourceError::NotInDispatch:
+    return "resource used outside an active dispatch";
+  case starling::ResourceError::WrongOwnership:
+    return "resource ownership mismatch";
+  case starling::ResourceError::UnknownResource:
+    return "unknown resource";
+  case starling::ResourceError::StaleToken:
+    return "stale resource generation";
+  case starling::ResourceError::ExpiredBorrow:
+    return "expired borrowed resource";
+  case starling::ResourceError::InvalidState:
+    return "resource was moved, dropped, or already has an owner";
+  }
+  return "unrecognized resource registry error";
+}
+
+bool report_resource_error(JSContext *cx, const char *operation,
+                           starling::ResourceError error) {
+  JS_ReportErrorUTF8(cx, "native dispatch: cannot %s: %s", operation,
+                     resource_error_message(error));
+  return false;
+}
+
+std::optional<starling::ResourceOwnership>
+resource_ownership_from_abi(StarlingJsResourceOwnership ownership) {
+  switch (ownership) {
+  case STARLING_JS_RESOURCE_OWN:
+    return starling::ResourceOwnership::Own;
+  case STARLING_JS_RESOURCE_BORROW:
+    return starling::ResourceOwnership::Borrow;
+  }
+  return std::nullopt;
+}
+
+StarlingJsResourceOwnership resource_ownership_to_abi(starling::ResourceOwnership ownership) {
+  switch (ownership) {
+  case starling::ResourceOwnership::Own:
+    return STARLING_JS_RESOURCE_OWN;
+  case starling::ResourceOwnership::Borrow:
+    return STARLING_JS_RESOURCE_BORROW;
+  }
+  MOZ_CRASH("unrecognized resource ownership");
+}
+
+bool encode_resource_to_js(JSContext *cx, const StarlingJsValue &value,
+                           JS::MutableHandleValue out) {
+  if (!value.resource_provider_ptr || value.resource_provider_len == 0 ||
+      !value.resource_name_ptr || value.resource_name_len == 0) {
+    JS_ReportErrorASCII(cx, "native dispatch: resource descriptor is missing");
+    return false;
+  }
+  const auto ownership = resource_ownership_from_abi(value.resource_ownership);
+  if (!ownership) {
+    JS_ReportErrorASCII(cx, "native dispatch: resource ownership is invalid");
+    return false;
+  }
+
+  JS::RootedObject obj(cx, JS_NewObject(cx, &resource_object_class));
+  if (!obj) {
+    return false;
+  }
+  JS::SetReservedSlot(obj, std::to_underlying(ResourceObjectSlot::Data),
+                      JS::PrivateValue(nullptr));
+
+  auto &registry = api::Engine::get(cx)->resource_registry();
+  const std::string_view provider(
+      reinterpret_cast<const char *>(value.resource_provider_ptr),
+      value.resource_provider_len);
+  const std::string_view name(reinterpret_cast<const char *>(value.resource_name_ptr),
+                              value.resource_name_len);
+  const starling::ResourceTokenResult acquired =
+      *ownership == starling::ResourceOwnership::Own
+          ? registry.acquire_owned(provider, name, value.resource_handle)
+          : registry.acquire_borrow(provider, name, value.resource_handle);
+  if (!acquired) {
+    return report_resource_error(cx, "create a JavaScript resource wrapper", acquired.error);
+  }
+
+  auto *data = new (std::nothrow) ResourceObjectData{
+      .registry = &registry,
+      .token = acquired.token,
+  };
+  if (!data) {
+    if (*ownership == starling::ResourceOwnership::Own) {
+      (void)registry.queue_drop(acquired.token);
+    }
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+  JS::SetReservedSlot(obj, std::to_underlying(ResourceObjectSlot::Data),
+                      JS::PrivateValue(data));
+  out.setObject(*obj);
+  return true;
+}
 
 // Encodes one `StarlingJsValue` leaf/subtree to a rooted JS value. Each
 // recursive call roots its own intermediates in its own C++ stack frame
@@ -615,6 +807,8 @@ bool encode_to_js(JSContext *cx, const StarlingJsValue &v, JS::MutableHandleValu
   case STARLING_JS_UNDEFINED:
     out.setUndefined();
     return true;
+  case STARLING_JS_RESOURCE:
+    return encode_resource_to_js(cx, v, out);
   }
   JS_ReportErrorASCII(cx, "native dispatch: unrecognized argument tag");
   return false;
@@ -692,6 +886,42 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
   }
   if (v.isObject()) {
     JS::RootedObject obj(cx, &v.toObject());
+
+    if (JS::GetClass(obj) == &resource_object_class) {
+      auto *data = static_cast<ResourceObjectData *>(
+          JS::GetReservedSlot(obj, std::to_underlying(ResourceObjectSlot::Data)).toPrivate());
+      if (!data) {
+        JS_ReportErrorASCII(cx, "native dispatch: resource wrapper has no registry token");
+        return false;
+      }
+      const starling::ResourceError valid = data->registry->validate(data->token);
+      if (valid != starling::ResourceError::None) {
+        return report_resource_error(cx, "use a JavaScript resource wrapper", valid);
+      }
+      const auto *descriptor = data->registry->descriptor(data->token.type_id);
+      if (!descriptor) {
+        JS_ReportErrorASCII(cx, "native dispatch: resource type is not registered");
+        return false;
+      }
+      // Recursive decoding releases each field/element's stack root before
+      // moving to the next one. Keep resource wrappers alive until Zig has
+      // validated the complete aggregate and committed or rejected ownership.
+      arena.root_resource(cx, obj);
+      *out = {
+          .tag = STARLING_JS_RESOURCE,
+          .resource_provider_ptr =
+              reinterpret_cast<const uint8_t *>(descriptor->provider.data()),
+          .resource_provider_len = descriptor->provider.size(),
+          .resource_name_ptr = reinterpret_cast<const uint8_t *>(descriptor->name.data()),
+          .resource_name_len = descriptor->name.size(),
+          .resource_type_id = data->token.type_id,
+          .resource_handle = data->token.handle,
+          .resource_ownership = resource_ownership_to_abi(data->token.ownership),
+          .resource_generation = data->token.generation,
+          .resource_borrow_epoch = data->token.borrow_epoch,
+      };
+      return true;
+    }
 
     // A `Uint8Array` must be detected before both the Array check and the
     // generic own-property-keys walk below: it is not itself a JS Array
@@ -781,11 +1011,10 @@ bool decode_from_js(JSContext *cx, JS::HandleValue v, NativeArena &arena, Starli
 
 } // namespace
 
-extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
-                                                size_t export_name_len,
-                                                const StarlingJsValue *args_ptr, size_t args_len,
-                                                uint8_t result_is_wit_result,
-                                                StarlingJsValue *out_result, void **out_arena) {
+static uint32_t dispatch_native_impl(const uint8_t *export_name_ptr, size_t export_name_len,
+                                     const StarlingJsValue *args_ptr, size_t args_len,
+                                     uint8_t result_is_wit_result,
+                                     StarlingJsValue *out_result, void **out_arena) {
   *out_result = {};
   *out_arena = nullptr;
 
@@ -868,9 +1097,125 @@ extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
   return 0;
 }
 
-extern "C" void starling_js_dispatch_native_free(void *arena) {
-  delete static_cast<NativeArena *>(arena);
+extern "C" uint32_t starling_js_dispatch_native(const uint8_t *export_name_ptr,
+                                                size_t export_name_len,
+                                                const StarlingJsValue *args_ptr, size_t args_len,
+                                                uint8_t result_is_wit_result,
+                                                StarlingJsValue *out_result, void **out_arena) {
+  JSContext *cx = api::Engine::cx();
+  if (!cx) {
+    return 1;
+  }
+  auto *engine = api::Engine::get(cx);
+  auto &registry = engine->resource_registry();
+  if (!reclaim_pending_dispatch_arena()) return 1;
+  if (registry.dispatch_depth() == 0 && !starling::drain_resource_drops(engine)) {
+    return 1;
+  }
+  registry.enter_dispatch();
+  const uint32_t result =
+      dispatch_native_impl(export_name_ptr, export_name_len, args_ptr, args_len,
+                           result_is_wit_result, out_result, out_arena);
+  if ((result == 0 || result == 2) && *out_arena) {
+    auto *arena = static_cast<NativeArena *>(*out_arena);
+    arena->dispatch_engine = engine;
+    arena->owns_dispatch_scope = true;
+    pending_dispatch_arena = arena;
+    return result;
+  }
+  const bool outermost = registry.leave_dispatch();
+  if (outermost && !starling::drain_resource_drops(engine)) return 1;
+  return result;
 }
+
+extern "C" uint32_t starling_js_dispatch_native_free(void *opaque_arena) {
+  return finish_native_arena(static_cast<NativeArena *>(opaque_arena)) ? 0 : 1;
+}
+
+extern "C" uint32_t starling_js_resource_validate(
+    uint32_t type_id, int32_t handle, uint64_t generation,
+    StarlingJsResourceOwnership ownership, uint64_t borrow_epoch) {
+  JSContext *cx = api::Engine::cx();
+  if (!cx) {
+    return static_cast<uint32_t>(starling::ResourceError::UnknownResource);
+  }
+  const auto native_ownership = resource_ownership_from_abi(ownership);
+  if (!native_ownership) {
+    return static_cast<uint32_t>(starling::ResourceError::WrongOwnership);
+  }
+  starling::ResourceToken token{
+      .type_id = type_id,
+      .handle = handle,
+      .generation = generation,
+      .ownership = *native_ownership,
+      .borrow_epoch = borrow_epoch,
+  };
+  auto &registry = api::Engine::get(cx)->resource_registry();
+  return static_cast<uint32_t>(registry.validate(token));
+}
+
+extern "C" uint32_t
+starling_js_resource_transfer_many(const starling::ResourceToken *tokens, size_t len) {
+  JSContext *cx = api::Engine::cx();
+  if (!cx) {
+    return static_cast<uint32_t>(starling::ResourceError::UnknownResource);
+  }
+  auto &registry = api::Engine::get(cx)->resource_registry();
+  return static_cast<uint32_t>(
+      registry.transfer_owned_many(std::span<const starling::ResourceToken>(tokens, len)));
+}
+
+extern "C" __attribute__((weak)) uint32_t starling_js_resource_drop(
+    const uint8_t *provider_ptr, size_t provider_len, const uint8_t *name_ptr,
+    size_t name_len, int32_t handle) {
+  (void)provider_ptr;
+  (void)provider_len;
+  (void)name_ptr;
+  (void)name_len;
+  (void)handle;
+  return 1;
+}
+
+namespace starling {
+
+bool drain_resource_drops(api::Engine *engine) {
+  auto &registry = engine->resource_registry();
+  while (auto request = registry.take_queued_drop()) {
+    const ResourceDescriptor *descriptor = registry.descriptor(request->token.type_id);
+    if (!descriptor) {
+      JS_ReportErrorASCII(engine->cx(),
+                          "native dispatch: queued drop has an unknown resource type");
+      return false;
+    }
+    if (starling_js_resource_drop(
+            reinterpret_cast<const uint8_t *>(descriptor->provider.data()),
+            descriptor->provider.size(),
+            reinterpret_cast<const uint8_t *>(descriptor->name.data()),
+            descriptor->name.size(), request->token.handle) != 0) {
+      JS_ReportErrorUTF8(engine->cx(),
+                         "native dispatch: host drop failed for resource '%s/%s'",
+                         descriptor->provider.c_str(), descriptor->name.c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+bool shutdown_resources(api::Engine *engine) {
+  if (!reclaim_pending_dispatch_arena()) {
+    return false;
+  }
+  auto &registry = engine->resource_registry();
+  if (registry.dispatch_depth() != 0) {
+    JS_ReportErrorASCII(engine->cx(),
+                        "native dispatch: cannot shut down resources during a dispatch");
+    return false;
+  }
+  registry.queue_all_owned();
+  return drain_resource_drops(engine);
+}
+
+} // namespace starling
 
 // ---------------------------------------------------------------------------
 // Reverse bridge: host-provided WIT interface imports called *from*
@@ -906,8 +1251,8 @@ namespace {
 // registered under, reusing `decode_from_js`/`encode_to_js` -- the same pair
 // used for export arguments/results -- with the roles reversed: arguments
 // come *from* JS (decode) and the result goes back *to* JS (encode).
-bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
-                 JS::CallArgs args) {
+bool call_import_impl(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
+                      JS::CallArgs args) {
   (void)receiver;
   JS::RootedString key_str(cx, extra.toString());
   auto key_utf8 = core::encode(cx, key_str);
@@ -956,6 +1301,25 @@ bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra
   }
   args.rval().set(result_val);
   return true;
+}
+
+bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
+                 JS::CallArgs args) {
+  auto *engine = api::Engine::get(cx);
+  if (!reclaim_pending_dispatch_arena()) {
+    return false;
+  }
+  auto &registry = engine->resource_registry();
+  if (registry.dispatch_depth() == 0 && !starling::drain_resource_drops(engine)) {
+    return false;
+  }
+  registry.enter_dispatch();
+  const bool result = call_import_impl(cx, receiver, extra, args);
+  const bool outermost = registry.leave_dispatch();
+  if (outermost && !starling::drain_resource_drops(engine)) {
+    return false;
+  }
+  return result;
 }
 
 // Splits one manifest TSV line "<module-id>\t<js-name>\t<dispatch-key>\t<arity>"

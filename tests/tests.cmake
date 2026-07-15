@@ -4,6 +4,16 @@ find_program(BASH_PROGRAM bash)
 include("wasmtime")
 include("weval")
 
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(resource-registry-tests
+        ${CMAKE_SOURCE_DIR}/runtime/resource_registry.cpp
+        ${CMAKE_SOURCE_DIR}/tests/resource_registry.cpp
+    )
+    target_include_directories(resource-registry-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(resource-registry-tests PRIVATE cxx_std_23)
+    add_test(NAME resource-registry COMMAND resource-registry-tests)
+endif()
+
 function(test_e2e TEST_NAME)
     get_target_property(RUNTIME_DIR starling-raw.wasm BINARY_DIR)
     add_test(e2e-${TEST_NAME} ${BASH_PROGRAM} ${CMAKE_SOURCE_DIR}/tests/test.sh ${RUNTIME_DIR} ${CMAKE_SOURCE_DIR}/tests/e2e/${TEST_NAME})

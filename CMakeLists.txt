@@ -63,6 +63,7 @@ set(SOURCES
     runtime/decode.cpp
     runtime/engine.cpp
     runtime/event_loop.cpp
+    runtime/resource_registry.cpp
     runtime/builtin.cpp
     runtime/script_loader.cpp
     runtime/debugger.cpp

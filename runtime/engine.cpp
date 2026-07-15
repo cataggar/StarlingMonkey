@@ -596,7 +596,9 @@ bool Engine::eval_toplevel(JS::SourceText<mozilla::Utf8Unit> &source, std::strin
   }
 
   SCRIPT_VALUE = ns;
-  this->run_event_loop();
+  if (!this->run_event_loop()) {
+    return false;
+  }
 
   // TLA rejections during pre-initialization are treated as top-level exceptions.
   // TLA may remain unresolved, in which case it will continue tasks at runtime.

@@ -569,7 +569,42 @@ pub fn build(b: *std.Build) void {
     });
     js_dispatch_test_mod.addImport("wit_types", wit_types_test_mod);
     const js_dispatch_tests = b.addTest(.{ .root_module = js_dispatch_test_mod });
-    test_step.dependOn(&b.addRunArtifact(js_dispatch_tests).step);
+    const run_js_dispatch_tests = b.addRunArtifact(js_dispatch_tests);
+    const js_dispatch_test_step =
+        b.step("js-dispatch-test", "Run typed JavaScript dispatch bridge tests");
+    js_dispatch_test_step.dependOn(&run_js_dispatch_tests.step);
+    test_step.dependOn(js_dispatch_test_step);
+    const resource_registry_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    resource_registry_test_mod.addIncludePath(b.path("include"));
+    resource_registry_test_mod.addCSourceFiles(.{
+        .files = &.{
+            "runtime/resource_registry.cpp",
+            "tests/resource_registry.cpp",
+        },
+        .flags = &.{
+            "-std=gnu++23",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fno-exceptions",
+            "-fno-rtti",
+        },
+        .language = .cpp,
+    });
+    const resource_registry_tests = b.addExecutable(.{
+        .name = "resource-registry-tests",
+        .root_module = resource_registry_test_mod,
+    });
+    const run_resource_registry_tests = b.addRunArtifact(resource_registry_tests);
+    const resource_registry_test_step =
+        b.step("resource-registry-test", "Run resource ownership and lifetime registry tests");
+    resource_registry_test_step.dependOn(&run_resource_registry_tests.step);
+    test_step.dependOn(resource_registry_test_step);
     const heap_limit_tests = b.addSystemCommand(&.{ "bash", "tests/js-heap-limit/run.sh" });
     heap_limit_tests.addArg(b.graph.zig_exe);
     if (b.lazyDependency("wasmtime", .{})) |d|
@@ -920,6 +955,7 @@ const runtime_sources = [_][]const u8{
     "runtime/engine.cpp",
     "runtime/event_loop.cpp",
     "runtime/js_dispatch.cpp",
+    "runtime/resource_registry.cpp",
     "runtime/builtin.cpp",
     "runtime/script_loader.cpp",
     "runtime/debugger.cpp",

@@ -6,6 +6,7 @@
 #include "heap-limit.h"
 #include "jsapi.h"
 #include "mozilla/WeakPtr.h"
+#include "resource_registry.h"
 
 using JS::RootedObject;
 using JS::RootedString;
@@ -77,6 +78,7 @@ enum class EngineState : uint8_t { Uninitialized, EngineInitializing, ScriptPreI
 class Engine {
   std::unique_ptr<EngineConfig> config_;
   EngineState state_ = EngineState::Uninitialized;
+  starling::ResourceRegistry resource_registry_;
 
 public:
   explicit Engine(std::unique_ptr<EngineConfig> config);
@@ -84,6 +86,7 @@ public:
 
   static JSContext *cx();
   static HandleObject global();
+  starling::ResourceRegistry &resource_registry() { return resource_registry_; }
   EngineState state();
   bool debugging_enabled();
   bool wpt_mode();

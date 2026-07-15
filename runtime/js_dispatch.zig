@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const wit_types = @import("wit_types");
 
 const DispatchResult = extern struct {
@@ -54,6 +55,20 @@ pub const NativeTag = enum(u32) {
     // Keep the numeric value in sync with `STARLING_JS_UNDEFINED` there --
     // deliberately `10`, not `9`: `.bytes` (above) already claimed `9`.
     undefined_ = 10,
+    resource = 11,
+};
+
+pub const ResourceOwnership = enum(u8) {
+    own = 0,
+    borrow = 1,
+};
+
+pub const ResourceToken = extern struct {
+    type_id: u32,
+    handle: i32,
+    generation: u64,
+    ownership: ResourceOwnership,
+    borrow_epoch: u64,
 };
 
 // Mirrors `struct StarlingJsValue` in js_dispatch.h field-for-field. Both
@@ -82,7 +97,77 @@ pub const NativeValue = extern struct {
     bigint_is_negative: u8 = 0,
     bigint_fits_i64: u8 = 0,
     bigint_fits_u64: u8 = 0,
+    resource_provider_ptr: ?[*]const u8 = null,
+    resource_provider_len: usize = 0,
+    resource_name_ptr: ?[*]const u8 = null,
+    resource_name_len: usize = 0,
+    resource_type_id: u32 = 0,
+    resource_handle: i32 = 0,
+    resource_ownership: ResourceOwnership = .borrow,
+    resource_generation: u64 = 0,
+    resource_borrow_epoch: u64 = 0,
 };
+
+pub fn encodeResource(
+    descriptor: wit_types.ResourceDescriptor,
+    handle: i32,
+    ownership: ResourceOwnership,
+) NativeValue {
+    return .{
+        .tag = .resource,
+        .resource_provider_ptr = descriptor.provider.ptr,
+        .resource_provider_len = descriptor.provider.len,
+        .resource_name_ptr = descriptor.name.ptr,
+        .resource_name_len = descriptor.name.len,
+        .resource_handle = handle,
+        .resource_ownership = ownership,
+    };
+}
+
+extern fn starling_js_resource_validate(
+    type_id: u32,
+    handle: i32,
+    generation: u64,
+    ownership: ResourceOwnership,
+    borrow_epoch: u64,
+) u32;
+
+extern fn starling_js_resource_transfer_many(tokens: [*]const ResourceToken, len: usize) u32;
+
+pub fn decodeResource(
+    value: *const NativeValue,
+    descriptor: wit_types.ResourceDescriptor,
+    ownership: ResourceOwnership,
+) i32 {
+    if (value.tag != .resource or value.resource_ownership != ownership) {
+        @panic("native dispatch: resource identity or ownership mismatch");
+    }
+    const provider_ptr = value.resource_provider_ptr orelse
+        @panic("native dispatch: resource provider is missing");
+    const name_ptr = value.resource_name_ptr orelse
+        @panic("native dispatch: resource name is missing");
+    if (!std.mem.eql(u8, provider_ptr[0..value.resource_provider_len], descriptor.provider) or
+        !std.mem.eql(u8, name_ptr[0..value.resource_name_len], descriptor.name))
+    {
+        @panic("native dispatch: resource identity or ownership mismatch");
+    }
+    if (!builtin.is_test) {
+        if (value.resource_type_id == 0 or value.resource_generation == 0) {
+            @panic("native dispatch: resource registry token is missing");
+        }
+        const status = starling_js_resource_validate(
+            value.resource_type_id,
+            value.resource_handle,
+            value.resource_generation,
+            value.resource_ownership,
+            value.resource_borrow_epoch,
+        );
+        if (status != 0) {
+            @panic("native dispatch: stale, moved, dropped, or expired resource");
+        }
+    }
+    return value.resource_handle;
+}
 
 // Mirrors `struct StarlingJsField` in js_dispatch.h. `value` is a pointer
 // (not embedded by value) to match the C++ side, which needs it that way to
@@ -104,7 +189,7 @@ extern fn starling_js_dispatch_native(
     out_arena: *?*anyopaque,
 ) u32;
 
-extern fn starling_js_dispatch_native_free(arena: ?*anyopaque) void;
+extern fn starling_js_dispatch_native_free(arena: ?*anyopaque) u32;
 
 // ---------------------------------------------------------------------------
 // Naming-convention helpers.
@@ -213,6 +298,7 @@ pub fn freeNativeArena(arena: ?*anyopaque) void {
 fn typeNeedsNative(comptime T: type) bool {
     if (T == i64 or T == u64) return true;
     if (T == wit_types.Char or T == wit_types.ByteList) return true;
+    if (wit_types.resourceInfo(T) != null) return true;
     return switch (@typeInfo(T)) {
         // JSON cannot preserve JavaScript `undefined`, nor can it express
         // the tagged object needed for option<option<T>>. Route every
@@ -292,6 +378,13 @@ pub fn encodeNative(comptime T: type, value: T, allocator: std.mem.Allocator) Na
     }
     if (T == wit_types.ByteList) {
         return .{ .tag = .bytes, .str_ptr = value.bytes.ptr, .str_len = value.bytes.len };
+    }
+    if (comptime wit_types.resourceInfo(T)) |info| {
+        const ownership: ResourceOwnership = switch (info.ownership) {
+            .own => .own,
+            .borrow => .borrow,
+        };
+        return encodeResource(info.descriptor, value.handle, ownership);
     }
     return switch (@typeInfo(T)) {
         .void => .{ .tag = .undefined_ },
@@ -652,6 +745,13 @@ pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.
             .{value.tag},
         );
     }
+    if (comptime wit_types.resourceInfo(T)) |info| {
+        const ownership: ResourceOwnership = switch (info.ownership) {
+            .own => .own,
+            .borrow => .borrow,
+        };
+        return .{ .handle = decodeResource(value, info.descriptor, ownership) };
+    }
     return switch (@typeInfo(T)) {
         // Only reachable if some future caller passes `void` through here
         // directly (today's call sites -- `callNative`/`callJson` -- both
@@ -915,6 +1015,113 @@ pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.
     };
 }
 
+fn collectOwnedResources(
+    comptime T: type,
+    decoded: T,
+    value: *const NativeValue,
+    resources: *std.ArrayListUnmanaged(ResourceToken),
+    allocator: std.mem.Allocator,
+) void {
+    if (comptime wit_types.resourceInfo(T)) |info| {
+        if (info.ownership == .own) {
+            resources.append(allocator, .{
+                .type_id = value.resource_type_id,
+                .handle = value.resource_handle,
+                .generation = value.resource_generation,
+                .ownership = .own,
+                .borrow_epoch = 0,
+            }) catch @panic("OOM");
+        }
+        return;
+    }
+    if (T == wit_types.Char or T == wit_types.ByteList) return;
+
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice or p.child == u8) return;
+            const items = value.list_ptr orelse
+                @panic("native dispatch: decoded list is missing its item pointer");
+            for (decoded, items[0..value.list_len]) |item, *native_item| {
+                collectOwnedResources(p.child, item, native_item, resources, allocator);
+            }
+        },
+        .optional => |o| {
+            const present = decoded orelse return;
+            const inner = if (value.tag == .option_some)
+                value.option_ptr orelse
+                    @panic("native dispatch: decoded option is missing its value")
+            else if (@typeInfo(o.child) == .optional and value.tag == .record)
+                findNativeField(value, "val") orelse
+                    @panic("native dispatch: decoded nested option is missing its value")
+            else
+                value;
+            collectOwnedResources(o.child, present, inner, resources, allocator);
+        },
+        .@"union" => |u| {
+            const active = std.meta.activeTag(decoded);
+            inline for (u.field_names, u.field_types, 0..) |name, field_type, i| {
+                if (field_type != void and @intFromEnum(active) == i) {
+                    const inner = findNativeField(value, "val") orelse
+                        @panic("native dispatch: decoded variant is missing its value");
+                    collectOwnedResources(
+                        field_type,
+                        @field(decoded, name),
+                        inner,
+                        resources,
+                        allocator,
+                    );
+                }
+            }
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"packed") return;
+            if (s.is_tuple) {
+                const items = value.list_ptr orelse
+                    @panic("native dispatch: decoded tuple is missing its item pointer");
+                inline for (s.field_names, s.field_types, 0..) |name, field_type, i| {
+                    collectOwnedResources(
+                        field_type,
+                        @field(decoded, name),
+                        &items[i],
+                        resources,
+                        allocator,
+                    );
+                }
+                return;
+            }
+            inline for (s.field_names, s.field_types) |name, field_type| {
+                const camel = comptime CamelCase(name);
+                const field_value = findNativeField(value, camel) orelse
+                    @panic("native dispatch: decoded record is missing field '" ++ camel ++ "'");
+                collectOwnedResources(
+                    field_type,
+                    @field(decoded, name),
+                    field_value,
+                    resources,
+                    allocator,
+                );
+            }
+        },
+        else => {},
+    }
+}
+
+/// Commit every owned resource in a successfully decoded value as one
+/// transaction. Validation happens while decoding; this separate phase keeps
+/// malformed later fields from consuming earlier owned handles.
+pub fn commitNativeResources(
+    comptime T: type,
+    decoded: T,
+    value: *const NativeValue,
+    allocator: std.mem.Allocator,
+) bool {
+    var resources: std.ArrayListUnmanaged(ResourceToken) = .empty;
+    defer resources.deinit(allocator);
+    collectOwnedResources(T, decoded, value, &resources, allocator);
+    if (resources.items.len == 0 or builtin.is_test) return true;
+    return starling_js_resource_transfer_many(resources.items.ptr, resources.items.len) == 0;
+}
+
 fn callNative(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
     var arg_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
     defer arg_arena.deinit();
@@ -948,11 +1155,13 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
     // `is_wit_result` is true (see js_dispatch.h); any other non-zero status
     // is a genuine dispatch failure.
     if (status != 0 and !(is_wit_result and status == 2)) {
-        starling_js_dispatch_native_free(out_arena);
+        _ = starling_js_dispatch_native_free(out_arena);
         @panic("JavaScript export dispatch failed");
     }
     if (Result == void) {
-        starling_js_dispatch_native_free(out_arena);
+        if (starling_js_dispatch_native_free(out_arena) != 0) {
+            @panic("JavaScript resource drop failed");
+        }
         return;
     }
     // Critical: decode (which deep-copies every string/list/record byte it
@@ -990,7 +1199,47 @@ fn callNative(comptime export_name: []const u8, comptime Result: type, args: any
         }
         break :blk decodeNative(Result, &out_result, result_arena.allocator());
     };
-    starling_js_dispatch_native_free(out_arena);
+    if (is_wit_result) {
+        const union_info = @typeInfo(Result).@"union";
+        const OkType = union_info.field_types[0];
+        const ErrType = union_info.field_types[1];
+        if (status == 2) {
+            if (ErrType != void) {
+                if (!commitNativeResources(
+                    ErrType,
+                    decoded.err,
+                    &out_result,
+                    result_arena.allocator(),
+                )) {
+                    _ = starling_js_dispatch_native_free(out_arena);
+                    @panic("native dispatch: resource transfer transaction failed");
+                }
+            }
+        } else if (OkType != void) {
+            if (!commitNativeResources(
+                OkType,
+                decoded.ok,
+                &out_result,
+                result_arena.allocator(),
+            )) {
+                _ = starling_js_dispatch_native_free(out_arena);
+                @panic("native dispatch: resource transfer transaction failed");
+            }
+        }
+    } else {
+        if (!commitNativeResources(
+            Result,
+            decoded,
+            &out_result,
+            result_arena.allocator(),
+        )) {
+            _ = starling_js_dispatch_native_free(out_arena);
+            @panic("native dispatch: resource transfer transaction failed");
+        }
+    }
+    if (starling_js_dispatch_native_free(out_arena) != 0) {
+        @panic("JavaScript resource drop failed");
+    }
     return decoded;
 }
 
@@ -1074,6 +1323,97 @@ test "needsNative routes plain types to JSON and option-containing signatures to
     const BigPoint = struct { p: Plain, id: u64 };
     try std.testing.expect(needsNative(BigPoint, @TypeOf(.{})));
     try std.testing.expect(needsNative(void, @TypeOf(.{BigPoint{ .p = .{ .x = 0, .y = 0 }, .id = 0 }})));
+}
+
+test "resource metadata preserves provider, name, handle, and ownership" {
+    const First = struct {
+        handle: i32,
+        pub const __wit_resource = wit_types.ResourceDescriptor{
+            .provider = "test:resources/first@1.0.0",
+            .name = "item",
+        };
+        pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;
+    };
+    const OtherProvider = struct {
+        handle: i32,
+        pub const __wit_resource = wit_types.ResourceDescriptor{
+            .provider = "test:resources/second@1.0.0",
+            .name = "item",
+        };
+        pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;
+    };
+    const OtherType = struct {
+        handle: i32,
+        pub const __wit_resource = wit_types.ResourceDescriptor{
+            .provider = "test:resources/first@1.0.0",
+            .name = "other",
+        };
+        pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;
+    };
+    const Borrowed = wit_types.Borrow(First);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first = encodeNative(First, .{ .handle = 1 }, arena.allocator());
+    const same_handle_other_provider =
+        encodeNative(OtherProvider, .{ .handle = 1 }, arena.allocator());
+    const same_handle_other_type = encodeNative(OtherType, .{ .handle = 1 }, arena.allocator());
+    const borrowed = encodeNative(Borrowed, .{ .handle = 1 }, arena.allocator());
+
+    try std.testing.expect(typeNeedsNative(First));
+    try std.testing.expect(typeNeedsNative(Borrowed));
+    try std.testing.expectEqual(NativeTag.resource, first.tag);
+    try std.testing.expectEqual(@as(i32, 1), decodeNative(First, &first, arena.allocator()).handle);
+    try std.testing.expectEqualStrings(
+        First.__wit_resource.provider,
+        first.resource_provider_ptr.?[0..first.resource_provider_len],
+    );
+    try std.testing.expectEqualStrings(
+        First.__wit_resource.name,
+        first.resource_name_ptr.?[0..first.resource_name_len],
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first.resource_provider_ptr.?[0..first.resource_provider_len],
+        same_handle_other_provider.resource_provider_ptr.?[0..same_handle_other_provider.resource_provider_len],
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first.resource_name_ptr.?[0..first.resource_name_len],
+        same_handle_other_type.resource_name_ptr.?[0..same_handle_other_type.resource_name_len],
+    ));
+    try std.testing.expect(first.resource_ownership != borrowed.resource_ownership);
+
+    var owned_native = first;
+    owned_native.resource_type_id = 5;
+    owned_native.resource_generation = 9;
+    var borrowed_native = borrowed;
+    borrowed_native.resource_type_id = 5;
+    borrowed_native.resource_generation = 9;
+    borrowed_native.resource_borrow_epoch = 2;
+    const fields = [_]NativeField{
+        .{ .name_ptr = "owned".ptr, .name_len = "owned".len, .value = &owned_native },
+        .{ .name_ptr = "borrowed".ptr, .name_len = "borrowed".len, .value = &borrowed_native },
+    };
+    const native_bundle = NativeValue{
+        .tag = .record,
+        .fields_ptr = &fields,
+        .fields_len = fields.len,
+    };
+    const Bundle = struct { owned: First, borrowed: Borrowed };
+    var transfers: std.ArrayListUnmanaged(ResourceToken) = .empty;
+    defer transfers.deinit(arena.allocator());
+    collectOwnedResources(
+        Bundle,
+        .{ .owned = .{ .handle = 1 }, .borrowed = .{ .handle = 1 } },
+        &native_bundle,
+        &transfers,
+        arena.allocator(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), transfers.items.len);
+    try std.testing.expectEqual(@as(u32, 5), transfers.items[0].type_id);
+    try std.testing.expectEqual(@as(u64, 9), transfers.items[0].generation);
 }
 
 test "encodes and decodes exact u64 values beyond 2^53" {

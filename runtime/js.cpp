@@ -99,7 +99,7 @@ extern "C" bool exports_wasi_cli_run_run() {
   auto config_parser = starling::ConfigParser();
   config_parser.apply_env()->apply_args(args);
   ENGINE = new api::Engine(config_parser.take());
-  return true;
+  return starling::shutdown_resources(ENGINE);
 }
 
 /**
