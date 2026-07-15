@@ -181,6 +181,11 @@ EOF
 cat > "$TOOLS/fake zig" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = "env" ]; then
+  test -d "$FAKE_ZIG_LIB_DIR"
+  printf '.{\n    .lib_dir = "%s",\n}\n' "$FAKE_ZIG_LIB_DIR"
+  exit 0
+fi
 if [ "${FAKE_FAIL_STAGE:-}" = "zig build" ]; then
   echo "injected zig build failure" >&2
   exit 23
@@ -193,6 +198,10 @@ if [ -n "${FAKE_ZIG_ACTIVE_DIR:-}" ]; then
   trap 'rmdir "$FAKE_ZIG_ACTIVE_DIR"' EXIT
   sleep "${FAKE_ZIG_DELAY:-0}"
 fi
+if [ -n "${FAKE_MUTATE_ZIG_LIB_DIR:-}" ]; then
+  printf 'mutated-original\n' > "$FAKE_MUTATE_ZIG_LIB_DIR/marker"
+fi
+test "$(cat "$ZIG_LIB_DIR/marker")" = "immutable-zig-lib"
 prefix=""
 for ((i = 1; i <= $#; i++)); do
   if [ "${!i}" = "--prefix" ]; then
@@ -201,7 +210,8 @@ for ((i = 1; i <= $#; i++)); do
   fi
 done
 printf '%s\n' "$prefix" >> "$FAKE_ZIG_PREFIX_LOG"
-printf '%s|%s\n' "${ZIG_LOCAL_CACHE_DIR-unset}" "$ZIG_GLOBAL_CACHE_DIR" \
+printf '%s|%s|%s\n' "${ZIG_LOCAL_CACHE_DIR-unset}" \
+  "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LIB_DIR" \
   >> "$FAKE_ZIG_ENV_LOG"
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
@@ -237,7 +247,10 @@ export FAKE_ZIG_ENV_LOG="$SCRATCH/zig env.log"
 export FAKE_BINDINGS="$SCRATCH/component-bindings.zig"
 export FAKE_WASIP3_BINDGEN="$TOOLS/fake wasip3-bindgen"
 export FAKE_WASM_OPT="$TOOLS/fake wasm-opt"
+export FAKE_ZIG_LIB_DIR="$SCRATCH/fake zig direct/lib"
 export STARLINGMONKEY_CONFIG="--ambient-config-must-not-reach-wizer"
+mkdir -p "$FAKE_ZIG_LIB_DIR"
+printf 'immutable-zig-lib\n' > "$FAKE_ZIG_LIB_DIR/marker"
 
 cat > "$FAKE_BINDINGS" <<'EOF'
 pub const js_import_manifest: []const u8 =
@@ -394,29 +407,102 @@ ln -s "$SOURCE_ALIAS_DIR/source.js" "$SOURCE_ALIAS"
 )
 grep -Fq -- "\"$SOURCE_ALIAS_DIR/source.js\"" "$FAKE_RUNTIME_ARGS_LOG"
 cmp "$ENGINE" "$SOURCE_ALIAS_OUTPUT"
+rm "$SOURCE_ALIAS"
 
 SYMLINK_OUTPUT="$WORK/symlinked inputs.wasm"
-ln -s "$ENGINE" "$WORK/engine link.wasm"
-ln -s "$ADAPTER" "$WORK/adapter link.wasm"
-ln -s "$TOOLS/fake wizer" "$WORK/wizer link"
-ln -s "$TOOLS/fake wabt" "$WORK/wabt link"
-ln -s "$TOOLS/fake wasm-tools" "$WORK/wasm-tools link"
+SYMLINK_INPUT_DIR="$SCRATCH/symlinked tool inputs"
+mkdir "$SYMLINK_INPUT_DIR"
+ln -s "$ENGINE" "$SYMLINK_INPUT_DIR/engine link.wasm"
+ln -s "$ADAPTER" "$SYMLINK_INPUT_DIR/adapter link.wasm"
+ln -s "$TOOLS/fake wizer" "$SYMLINK_INPUT_DIR/wizer link"
+ln -s "$TOOLS/fake wabt" "$SYMLINK_INPUT_DIR/wabt link"
+ln -s "$TOOLS/fake wasm-tools" "$SYMLINK_INPUT_DIR/wasm-tools link"
 "$COMPONENTIZER" \
-  --engine "$WORK/engine link.wasm" \
-  --preview2-adapter "$WORK/adapter link.wasm" \
+  --engine "$SYMLINK_INPUT_DIR/engine link.wasm" \
+  --preview2-adapter "$SYMLINK_INPUT_DIR/adapter link.wasm" \
   --wit "$WIT" \
   --world-name exports \
-  --wizer-bin "$WORK/wizer link" \
-  --wabt-bin "$WORK/wabt link" \
-  --wasm-tools-bin "$WORK/wasm-tools link" \
+  --wizer-bin "$SYMLINK_INPUT_DIR/wizer link" \
+  --wabt-bin "$SYMLINK_INPUT_DIR/wabt link" \
+  --wasm-tools-bin "$SYMLINK_INPUT_DIR/wasm-tools link" \
   --out "$SYMLINK_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$SYMLINK_OUTPUT"
+
+PROVENANCE_ROOT="$SCRATCH/provenance roots"
+PROVENANCE_A="$PROVENANCE_ROOT/clean root a"
+PROVENANCE_B="$PROVENANCE_ROOT/clean root b"
+mkdir -p "$PROVENANCE_A/nested" "$PROVENANCE_B/nested"
+cat > "$PROVENANCE_A/main.js" <<'EOF'
+import { value } from "./alias.js";
+export const result = value;
+EOF
+printf 'export const value = 1;\n' > "$PROVENANCE_A/nested/module.js"
+printf 'export const value = 1;\n' > "$PROVENANCE_A/nested/other.js"
+ln -s nested/module.js "$PROVENANCE_A/alias.js"
+ln -s nested/module.js "$PROVENANCE_B/alias.js"
+printf 'export const value = 1;\n' > "$PROVENANCE_B/nested/other.js"
+printf 'export const value = 1;\n' > "$PROVENANCE_B/nested/module.js"
+cp "$PROVENANCE_A/main.js" "$PROVENANCE_B/main.js"
+chmod 600 "$PROVENANCE_B/main.js"
+touch -t 202001020304 "$PROVENANCE_B/main.js" \
+  "$PROVENANCE_B/nested/module.js"
+
+source_provenance() {
+  local source="$1" output="$2" metadata="$3"
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --metadata-out "$metadata" \
+    --out "$output" \
+    "$source"
+}
+
+source_provenance "$PROVENANCE_A/main.js" \
+  "$WORK/provenance clean a.wasm" "$WORK/provenance clean a.json"
+source_provenance "$PROVENANCE_B/main.js" \
+  "$WORK/provenance clean b.wasm" "$WORK/provenance clean b.json"
+printf 'export const value = 2;\n' > "$PROVENANCE_B/nested/module.js"
+source_provenance "$PROVENANCE_B/main.js" \
+  "$WORK/provenance nested changed.wasm" \
+  "$WORK/provenance nested changed.json"
+printf 'export const value = 1;\n' > "$PROVENANCE_B/nested/module.js"
+rm "$PROVENANCE_B/alias.js"
+ln -s nested/other.js "$PROVENANCE_B/alias.js"
+source_provenance "$PROVENANCE_B/main.js" \
+  "$WORK/provenance link changed.wasm" \
+  "$WORK/provenance link changed.json"
+python3 - "$WORK/provenance clean a.json" \
+  "$WORK/provenance clean b.json" \
+  "$WORK/provenance nested changed.json" \
+  "$WORK/provenance link changed.json" <<'PY'
+import json, sys
+clean_a, clean_b, nested, link = [
+    json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]
+]
+inputs = [doc["provenance"]["inputs"] for doc in (
+    clean_a, clean_b, nested, link
+)]
+assert all(value["source_tree"]["entry"] == "main.js" for value in inputs)
+assert inputs[0]["source_tree"]["sha256"] == \
+    inputs[1]["source_tree"]["sha256"]
+assert inputs[1]["source_tree"]["sha256"] != \
+    inputs[2]["source_tree"]["sha256"]
+assert inputs[1]["source_tree"]["sha256"] != \
+    inputs[3]["source_tree"]["sha256"]
+assert len({value["source_sha256"] for value in inputs}) == 1
+assert all(value["initializer_tree"] is None for value in inputs)
+assert clean_b["provenance"] != nested["provenance"]
+assert clean_b["provenance"] != link["provenance"]
+PY
 
 READ_ONLY_DIR="$WORK/read only source"
 READ_ONLY_SOURCE="$READ_ONLY_DIR/read only.js"
 READ_ONLY_INITIALIZER="$READ_ONLY_DIR/initializer.js"
 READ_ONLY_OUTPUT="$WORK/read only output.wasm"
+READ_ONLY_METADATA="$WORK/read only metadata.json"
 mkdir "$READ_ONLY_DIR"
 printf 'export const readOnly = true;\n' > "$READ_ONLY_SOURCE"
 printf 'globalThis.initialized = true;\n' > "$READ_ONLY_INITIALIZER"
@@ -428,12 +514,21 @@ chmod 555 "$READ_ONLY_DIR"
   --wizer-bin "$TOOLS/fake wizer" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --initializer-script-path "$READ_ONLY_INITIALIZER" \
+  --metadata-out "$READ_ONLY_METADATA" \
   --out "$READ_ONLY_OUTPUT" \
   "$READ_ONLY_SOURCE"
 chmod 755 "$READ_ONLY_DIR"
 grep -Fq -- "\"$READ_ONLY_SOURCE\"" "$FAKE_RUNTIME_ARGS_LOG"
 grep -Fq -- "\"$READ_ONLY_INITIALIZER\"" "$FAKE_RUNTIME_ARGS_LOG"
 cmp "$ENGINE" "$READ_ONLY_OUTPUT"
+python3 - "$READ_ONLY_METADATA" <<'PY'
+import json, sys
+inputs = json.load(open(sys.argv[1], encoding="utf-8"))["provenance"]["inputs"]
+assert inputs["source_tree"]["entry"] == "read only.js"
+assert inputs["initializer_tree"]["entry"] == "initializer.js"
+assert inputs["initializer_tree"]["shares_source_tree"] is True
+assert inputs["initializer_tree"]["sha256"] == inputs["source_tree"]["sha256"]
+PY
 
 UNREADABLE_SOURCE="$WORK/unreadable source.js"
 UNREADABLE_ERROR="$SCRATCH/unreadable-source.jsonl"
@@ -776,9 +871,9 @@ test -f "$CHANGED_INPUT_SAVED/source/source module.js"
 cmp "$ENGINE" "$CHANGED_INPUT_OUTPUT"
 rm -rf "$CHANGED_INPUT_ROOT" "$CHANGED_INPUT_SAVED"
 
-PUBLICATION_A="$WORK/publication-a"
-PUBLICATION_B="$WORK/publication-b"
-PUBLICATION_LINK="$WORK/publication-link"
+PUBLICATION_A="$SCRATCH/publication-a"
+PUBLICATION_B="$SCRATCH/publication-b"
+PUBLICATION_LINK="$SCRATCH/publication-link"
 mkdir "$PUBLICATION_A" "$PUBLICATION_B"
 ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
 printf 'unrelated-a\n' > "$PUBLICATION_A/unrelated"
@@ -919,6 +1014,7 @@ then
 fi
 test -L "$SYMLINK_RACE_METADATA"
 test "$(cat "$SYMLINK_RACE_TARGET")" = "symlink-target"
+rm "$SYMLINK_RACE_METADATA"
 
 COLLISION_DIR="$WORK/debug collision"
 COLLISION_OUTPUT="$COLLISION_DIR/component.wasm"
@@ -961,6 +1057,7 @@ then
   exit 1
 fi
 test "$(cat "$SYMLINK_OUTPUT")" = "symlink-collision-output"
+rm "$SYMLINK_DEBUG_DIR"
 
 LINK_DEBUG_DIR="$WORK/debug file link"
 LINK_TARGET="$WORK/commands link target.txt"
@@ -1008,13 +1105,17 @@ CACHE="$WORK/runtime cache"
 BUILD_OUTPUT_1="$WORK/built output 1.wasm"
 BUILD_OUTPUT_2="$WORK/built output 2.wasm"
 BUILD_OUTPUT_3="$WORK/built output 3.wasm"
-build_with_fake_zig() {
-  local output="$1"
-  shift
+BUILD_SOURCE_DIR="$SCRATCH/runtime build source"
+BUILD_SOURCE="$BUILD_SOURCE_DIR/source module.js"
+mkdir "$BUILD_SOURCE_DIR"
+cp "$SOURCE" "$BUILD_SOURCE"
+build_with_selected_zig() {
+  local zig="$1" output="$2"
+  shift 2
   "$COMPONENTIZER" \
     --build-root "$ROOT" \
     --cache-dir "$CACHE" \
-    --zig-bin "$TOOLS/fake zig" \
+    --zig-bin "$zig" \
     --wit "$WIT" \
     --world-name exports \
     --wizer-bin "$TOOLS/fake wizer" \
@@ -1022,7 +1123,12 @@ build_with_fake_zig() {
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
     "$@" \
     --out "$output" \
-    "$SOURCE"
+    "$BUILD_SOURCE"
+}
+build_with_fake_zig() {
+  local output="$1"
+  shift
+  build_with_selected_zig "$TOOLS/fake zig" "$output" "$@"
 }
 build_with_fake_zig "$BUILD_OUTPUT_1"
 build_with_fake_zig "$BUILD_OUTPUT_2"
@@ -1030,7 +1136,7 @@ printf '\n// cache invalidation\n' >> "$WIT/world.wit"
 build_with_fake_zig "$BUILD_OUTPUT_3"
 
 METADATA_OUTPUT="$WORK/public metadata.json"
-METADATA_REFERENCE="$WORK/public metadata reference.json"
+METADATA_REFERENCE="$SCRATCH/public metadata reference.json"
 BUILD_DEBUG_DIR="$WORK/build debug bindings"
 build_with_fake_zig "$WORK/metadata component.wasm" \
   --metadata-out "$METADATA_OUTPUT" \
@@ -1067,7 +1173,15 @@ assert provenance["component_world"]["name"] == "exports"
 assert all(sha256.match(provenance[k]) for k in (
     "worlds_sha256", "features_sha256", "tools_sha256",
 ))
-assert all(sha256.match(v) for k, v in provenance["inputs"].items() if v)
+inputs = provenance["inputs"]
+assert all(sha256.match(inputs[k]) for k in (
+    "source_sha256", "runtime_arguments_sha256", "engine_sha256",
+    "preview2_adapter_sha256",
+))
+assert inputs["initializer_sha256"] is None
+assert inputs["source_tree"]["entry"] == "source module.js"
+assert sha256.match(inputs["source_tree"]["sha256"])
+assert inputs["initializer_tree"] is None
 assert [f["name"] for f in provenance["features"]] == [
     "stdio", "random", "clocks", "http", "fetch-event",
 ]
@@ -1082,8 +1196,35 @@ assert provenance["inputs"]["runtime_arguments_sha256"] == \
     hashlib.sha256(runtime_args).hexdigest()
 PY
 build_with_fake_zig "$WORK/metadata component.wasm" \
-  --metadata-out "$METADATA_OUTPUT"
+  --metadata-out "$METADATA_OUTPUT" \
+  --debug-dir "$BUILD_DEBUG_DIR"
 cmp "$METADATA_REFERENCE" "$METADATA_OUTPUT"
+
+DIRECT_ZIG_ROOT="$SCRATCH/direct Zig layout with spaces"
+INSTALLED_ZIG_ROOT="$SCRATCH/installed Zig layout with spaces"
+ZIG_LINK_ROOT="$SCRATCH/symlinked Zig path with spaces"
+mkdir -p "$DIRECT_ZIG_ROOT/lib" "$INSTALLED_ZIG_ROOT/bin" \
+  "$INSTALLED_ZIG_ROOT/lib/zig" "$ZIG_LINK_ROOT"
+cp "$TOOLS/fake zig" "$DIRECT_ZIG_ROOT/zig"
+cp "$TOOLS/fake zig" "$INSTALLED_ZIG_ROOT/bin/zig"
+chmod +x "$DIRECT_ZIG_ROOT/zig" "$INSTALLED_ZIG_ROOT/bin/zig"
+printf 'immutable-zig-lib\n' > "$DIRECT_ZIG_ROOT/lib/marker"
+printf 'immutable-zig-lib\n' > "$INSTALLED_ZIG_ROOT/lib/zig/marker"
+ln -s "$INSTALLED_ZIG_ROOT/bin/zig" "$ZIG_LINK_ROOT/zig link"
+FAKE_ZIG_LIB_DIR="$DIRECT_ZIG_ROOT/lib" \
+FAKE_MUTATE_ZIG_LIB_DIR="$DIRECT_ZIG_ROOT/lib" \
+  build_with_selected_zig "$DIRECT_ZIG_ROOT/zig" \
+    "$WORK/direct Zig layout.wasm"
+test "$(cat "$DIRECT_ZIG_ROOT/lib/marker")" = "mutated-original"
+FAKE_ZIG_LIB_DIR="$INSTALLED_ZIG_ROOT/lib/zig" \
+  build_with_selected_zig "$INSTALLED_ZIG_ROOT/bin/zig" \
+    "$WORK/installed Zig layout.wasm"
+FAKE_ZIG_LIB_DIR="$INSTALLED_ZIG_ROOT/lib/zig" \
+  build_with_selected_zig "$ZIG_LINK_ROOT/zig link" \
+    "$WORK/symlinked Zig layout.wasm"
+ZIG_LIB_DIR="$INSTALLED_ZIG_ROOT/lib/zig" \
+  build_with_selected_zig "$INSTALLED_ZIG_ROOT/bin/zig" \
+    "$WORK/explicit Zig lib layout.wasm"
 
 rm -rf "$CACHE"
 export FAKE_ZIG_ACTIVE_DIR="$SCRATCH/fake-zig-active"
@@ -1097,18 +1238,24 @@ wait "$pid2"
 unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
-test "${#prefixes[@]}" -eq 7
+test "${#prefixes[@]}" -eq 11
 test "${prefixes[0]}" = "${prefixes[1]}"
 test "${prefixes[0]}" != "${prefixes[2]}"
-test "${prefixes[2]}" = "${prefixes[3]}"
-test "${prefixes[2]}" = "${prefixes[4]}"
-test "${prefixes[2]}" = "${prefixes[5]}"
-test "${prefixes[2]}" = "${prefixes[6]}"
+for prefix in "${prefixes[@]:3}"; do
+  test "${prefixes[2]}" = "$prefix"
+done
 cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
 cmp "$ENGINE" "$WORK/concurrent output 2.wasm"
-while IFS='|' read -r local_cache global_cache; do
+while IFS='|' read -r local_cache global_cache zig_lib; do
   test "$local_cache" = "unset"
   test "$global_cache" = "$CACHE/zig-global-cache"
+  case "$zig_lib" in
+    */zig-install/lib) ;;
+    *)
+      echo "FAIL: Zig build did not consume snapshotted library: $zig_lib" >&2
+      exit 1
+      ;;
+  esac
 done < "$FAKE_ZIG_ENV_LOG"
 cmp "$ENGINE" "$BUILD_OUTPUT_1"
 cmp "$ENGINE" "$BUILD_OUTPUT_2"

@@ -121,6 +121,12 @@ content hashes of both complete WIT layouts, the resolved feature booleans,
 SHA-256 hashes of every invoked tool (including nested runtime-build tools
 such as `wasip3-bindgen` and `wasm-opt`), source/initializer/runtime-argument
 hashes, engine/adapter hashes, and the exact published component hash.
+`source_sha256` and `initializer_sha256` remain hashes of the exact entry
+files. The `source_tree` and optional `initializer_tree` records add the
+normalized relative entry path and a domain-separated digest of every staged
+directory, regular file, file byte, and symlink target. An initializer record
+states whether it shares the source tree, including nested overlap, so one
+snapshot is not ambiguously represented as two independent inputs.
 Canonical aggregate hashes cover worlds, features, and tools. It contains no
 timestamps, random transaction names, or host paths, so its provenance fields
 are deterministic even if an underlying snapshot tool emits byte-distinct
@@ -129,6 +135,10 @@ executables are copied to immutable per-run snapshots in controlled transaction
 storage before use; hashes are computed while creating those snapshots, and
 every child executes or consumes the corresponding snapshot. This retains
 relative sibling and nested-module visibility even for read-only source trees.
+Source-tree traversal order, permissions, timestamps, and absolute root
+location do not affect tree hashes. Relative symlinks that remain within the
+staged tree are preserved and hashed by target; absolute or escaping symlinks
+are rejected so a child cannot consume mutable files outside its snapshot.
 Source and initializer snapshots are mapped to their original logical paths for
 Wizer, and the runtime-argument hash covers the exact stable byte stream
 supplied to Wizer.
@@ -157,6 +167,13 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--preview2-adapter`. `--wasmtime-bin` selects Wasmtime's `wizer` subcommand;
 `--wizer-bin` selects a standalone Wizer and uses its native
 `--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
+For runtime builds, the selected Zig reports its library directory through
+`zig env` unless a valid `ZIG_LIB_DIR` is explicit. The executable and complete
+library tree are copied together into transaction storage, and the build runs
+only that executable with `ZIG_LIB_DIR` fixed to the immutable copy. This
+supports archive layouts, installed `bin/zig` plus `lib/zig` layouts, symlinked
+executables, and paths containing spaces without consulting the original
+installation after snapshot validation.
 
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized

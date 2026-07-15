@@ -41,6 +41,20 @@ const InputSnapshot = struct {
     logical_path: []const u8,
     host_dir: []const u8,
     guest_dir: []const u8,
+    tree_entry: []const u8,
+    tree_digest: []const u8,
+    shares_source_tree: bool,
+};
+
+const TreeSnapshot = struct {
+    file: Snapshot,
+    entry: []const u8,
+    digest: []const u8,
+};
+
+const ZigSnapshot = struct {
+    executable: Snapshot,
+    lib_dir: []const u8,
 };
 
 const EntryIdentity = struct {
@@ -668,6 +682,14 @@ fn execute(
             try absolutePath(allocator, cwd, path),
         ) catch @panic("out of memory");
     }
+    input_exclusions.append(allocator, resolved_output) catch
+        @panic("out of memory");
+    if (metadata_output) |path| {
+        input_exclusions.append(allocator, path) catch @panic("out of memory");
+    }
+    if (debug_dir) |path| {
+        input_exclusions.append(allocator, path) catch @panic("out of memory");
+    }
     const source_parent = std.fs.path.dirname(source).?;
     const initializer_parent = if (initializer) |path|
         std.fs.path.dirname(path).?
@@ -1028,8 +1050,8 @@ fn execute(
             allocator,
             io,
             config,
-            source_snapshot.file,
-            if (initializer_snapshot) |snapshot| snapshot.file else null,
+            source_snapshot,
+            initializer_snapshot,
             runtime_args,
             runtime,
             tools,
@@ -1310,13 +1332,15 @@ fn buildRuntime(
     else
         build_options.zig_exe;
     const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
-    const zig = try snapshotFile(
+    const zig_install = try snapshotZigInstallation(
         allocator,
         io,
         zig_resolved,
-        try std.fs.path.join(allocator, &.{ transaction_dir, "zig" }),
+        environ,
+        build_root,
         transaction,
     );
+    const zig = zig_install.executable;
 
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(allocator, &.{
@@ -1371,18 +1395,8 @@ fn buildRuntime(
     var build_env = std.process.Environ.Map.init(allocator);
     try copyEnvironment(&build_env, environ);
     try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_cache);
+    try build_env.put("ZIG_LIB_DIR", zig_install.lib_dir);
     _ = build_env.swapRemove("ZIG_LOCAL_CACHE_DIR");
-    if (environ.get("ZIG_LIB_DIR") == null) {
-        const zig_parent = std.fs.path.dirname(zig_resolved) orelse
-            return error.MissingBuildArtifact;
-        const zig_lib_dir = try std.fs.path.join(
-            allocator,
-            &.{ zig_parent, "lib" },
-        );
-        if (try pathKindNoFollow(io, zig_lib_dir) == .directory) {
-            try build_env.put("ZIG_LIB_DIR", zig_lib_dir);
-        }
-    }
     var command_log: std.ArrayList(u8) = .empty;
     try runCommand(
         allocator,
@@ -1468,6 +1482,168 @@ fn buildRuntime(
         .build_tools = build_tools,
         .cache_lock = lock_file,
     };
+}
+
+fn snapshotZigInstallation(
+    allocator: Allocator,
+    io: Io,
+    zig_path: []const u8,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    transaction: *Transaction,
+) !ZigSnapshot {
+    const zig_absolute = try absolutePath(allocator, cwd, zig_path);
+    const zig_source = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        zig_absolute,
+        allocator,
+    );
+    const zig_identity = try sourceFileIdentity(io, zig_source);
+    const lib_source = try discoverZigLibDir(
+        allocator,
+        io,
+        zig_source,
+        environ,
+        cwd,
+    );
+    if (!zig_identity.matches(try Dir.cwd().statFile(
+        io,
+        zig_source,
+        .{ .follow_symlinks = false },
+    ))) return error.InputChanged;
+
+    try transaction.ensureStorageDirPath(allocator, io, "zig-install/bin");
+    try transaction.ensureStorageDirPath(allocator, io, "zig-install/lib");
+    const executable_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, "zig-install", "bin", "zig" },
+    );
+    const executable = try snapshotFileExpected(
+        allocator,
+        io,
+        zig_source,
+        executable_path,
+        transaction,
+        zig_identity,
+    );
+    const lib_destination = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, "zig-install", "lib" },
+    );
+    try snapshotDirectoryTree(
+        allocator,
+        io,
+        lib_source,
+        lib_destination,
+        transaction,
+    );
+    return .{ .executable = executable, .lib_dir = lib_destination };
+}
+
+fn discoverZigLibDir(
+    allocator: Allocator,
+    io: Io,
+    zig: []const u8,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+) ![]const u8 {
+    const discovered = if (environ.get("ZIG_LIB_DIR")) |configured|
+        try absolutePath(allocator, cwd, configured)
+    else blk: {
+        const result = try std.process.run(allocator, io, .{
+            .argv = &.{ zig, "env" },
+            .cwd = .{ .path = cwd },
+            .environ_map = environ,
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (!termSucceeded(result.term)) return error.MissingBuildArtifact;
+
+        const marker = ".lib_dir = ";
+        const marker_start = std.mem.indexOf(u8, result.stdout, marker) orelse
+            return error.MissingBuildArtifact;
+        const value_start = marker_start + marker.len;
+        const value_end = if (std.mem.indexOfScalar(
+            u8,
+            result.stdout[value_start..],
+            '\n',
+        )) |offset|
+            value_start + offset
+        else
+            result.stdout.len;
+        var literal = std.mem.trim(u8, result.stdout[value_start..value_end], " \t\r");
+        if (std.mem.endsWith(u8, literal, ",")) {
+            literal = std.mem.trimEnd(u8, literal[0 .. literal.len - 1], " \t\r");
+        }
+        const parsed = std.zig.string_literal.parseAlloc(
+            allocator,
+            literal,
+        ) catch return error.MissingBuildArtifact;
+        break :blk try absolutePath(allocator, cwd, parsed);
+    };
+    const canonical = try Dir.realPathFileAbsoluteAlloc(io, discovered, allocator);
+    const stat = try Dir.cwd().statFile(
+        io,
+        canonical,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .directory) return error.MissingBuildArtifact;
+    return canonical;
+}
+
+fn snapshotDirectoryTree(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    transaction: *Transaction,
+) !void {
+    var source = try Dir.openDirAbsolute(
+        io,
+        source_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    const source_identity = SourceIdentity.fromStat(try source.stat(io));
+    var destination = try Dir.openDirAbsolute(
+        io,
+        destination_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer destination.close(io);
+    const destination_relative = try std.fs.path.relative(
+        allocator,
+        transaction.storage_path,
+        null,
+        transaction.storage_path,
+        destination_path,
+    );
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("starling-componentizer-zig-lib-tree-v1\x00");
+    _ = try copyInputDirectory(
+        allocator,
+        io,
+        source,
+        destination,
+        source_path,
+        "",
+        destination_relative,
+        "",
+        &.{},
+        transaction,
+        &hasher,
+    );
+    if (!source_identity.matches(try source.stat(io)) or
+        !source_identity.matches(try Dir.cwd().statFile(
+            io,
+            source_path,
+            .{ .follow_symlinks = false },
+        )))
+    {
+        return error.InputChanged;
+    }
 }
 
 fn copyEnvironment(
@@ -1738,8 +1914,8 @@ fn buildMetadataDocument(
     allocator: Allocator,
     io: Io,
     config: *const cli.Config,
-    source: Snapshot,
-    initializer: ?Snapshot,
+    source: InputSnapshot,
+    initializer: ?InputSnapshot,
     runtime_args: []const u8,
     runtime: Runtime,
     tools: Tools,
@@ -1844,9 +2020,21 @@ fn buildMetadataDocument(
             .tools = tool_values.toOwnedSlice(allocator) catch @panic("out of memory"),
             .tools_sha256 = try metadata.hashFields(allocator, tool_fields.items),
             .inputs = .{
-                .source_sha256 = source.digest,
+                .source_sha256 = source.file.digest,
                 .initializer_sha256 = if (initializer) |snapshot|
-                    snapshot.digest
+                    snapshot.file.digest
+                else
+                    null,
+                .source_tree = .{
+                    .entry = source.tree_entry,
+                    .sha256 = source.tree_digest,
+                },
+                .initializer_tree = if (initializer) |snapshot|
+                    .{
+                        .entry = snapshot.tree_entry,
+                        .sha256 = snapshot.tree_digest,
+                        .shares_source_tree = snapshot.shares_source_tree,
+                    }
                 else
                     null,
                 .runtime_arguments_sha256 = try metadata.sha256Bytes(
@@ -2015,15 +2203,22 @@ fn snapshotInputs(
         std.fs.path.dirname(path) orelse return error.InvalidPath
     else
         null;
-    const shared_parent = initializer_parent != null and
-        std.mem.eql(u8, source_parent, initializer_parent.?);
+    const shared_root = if (initializer_parent) |parent|
+        if (pathContains(source_parent, parent))
+            source_parent
+        else if (pathContains(parent, source_parent))
+            parent
+        else
+            null
+    else
+        null;
     try transaction.createStorageDir(
         allocator,
         io,
         "inputs",
         .fromMode(0o700),
     );
-    const source_tree_name = if (shared_parent)
+    const source_tree_name = if (shared_root != null)
         "inputs/shared"
     else
         "inputs/source";
@@ -2040,29 +2235,38 @@ fn snapshotInputs(
     const source_file = try snapshotInputTree(
         allocator,
         io,
-        source_parent,
+        shared_root orelse source_parent,
         source_host,
-        std.fs.path.basename(source),
+        try std.fs.path.relative(
+            allocator,
+            shared_root orelse source_parent,
+            null,
+            shared_root orelse source_parent,
+            source,
+        ),
         excluded_paths,
         transaction,
     );
     const source_snapshot = InputSnapshot{
-        .file = source_file,
+        .file = source_file.file,
         .logical_path = source,
         .host_dir = source_host,
-        .guest_dir = source_parent,
+        .guest_dir = shared_root orelse source_parent,
+        .tree_entry = source_file.entry,
+        .tree_digest = source_file.digest,
+        .shares_source_tree = false,
     };
 
     const initializer_snapshot: ?InputSnapshot = if (initializer) |path| blk: {
         if (std.mem.eql(u8, path, source)) break :blk source_snapshot;
-        const host = if (shared_parent)
+        const host = if (shared_root != null)
             source_host
         else
             try std.fs.path.join(
                 allocator,
                 &.{ transaction.storage_path, "inputs", "initializer" },
             );
-        if (!shared_parent) {
+        if (shared_root == null) {
             try transaction.createStorageDir(
                 allocator,
                 io,
@@ -2070,35 +2274,56 @@ fn snapshotInputs(
                 .fromMode(0o700),
             );
         }
+        const tree_root = shared_root orelse initializer_parent.?;
+        const entry = try std.fs.path.relative(
+            allocator,
+            tree_root,
+            null,
+            tree_root,
+            path,
+        );
+        const distinct_tree = if (shared_root == null)
+            try snapshotInputTree(
+                allocator,
+                io,
+                initializer_parent.?,
+                host,
+                entry,
+                excluded_paths,
+                transaction,
+            )
+        else
+            null;
         break :blk .{
-            .file = if (shared_parent)
+            .file = if (shared_root != null)
                 Snapshot{
                     .path = try std.fs.path.join(
                         allocator,
-                        &.{ host, std.fs.path.basename(path) },
+                        &.{ host, entry },
                     ),
                     .digest = try metadata.sha256File(
                         allocator,
                         io,
                         try std.fs.path.join(
                             allocator,
-                            &.{ host, std.fs.path.basename(path) },
+                            &.{ host, entry },
                         ),
                     ),
                 }
             else
-                try snapshotInputTree(
-                    allocator,
-                    io,
-                    initializer_parent.?,
-                    host,
-                    std.fs.path.basename(path),
-                    excluded_paths,
-                    transaction,
-                ),
+                distinct_tree.?.file,
             .logical_path = path,
             .host_dir = host,
-            .guest_dir = initializer_parent.?,
+            .guest_dir = tree_root,
+            .tree_entry = if (shared_root != null)
+                try normalizeTreePath(allocator, entry)
+            else
+                distinct_tree.?.entry,
+            .tree_digest = if (shared_root != null)
+                source_snapshot.tree_digest
+            else
+                distinct_tree.?.digest,
+            .shares_source_tree = shared_root != null,
         };
     } else null;
 
@@ -2161,13 +2386,14 @@ fn snapshotInputTree(
     entry_name: []const u8,
     excluded_paths: []const []const u8,
     transaction: *Transaction,
-) !Snapshot {
+) !TreeSnapshot {
     var source_dir = try Dir.openDirAbsolute(
         io,
         source_path,
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer source_dir.close(io);
+    const source_identity = SourceIdentity.fromStat(try source_dir.stat(io));
     var destination_dir = try Dir.openDirAbsolute(
         io,
         destination_path,
@@ -2181,7 +2407,10 @@ fn snapshotInputTree(
         transaction.storage_path,
         destination_path,
     );
-    const digest = try copyInputDirectory(
+    const normalized_entry = try normalizeTreePath(allocator, entry_name);
+    var tree_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    tree_hasher.update("starling-componentizer-source-tree-v1\x00");
+    const file_digest = try copyInputDirectory(
         allocator,
         io,
         source_dir,
@@ -2189,17 +2418,79 @@ fn snapshotInputTree(
         source_path,
         "",
         destination_relative,
-        entry_name,
+        normalized_entry,
         excluded_paths,
         transaction,
+        &tree_hasher,
     );
+    if (!source_identity.matches(try source_dir.stat(io))) {
+        return error.InputChanged;
+    }
+    var tree_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+        undefined;
+    tree_hasher.final(&tree_digest_bytes);
+    const tree_digest_hex = std.fmt.bytesToHex(tree_digest_bytes, .lower);
     return .{
-        .path = try std.fs.path.join(
-            allocator,
-            &.{ destination_path, entry_name },
-        ),
-        .digest = digest orelse return error.MissingBuildArtifact,
+        .file = .{
+            .path = try std.fs.path.join(
+                allocator,
+                &.{ destination_path, entry_name },
+            ),
+            .digest = file_digest orelse return error.MissingBuildArtifact,
+        },
+        .entry = normalized_entry,
+        .digest = try allocator.dupe(u8, &tree_digest_hex),
     };
+}
+
+fn normalizeTreePath(allocator: Allocator, path: []const u8) ![]const u8 {
+    const normalized = try allocator.dupe(u8, path);
+    if (std.fs.path.sep != '/') {
+        for (normalized) |*byte| {
+            if (byte.* == std.fs.path.sep) byte.* = '/';
+        }
+    }
+    return normalized;
+}
+
+fn hashTreeEntryHeader(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    kind: u8,
+    relative: []const u8,
+    payload_len: u64,
+) void {
+    var length_buffer: [32]u8 = undefined;
+    const encoded_length = std.fmt.bufPrint(
+        &length_buffer,
+        "{d}",
+        .{payload_len},
+    ) catch unreachable;
+    hasher.update(&.{kind});
+    hasher.update(relative);
+    hasher.update(&.{0});
+    hasher.update(encoded_length);
+    hasher.update(&.{0});
+}
+
+fn validateTreeSymlink(relative: []const u8, target: []const u8) !void {
+    if (std.fs.path.isAbsolute(target)) return error.UnsupportedInputEntry;
+    var depth: usize = 0;
+    if (std.fs.path.dirname(relative)) |parent| {
+        var parent_components = std.mem.splitScalar(u8, parent, '/');
+        while (parent_components.next()) |component| {
+            if (component.len != 0) depth += 1;
+        }
+    }
+    var target_components = std.mem.splitScalar(u8, target, std.fs.path.sep);
+    while (target_components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (depth == 0) return error.UnsupportedInputEntry;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
 }
 
 fn copyInputDirectory(
@@ -2213,6 +2504,7 @@ fn copyInputDirectory(
     digest_entry: []const u8,
     excluded_paths: []const []const u8,
     transaction: *Transaction,
+    tree_hasher: *std.crypto.hash.sha2.Sha256,
 ) !?[]const u8 {
     const SourceEntry = struct {
         name: []const u8,
@@ -2245,13 +2537,22 @@ fn copyInputDirectory(
             }) catch @panic("out of memory");
         }
     }
+    std.mem.sort(SourceEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: SourceEntry, right: SourceEntry) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
 
     var selected_digest: ?[]const u8 = null;
     for (entries.items) |entry| {
         const child_relative = if (relative.len == 0)
             try allocator.dupe(u8, entry.name)
         else
-            try std.fs.path.join(allocator, &.{ relative, entry.name });
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ relative, entry.name },
+            );
         const child_source_path = try std.fs.path.join(
             allocator,
             &.{ source_path, entry.name },
@@ -2262,6 +2563,12 @@ fn copyInputDirectory(
         );
         switch (entry.identity.entry.kind) {
             .file => {
+                hashTreeEntryHeader(
+                    tree_hasher,
+                    'f',
+                    child_relative,
+                    entry.identity.size,
+                );
                 var source_file = try source.openFile(io, entry.name, .{});
                 defer source_file.close(io);
                 if (!entry.identity.matches(try source_file.stat(io))) {
@@ -2289,13 +2596,13 @@ fn copyInputDirectory(
                         else => return err,
                     };
                     if (count == 0) continue;
-                    if (relative.len == 0 and
-                        std.mem.eql(u8, entry.name, digest_entry))
-                    {
+                    if (std.mem.eql(u8, child_relative, digest_entry)) {
                         hasher.update(buffer[0..count]);
                     }
+                    tree_hasher.update(buffer[0..count]);
                     try destination_file.writeStreamingAll(io, buffer[0..count]);
                 }
+                tree_hasher.update(&.{0xff});
                 if (!entry.identity.matches(try source_file.stat(io))) {
                     return error.InputChanged;
                 }
@@ -2304,9 +2611,7 @@ fn copyInputDirectory(
                     (try source_file.stat(io)).permissions,
                 );
                 try destination_file.sync(io);
-                if (relative.len == 0 and
-                    std.mem.eql(u8, entry.name, digest_entry))
-                {
+                if (std.mem.eql(u8, child_relative, digest_entry)) {
                     var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
                         undefined;
                     hasher.final(&digest_bytes);
@@ -2315,6 +2620,8 @@ fn copyInputDirectory(
                 }
             },
             .directory => {
+                hashTreeEntryHeader(tree_hasher, 'd', child_relative, 0);
+                tree_hasher.update(&.{0xff});
                 try destination.createDir(io, entry.name, .fromMode(0o700));
                 const destination_absolute = try destination.realPathFileAlloc(
                     io,
@@ -2352,6 +2659,7 @@ fn copyInputDirectory(
                     digest_entry,
                     excluded_paths,
                     transaction,
+                    tree_hasher,
                 );
                 if (!entry.identity.entry.matches(try source_child.stat(io))) {
                     return error.InputChanged;
@@ -2369,6 +2677,15 @@ fn copyInputDirectory(
                     entry.name,
                     .{ .follow_symlinks = false },
                 ))) return error.InputChanged;
+                try validateTreeSymlink(child_relative, link_buffer[0..link_len]);
+                hashTreeEntryHeader(
+                    tree_hasher,
+                    'l',
+                    child_relative,
+                    link_len,
+                );
+                tree_hasher.update(link_buffer[0..link_len]);
+                tree_hasher.update(&.{0xff});
                 try destination.symLink(
                     io,
                     link_buffer[0..link_len],
@@ -2415,7 +2732,7 @@ fn copyInputDirectory(
                 matched = true;
                 break;
             }
-            if (!matched) continue;
+            if (!matched) return error.InputChanged;
             seen += 1;
         }
     }
@@ -2435,6 +2752,29 @@ fn snapshotFile(
     destination_path: []const u8,
     transaction: *Transaction,
 ) !Snapshot {
+    const source_stat = try Dir.cwd().statFile(
+        io,
+        source_path,
+        .{ .follow_symlinks = true },
+    );
+    return snapshotFileExpected(
+        allocator,
+        io,
+        source_path,
+        destination_path,
+        transaction,
+        SourceIdentity.fromStat(source_stat),
+    );
+}
+
+fn snapshotFileExpected(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    transaction: *Transaction,
+    expected_identity: SourceIdentity,
+) !Snapshot {
     var source = try Dir.openFileAbsolute(
         io,
         source_path,
@@ -2444,6 +2784,7 @@ fn snapshotFile(
     const source_stat = try source.stat(io);
     if (source_stat.kind != .file) return error.MissingBuildArtifact;
     const source_identity = SourceIdentity.fromStat(source_stat);
+    if (!expected_identity.matches(source_stat)) return error.InputChanged;
 
     var destination = try Dir.createFileAbsolute(
         io,
@@ -2471,7 +2812,15 @@ fn snapshotFile(
         hasher.update(buffer[0..count]);
         try destination.writeStreamingAll(io, buffer[0..count]);
     }
-    if (!source_identity.matches(try source.stat(io))) return error.InputChanged;
+    if (!source_identity.matches(try source.stat(io)) or
+        !source_identity.matches(try Dir.cwd().statFile(
+            io,
+            source_path,
+            .{ .follow_symlinks = true },
+        )))
+    {
+        return error.InputChanged;
+    }
     try destination.setPermissions(io, source_stat.permissions);
     try destination.sync(io);
     var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;

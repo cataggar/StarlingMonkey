@@ -31,6 +31,11 @@ componentize() {
   local source="$1" output="$2"
   local dispatch_wit="${3:-$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js}"
   local component_world="${4:-js-dispatch}"
+  local metadata="${5:-}"
+  local metadata_args=()
+  if [ -n "$metadata" ]; then
+    metadata_args=(--metadata-out "$metadata")
+  fi
   WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
     --build-root "$ROOT" \
     --cache-dir "$CACHE/runtime cache" \
@@ -43,6 +48,7 @@ componentize() {
     --wabt-bin "$WABT" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
+    "${metadata_args[@]}" \
     --out "$output" \
     "$source"
 }
@@ -86,24 +92,65 @@ grep -Fq 'starling-componentize' "$WORK/embedded metadata.txt"
 RELATIVE_DIR="$WORK/read only relative modules"
 RELATIVE_SOURCE="$RELATIVE_DIR/main.js"
 RELATIVE_OUTPUT="$WORK/relative import component.wasm"
-mkdir "$RELATIVE_DIR"
-cat > "$RELATIVE_DIR/sibling.js" <<'EOF'
+RELATIVE_METADATA="$WORK/relative import metadata.json"
+RELATIVE_COPY_DIR="$WORK/clean relative modules copy"
+RELATIVE_COPY_SOURCE="$RELATIVE_COPY_DIR/main.js"
+RELATIVE_COPY_OUTPUT="$WORK/relative import copy component.wasm"
+RELATIVE_COPY_METADATA="$WORK/relative import copy metadata.json"
+RELATIVE_CHANGED_OUTPUT="$WORK/relative import changed component.wasm"
+RELATIVE_CHANGED_METADATA="$WORK/relative import changed metadata.json"
+mkdir -p "$RELATIVE_DIR/nested" "$RELATIVE_COPY_DIR/nested"
+cat > "$RELATIVE_DIR/nested/sibling.js" <<'EOF'
 export function add(a, b) {
   return a + b;
 }
 EOF
 {
-  printf 'import { add } from "./sibling.js";\n\n'
+  printf 'import { add } from "./nested/sibling.js";\n\n'
   tail -n +5 "$ROOT/tests/fixtures/js-dispatch.js"
 } > "$RELATIVE_SOURCE"
-chmod 444 "$RELATIVE_SOURCE" "$RELATIVE_DIR/sibling.js"
-chmod 555 "$RELATIVE_DIR"
-componentize "$RELATIVE_SOURCE" "$RELATIVE_OUTPUT"
+cp "$RELATIVE_DIR/nested/sibling.js" \
+  "$RELATIVE_COPY_DIR/nested/sibling.js"
+cp "$RELATIVE_SOURCE" "$RELATIVE_COPY_SOURCE"
+chmod 444 "$RELATIVE_SOURCE" "$RELATIVE_DIR/nested/sibling.js"
+chmod 555 "$RELATIVE_DIR" "$RELATIVE_DIR/nested"
+chmod 600 "$RELATIVE_COPY_SOURCE"
+touch -t 202001020304 "$RELATIVE_COPY_SOURCE" \
+  "$RELATIVE_COPY_DIR/nested/sibling.js"
+componentize "$RELATIVE_SOURCE" "$RELATIVE_OUTPUT" "" "" "$RELATIVE_METADATA"
+componentize "$RELATIVE_COPY_SOURCE" "$RELATIVE_COPY_OUTPUT" "" "" \
+  "$RELATIVE_COPY_METADATA"
 "$WASM_TOOLS" validate --features all "$RELATIVE_OUTPUT"
 test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
   "$RELATIVE_OUTPUT")" = 5
-chmod 755 "$RELATIVE_DIR"
-chmod 644 "$RELATIVE_SOURCE" "$RELATIVE_DIR/sibling.js"
+cat > "$RELATIVE_COPY_DIR/nested/sibling.js" <<'EOF'
+export function add(a, b) {
+  return a + b + 1;
+}
+EOF
+componentize "$RELATIVE_COPY_SOURCE" "$RELATIVE_CHANGED_OUTPUT" "" "" \
+  "$RELATIVE_CHANGED_METADATA"
+"$WASM_TOOLS" validate --features all "$RELATIVE_CHANGED_OUTPUT"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
+  "$RELATIVE_CHANGED_OUTPUT")" = 6
+python3 - "$RELATIVE_OUTPUT" "$RELATIVE_METADATA" \
+  "$RELATIVE_COPY_OUTPUT" "$RELATIVE_COPY_METADATA" \
+  "$RELATIVE_CHANGED_OUTPUT" "$RELATIVE_CHANGED_METADATA" <<'PY'
+import hashlib, json, sys
+components = [open(path, "rb").read() for path in sys.argv[1::2]]
+metadata = [json.load(open(path, encoding="utf-8")) for path in sys.argv[2::2]]
+inputs = [document["provenance"]["inputs"] for document in metadata]
+assert inputs[0]["source_tree"] == inputs[1]["source_tree"]
+assert inputs[0]["source_tree"]["entry"] == "main.js"
+assert inputs[1]["source_tree"]["sha256"] != \
+    inputs[2]["source_tree"]["sha256"]
+assert len({value["source_sha256"] for value in inputs}) == 1
+assert components[1] != components[2]
+for component, document in zip(components, metadata):
+    assert document["component_sha256"] == hashlib.sha256(component).hexdigest()
+PY
+chmod 755 "$RELATIVE_DIR" "$RELATIVE_DIR/nested"
+chmod 644 "$RELATIVE_SOURCE" "$RELATIVE_DIR/nested/sibling.js"
 
 # A second identical WIT selection reuses the same monolithic Zig cache entry.
 "$COMPONENTIZER" \

@@ -35,9 +35,22 @@ pub const Tool = struct {
     sha256: []const u8,
 };
 
+pub const SourceTree = struct {
+    entry: []const u8,
+    sha256: []const u8,
+};
+
+pub const InitializerTree = struct {
+    entry: []const u8,
+    sha256: []const u8,
+    shares_source_tree: bool,
+};
+
 pub const Inputs = struct {
     source_sha256: []const u8,
     initializer_sha256: ?[]const u8,
+    source_tree: SourceTree,
+    initializer_tree: ?InitializerTree,
     runtime_arguments_sha256: []const u8,
     engine_sha256: []const u8,
     preview2_adapter_sha256: []const u8,
