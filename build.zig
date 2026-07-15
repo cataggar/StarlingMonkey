@@ -207,6 +207,11 @@ pub fn build(b: *std.Build) void {
     );
     componentizer_orchestration.addArtifactArg(componentizer);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
+    const absolute_wit_inputs = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
+    );
+    absolute_wit_inputs.addArg(b.graph.zig_exe);
+    componentizer_test_step.dependOn(&absolute_wit_inputs.step);
     const componentizer_e2e_step = b.step(
         "componentizer-e2e-test",
         "Run the real cached monolithic native componentizer E2E",
@@ -406,6 +411,10 @@ pub fn build(b: *std.Build) void {
     // the program. Mirrors cmake `add_executable(starling-raw.wasm ${SOURCES})`.
     var generated_bindings: ?std.Build.LazyPath = null;
     var wasip3_dep: ?*std.Build.Dependency = null;
+    const wit_bindgen_step = b.step(
+        "wit-bindgen",
+        "Generate dispatch bindings without building the runtime",
+    );
     if (dispatch_wit) |wit_dir| {
         const dep = b.dependency("wasip3", .{});
         wasip3_dep = dep;
@@ -423,6 +432,11 @@ pub fn build(b: *std.Build) void {
         addWitArg(b, bindgen, inputPath(b, wit_dir));
         bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "--js-imports", "-o" });
         generated_bindings = bindgen.addOutputFileArg("component_bindings.zig");
+        const install_bindings = b.addInstallFile(
+            generated_bindings.?,
+            "wit-bindgen/component_bindings.zig",
+        );
+        wit_bindgen_step.dependOn(&install_bindings.step);
     }
 
     const link_mod = b.createModule(.{
@@ -958,29 +972,43 @@ fn renderComponentizeScript(b: *std.Build, component_world: ?[]const u8) std.Bui
 
 fn addWitArg(b: *std.Build, cmd: *std.Build.Step.Run, wit: std.Build.LazyPath) void {
     cmd.addDirectoryArg(wit);
-    const sp = switch (wit) {
-        .src_path => |source| source,
+    const io = b.graph.io;
+    var dir = switch (wit) {
+        .src_path => |sp| blk: {
+            const path = sp.owner.root.join(b.allocator, sp.sub_path) catch |err|
+                std.process.fatal("failed to resolve WIT directory '{s}': {t}", .{ sp.sub_path, err });
+            break :blk path.root_dir.handle.openDir(
+                io,
+                path.sub_path,
+                .{ .iterate = true },
+            ) catch |err| std.process.fatal("failed to open WIT directory '{s}': {t}", .{ sp.sub_path, err });
+        },
+        .cwd_relative => |path| if (std.fs.path.isAbsolute(path))
+            std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch |err|
+                std.process.fatal("failed to open WIT directory '{s}': {t}", .{ path, err })
+        else
+            std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err|
+                std.process.fatal("failed to open WIT directory '{s}': {t}", .{ path, err }),
         else => return,
     };
-    const io = b.graph.io;
-    const path = sp.owner.root.join(b.allocator, sp.sub_path) catch |err|
-        std.process.fatal("failed to resolve WIT directory '{s}': {t}", .{ sp.sub_path, err });
-    var dir = path.root_dir.handle.openDir(
-        io,
-        path.sub_path,
-        .{ .iterate = true },
-    ) catch |err| std.process.fatal("failed to open WIT directory '{s}': {t}", .{ sp.sub_path, err });
     defer dir.close(io);
     var walker = dir.walk(b.allocator) catch |err|
-        std.process.fatal("failed to walk WIT directory '{s}': {t}", .{ sp.sub_path, err });
+        std.process.fatal("failed to walk WIT directory '{s}': {t}", .{ wit.getDisplayName(), err });
     defer walker.deinit();
+    var files: std.ArrayList([]const u8) = .empty;
     while (walker.next(io) catch |err|
-        std.process.fatal("failed to read WIT directory '{s}': {t}", .{ sp.sub_path, err })) |entry|
+        std.process.fatal("failed to read WIT directory '{s}': {t}", .{ wit.getDisplayName(), err })) |entry|
     {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".wit")) continue;
-        cmd.addFileInput(wit.path(b, entry.path));
+        files.append(b.allocator, b.dupe(entry.path)) catch @panic("OOM");
     }
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+    for (files.items) |path| cmd.addFileInput(wit.path(b, path));
 }
 
 fn addStarlingSources(ctx: Ctx, mod: *std.Build.Module) void {

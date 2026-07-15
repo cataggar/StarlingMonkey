@@ -78,7 +78,7 @@ test -s "$METADATA"
 python3 - "$METADATA" <<'PY'
 import json, re, sys
 metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-assert metadata["schema"] == "starling-componentize-metadata/v1"
+assert metadata["schema"] == "starling-componentize-metadata/v2"
 assert metadata["processed_by"]["name"] == "starling-componentize"
 assert re.fullmatch(r"[0-9a-f]{64}", metadata["provenance"]["worlds_sha256"])
 assert re.fullmatch(r"[0-9a-f]{64}", metadata["provenance"]["tools_sha256"])
@@ -88,6 +88,8 @@ grep -Fq 'language' "$WORK/embedded metadata.txt"
 grep -Fq 'JavaScript' "$WORK/embedded metadata.txt"
 grep -Fq 'processed-by' "$WORK/embedded metadata.txt"
 grep -Fq 'starling-componentize' "$WORK/embedded metadata.txt"
+grep -Fq 'zig-sha256' "$WORK/embedded metadata.txt"
+grep -Fq 'zig-lib-sha256' "$WORK/embedded metadata.txt"
 
 RELATIVE_DIR="$WORK/read only relative modules"
 RELATIVE_SOURCE="$RELATIVE_DIR/main.js"

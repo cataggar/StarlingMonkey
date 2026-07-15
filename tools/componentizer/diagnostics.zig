@@ -85,6 +85,7 @@ pub const Context = struct {
     }
 
     pub fn report(self: *Context, err: anyerror) void {
+        if (err == error.InvalidUtf8Path) self.phase = .inputs;
         const code = phaseCode(self.phase);
         const message = self.message orelse errorMessage(err, self.phase);
         const hint = errorHint(err) orelse phaseHint(self.phase);
@@ -203,16 +204,19 @@ pub const Context = struct {
     ) void {
         const diagnostic = .{
             .schema = "starling-componentize-diagnostic/v1",
-            .severity = severity,
-            .code = code,
-            .phase = phase,
-            .message = message,
-            .cause = cause,
-            .detail = detail,
-            .hint = hint,
-            .source = source,
-            .output = output_path,
-            .command = command orelse self.command,
+            .severity = self.jsonString(severity),
+            .code = self.jsonString(code),
+            .phase = self.jsonString(phase),
+            .message = self.jsonString(message),
+            .cause = if (cause) |value| self.jsonString(value) else null,
+            .detail = if (detail) |value| self.jsonString(value) else null,
+            .hint = if (hint) |value| self.jsonString(value) else null,
+            .source = if (source) |value| self.jsonString(value) else null,
+            .output = if (output_path) |value| self.jsonString(value) else null,
+            .command = if (command orelse self.command) |value|
+                self.jsonString(value)
+            else
+                null,
             .exit_code = exit_code orelse self.exit_code,
             .signal = signal orelse self.signal,
         };
@@ -221,6 +225,11 @@ pub const Context = struct {
         std.json.Stringify.value(diagnostic, .{}, &rendered.writer) catch return;
         rendered.writer.writeByte('\n') catch return;
         File.stderr().writeStreamingAll(self.io, rendered.written()) catch {};
+    }
+
+    fn jsonString(self: *Context, value: []const u8) []const u8 {
+        if (std.unicode.utf8ValidateSlice(value)) return value;
+        return sanitizeStderr(self.allocator, value, std.math.maxInt(usize));
     }
 };
 
@@ -300,6 +309,9 @@ fn errorMessage(err: anyerror, phase: Phase) []const u8 {
         error.IncompatibleEngineOptions => "--engine cannot be combined with feature selection or --use-debug-build",
         error.MetadataUnavailable => "public imports metadata requires generated bindings from a native runtime build",
         error.InvalidBindingsManifest => "the generated bindings contain an invalid JavaScript imports manifest",
+        error.InvalidUtf8Metadata => "generated public metadata contains a non-UTF-8 string",
+        error.InvalidUtf8Path => "a filesystem path is not valid UTF-8",
+        error.RollbackIncomplete => "publication rollback was incomplete; transaction storage was retained",
         error.EmptyRuntimeArgument => "--runtime-arg cannot represent an empty argument",
         error.UnrepresentableRuntimeArgument => "a runtime argument cannot be represented by StarlingMonkey's configuration parser",
         error.MissingWitFiles => "the selected WIT layout contains no .wit files",
@@ -317,6 +329,9 @@ fn errorHint(err: anyerror) ?[]const u8 {
         error.IncompatibleEngineOptions => "build a matching runtime natively or remove the build-changing options",
         error.MetadataUnavailable => "omit --engine so the CLI can retain and inspect generated bindings",
         error.InvalidBindingsManifest => "rebuild with the repository-pinned binding generator",
+        error.InvalidUtf8Metadata => "use UTF-8 names for all public metadata fields",
+        error.InvalidUtf8Path => "rename the path using valid UTF-8 bytes and retry",
+        error.RollbackIncomplete => "inspect the retained transaction beside the output and resolve raced destinations manually",
         error.EmptyRuntimeArgument, error.UnrepresentableRuntimeArgument => "use --runtime-arg only for values accepted by the runtime string parser",
         error.MissingWitFiles, error.UnsupportedWitEntry => "provide a regular WIT directory containing only directories and .wit files",
         error.MissingBuildArtifact => "verify tool overrides and native runtime build outputs",

@@ -48,6 +48,20 @@ printf '%s\n' "$*" | grep -q -- '--init-func wizer-initialize'
 printf '%s\n' "$*" | grep -q -- '--inherit-env true'
 printf '%s\n' "$*" | grep -q -- '--wasm-bulk-memory true'
 printf '%s\n' "$@" > "$FAKE_WIZER_ARGS_LOG"
+if [ -n "${FAKE_ASSERT_SNAPSHOT_NAMES:-}" ]; then
+  snapshot=""
+  for arg in "$@"; do
+    case "$arg" in
+      *::*)
+        snapshot="${arg%%::*}"
+        break
+        ;;
+    esac
+  done
+  test -f "$snapshot/.looks.starling-componentize-file.js"
+  test -f \
+    "$snapshot/.looks.starling-componentize-directory/nested-module.js"
+fi
 cat > "$FAKE_RUNTIME_ARGS_LOG"
 if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-source\n' > "$FAKE_REPLACE_SOURCE"
@@ -76,10 +90,17 @@ cat > "$TOOLS/fake wabt" <<'EOF'
 set -euo pipefail
 stage="$1 $2"
 if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
-  if [ "${FAKE_INVALID_STDERR:-}" = "1" ]; then
+  if [ "${FAKE_LARGE_OUTPUT:-}" = "1" ]; then
+    python3 - <<'PY'
+import os
+for index in range(256):
+    os.write(1, (f"stdout-{index:04d}-" + "o" * 4096 + "\n").encode())
+    os.write(2, (f"stderr-{index:04d}-" + "e" * 4096 + "\n").encode())
+PY
+  elif [ "${FAKE_INVALID_STDERR:-}" = "1" ]; then
     python3 - <<'PY' >&2
 import sys
-sys.stderr.buffer.write(b"\xff" + b"x" * 16383 + "€".encode())
+sys.stderr.buffer.write(b"\xff" + b"x" * 128 + b"\xe2\x82")
 PY
   else
     echo "injected $stage failure" >&2
@@ -433,17 +454,27 @@ PROVENANCE_ROOT="$SCRATCH/provenance roots"
 PROVENANCE_A="$PROVENANCE_ROOT/clean root a"
 PROVENANCE_B="$PROVENANCE_ROOT/clean root b"
 mkdir -p "$PROVENANCE_A/nested" "$PROVENANCE_B/nested"
+mkdir -p "$PROVENANCE_A/.looks.starling-componentize-directory" \
+  "$PROVENANCE_B/.looks.starling-componentize-directory"
 cat > "$PROVENANCE_A/main.js" <<'EOF'
 import { value } from "./alias.js";
 export const result = value;
 EOF
 printf 'export const value = 1;\n' > "$PROVENANCE_A/nested/module.js"
 printf 'export const value = 1;\n' > "$PROVENANCE_A/nested/other.js"
+printf 'export const hiddenFile = 1;\n' > \
+  "$PROVENANCE_A/.looks.starling-componentize-file.js"
+printf 'export const hiddenDirectory = 1;\n' > \
+  "$PROVENANCE_A/.looks.starling-componentize-directory/nested-module.js"
 ln -s nested/module.js "$PROVENANCE_A/alias.js"
 ln -s nested/module.js "$PROVENANCE_B/alias.js"
 printf 'export const value = 1;\n' > "$PROVENANCE_B/nested/other.js"
 printf 'export const value = 1;\n' > "$PROVENANCE_B/nested/module.js"
 cp "$PROVENANCE_A/main.js" "$PROVENANCE_B/main.js"
+cp "$PROVENANCE_A/.looks.starling-componentize-file.js" \
+  "$PROVENANCE_B/.looks.starling-componentize-file.js"
+cp "$PROVENANCE_A/.looks.starling-componentize-directory/nested-module.js" \
+  "$PROVENANCE_B/.looks.starling-componentize-directory/nested-module.js"
 chmod 600 "$PROVENANCE_B/main.js"
 touch -t 202001020304 "$PROVENANCE_B/main.js" \
   "$PROVENANCE_B/nested/module.js"
@@ -460,10 +491,24 @@ source_provenance() {
     "$source"
 }
 
-source_provenance "$PROVENANCE_A/main.js" \
+FAKE_ASSERT_SNAPSHOT_NAMES=1 source_provenance "$PROVENANCE_A/main.js" \
   "$WORK/provenance clean a.wasm" "$WORK/provenance clean a.json"
 source_provenance "$PROVENANCE_B/main.js" \
   "$WORK/provenance clean b.wasm" "$WORK/provenance clean b.json"
+printf 'export const hiddenFile = 2;\n' > \
+  "$PROVENANCE_B/.looks.starling-componentize-file.js"
+source_provenance "$PROVENANCE_B/main.js" \
+  "$WORK/provenance hidden file changed.wasm" \
+  "$WORK/provenance hidden file changed.json"
+cp "$PROVENANCE_A/.looks.starling-componentize-file.js" \
+  "$PROVENANCE_B/.looks.starling-componentize-file.js"
+printf 'export const hiddenDirectory = 2;\n' > \
+  "$PROVENANCE_B/.looks.starling-componentize-directory/nested-module.js"
+source_provenance "$PROVENANCE_B/main.js" \
+  "$WORK/provenance hidden directory changed.wasm" \
+  "$WORK/provenance hidden directory changed.json"
+cp "$PROVENANCE_A/.looks.starling-componentize-directory/nested-module.js" \
+  "$PROVENANCE_B/.looks.starling-componentize-directory/nested-module.js"
 printf 'export const value = 2;\n' > "$PROVENANCE_B/nested/module.js"
 source_provenance "$PROVENANCE_B/main.js" \
   "$WORK/provenance nested changed.wasm" \
@@ -476,24 +521,26 @@ source_provenance "$PROVENANCE_B/main.js" \
   "$WORK/provenance link changed.json"
 python3 - "$WORK/provenance clean a.json" \
   "$WORK/provenance clean b.json" \
+  "$WORK/provenance hidden file changed.json" \
+  "$WORK/provenance hidden directory changed.json" \
   "$WORK/provenance nested changed.json" \
   "$WORK/provenance link changed.json" <<'PY'
 import json, sys
-clean_a, clean_b, nested, link = [
+clean_a, clean_b, hidden_file, hidden_directory, nested, link = [
     json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]
 ]
 inputs = [doc["provenance"]["inputs"] for doc in (
-    clean_a, clean_b, nested, link
+    clean_a, clean_b, hidden_file, hidden_directory, nested, link
 )]
 assert all(value["source_tree"]["entry"] == "main.js" for value in inputs)
 assert inputs[0]["source_tree"]["sha256"] == \
     inputs[1]["source_tree"]["sha256"]
-assert inputs[1]["source_tree"]["sha256"] != \
-    inputs[2]["source_tree"]["sha256"]
-assert inputs[1]["source_tree"]["sha256"] != \
-    inputs[3]["source_tree"]["sha256"]
+assert all(inputs[1]["source_tree"]["sha256"] != value["source_tree"]["sha256"]
+           for value in inputs[2:])
 assert len({value["source_sha256"] for value in inputs}) == 1
 assert all(value["initializer_tree"] is None for value in inputs)
+assert clean_b["provenance"] != hidden_file["provenance"]
+assert clean_b["provenance"] != hidden_directory["provenance"]
 assert clean_b["provenance"] != nested["provenance"]
 assert clean_b["provenance"] != link["provenance"]
 PY
@@ -528,6 +575,46 @@ assert inputs["source_tree"]["entry"] == "read only.js"
 assert inputs["initializer_tree"]["entry"] == "initializer.js"
 assert inputs["initializer_tree"]["shares_source_tree"] is True
 assert inputs["initializer_tree"]["sha256"] == inputs["source_tree"]["sha256"]
+PY
+
+SHARED_FILE_DIR="$SCRATCH/shared source tree"
+SHARED_FILE_SOURCE="$SHARED_FILE_DIR/shared.js"
+SHARED_FILE_ALIAS_DIR="$SCRATCH/shared source aliases"
+SHARED_FILE_ALIAS="$SHARED_FILE_ALIAS_DIR/shared alias.js"
+SHARED_FILE_EXACT_METADATA="$WORK/shared exact metadata.json"
+SHARED_FILE_ALIAS_METADATA="$WORK/shared alias metadata.json"
+mkdir -p "$SHARED_FILE_DIR" "$SHARED_FILE_ALIAS_DIR"
+printf 'export const shared = true;\n' > "$SHARED_FILE_SOURCE"
+ln -s "$SHARED_FILE_SOURCE" "$SHARED_FILE_ALIAS"
+for initializer_case in exact alias; do
+  initializer="$SHARED_FILE_SOURCE"
+  metadata_path="$SHARED_FILE_EXACT_METADATA"
+  if [ "$initializer_case" = alias ]; then
+    initializer="$SHARED_FILE_ALIAS"
+    metadata_path="$SHARED_FILE_ALIAS_METADATA"
+  fi
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --initializer-script-path "$initializer" \
+    --metadata-out "$metadata_path" \
+    --out "$WORK/shared $initializer_case.wasm" \
+    "$SHARED_FILE_SOURCE"
+done
+python3 - "$SHARED_FILE_EXACT_METADATA" "$SHARED_FILE_ALIAS_METADATA" <<'PY'
+import json, sys
+exact, alias = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
+for document in (exact, alias):
+    inputs = document["provenance"]["inputs"]
+    assert inputs["initializer_sha256"] == inputs["source_sha256"]
+    assert inputs["initializer_tree"]["shares_source_tree"] is True
+    assert inputs["initializer_tree"]["entry"] == \
+        inputs["source_tree"]["entry"] == "shared.js"
+    assert inputs["initializer_tree"]["sha256"] == \
+        inputs["source_tree"]["sha256"]
+assert exact == alias
 PY
 
 UNREADABLE_SOURCE="$WORK/unreadable source.js"
@@ -684,6 +771,90 @@ assert diagnostic["phase"] == "arguments"
 assert diagnostic["cause"] == "UnknownArgument"
 PY
 
+python3 - "$COMPONENTIZER" "$SCRATCH" "$SOURCE" "$ENGINE" "$ADAPTER" \
+  "$TOOLS/fake wizer" "$TOOLS/fake wasm-tools" <<'PY'
+import json, os, shutil, subprocess, sys
+
+componentizer, scratch, source, engine, adapter, wizer, wasm_tools = [
+    os.fsencode(value) for value in sys.argv[1:]
+]
+invalid_root = os.path.join(scratch, b"invalid-\xff-paths")
+os.mkdir(invalid_root)
+invalid_source = os.path.join(invalid_root, b"source-\xff.js")
+invalid_initializer = os.path.join(invalid_root, b"initializer-\xff.js")
+invalid_output = os.path.join(invalid_root, b"output-\xff.wasm")
+invalid_wit = os.path.join(invalid_root, b"wit-\xff")
+invalid_tool = os.path.join(invalid_root, b"tool-\xff")
+tree_root = os.path.join(invalid_root, b"tree")
+os.mkdir(invalid_wit)
+os.mkdir(tree_root)
+for path, data in (
+    (invalid_source, b"export const invalidSource = true;\n"),
+    (invalid_initializer, b"globalThis.invalidInitializer = true;\n"),
+    (os.path.join(invalid_wit, b"world.wit"),
+     b"package test:invalid; world exports {}\n"),
+    (os.path.join(tree_root, b"main.js"),
+     b"export const invalidTree = true;\n"),
+    (os.path.join(tree_root, b"nested-\xff.js"),
+     b"export const invalidEntry = true;\n"),
+):
+    with open(path, "wb") as output:
+        output.write(data)
+shutil.copyfile(wasm_tools, invalid_tool)
+os.chmod(invalid_tool, 0o755)
+
+common = [
+    b"--engine", engine,
+    b"--preview2-adapter", adapter,
+    b"--wizer-bin", wizer,
+    b"--wasm-tools-bin", wasm_tools,
+]
+cases = {
+    "source": [b"--out", os.path.join(invalid_root, b"source-result.wasm"),
+               invalid_source],
+    "initializer": [
+        b"--initializer-script-path", invalid_initializer,
+        b"--out", os.path.join(invalid_root, b"initializer-result.wasm"),
+        source,
+    ],
+    "output": [b"--out", invalid_output, source],
+    "wit": [
+        b"--wit", invalid_wit, b"--world-name", b"exports",
+        b"--out", os.path.join(invalid_root, b"wit-result.wasm"),
+        source,
+    ],
+    "tool": [
+        b"--wasm-tools-bin", invalid_tool,
+        b"--out", os.path.join(invalid_root, b"tool-result.wasm"),
+        source,
+    ],
+    "tree-entry": [
+        b"--out", os.path.join(invalid_root, b"tree-result.wasm"),
+        os.path.join(tree_root, b"main.js"),
+    ],
+}
+for name, case_args in cases.items():
+    for mode in ("human", "json"):
+        mode_args = [b"--json-diagnostics"] if mode == "json" else []
+        result = subprocess.run(
+            [componentizer, *mode_args, *common, *case_args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode != 0, (name, mode)
+        result.stderr.decode("utf-8")
+        if mode == "json":
+            diagnostic = json.loads(result.stderr)
+            assert diagnostic["code"] == "SMC1001", (name, diagnostic)
+            assert diagnostic["phase"] == "inputs", (name, diagnostic)
+            assert diagnostic["cause"] == "InvalidUtf8Path", (name, diagnostic)
+            assert isinstance(diagnostic["message"], str)
+        else:
+            assert b"error[SMC1001] inputs:" in result.stderr, (name, result.stderr)
+            assert b"InvalidUtf8Path" in result.stderr, (name, result.stderr)
+PY
+
 negative_stage() {
   local injected="$1" mode="$2" expected_code="$3" expected_phase="$4"
   local expected_command="$5" slug="${1// /-}"
@@ -761,6 +932,33 @@ assert diagnostic["phase"] == "embed"
 assert "\ufffd" in diagnostic["detail"]
 assert len(diagnostic["detail"].encode("utf-8")) < 17 * 1024
 PY
+
+LARGE_CHILD_ERROR="$SCRATCH/large-child-error.jsonl"
+if FAKE_FAIL_STAGE="component embed" FAKE_LARGE_OUTPUT=1 "$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WORK/large-child-output.wasm" \
+  "$SOURCE" >/dev/null 2> "$LARGE_CHILD_ERROR"
+then
+  echo "FAIL: large child-output injection unexpectedly succeeded" >&2
+  exit 1
+fi
+python3 - "$LARGE_CHILD_ERROR" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+assert len(raw) < 17 * 1024
+diagnostic = json.loads(raw)
+assert diagnostic["phase"] == "embed"
+assert "[child stderr truncated; showing final output]" in diagnostic["detail"]
+assert "stderr-0255-" in diagnostic["detail"]
+PY
+test ! -e "$WORK/large-child-output.wasm"
 
 UNAVAILABLE_OUTPUT="$WORK/unavailable metadata.wasm"
 UNAVAILABLE_METADATA="$WORK/unavailable metadata.json"
@@ -878,6 +1076,7 @@ mkdir "$PUBLICATION_A" "$PUBLICATION_B"
 ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
 printf 'unrelated-a\n' > "$PUBLICATION_A/unrelated"
 printf 'unrelated-b\n' > "$PUBLICATION_B/unrelated"
+RETARGET_HUMAN_LOG="$SCRATCH/retarget-human.log"
 FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
 FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
 "$COMPONENTIZER" \
@@ -886,17 +1085,111 @@ FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
   --wizer-bin "$TOOLS/fake wizer" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$PUBLICATION_LINK/retarget-safe.wasm" \
-  "$SOURCE"
+  "$SOURCE" 2> "$RETARGET_HUMAN_LOG"
 test "$(readlink "$PUBLICATION_LINK")" = "$PUBLICATION_B"
 cmp "$ENGINE" "$PUBLICATION_A/retarget-safe.wasm"
 test ! -e "$PUBLICATION_B/retarget-safe.wasm"
+grep -Fq "into $PUBLICATION_A/retarget-safe.wasm" "$RETARGET_HUMAN_LOG"
+if grep -Fq "into $PUBLICATION_LINK/retarget-safe.wasm" \
+  "$RETARGET_HUMAN_LOG"; then
+  echo "FAIL: human success reported retargetable lexical output" >&2
+  exit 1
+fi
 test "$(cat "$PUBLICATION_A/unrelated")" = "unrelated-a"
 test "$(cat "$PUBLICATION_B/unrelated")" = "unrelated-b"
+
+rm "$PUBLICATION_LINK"
+ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
+RETARGET_JSON_LOG="$SCRATCH/retarget-json.log"
+FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
+FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$PUBLICATION_LINK/retarget-json.wasm" \
+  "$SOURCE" 2> "$RETARGET_JSON_LOG"
+cmp "$ENGINE" "$PUBLICATION_A/retarget-json.wasm"
+test ! -e "$PUBLICATION_B/retarget-json.wasm"
+python3 - "$RETARGET_JSON_LOG" \
+  "$PUBLICATION_A/retarget-json.wasm" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC0000", diagnostic
+assert diagnostic["output"] == sys.argv[2], diagnostic
+PY
 if find "$PUBLICATION_A" "$PUBLICATION_B" \
   -name '.*.starling-componentize-*' | grep -q .; then
   echo "FAIL: parent-symlink retarget left transaction artifacts" >&2
   exit 1
 fi
+
+ROLLBACK_RACE_OUTPUT="$WORK/rollback completeness.wasm"
+ROLLBACK_RACE_METADATA="$WORK/rollback completeness.json"
+ROLLBACK_RACE_DEBUG="$WORK/rollback completeness.debug"
+ROLLBACK_RACE_ERROR="$SCRATCH/rollback-completeness-error.jsonl"
+printf 'original-component\n' > "$ROLLBACK_RACE_OUTPUT"
+printf 'original-metadata\n' > "$ROLLBACK_RACE_METADATA"
+mkdir "$ROLLBACK_RACE_DEBUG"
+python3 - "$ROLLBACK_RACE_DEBUG" <<'PY'
+import os, sys
+for index in range(1000):
+    with open(os.path.join(sys.argv[1], f"unrelated-{index}"), "w") as output:
+        output.write(f"preserve-{index}\n")
+PY
+python3 - "$ROLLBACK_RACE_METADATA" <<'PY' &
+import os, sys, time
+metadata = sys.argv[1]
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    try:
+        fd = os.open(metadata, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        continue
+    with os.fdopen(fd, "wb") as replacement:
+        replacement.write(b"replacement-metadata\n")
+    break
+else:
+    raise SystemExit("failed to inject metadata publication race")
+PY
+rollback_racer=$!
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$ROLLBACK_RACE_METADATA" \
+  --debug-dir "$ROLLBACK_RACE_DEBUG" \
+  --out "$ROLLBACK_RACE_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$ROLLBACK_RACE_ERROR"
+then
+  kill "$rollback_racer" 2>/dev/null || true
+  wait "$rollback_racer" 2>/dev/null || true
+  echo "FAIL: metadata publication race unexpectedly succeeded" >&2
+  exit 1
+fi
+wait "$rollback_racer"
+test "$(cat "$ROLLBACK_RACE_OUTPUT")" = "original-component"
+test "$(cat "$ROLLBACK_RACE_METADATA")" = "replacement-metadata"
+test "$(cat "$ROLLBACK_RACE_DEBUG/unrelated-999")" = "preserve-999"
+ROLLBACK_RACE_ROOT="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.rollback completeness.wasm.starling-componentize-*' -print -quit)"
+test -n "$ROLLBACK_RACE_ROOT"
+test "$(cat "$ROLLBACK_RACE_ROOT/data/previous-metadata")" = \
+  "original-metadata"
+cmp "$ENGINE" "$ROLLBACK_RACE_ROOT/data/component.wasm"
+python3 - "$ROLLBACK_RACE_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "RollbackIncomplete", diagnostic
+assert "transaction storage was retained" in diagnostic["message"], diagnostic
+PY
+rm -rf "$ROLLBACK_RACE_ROOT"
 
 BACKUP_RACE_OUTPUT="$WORK/backup identity race.wasm"
 BACKUP_RACE_DEBUG="$WORK/backup identity race.debug"
@@ -1151,7 +1444,7 @@ import hashlib, json, re, sys
 metadata = json.load(open(sys.argv[1], encoding="utf-8"))
 imports = json.load(open(sys.argv[2], encoding="utf-8"))
 sha256 = re.compile(r"^[0-9a-f]{64}$")
-assert metadata["schema"] == "starling-componentize-metadata/v1"
+assert metadata["schema"] == "starling-componentize-metadata/v2"
 assert metadata["processed_by"] == {
     "name": "starling-componentize",
     "version": "0.3.0",
@@ -1190,6 +1483,8 @@ assert [t["name"] for t in provenance["tools"]] == [
     "zig", "wasip3-bindgen", "wasm-opt", "wizer", "wabt", "wasm-tools",
 ]
 assert all(sha256.match(t["sha256"]) for t in provenance["tools"])
+assert sha256.match(provenance["tools"][0]["lib_tree_sha256"])
+assert all(t["lib_tree_sha256"] is None for t in provenance["tools"][1:])
 assert sha256.match(metadata["component_sha256"])
 runtime_args = open(sys.argv[3], "rb").read()
 assert provenance["inputs"]["runtime_arguments_sha256"] == \
@@ -1226,6 +1521,54 @@ ZIG_LIB_DIR="$INSTALLED_ZIG_ROOT/lib/zig" \
   build_with_selected_zig "$INSTALLED_ZIG_ROOT/bin/zig" \
     "$WORK/explicit Zig lib layout.wasm"
 
+ZIG_PROVENANCE_ROOT="$SCRATCH/Zig provenance roots"
+ZIG_PROVENANCE_A="$ZIG_PROVENANCE_ROOT/clean a"
+ZIG_PROVENANCE_B="$ZIG_PROVENANCE_ROOT/clean b"
+mkdir -p "$ZIG_PROVENANCE_A/lib" "$ZIG_PROVENANCE_B/lib"
+cp "$TOOLS/fake zig" "$ZIG_PROVENANCE_A/zig"
+cp "$TOOLS/fake zig" "$ZIG_PROVENANCE_B/zig"
+chmod +x "$ZIG_PROVENANCE_A/zig" "$ZIG_PROVENANCE_B/zig"
+printf 'immutable-zig-lib\n' > "$ZIG_PROVENANCE_A/lib/marker"
+printf 'immutable-zig-lib\n' > "$ZIG_PROVENANCE_B/lib/marker"
+ZIG_PROVENANCE_A_METADATA="$WORK/Zig provenance clean a.json"
+ZIG_PROVENANCE_B_METADATA="$WORK/Zig provenance clean b.json"
+ZIG_PROVENANCE_CHANGED_METADATA="$WORK/Zig provenance changed.json"
+FAKE_ZIG_LIB_DIR="$ZIG_PROVENANCE_A/lib" \
+  build_with_selected_zig "$ZIG_PROVENANCE_A/zig" \
+    "$WORK/Zig provenance clean a.wasm" \
+    --metadata-out "$ZIG_PROVENANCE_A_METADATA"
+FAKE_ZIG_LIB_DIR="$ZIG_PROVENANCE_B/lib" \
+  build_with_selected_zig "$ZIG_PROVENANCE_B/zig" \
+    "$WORK/Zig provenance clean b.wasm" \
+    --metadata-out "$ZIG_PROVENANCE_B_METADATA"
+mkdir "$ZIG_PROVENANCE_B/lib/nested"
+printf 'library-only-change\n' > \
+  "$ZIG_PROVENANCE_B/lib/nested/provenance-input"
+FAKE_ZIG_LIB_DIR="$ZIG_PROVENANCE_B/lib" \
+  build_with_selected_zig "$ZIG_PROVENANCE_B/zig" \
+    "$WORK/Zig provenance changed.wasm" \
+    --metadata-out "$ZIG_PROVENANCE_CHANGED_METADATA"
+python3 - "$ZIG_PROVENANCE_A_METADATA" "$ZIG_PROVENANCE_B_METADATA" \
+  "$ZIG_PROVENANCE_CHANGED_METADATA" <<'PY'
+import json, sys
+clean_a, clean_b, changed = [
+    json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]
+]
+assert clean_a["provenance"] == clean_b["provenance"]
+clean_tools = {tool["name"]: tool for tool in clean_b["provenance"]["tools"]}
+changed_tools = {tool["name"]: tool for tool in changed["provenance"]["tools"]}
+assert clean_tools["zig"]["sha256"] == changed_tools["zig"]["sha256"]
+assert clean_tools["zig"]["lib_tree_sha256"] != \
+    changed_tools["zig"]["lib_tree_sha256"]
+assert {
+    name: tool for name, tool in clean_tools.items() if name != "zig"
+} == {
+    name: tool for name, tool in changed_tools.items() if name != "zig"
+}
+assert clean_b["provenance"]["tools_sha256"] != \
+    changed["provenance"]["tools_sha256"]
+PY
+
 rm -rf "$CACHE"
 export FAKE_ZIG_ACTIVE_DIR="$SCRATCH/fake-zig-active"
 export FAKE_ZIG_DELAY=1
@@ -1238,7 +1581,7 @@ wait "$pid2"
 unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
-test "${#prefixes[@]}" -eq 11
+test "${#prefixes[@]}" -eq 14
 test "${prefixes[0]}" = "${prefixes[1]}"
 test "${prefixes[0]}" != "${prefixes[2]}"
 for prefix in "${prefixes[@]:3}"; do

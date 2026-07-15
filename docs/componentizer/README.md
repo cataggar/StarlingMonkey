@@ -100,11 +100,16 @@ JSON Lines on stderr. Each object uses schema
 `message`, `cause`, `detail`, and `hint`, plus typed `command`, `exit_code`,
 and `signal` process fields; a successful run emits `SMC0000`. Child output is
 captured in this mode, so the diagnostic stream is not mixed with ad hoc
-subprocess text.
+subprocess text. Capture is bounded per stream; failed commands retain at most
+16 KiB of final stderr and include an explicit truncation marker. Human mode
+streams child stdout and stderr while retaining the same bounded failure tail.
+Filesystem paths must be valid UTF-8. Invalid source, initializer, output, WIT,
+tool, or traversed tree paths fail during input diagnostics with
+`InvalidUtf8Path`, ensuring every public diagnostic path remains a JSON string.
 
 ## Imports and provenance metadata
 
-`--metadata-out <file>` writes `starling-componentize-metadata/v1` JSON next
+`--metadata-out <file>` writes `starling-componentize-metadata/v2` JSON next
 to the component. Its `imports` array uses ComponentizeJS 0.21's public
 `[[specifier, binding], ...]` convention, including default-import records for
 world-level functions. The typed `bindings` array adds function arity,
@@ -120,7 +125,14 @@ The `provenance` object records the selected dispatch and component worlds,
 content hashes of both complete WIT layouts, the resolved feature booleans,
 SHA-256 hashes of every invoked tool (including nested runtime-build tools
 such as `wasip3-bindgen` and `wasm-opt`), source/initializer/runtime-argument
-hashes, engine/adapter hashes, and the exact published component hash.
+hashes, engine/adapter hashes, and the exact published component hash. The
+`zig` tool record carries both the executable `sha256` and a domain-separated
+`lib_tree_sha256` over the complete snapshotted Zig library tree; both fields
+participate unambiguously in `tools_sha256`. Other tool records set
+`lib_tree_sha256` to `null`.
+Native components also expose `zig-sha256` and `zig-lib-sha256` entries in
+their standard WebAssembly `processed-by` producers section, beside the
+`starling-componentize` version.
 `source_sha256` and `initializer_sha256` remain hashes of the exact entry
 files. The `source_tree` and optional `initializer_tree` records add the
 normalized relative entry path and a domain-separated digest of every staged
@@ -139,9 +151,17 @@ Source-tree traversal order, permissions, timestamps, and absolute root
 location do not affect tree hashes. Relative symlinks that remain within the
 staged tree are preserved and hashed by target; absolute or escaping symlinks
 are rejected so a child cannot consume mutable files outside its snapshot.
+Only the current transaction directory is excluded, after no-follow identity
+verification; unrelated names that resemble transaction names remain ordinary
+hashed and staged source entries.
 Source and initializer snapshots are mapped to their original logical paths for
 Wizer, and the runtime-argument hash covers the exact stable byte stream
 supplied to Wizer.
+Native bindgen registers every nested `.wit` file as a content-hashed build
+input for both relative and absolute WIT roots, in sorted order. Rewriting a WIT
+file at the same path therefore invalidates bindgen without relying on a
+directory timestamp; spaces and checkout-root relocation do not affect the
+generated bindings.
 The component itself also receives standard WebAssembly producers metadata
 compatible with `wasm-tools metadata show`.
 

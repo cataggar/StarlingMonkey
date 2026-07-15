@@ -33,6 +33,7 @@ pub const Feature = struct {
 pub const Tool = struct {
     name: []const u8,
     sha256: []const u8,
+    lib_tree_sha256: ?[]const u8 = null,
 };
 
 pub const SourceTree = struct {
@@ -68,7 +69,7 @@ pub const Provenance = struct {
 };
 
 pub const Document = struct {
-    schema: []const u8 = "starling-componentize-metadata/v1",
+    schema: []const u8 = "starling-componentize-metadata/v2",
     processed_by: ProcessedBy,
     component_sha256: []const u8,
     imports_complete: bool,
@@ -168,6 +169,7 @@ pub fn parseBindings(
 }
 
 pub fn render(allocator: Allocator, document: Document) ![]const u8 {
+    try validateDocumentUtf8(document);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try std.json.Stringify.value(document, .{ .whitespace = .indent_2 }, &output.writer);
@@ -176,6 +178,7 @@ pub fn render(allocator: Allocator, document: Document) ![]const u8 {
 }
 
 pub fn renderImports(allocator: Allocator, imports: Imports) ![]const u8 {
+    try validateImportsUtf8(imports);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try std.json.Stringify.value(.{
@@ -186,6 +189,66 @@ pub fn renderImports(allocator: Allocator, imports: Imports) ![]const u8 {
     }, .{ .whitespace = .indent_2 }, &output.writer);
     try output.writer.writeByte('\n');
     return allocator.dupe(u8, output.written());
+}
+
+fn validateDocumentUtf8(document: Document) !void {
+    try validateString(document.schema);
+    try validateString(document.processed_by.name);
+    try validateString(document.processed_by.version);
+    try validateString(document.component_sha256);
+    try validateImportsUtf8(.{
+        .complete = document.imports_complete,
+        .public = document.imports,
+        .bindings = document.bindings,
+    });
+    try validateWorldUtf8(document.provenance.dispatch_world);
+    try validateWorldUtf8(document.provenance.component_world);
+    try validateString(document.provenance.worlds_sha256);
+    if (document.provenance.features) |features| {
+        for (features) |feature| try validateString(feature.name);
+    }
+    if (document.provenance.features_sha256) |digest| try validateString(digest);
+    for (document.provenance.tools) |tool| {
+        try validateString(tool.name);
+        try validateString(tool.sha256);
+        if (tool.lib_tree_sha256) |digest| try validateString(digest);
+    }
+    try validateString(document.provenance.tools_sha256);
+    const inputs = document.provenance.inputs;
+    try validateString(inputs.source_sha256);
+    if (inputs.initializer_sha256) |digest| try validateString(digest);
+    try validateString(inputs.source_tree.entry);
+    try validateString(inputs.source_tree.sha256);
+    if (inputs.initializer_tree) |tree| {
+        try validateString(tree.entry);
+        try validateString(tree.sha256);
+    }
+    try validateString(inputs.runtime_arguments_sha256);
+    try validateString(inputs.engine_sha256);
+    try validateString(inputs.preview2_adapter_sha256);
+}
+
+fn validateImportsUtf8(imports: Imports) !void {
+    for (imports.public) |entry| {
+        try validateString(entry[0]);
+        try validateString(entry[1]);
+    }
+    for (imports.bindings) |binding| {
+        try validateString(binding.kind);
+        try validateString(binding.specifier);
+        try validateString(binding.name);
+        if (binding.dispatch_key) |value| try validateString(value);
+        if (binding.resource) |value| try validateString(value);
+    }
+}
+
+fn validateWorldUtf8(world: World) !void {
+    if (world.name) |name| try validateString(name);
+    if (world.wit_sha256) |digest| try validateString(digest);
+}
+
+fn validateString(value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8Metadata;
 }
 
 pub fn sha256Bytes(allocator: Allocator, bytes: []const u8) ![]const u8 {
@@ -298,4 +361,50 @@ test "missing import manifest means no JavaScript guest imports" {
     try std.testing.expect(parsed.complete);
     try std.testing.expectEqual(@as(usize, 0), parsed.public.len);
     try std.testing.expectEqual(@as(usize, 0), parsed.bindings.len);
+}
+
+test "public JSON rejects non-UTF-8 strings instead of emitting byte arrays" {
+    try std.testing.expectError(
+        error.InvalidUtf8Metadata,
+        renderImports(std.testing.allocator, .{
+            .complete = true,
+            .public = &.{
+                .{ "valid", "invalid\xff" },
+            },
+            .bindings = &.{},
+        }),
+    );
+
+    const document = Document{
+        .processed_by = .{ .version = "test" },
+        .component_sha256 = "00",
+        .imports_complete = true,
+        .imports = &.{},
+        .bindings = &.{},
+        .provenance = .{
+            .dispatch_world = .{ .name = null, .wit_sha256 = null },
+            .component_world = .{ .name = null, .wit_sha256 = null },
+            .worlds_sha256 = "00",
+            .features = null,
+            .features_sha256 = null,
+            .tools = &.{},
+            .tools_sha256 = "00",
+            .inputs = .{
+                .source_sha256 = "00",
+                .initializer_sha256 = null,
+                .source_tree = .{
+                    .entry = "invalid\xff",
+                    .sha256 = "00",
+                },
+                .initializer_tree = null,
+                .runtime_arguments_sha256 = "00",
+                .engine_sha256 = "00",
+                .preview2_adapter_sha256 = "00",
+            },
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidUtf8Metadata,
+        render(std.testing.allocator, document),
+    );
 }
