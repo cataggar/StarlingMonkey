@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const aot_cache = @import("aot_cache.zig");
 const cli = @import("cli.zig");
 const diagnostics = @import("diagnostics.zig");
 const metadata = @import("metadata.zig");
@@ -16,6 +17,7 @@ const runtime_build_manifest = "tools/componentizer/runtime-build-inputs.txt";
 const PipelineError = error{
     CacheDirectoryChanged,
     CommandFailed,
+    CorruptAotCache,
     DebugOutputCollision,
     EmptyRuntimeArgument,
     EngineProvenanceMismatch,
@@ -24,18 +26,21 @@ const PipelineError = error{
     InvalidBuildRoot,
     InvalidBindingsManifest,
     InvalidMetadataDestination,
+    InvalidAotCache,
     InvalidPath,
     InvalidToolManifest,
     InvalidUtf8Path,
     MetadataUnavailable,
     MissingBuildArtifact,
     MissingEngineProvenance,
+    MissingAotCache,
     MissingWitFiles,
     PublicationDirectoryChanged,
     RollbackIncomplete,
     UnrepresentableRuntimeArgument,
     UnsupportedWitEntry,
     UnsupportedZigVersion,
+    StaleAotCache,
 };
 
 const StagedWit = struct {
@@ -2205,6 +2210,10 @@ const Transaction = struct {
         };
         return identity.matches(stat);
     }
+const AotCache = struct {
+    cache: []const u8,
+    manifest: []const u8,
+    expected_feature_abi: ?[]const u8,
 };
 
 const Runtime = struct {
@@ -2223,6 +2232,7 @@ const Runtime = struct {
     zig: ?ZigSnapshot,
     build_tools: []const metadata.Tool,
     build_root_digest: ?[]const u8,
+    aot_cache: ?AotCache,
     cache_lock: ?File,
 };
 
@@ -2253,6 +2263,9 @@ const Tools = struct {
     wizer: WizerTool,
     wabt: Snapshot,
     wasm_tools: Snapshot,
+    weval: ?[]const u8,
+    wabt: ?[]const u8,
+    wasm_tools: []const u8,
 };
 
 const FeatureSurfaceCommandContext = struct {
@@ -2533,6 +2546,9 @@ fn parseErrorMessage(err: cli.ParseError) []const u8 {
     return switch (err) {
         error.ConflictingFeatures => "the same feature cannot be both enabled and disabled",
         error.InvalidDiagnosticFormat => "--diagnostic-format must be human or json",
+        error.AotOptionRequiresAot => "AOT cache, tool, and stack controls require --aot",
+        error.IncompatibleAotOptions => "--aot cannot be combined with --use-debug-build",
+        error.InvalidAotMinStackSize => "--aot-min-stack-size must be a positive integer",
         error.InvalidHeapLimit => "--js-heap-limit-mib must be an integer from 1 to 4095",
         error.MissingSource => "missing JavaScript source path",
         error.MissingValue => "an option is missing its value",
@@ -2541,7 +2557,6 @@ fn parseErrorMessage(err: cli.ParseError) []const u8 {
         error.UnexpectedComponentWorld => "--component-wit requires --wit and its own world name",
         error.UnknownArgument => "unknown option",
         error.UnknownFeature => "unknown feature (expected stdio, random, clocks, http, or fetch-event)",
-        error.UnsupportedAot => "AOT options are reserved for the dedicated AOT phase and are not implemented",
     };
 }
 
@@ -2782,6 +2797,28 @@ fn execute(
         environ,
     );
     defer publication_locks.deinit(io);
+    if (config.aot) {
+        const bundle = runtime.aot_cache orelse return error.MissingAotCache;
+        validateAotCache(
+            allocator,
+            io,
+            runtime.engine,
+            tools.weval.?,
+            bundle,
+        ) catch |err| {
+            std.debug.print(
+                "error: AOT cache validation failed for {s}: {t}\n",
+                .{ bundle.cache, err },
+            );
+            return switch (err) {
+                error.MissingCacheArtifact => error.MissingAotCache,
+                error.CorruptCache, error.InvalidCacheFormat => error.CorruptAotCache,
+                error.InvalidManifest => error.InvalidAotCache,
+                error.StaleEngine, error.StaleFeatureAbi, error.StaleTool => error.StaleAotCache,
+                else => err,
+            };
+        };
+    }
 
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
@@ -3043,13 +3080,49 @@ fn execute(
     } else {
         wizer_args.appendSlice(allocator, &.{
             "--allow-wasi",
+    var initialization_args: std.ArrayList([]const u8) = .empty;
+    if (config.aot) {
+        initialization_args.appendSlice(allocator, &.{
+            tools.weval.?,
+            "weval",
+            "-w",
             "--init-func",
             "wizer-initialize",
-            "--inherit-env",
-            "true",
-            "--wasm-bulk-memory",
-            "true",
+            "--cache-ro",
+            runtime.aot_cache.?.cache,
         }) catch @panic("out of memory");
+        if (config.verbose) {
+            initialization_args.appendSlice(
+                allocator,
+                &.{ "--verbose", "--show-stats" },
+            ) catch @panic("out of memory");
+        }
+    } else {
+        initialization_args.append(allocator, tools.wizer.executable) catch
+            @panic("out of memory");
+        if (tools.wizer.wasmtime_subcommand) {
+            initialization_args.append(allocator, "wizer") catch @panic("out of memory");
+            initialization_args.appendSlice(allocator, &.{
+                "-S",
+                "cli",
+                "-S",
+                "inherit-env",
+                "-W",
+                "bulk-memory",
+                "-W",
+                "unknown-imports-trap",
+            }) catch @panic("out of memory");
+        } else {
+            initialization_args.appendSlice(allocator, &.{
+                "--allow-wasi",
+                "--init-func",
+                "wizer-initialize",
+                "--inherit-env",
+                "true",
+                "--wasm-bulk-memory",
+                "true",
+            }) catch @panic("out of memory");
+        }
     }
 
     try addMappedPreopen(
@@ -3078,17 +3151,45 @@ fn execute(
     }
     wizer_args.appendSlice(allocator, &.{ "-o", initialized.path, runtime.engine.path }) catch
         @panic("out of memory");
+    const source_dir = std.fs.path.dirname(source) orelse return error.InvalidPath;
+    try addPreopen(allocator, &initialization_args, source_dir);
+    if (initializer) |initializer_path| {
+        const initializer_dir = std.fs.path.dirname(initializer_path) orelse return error.InvalidPath;
+        try addPreopen(allocator, &initialization_args, initializer_dir);
+    }
+    for (config.preopen_dirs) |preopen| {
+        const preopen_abs = try absolutePath(allocator, cwd, preopen);
+        try addPreopen(allocator, &initialization_args, preopen_abs);
+    }
+    initialization_args.appendSlice(
+        allocator,
+        if (config.aot)
+            &.{ "-o", initialized, "-i", runtime.engine }
+        else
+            &.{ "-o", initialized, runtime.engine },
+    ) catch @panic("out of memory");
 
     var pipeline_env = std.process.Environ.Map.init(allocator);
     try copyEnvironment(&pipeline_env, environ);
     try pipeline_env.put("WASMTIME_BACKTRACE_DETAILS", "1");
     _ = pipeline_env.swapRemove("STARLINGMONKEY_CONFIG");
     diagnostic.begin(.initialize);
+    _ = pipeline_env.swapRemove("RUST_MIN_STACK");
+    if (config.aot) {
+        try pipeline_env.put(
+            "RUST_MIN_STACK",
+            try std.fmt.allocPrint(
+                allocator,
+                "{d}",
+                .{config.aot_min_stack_size orelse aot_cache.default_min_stack_size},
+            ),
+        );
+    }
     try runCommand(
         allocator,
         io,
-        "wizer",
-        wizer_args.items,
+        if (config.aot) "weval AOT" else "wizer",
+        initialization_args.items,
         cwd,
         &pipeline_env,
         runtime_args_child_path,
@@ -3577,6 +3678,9 @@ fn execute(
                 "debug/component-bindings.zig",
             );
         }
+        if (runtime.aot_cache) |bundle| {
+            try copyDebugFile(io, bundle.manifest, debug_dir_handle, "aot-cache.manifest");
+        }
         try copyDebugFile(io, command_log_path, debug_dir_handle, "commands.txt");
         try transaction.recordStoragePath(allocator, io, "debug/commands.txt");
         if (metadata_json) |json| {
@@ -3850,6 +3954,17 @@ fn externalRuntime(
         .zig = null,
         .build_tools = &.{},
         .build_root_digest = null,
+        .aot_cache = if (config.aot)
+            try resolveAotBundle(
+                allocator,
+                io,
+                cwd,
+                config.aot_cache_dir,
+                std.fs.path.dirname(engine) orelse return error.InvalidPath,
+                null,
+            )
+        else
+            null,
         .cache_lock = null,
     };
 }
@@ -4431,6 +4546,9 @@ fn buildRuntime(
             try std.fmt.allocPrint(allocator, "-Ddispatch-world={s}", .{config.world_name.?}),
         }) catch @panic("out of memory");
     }
+    if (config.aot) {
+        argv.append(allocator, "-Daot-engine=true") catch @panic("out of memory");
+    }
     if (config.disable_features.len != 0) {
         argv.append(
             allocator,
@@ -4456,6 +4574,15 @@ fn buildRuntime(
             @panic("out of memory");
     }
 
+
+    const zig_global_cache = if (environ.get("ZIG_GLOBAL_CACHE_DIR")) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        try std.fs.path.join(
+            allocator,
+            &.{ cache_dir, "zig-global-cache" },
+        );
+    try Dir.cwd().createDirPath(io, zig_global_cache);
     var build_env = std.process.Environ.Map.init(allocator);
     try copyEnvironment(&build_env, environ);
     try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_child_path);
@@ -4624,6 +4751,25 @@ fn buildRuntime(
         );
     };
     const surface_target_world = config.world_name orelse "caller";
+        try requireFile(io, path);
+        break :blk path;
+    } else null;
+    const expected_feature_abi = if (config.aot)
+        try resolvedFeatureAbi(allocator, config)
+    else
+        null;
+    const aot_bundle = if (config.aot)
+        try resolveAotBundle(
+            allocator,
+            io,
+            cwd,
+            config.aot_cache_dir,
+            try std.fs.path.join(allocator, &.{ prefix, "bin" }),
+            expected_feature_abi,
+        )
+    else
+        null;
+
     return .{
         .engine = engine,
         .adapter = adapter,
@@ -4640,6 +4786,7 @@ fn buildRuntime(
         .zig = zig_install,
         .build_tools = build_tools,
         .build_root_digest = build_snapshot.digest,
+        .aot_cache = aot_bundle,
         .cache_lock = lock_file,
     };
 }
@@ -5224,6 +5371,135 @@ fn resolveTools(
         "wabt",
     )).snapshot;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
+    const weval = if (!config.aot)
+        null
+    else if (config.weval_bin) |path|
+        try resolveExecutable(allocator, io, environ, cwd, path)
+    else if (environ.get("WEVAL_BIN")) |path|
+        try resolveExecutable(allocator, io, environ, cwd, path)
+    else blk: {
+        const sibling = try std.fs.path.join(allocator, &.{ executable_dir, "weval" });
+        if (pathExists(io, sibling)) break :blk sibling;
+        break :blk try resolveExecutable(allocator, io, environ, cwd, "weval");
+    };
+    return .{
+        .wizer = wizer,
+        .weval = weval,
+        .wabt = wabt,
+        .wasm_tools = wasm_tools,
+    };
+}
+
+fn resolveAotBundle(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    override: ?[]const u8,
+    default_dir: []const u8,
+    expected_feature_abi: ?[]const u8,
+) !AotCache {
+    const root = if (override) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        default_dir;
+    const stat = Dir.cwd().statFile(io, root, .{}) catch null;
+    const cache = if (stat != null and stat.?.kind == .file)
+        root
+    else
+        try std.fs.path.join(allocator, &.{ root, aot_cache.cache_basename });
+    const manifest = if (stat != null and stat.?.kind == .file)
+        try std.fmt.allocPrint(allocator, "{s}.manifest", .{root})
+    else
+        try std.fs.path.join(allocator, &.{ root, aot_cache.manifest_basename });
+    return .{
+        .cache = cache,
+        .manifest = manifest,
+        .expected_feature_abi = expected_feature_abi,
+    };
+}
+
+fn validateAotCache(
+    allocator: Allocator,
+    io: Io,
+    engine: []const u8,
+    weval: []const u8,
+    bundle: AotCache,
+) !void {
+    _ = try aot_cache.validate(
+        allocator,
+        io,
+        engine,
+        weval,
+        bundle.cache,
+        bundle.manifest,
+        bundle.expected_feature_abi,
+    );
+}
+
+fn resolvedFeatureAbi(
+    allocator: Allocator,
+    config: *const cli.Config,
+) ![]const u8 {
+    var stdio = true;
+    var random = true;
+    var clocks = true;
+    var http = true;
+    var fetch_event = true;
+    for (config.disable_features) |feature| {
+        if (std.mem.eql(u8, feature, "stdio")) stdio = false;
+        if (std.mem.eql(u8, feature, "random")) random = false;
+        if (std.mem.eql(u8, feature, "clocks")) clocks = false;
+        if (std.mem.eql(u8, feature, "http")) http = false;
+        if (std.mem.eql(u8, feature, "fetch-event")) fetch_event = false;
+    }
+    for (config.enable_features) |feature| {
+        if (std.mem.eql(u8, feature, "stdio")) stdio = true;
+        if (std.mem.eql(u8, feature, "random")) random = true;
+        if (std.mem.eql(u8, feature, "clocks")) clocks = true;
+        if (std.mem.eql(u8, feature, "http")) http = true;
+        if (std.mem.eql(u8, feature, "fetch-event")) fetch_event = true;
+    }
+    return aot_cache.featureAbi(
+        allocator,
+        stdio,
+        random,
+        clocks,
+        http,
+        fetch_event,
+        if (config.use_debug_build) "Debug" else "ReleaseSmall",
+        "wasi-0.2.10",
+        true,
+    );
+}
+
+fn resolveExecutable(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    if (std.fs.path.isAbsolute(name) or
+        std.mem.indexOfScalar(u8, name, std.fs.path.sep) != null)
+    {
+        const path = try absolutePath(allocator, cwd, name);
+        try requireFile(io, path);
+        return Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    const path_value = environ.get("PATH") orelse return error.MissingBuildArtifact;
+    var entries = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (entries.next()) |entry| {
+        const directory = if (entry.len == 0) cwd else entry;
+        const candidate = try std.fs.path.join(allocator, &.{ directory, name });
+        const absolute = if (std.fs.path.isAbsolute(candidate))
+            candidate
+        else
+            try absolutePath(allocator, cwd, candidate);
+        const stat = Dir.cwd().statFile(io, absolute, .{}) catch continue;
+        if (stat.kind != .file) continue;
+        return Dir.realPathFileAbsoluteAlloc(io, absolute, allocator);
+    }
+    return error.MissingBuildArtifact;
 }
 
 fn discoverBuildRoot(
@@ -5516,10 +5792,13 @@ fn runtimeKey(
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashField(&hasher, "schema", "3");
+    hashField(&hasher, "schema", "2");
     hashField(&hasher, "version", build_options.version);
     hashField(&hasher, "host-api", build_options.host_api);
     hashField(&hasher, "host-api-world", host_api_world);
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
+    hashField(&hasher, "pipeline", if (config.aot) "weval-aot" else "wizer");
+    if (config.aot) hashField(&hasher, "aot-engine-abi", aot_cache.engine_abi);
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
     hashField(&hasher, "preview1-adapter", adapter_digest);
@@ -5533,8 +5812,9 @@ fn runtimeKey(
     hashField(&hasher, "zig-lib", zig.lib_digest);
     hashField(&hasher, "dispatch-world", config.world_name orelse "");
     hashField(&hasher, "component-world", config.component_world_name orelse config.world_name orelse "");
-    for (config.disable_features) |feature| hashField(&hasher, "disable", feature);
-    for (config.enable_features) |feature| hashField(&hasher, "enable", feature);
+    const feature_abi = try resolvedFeatureAbi(allocator, config);
+    defer allocator.free(feature_abi);
+    hashField(&hasher, "feature-abi", feature_abi);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const encoded = std.fmt.bytesToHex(digest, .lower);
@@ -11320,4 +11600,21 @@ test "engine provenance requires a complete feature and topology tuple" {
                 "surface-world=caller\n",
         ),
     );
+test "runtime cache key separates AOT and canonicalizes feature order" {
+    var config = cli.Config{
+        .source = "source.js",
+        .world_name = "world",
+        .disable_features = &.{ "http", "random" },
+    };
+    const wizer = try runtimeKey(std.testing.allocator, &config, "a", "b");
+    defer std.testing.allocator.free(wizer);
+    config.aot = true;
+    const aot = try runtimeKey(std.testing.allocator, &config, "a", "b");
+    defer std.testing.allocator.free(aot);
+    try std.testing.expect(!std.mem.eql(u8, wizer, aot));
+
+    config.disable_features = &.{ "random", "http" };
+    const reordered = try runtimeKey(std.testing.allocator, &config, "a", "b");
+    defer std.testing.allocator.free(reordered);
+    try std.testing.expectEqualStrings(aot, reordered);
 }

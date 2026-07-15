@@ -72,7 +72,7 @@ int clock_gettime(clockid_t clock, timespec * ts) {
   return 0;
 }
 
-void wizen() {
+void wizen_impl(bool skip_export_validation) {
   std::string args;
   std::getline(std::cin, args);
   auto config_parser = starling::ConfigParser();
@@ -80,7 +80,7 @@ void wizen() {
   auto config = config_parser.take();
   config->pre_initialize = true;
   ENGINE = new api::Engine(std::move(config));
-  if (!starling_validate_required_exports()) {
+  if (!skip_export_validation && !starling_validate_required_exports()) {
     ENGINE->abort("validating required JavaScript exports");
   }
   ENGINE->finish_pre_initialization();
@@ -91,6 +91,13 @@ void wizen() {
   MOZ_RELEASE_ASSERT(!__wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &t));
   mono_clock_offset = std::max(mono_clock_offset, t);
   __wasilibc_deinitialize_environ();
+}
+
+void wizen() { wizen_impl(false); }
+
+extern "C" __attribute__((export_name("starling-aot-cache-initialize"))) void
+starling_aot_cache_initialize() {
+  wizen_impl(true);
 }
 
 WIZER_INIT(wizen);

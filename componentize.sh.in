@@ -19,7 +19,30 @@ surface_target_world="@SURFACE_TARGET_WORLD@"
 surface_target_wit="$script_dir/surface-wit"
 feature_tuple="@FEATURE_STDIO@,@FEATURE_RANDOM@,@FEATURE_CLOCKS@,@FEATURE_HTTP@,@FEATURE_FETCH_EVENT@"
 aot=@AOT@
+aot_driver="@AOT_DRIVER@"
 preopen_dir="${PREOPEN_DIR:-}"
+
+if [[ $aot -ne 0 && "$aot_driver" == native ]]; then
+  aot_args=(
+    --aot
+    --engine "$(dirname "$0")/starling-raw.wasm"
+    --aot-cache-dir "${WEVAL_CACHE_DIR:-$(dirname "$0")}"
+    --weval-bin "$weval"
+    --preview2-adapter "$(dirname "$0")/preview1-adapter.wasm"
+    --wabt-bin "$wabt"
+    --wasm-tools-bin "$wasm_tools"
+  )
+  if [[ -n "$component_world" ]]; then
+    aot_args+=(
+      --wit "$component_wit"
+      --world-name "$component_world"
+    )
+  fi
+  if [[ -n "${AOT_MIN_STACK_SIZE:-}" ]]; then
+    aot_args+=(--aot-min-stack-size "$AOT_MIN_STACK_SIZE")
+  fi
+  exec "$(dirname "$0")/starling-componentize" "${aot_args[@]}" "$@"
+fi
 
 usage() {
   echo "Usage: $(basename "$0")  [--verbose] [-i,--initializer-script-path path] [--strip-path-prefix prefix] [--js-heap-limit-mib MiB] [--legacy-script] [input.js] [-o output.wasm]"

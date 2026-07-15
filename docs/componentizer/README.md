@@ -10,6 +10,9 @@ command string):
 1. Select and cache a WIT-specific `zig build` of `starling-raw.wasm`.
 2. Pre-initialize the JavaScript module with Wizer.
 3. Strip and embed the selected component world with `wasm-tools`.
+2. Pre-initialize the JavaScript module with Wizer, or partially evaluate it
+   with the explicitly selected Weval AOT pipeline.
+3. Strip and embed the selected component world with WABT.
 4. Adapt the reactor into a component.
 5. Generate and compose feature-surface providers with pinned WABT so
    disabled/runtime-only
@@ -73,6 +76,83 @@ resource identities across WASI releases.
 The componentizer test target is the required gate: it runs unit and fake-tool
 coverage plus real `wasm-tools`/Wizer relinks for two distinct WIT worlds.
 
+## Weval AOT engine and cache
+
+The AOT engine is a separate SpiderMonkey build. It enables forced portable
+baseline interpretation, AOT inline caches, and PBL/Weval integration; a
+normal `deps/sm-obj-zig` archive is never relabeled as AOT. Build dependencies
+and a directly packaged AOT engine with:
+
+```console
+./deps/build-deps.sh --aot
+zig build -Doptimize=ReleaseSmall -Daot-engine=true
+```
+
+`--all` builds both standard and AOT SpiderMonkey variants. An AOT Zig build
+defaults `-Dwasm-opt` to false, matching the upstream Weval build; explicitly
+enabling wasm-opt or selecting a Debug build is rejected. It installs:
+
+- `starling-raw.wasm`, linked against `deps/sm-obj-zig-aot`;
+- `starling-ics.wevalcache`, primed by pinned Weval 0.4.1;
+- `starling-ics.wevalcache.manifest`, the integrity and compatibility seal;
+- `starling-componentize`, `starling-aot-cache`, and the pinned tools.
+
+For a per-WIT production build, select AOT explicitly:
+
+```console
+zig-out/bin/starling-componentize \
+  --aot \
+  --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
+  --world-name js-exports \
+  --component-wit host-apis/wasi-0.2.10/wit \
+  --component-world-name js-dispatch \
+  --out app.wasm \
+  app.js
+```
+
+The componentizer uses a distinct runtime-cache key for Wizer and AOT and
+passes `-Daot-engine=true` to the nested Zig build. The generated cache seal
+keys the cache schema, explicit AOT engine ABI, exact engine and Weval binary
+SHA-256 digests, resolved feature/build/host ABI, dedicated cache-initializer
+ABI, and cache-primer digest. A separate cache SHA-256 protects the SQLite
+bytes. WIT closures, generated
+bindings, host APIs, source/toolchain changes, and linked libraries are bound
+by the engine digest; WIT/world and feature selections also remain in the
+outer runtime key. Sealing and validation additionally require the cache
+database to contain the exact engine digest as a Weval module key, so an
+unrelated but otherwise valid SQLite cache cannot be relabeled for an engine.
+
+`--aot-cache-dir` selects a read-only cache bundle containing the two
+`starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
+with the manifest at `<path>.manifest`, for compatibility with callers that
+treat ComponentizeJS's `--aot-cache-dir` as a file option. `--engine --aot`
+defaults to a bundle beside the engine. `--weval-bin` must identify the exact
+binary in the seal. Missing artifacts, malformed manifests, non-SQLite or
+checksum-corrupt caches, and engine/tool/feature mismatches all fail before
+initialization or output publication; there is no Wizer fallback.
+
+`--aot-min-stack-size` sets Weval's `RUST_MIN_STACK`. The deterministic
+default is 8 MiB, and ambient `RUST_MIN_STACK` and `STARLINGMONKEY_CONFIG`
+are removed so every snapshot-affecting input is explicit. All subprocess
+arguments are structured, including cache, source, output, and preopen paths
+containing spaces.
+
+An AOT `componentize.sh` installation delegates to the same native driver.
+`WEVAL_CACHE_DIR` and `AOT_MIN_STACK_SIZE` provide shell-entry-point
+equivalents for the two controls.
+
+Run the focused cache and equivalence coverage with:
+
+```console
+zig build componentizer-test -Doptimize=ReleaseSmall
+zig build aot-engine-test -Doptimize=ReleaseSmall
+```
+
+The first includes fake-tool positive and missing/stale/corrupt cache cases.
+The second builds both real engine variants, validates both components, and
+invokes the same typed JavaScript exports through Wasmtime to prove Wizer/AOT
+behavioral equivalence. Its fixtures and cache/output paths include spaces.
+
 ## Per-run WIT worlds
 
 The monolithic runtime needs two related WIT views:
@@ -106,6 +186,8 @@ are keyed by the componentizer's embedded host API, the two WIT closures,
 worlds, feature selection, and build mode. Every nested build receives that
 exact `-Dhost-api`; an installed componentizer cannot silently fall back to a
 different adapter/provider identity.
+are keyed by the pipeline/engine ABI, two WIT closures, worlds, resolved
+feature ABI, and build mode.
 The CLI still invokes `zig build` on every run so source/toolchain changes
 cannot reuse stale output; Zig's own dependency cache makes an unchanged
 monolithic relink a fast cache hit. JavaScript source is deliberately excluded
@@ -124,6 +206,9 @@ root or descendant replacement cannot redirect writes or reads into a
 replacement. Only the exact effective-cache
 directory identity is excluded if it is nested inside a snapshotted source
 tree.
+An explicit `ZIG_GLOBAL_CACHE_DIR` is preserved for nested builds; otherwise
+the CLI uses `<cache-dir>/zig-global-cache`. `ZIG_LOCAL_CACHE_DIR` is always
+removed.
 
 `--engine` accepts only a `starling-raw.wasm` carrying StarlingMonkey's
 integrity-bound embedded engine provenance and a matching sibling
@@ -356,6 +441,5 @@ retained as the rollback anchor while unrelated entries are identity-checked
 and copied into the staged merge. The complete merged directory is published
 only after validation, with rollback on any publication failure.
 
-The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
-them explicitly. Weval execution and cache controls belong to the separate
-`aot-engine` milestone; silently falling back to Wizer would be incorrect.
+The AOT option names match the frozen ComponentizeJS 0.21 CLI surface, while
+cache sealing and deterministic failure behavior are stricter.

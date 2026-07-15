@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // pipeline. It is a host tool even though the runtime it builds targets
     // wasm32-wasi.
     const componentizer_options = b.addOptions();
-    componentizer_options.addOption([]const u8, "version", "0.3.0");
+    componentizer_options.addOption([]const u8, "version", "0.4.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     componentizer_options.addOption([]const u8, "host_api", host_api_selection);
     componentizer_options.addOption([]const u8, "host_api_world", host_api_world);
@@ -212,6 +212,15 @@ pub fn build(b: *std.Build) void {
         .root_module = feature_surface_mod,
     });
     b.installArtifact(feature_surface);
+    const aot_cache_tool = b.addExecutable(.{
+        .name = "starling-aot-cache",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/componentizer/aot_cache_seal.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(aot_cache_tool);
     const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
     const install_wabt = b.addInstallArtifact(wabt, .{});
     b.getInstallStep().dependOn(&install_wabt.step);
@@ -257,6 +266,7 @@ pub fn build(b: *std.Build) void {
     );
     componentizer_orchestration.addArtifactArg(componentizer);
     componentizer_orchestration.addArg(host_api_selection);
+    componentizer_orchestration.addArtifactArg(aot_cache_tool);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
@@ -289,6 +299,29 @@ pub fn build(b: *std.Build) void {
     componentizer_e2e.addArg(host_api_identity);
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
+    const aot_engine_test_step = b.step(
+        "aot-engine-test",
+        "Build Wizer/AOT variants and prove component behavior is equivalent",
+    );
+    const aot_engine_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot.sh" },
+    );
+    aot_engine_test.addArtifactArg(componentizer);
+    aot_engine_test.addArg(b.graph.zig_exe);
+    if (b.lazyDependency("wasmtime", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("wasmtime"));
+    }
+    if (b.lazyDependency("wasm-tools", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("wasm-tools"));
+    }
+    aot_engine_test.addArtifactArg(wabt);
+    aot_engine_test.addFileArg(
+        b.path("host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+    );
+    if (b.lazyDependency("weval", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("weval"));
+    }
+    aot_engine_test_step.dependOn(&aot_engine_test.step);
 
     // StarlingMonkey only targets wasm32-wasi (reactor).
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
@@ -296,6 +329,17 @@ pub fn build(b: *std.Build) void {
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
     const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
     const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
+    const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
+    const aot_engine = b.option(
+        bool,
+        "aot-engine",
+        "Build the PBL+Weval SpiderMonkey variant and its sealed IC cache",
+    ) orelse false;
+    const requested_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds");
+    const use_wasm_opt = requested_wasm_opt orelse !aot_engine;
+    if (aot_engine and use_wasm_opt) {
+        @panic("-Daot-engine requires -Dwasm-opt=false (the default for AOT builds)");
+    }
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
     const component_world = b.option([]const u8, "component-world", "World to generate JavaScript-backed exports for");
     if ((component_wit == null) != (component_world == null)) {
@@ -324,10 +368,30 @@ pub fn build(b: *std.Build) void {
         .fetch_event = b.option(bool, "feature-fetch-event", "Enable the incoming FetchEvent/http-incoming-handler surface (addEventListener('fetch', ...)); default true") orelse true,
     };
     const features = resolveFeatures(b, feature_defaults);
+    const feature_abi = b.fmt(
+        "starling-features-v1;stdio={d};random={d};clocks={d};http={d};" ++
+            "fetch-event={d};optimize={s};host-api={s};debugger={d}",
+        .{
+            @intFromBool(features.stdio),
+            @intFromBool(features.random),
+            @intFromBool(features.clocks),
+            @intFromBool(features.http),
+            @intFromBool(features.fetch_event),
+            @tagName(optimize),
+            host_api_name,
+            @intFromBool(enable_debugger),
+        },
+    );
 
     // SpiderMonkey artifacts built from source with Zig (see deps/mozconfig-zig).
-    const sm_dist = b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
-    const sm_confdefs = b.option([]const u8, "spidermonkey-confdefs", "Path to js-confdefs.h") orelse "deps/sm-obj-zig/js/src/js-confdefs.h";
+    const sm_dist = if (aot_engine)
+        b.option([]const u8, "spidermonkey-aot-dist", "Path to an explicitly AOT-enabled Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig-aot/dist"
+    else
+        b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
+    const sm_confdefs = if (aot_engine)
+        b.option([]const u8, "spidermonkey-aot-confdefs", "Path to the explicitly AOT-enabled js-confdefs.h") orelse "deps/sm-obj-zig-aot/js/src/js-confdefs.h"
+    else
+        b.option([]const u8, "spidermonkey-confdefs", "Path to js-confdefs.h") orelse "deps/sm-obj-zig/js/src/js-confdefs.h";
     const sm_include = b.pathJoin(&.{ sm_dist, "include" });
     const sm_lib = b.pathJoin(&.{ sm_dist, "libspidermonkey.a" });
 
@@ -636,6 +700,61 @@ pub fn build(b: *std.Build) void {
             "runtime-build-tools.json",
         ).step,
     );
+    if (aot_engine) {
+        if (is_debug) @panic("-Daot-engine does not support Debug builds");
+        const weval_dep = b.lazyDependency("weval", .{}) orelse
+            @panic("the pinned Weval artifact is required for -Daot-engine");
+        const prime_cache = std.Build.Step.Run.create(b, "prime Weval IC cache");
+        prime_cache.addFileArg(weval_dep.path("weval"));
+        prime_cache.addArgs(&.{
+            "weval",
+            "-w",
+            "--init-func",
+            "starling-aot-cache-initialize",
+            "--dir",
+            ".",
+            "--cache",
+        });
+        const cache = prime_cache.addOutputFileArg("starling-ics.wevalcache");
+        prime_cache.addArg("-i");
+        prime_cache.addFileArg(raw_wasm);
+        prime_cache.addArg("-o");
+        _ = prime_cache.addOutputFileArg("primed-starling-raw.wasm");
+        prime_cache.setCwd(b.path("."));
+        prime_cache.setStdIn(.{ .bytes = "tools/componentizer/aot-cache-primer.js\n" });
+        prime_cache.removeEnvironmentVariable("STARLINGMONKEY_CONFIG");
+        prime_cache.removeEnvironmentVariable("ENABLE_PBL");
+        prime_cache.setEnvironmentVariable("RUST_MIN_STACK", "8388608");
+        prime_cache.setEnvironmentVariable("WASMTIME_BACKTRACE_DETAILS", "1");
+
+        const seal_cache = b.addRunArtifact(aot_cache_tool);
+        seal_cache.addArg("seal");
+        seal_cache.addArg("--engine");
+        seal_cache.addFileArg(raw_wasm);
+        seal_cache.addArg("--weval");
+        seal_cache.addFileArg(weval_dep.path("weval"));
+        seal_cache.addArg("--cache");
+        seal_cache.addFileArg(cache);
+        seal_cache.addArg("--primer");
+        seal_cache.addFileArg(b.path("tools/componentizer/aot-cache-primer.js"));
+        seal_cache.addArgs(&.{ "--feature-abi", feature_abi, "--out" });
+        const manifest = seal_cache.addOutputFileArg("starling-ics.wevalcache.manifest");
+
+        const install_cache = b.addInstallBinFile(cache, "starling-ics.wevalcache");
+        const install_manifest = b.addInstallBinFile(
+            manifest,
+            "starling-ics.wevalcache.manifest",
+        );
+        b.getInstallStep().dependOn(&install_cache.step);
+        b.getInstallStep().dependOn(&install_manifest.step);
+        const aot_step = b.step(
+            "aot-engine",
+            "Build and install the AOT engine with its sealed Weval cache",
+        );
+        aot_step.dependOn(&install_raw.step);
+        aot_step.dependOn(&install_cache.step);
+        aot_step.dependOn(&install_manifest.step);
+    }
 
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
     // Install the preview1 adapter and a generated componentize.sh next to
@@ -685,6 +804,7 @@ pub fn build(b: *std.Build) void {
         dispatch_world orelse "caller",
         features,
     );
+    const componentize_sh = renderComponentizeScript(b, component_world, aot_engine);
     const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
     b.getInstallStep().dependOn(&inst_componentize.step);
     // Installed generated files aren't executable; componentize.sh is invoked
@@ -1129,6 +1249,7 @@ fn renderComponentizeScript(
     component_world: ?[]const u8,
     surface_target_world: []const u8,
     features: Features,
+    aot_engine: bool,
 ) std.Build.LazyPath {
     const template = @embedFile("componentize.sh.in");
     var buf = std.ArrayList(u8).empty;
@@ -1137,6 +1258,11 @@ fn renderComponentizeScript(
     const subs = [_]struct { from: []const u8, to: []const u8 }{
         .{ .from = "@AOT@", .to = "0" },
         .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
+        .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
+        .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
+        .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
+        .{ .from = "@AOT@", .to = if (aot_engine) "1" else "0" },
+        .{ .from = "@AOT_DRIVER@", .to = "native" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
         .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },
         .{ .from = "@FEATURE_STDIO@", .to = if (features.stdio) "1" else "0" },

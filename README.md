@@ -106,6 +106,24 @@ zig-out/bin/componentize.sh path/to/index.js -o index.wasm
 zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 ```
 
+Weval AOT uses a distinct SpiderMonkey build and a sealed, engine-specific IC
+cache. Build that variant and select it explicitly:
+
+```console
+./deps/build-deps.sh --aot
+zig build -Doptimize=ReleaseSmall -Daot-engine=true
+zig-out/bin/starling-componentize --aot \
+  --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
+  --world-name js-exports \
+  --component-wit host-apis/wasi-0.2.10/wit \
+  --component-world-name js-dispatch \
+  --out app.wasm app.js
+```
+
+See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT
+cache controls, integrity/ABI keys, custom-engine packaging, deterministic
+failure behavior, and the Wizer/AOT equivalence test.
+
 The Zig build also installs `starling-componentize`, a host-native, Node-free
 CLI that drives the monolithic Zig/Wizer/WABT pipeline without shell command
 construction. It supports per-run WIT/world selection, content-addressed

@@ -3,11 +3,13 @@ set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 <starling-componentize> <host-api>" >&2
+  echo "usage: $0 <starling-componentize> <starling-aot-cache>" >&2
   exit 2
 fi
 
 COMPONENTIZER="$(realpath "$1")"
 EXPECTED_HOST_API="$2"
+CACHE_TOOL="$(realpath "$2")"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 BARRIERS="$SCRATCH/test barriers"
@@ -242,6 +244,35 @@ for ((i = 1; i <= $#; i++)); do
   fi
 done
 input="${!#}"
+cp "$input" "$out"
+EOF
+
+cat > "$TOOLS/fake weval" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test -z "${STARLINGMONKEY_CONFIG+x}"
+test "${RUST_MIN_STACK:-}" = "${EXPECTED_RUST_MIN_STACK:-8388608}"
+test "$1" = "weval"
+printf '%s\n' "$*" | grep -q -- '--cache-ro'
+if printf '%s\n' "$*" | grep -Eq -- '(^| )--cache( |$)'; then
+  echo "AOT componentization attempted to mutate its read-only cache" >&2
+  exit 26
+fi
+cat > "$FAKE_AOT_RUNTIME_ARGS_LOG"
+out=""
+input=""
+for ((i = 1; i <= $#; i++)); do
+  case "${!i}" in
+    -o)
+      j=$((i + 1))
+      out="${!j}"
+      ;;
+    -i)
+      j=$((i + 1))
+      input="${!j}"
+      ;;
+  esac
+done
 cp "$input" "$out"
 EOF
 
@@ -612,6 +643,7 @@ chmod +x "$TOOLS"/*
 
 export FAKE_RUNTIME_ARGS_LOG="$SCRATCH/runtime args.log"
 export FAKE_WIZER_ARGS_LOG="$SCRATCH/wizer args.log"
+export FAKE_AOT_RUNTIME_ARGS_LOG="$SCRATCH/aot runtime args.log"
 export FAKE_ENGINE="$ENGINE"
 export FAKE_ADAPTER="$ADAPTER"
 export FAKE_ZIG_PREFIX_LOG="$SCRATCH/zig prefixes.log"
@@ -634,6 +666,7 @@ pub const js_import_manifest: []const u8 =
     "root-log\tdefault\t$root#root-log\t1\n" ++
     "";
 EOF
+EXPECTED_ZIG_GLOBAL_CACHE="${ZIG_GLOBAL_CACHE_DIR:-}"
 
 OUTPUT="$WORK/output component.wasm"
 DEBUG_DIR="$WORK/debug output"
@@ -1319,6 +1352,108 @@ fi
 assert_json_diagnostic "$WORK/missing WIT.jsonl" SMC4201 adapt \
   MissingGeneratedWitRoot "generated WIT has no root package"
 test ! -e "$WORK/missing generated WIT.wasm"
+
+AOT_BUNDLE="$WORK/aot cache bundle"
+AOT_OUTPUT="$WORK/aot output component.wasm"
+mkdir -p "$AOT_BUNDLE"
+python3 - "$AOT_BUNDLE/starling-ics.wevalcache" "$ENGINE" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+db.execute("create table weval_cache(module_hash blob, key blob, result blob, created_time integer)")
+with open(sys.argv[2], "rb") as engine:
+    engine_hash = hashlib.sha256(engine.read()).digest()
+db.execute("insert into weval_cache values (?, ?, ?, 0)", (engine_hash, b"key", b"result"))
+db.commit()
+db.close()
+PY
+"$CACHE_TOOL" seal \
+  --engine "$ENGINE" \
+  --weval "$TOOLS/fake weval" \
+  --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
+  --primer "$SOURCE" \
+  --feature-abi 'starling-features-v1;fake=1' \
+  --out "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+export EXPECTED_RUST_MIN_STACK=123456
+RUST_MIN_STACK=999 "$COMPONENTIZER" \
+  --aot \
+  --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE" \
+  --aot-min-stack-size "$EXPECTED_RUST_MIN_STACK" \
+  --weval-bin "$TOOLS/fake weval" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$AOT_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$AOT_OUTPUT"
+grep -Fq -- "\"$SOURCE\"" "$FAKE_AOT_RUNTIME_ARGS_LOG"
+
+DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
+export EXPECTED_RUST_MIN_STACK=8388608
+"$COMPONENTIZER" \
+  --aot \
+  --engine "$ENGINE" \
+  --aot-cache-dir "$AOT_BUNDLE/starling-ics.wevalcache" \
+  --weval-bin "$TOOLS/fake weval" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$DIRECT_CACHE_OUTPUT" \
+  "$SOURCE"
+cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
+
+expect_aot_cache_failure() {
+  local bundle="$1" engine="$2" weval="$3" label="$4"
+  local failure_output="$WORK/$label output.wasm"
+  printf 'preserved\n' > "$failure_output"
+  if "$COMPONENTIZER" \
+    --aot \
+    --engine "$engine" \
+    --aot-cache-dir "$bundle" \
+    --weval-bin "$weval" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$failure_output" \
+    "$SOURCE"
+  then
+    echo "FAIL: $label AOT cache unexpectedly succeeded" >&2
+    exit 1
+  fi
+  test "$(cat "$failure_output")" = "preserved"
+}
+
+expect_aot_cache_failure "$WORK/missing bundle" "$ENGINE" "$TOOLS/fake weval" missing
+
+STALE_ENGINE="$WORK/stale engine.wasm"
+cp "$ENGINE" "$STALE_ENGINE"
+printf 'stale\n' >> "$STALE_ENGINE"
+expect_aot_cache_failure "$AOT_BUNDLE" "$STALE_ENGINE" "$TOOLS/fake weval" stale
+
+CORRUPT_BUNDLE="$WORK/corrupt cache bundle"
+cp -R "$AOT_BUNDLE" "$CORRUPT_BUNDLE"
+printf 'corrupt\n' >> "$CORRUPT_BUNDLE/starling-ics.wevalcache"
+expect_aot_cache_failure "$CORRUPT_BUNDLE" "$ENGINE" "$TOOLS/fake weval" corrupt
+
+STALE_WEVAL="$TOOLS/stale weval"
+cp "$TOOLS/fake weval" "$STALE_WEVAL"
+printf '# stale tool\n' >> "$STALE_WEVAL"
+expect_aot_cache_failure "$AOT_BUNDLE" "$ENGINE" "$STALE_WEVAL" stale-tool
+
+INVALID_BUNDLE="$WORK/invalid manifest bundle"
+cp -R "$AOT_BUNDLE" "$INVALID_BUNDLE"
+printf 'not-a-manifest\n' > "$INVALID_BUNDLE/starling-ics.wevalcache.manifest"
+expect_aot_cache_failure "$INVALID_BUNDLE" "$ENGINE" "$TOOLS/fake weval" invalid-manifest
+unset EXPECTED_RUST_MIN_STACK
 
 SOURCE_ALIAS_DIR="$SCRATCH/real sources"
 SOURCE_ALIAS="$WORK/source alias.js"
@@ -4353,6 +4488,13 @@ while IFS='|' read -r local_cache global_cache zig_lib; do
       exit 1
       ;;
   esac
+while IFS='|' read -r local_cache global_cache; do
+  test "$local_cache" = "unset"
+  if [ -n "$EXPECTED_ZIG_GLOBAL_CACHE" ]; then
+    test "$global_cache" = "$EXPECTED_ZIG_GLOBAL_CACHE"
+  else
+    test "$global_cache" = "$CACHE/zig-global-cache"
+  fi
 done < "$FAKE_ZIG_ENV_LOG"
 host_api_arg_count="$(
   grep -c -- "-Dhost-api=$EXPECTED_HOST_API" "$FAKE_ZIG_ARGS_LOG"
