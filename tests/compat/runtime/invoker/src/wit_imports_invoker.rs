@@ -385,12 +385,62 @@ fn take_s32(mut results: Vec<Val>, operation: &str) -> Result<i32> {
     }
 }
 
+fn take_record_resource(
+    mut results: Vec<Val>,
+    operation: &str,
+) -> Result<wasmtime::component::ResourceAny> {
+    if results.len() != 1 {
+        anyhow::bail!(
+            "{operation} returned {} values, expected one",
+            results.len()
+        );
+    }
+    let Val::Record(mut fields) = results.remove(0) else {
+        anyhow::bail!("{operation} did not return a record");
+    };
+    if fields.len() != 1 || fields[0].0 != "value" {
+        anyhow::bail!("{operation} returned unexpected fields {fields:?}");
+    }
+    match fields.remove(0).1 {
+        Val::Resource(resource) if resource.owned() => Ok(resource),
+        other => anyhow::bail!("{operation}.value returned {other:?}, expected an owned resource"),
+    }
+}
+
+fn exported_resource_root_count(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<Host>,
+    component: &Component,
+    engine: &Engine,
+) -> Result<u32> {
+    let func = resolve_func(
+        instance,
+        store,
+        component,
+        engine,
+        None,
+        "starling-js-exported-resource-count",
+    )?;
+    let mut results = [Val::Bool(false)];
+    func.call(&mut *store, &[], &mut results)
+        .map_err(anyhow::Error::from)
+        .context("calling exported resource root count")?;
+    match &results[0] {
+        Val::U32(value) => Ok(*value),
+        other => anyhow::bail!("resource root count returned {other:?}, expected u32"),
+    }
+}
+
 fn check_exported_resources(
     instance: &wasmtime::component::Instance,
     store: &mut Store<Host>,
     component: &Component,
     engine: &Engine,
 ) -> Result<serde_json::Value> {
+    let roots_before = exported_resource_root_count(instance, store, component, engine)?;
+    if roots_before != 0 {
+        anyhow::bail!("fresh instance started with {roots_before} exported resource roots");
+    }
     let counter = take_owned_resource(
         call_resource_operation(
             instance,
@@ -428,6 +478,78 @@ fn check_exported_resources(
         .resource_drop(&mut *store)
         .map_err(anyhow::Error::from)
         .context("dropping alternate-counter")?;
+    let rejected = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[constructor]js-counter",
+            &[Val::S32(99)],
+        )?,
+        "rejected js-counter constructor",
+    )?;
+    let rejection = call_resource_operation(
+        instance,
+        store,
+        component,
+        engine,
+        "reject-after-take",
+        &[Val::Resource(rejected)],
+    )?;
+    match rejection.as_slice() {
+        [Val::Result(Err(Some(reason)))]
+            if matches!(reason.as_ref(), Val::String(message) if message == "rejected after take") =>
+        {}
+        other => anyhow::bail!("reject-after-take returned {other:?}, expected err(string)"),
+    }
+    let roots_after_rejection =
+        exported_resource_root_count(instance, store, component, engine)?;
+    if roots_after_rejection != 1 {
+        anyhow::bail!(
+            "throwing owned transfer left {roots_after_rejection} roots, expected the live counter only"
+        );
+    }
+    let boxed = take_owned_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[constructor]js-counter",
+            &[Val::S32(33)],
+        )?,
+        "boxed js-counter constructor",
+    )?;
+    let boxed_replacement = take_record_resource(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "round-trip-js-counter-box",
+            &[Val::Record(vec![(
+                "value".to_string(),
+                Val::Resource(boxed),
+            )])],
+        )?,
+        "round-trip-js-counter-box",
+    )?;
+    let boxed_value = take_s32(
+        call_resource_operation(
+            instance,
+            store,
+            component,
+            engine,
+            "[method]js-counter.value",
+            &[Val::Resource(boxed_replacement)],
+        )?,
+        "boxed js-counter.value",
+    )?;
+    boxed_replacement
+        .resource_drop(&mut *store)
+        .map_err(anyhow::Error::from)
+        .context("dropping boxed js-counter")?;
     call_resource_operation(
         instance,
         store,
@@ -508,6 +630,10 @@ fn check_exported_resources(
         .resource_drop(&mut *store)
         .map_err(anyhow::Error::from)
         .context("dropping round-tripped js-counter")?;
+    let roots_after = exported_resource_root_count(instance, store, component, engine)?;
+    if roots_after != 0 {
+        anyhow::bail!("exported resource lifecycle leaked {roots_after} roots");
+    }
     if call_resource_operation(
         instance,
         store,
@@ -527,6 +653,10 @@ fn check_exported_resources(
         "consumed": consumed_value,
         "roundTrip": replacement_value,
         "alternate": alternate_value,
+        "boxed": boxed_value,
+        "rootsBefore": roots_before,
+        "rootsAfterRejection": roots_after_rejection,
+        "rootsAfter": roots_after,
     }))
 }
 

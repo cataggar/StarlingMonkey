@@ -382,6 +382,10 @@ export const api = {
   "borrow-js-counter": (value) => value.value(),
   "take-js-counter": (value) => value.value(),
   "round-trip-js-counter": (value) => value,
+  "round-trip-js-counter-box": (value) => value,
+  "reject-after-take": () => {
+    throw "rejected after take";
+  },
   "run-add": runAdd,
   "run-sum-list": runSumList,
   "run-greet": runGreet,

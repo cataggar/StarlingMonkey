@@ -1862,6 +1862,10 @@ extern "C" __attribute__((weak)) uint32_t starling_js_resource_drop(
 
 namespace starling {
 
+size_t exported_resource_count() {
+  return exported_resource_entries.size();
+}
+
 bool drain_resource_drops(api::Engine *engine) {
   auto &registry = engine->resource_registry();
   while (auto request = registry.take_queued_drop()) {

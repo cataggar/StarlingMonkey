@@ -110,6 +110,12 @@ bool starling_js_shutdown_resources() {
   return ENGINE && starling::shutdown_resources(ENGINE);
 }
 
+extern "C" STARLING_ENGINE_EXPORT
+    __attribute__((export_name("starling-js-exported-resource-count")))
+uint32_t starling_js_exported_resource_count() {
+  return static_cast<uint32_t>(starling::exported_resource_count());
+}
+
 /**
  * Initialize the runtime with the configuration provided via an environment variable.
  *

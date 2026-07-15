@@ -221,9 +221,16 @@ interface api {
         value: func() -> s32;
     }
 
+    type js-counter-alias = js-counter;
+    record owned-js-counter-box {
+        value: js-counter-alias,
+    }
+
     borrow-js-counter: func(value: borrow<js-counter>) -> s32;
     take-js-counter: func(value: js-counter) -> s32;
     round-trip-js-counter: func(value: js-counter) -> js-counter;
+    round-trip-js-counter-box: func(value: owned-js-counter-box) -> owned-js-counter-box;
+    reject-after-take: func(value: js-counter) -> result<_, string>;
 
     run-add: func(a: s64, b: s64) -> s64;
     run-sum-list: func(xs: list<u64>) -> u64;

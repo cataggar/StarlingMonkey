@@ -13,6 +13,7 @@ class Engine;
 namespace starling {
 bool drain_resource_drops(api::Engine *engine);
 bool shutdown_resources(api::Engine *engine);
+size_t exported_resource_count();
 }
 
 // world-shell-integration: in the monolithic build these functions are kept

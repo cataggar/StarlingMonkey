@@ -421,6 +421,10 @@ expected = [{
         "consumed": 14,
         "roundTrip": 15,
         "alternate": 22,
+        "boxed": 33,
+        "rootsBefore": 0,
+        "rootsAfterRejection": 1,
+        "rootsAfter": 0,
     },
 }]
 raise SystemExit(0 if data == expected else 1)
