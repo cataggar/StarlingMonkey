@@ -1,36 +1,12 @@
-# feature-selection: ComponentizeJS-compatible platform feature defaults/disabling
+# Platform feature selection and pure components
 
-Branch: `feat/feature-selection` (worktree `/work/StarlingMonkey-feature-selection`).
-Todo id: `feature-selection`. Roadmap: cataggar/StarlingMonkey#6 Phase 6.
+StarlingMonkey exposes ComponentizeJS 0.21-compatible controls for `stdio`,
+`random`, `clocks`, `http`, and `fetch-event`. All five are enabled by
+default.
 
-## 1. Goal
+## Build options
 
-Provide ComponentizeJS 0.21.0-compatible platform feature defaults and
-disabling behavior for **stdio**, **random**, **clocks**, **http**, and
-**fetch-event**, via typed Zig build options (not environment-variable
-hacks), so that:
-
-- Defaults match ComponentizeJS 0.21.0 (all five features enabled).
-- Disabling a feature prunes or stubs its WASI imports so `wasm-tools
-  component wit`/metadata reflects the selected surface where architecturally
-  possible.
-- A **pure-component mode** (all five disabled) emits the smallest viable
-  import surface achievable given this repository's WASI closure and
-  prebuilt preview1-adapter, and fails deterministically -- never silently --
-  if user JavaScript requests disabled host functionality.
-- Incompatible/unknown feature selections produce a deterministic build-time
-  error, never a silent fallback.
-- The production componentizer (`componentize.sh`) remains entirely
-  Node-free; Node is only ever used, opt-in, to cross-check against the real
-  pinned ComponentizeJS release (`tests/feature-selection/reference/`).
-
-This document is the authoritative behavior matrix and deviation list;
-inline comments throughout the changed source point back here.
-
-## 2. CLI / build usage
-
-Five typed boolean options, all defaulting to `true` (matches
-ComponentizeJS's "all features enabled by default"):
+Each feature has a typed boolean:
 
 ```sh
 zig build -Dfeature-stdio=false
@@ -40,326 +16,127 @@ zig build -Dfeature-http=false
 zig build -Dfeature-fetch-event=false
 ```
 
-Any combination may be given together, e.g. pure-component mode:
-
-```sh
-zig build \
-  -Dfeature-stdio=false -Dfeature-random=false -Dfeature-clocks=false \
-  -Dfeature-http=false -Dfeature-fetch-event=false
-```
-
-For ComponentizeJS-CLI ergonomics, two comma-separated-list options are also
-accepted and are layered on top of the typed booleans (a name in both lists
-is a **conflict**, see below):
+The ComponentizeJS-style list forms are also accepted:
 
 ```sh
 zig build -Ddisable-features=http,fetch-event
-zig build -Denable-features=random          # re-enable a typed-disabled feature
+zig build -Dfeature-random=false -Denable-features=random
 ```
 
-The resolved selection is written to `zig-out/bin/features.json` (or
-`<prefix>/bin/features.json`) as a small JSON manifest, e.g.:
-
-```json
-{
-  "stdio": true,
-  "random": true,
-  "clocks": true,
-  "http": false,
-  "fetch-event": true
-}
-```
-
-### Diagnostics (deterministic, never a silent fallback)
+Pure mode disables all five:
 
 ```sh
-$ zig build -Ddisable-features=bogus-name
-error: -Ddisable-features: unknown feature 'bogus-name' (known features: stdio, random, clocks, http, fetch-event)
-panic: unknown feature name
-[...]
-$ echo $?
-1
-
-$ zig build -Ddisable-features=http -Denable-features=http
-error: feature 'http' appears in both -Ddisable-features and -Denable-features
-panic: conflicting feature selection
-[...]
-$ echo $?
-1
+zig build -Doptimize=ReleaseSmall \
+  -Dfeature-stdio=false -Dfeature-random=false \
+  -Dfeature-clocks=false -Dfeature-http=false \
+  -Dfeature-fetch-event=false
 ```
 
-Both checks run during Zig's build-graph configuration (before any
-compilation), so they fail in well under a second even for a `--help`
-invocation -- see `tests/feature-selection/run-build-option-tests.sh`.
+The resolved values are installed as `bin/features.json`.
 
-## 3. Behavior matrix
+Unknown feature names and a feature present in both lists are build-time
+errors. StarlingMonkey intentionally rejects these configurations even though
+ComponentizeJS 0.21 silently accepts them.
 
-Each row: feature, ComponentizeJS 0.21.0 reference default/behavior when
-disabled (empirically verified against the pinned npm release --
-`tests/feature-selection/reference/`), and this repository's behavior.
+## Exact component surfaces
 
-| Feature | Default | Reference (disabled) | This repo (disabled) |
-|---|---|---|---|
-| `stdio` | enabled | `wasi:cli/stdin`+`stdout`+terminal-* removed; `cli/stderr` **kept** | `terminal-*` (5 imports) removed; `wasi:cli/stdin`\|`stdout`\|`stderr` **all kept** (adapter-level residual, see deviation D1) |
-| `random` | enabled | `wasi:random/random` removed entirely | `wasi:random/random` removed entirely (matches); `crypto.getRandomValues` returns a deterministic splitmix64 PRNG stream instead of throwing |
-| `clocks` | enabled | `wasi:clocks/monotonic-clock` removed; `wasi:clocks/wall-clock` **kept** | **neither** clock import removed (see deviation D2); `setTimeout`/`setInterval` throw a catchable `FeatureDisabled` `TypeError` instead |
-| `http` | enabled | `wasi:http/outgoing-handler` removed; `wasi:http/types` **kept** | `wasi:http/outgoing-handler` removed; `wasi:http/types` **kept** (matches); `fetch()` rejects with a catchable error instead of trapping |
-| `fetch-event` | enabled | no import-surface change (only export-surface differs, not probed here) | no import-surface change (matches); `addEventListener('fetch', ...)` throws a catchable `FeatureDisabled` `TypeError` synchronously |
-| `http` + `fetch-event` both disabled | -- | not applicable (ComponentizeJS's world is caller-defined; ours is fixed) | `wasi:http/outgoing-handler` removed; `wasi:http/types` import and `wasi:http/incoming-handler` export **both kept** (see deviation D3) |
-| all five disabled ("pure mode") | -- | `disableFeatures: [...]` on a world with no HTTP/fetch surface at all -> **zero** imports | `terminal-*`, `wasi:random/random`, `wasi:http/outgoing-handler` removed; `wasi:cli/stdin`\|`stdout`\|`stderr`, `wasi:clocks/monotonic-clock`\|`wall-clock`, `wasi:http/types`, filesystem/sockets/environment/exit/io imports **all remain** (see deviation D4) |
-| unknown feature name | -- | **silently ignored** (does not throw) | `@panic`s deterministically at build-configure time (see deviation D5) |
-| same feature in both enable+disable lists | -- | **silently accepted** (last-specified or otherwise non-conflicting behavior; does not throw) | `@panic`s deterministically at build-configure time (see deviation D5) |
+After preview1 adaptation, `starling-feature-surface` resolves the selected WIT
+world, generates dummy provider components for imports that must be internal,
+and composes those providers into the candidate. Providers are generated from
+the installed `feature-wit` closure, so resource identities and interface
+versions come from the same WIT definitions as the runtime. Dependencies
+between provider interfaces are composed in order rather than leaked back out
+as residual imports.
 
-See `tests/feature-selection/reference/expected/import-surfaces.json` for
-the exact, machine-checked reference import lists this table is derived
-from, and `tests/feature-selection/run-runtime-tests.sh` for the exact,
-machine-checked assertions against this repository's own output.
+For a caller world without explicit WASI imports, the frozen ComponentizeJS
+0.21 surfaces are:
 
-## 4. Known deviations
+| Selection | Removed from the default feature closure |
+|---|---|
+| `stdio=false` | stdin, stdout, all terminal interfaces, and filesystem adapter residuals; stderr remains |
+| `random=false` | `wasi:random/random` |
+| `clocks=false` | monotonic clock; wall clock remains |
+| `http=false` | outgoing handler; HTTP types remain while fetch-event is enabled |
+| `fetch-event=false` | no import change |
+| all disabled | every `wasi:*` import |
 
-**D1 -- stdio residual adapter imports.** The prebuilt
-`preview1-adapter.wasm` (a wasi-sdk artifact, out of this phase's scope to
-modify) unconditionally imports `wasi:cli/stdin`/`stdout`/`stderr`
-regardless of whether the core module still calls the preview1
-`fd_write`/`fd_fdstat_get` syscalls. Disabling `stdio` therefore only
-eliminates the 5 `terminal-*` imports (confirmed empirically); the three
-`wasi:cli/std*` imports are an unavoidable, structural residual. (The
-ComponentizeJS reference achieves a *better* partial result here --
-dropping `stdin`/`stdout` too, while keeping `stderr` -- because its
-Rust-based embedding controls its own preview1-adapter linkage
-differently; this is a genuine, currently-unclosed gap, not an oversight.)
+The executable oracle is
+`tests/feature-selection/reference/expected/import-surfaces.json`.
+`tests/feature-selection/run-surface-tests.sh` constructs a component with the
+full runtime closure and checks complete sorted import and export lists against
+that file. It checks the whole surface, not selected substrings.
 
-**D2 -- `clocks` keeps both clock imports.**
-`MonotonicClock::subscribe()`/`unsubscribe()` (`host-apis/wasi-0.2.0/host_api.cpp`)
-are deliberately left **ungated** even when `clocks` is disabled, because
-the async task scheduler's `AsyncTask::select()` (same file) uses
-`subscribe_duration(0)` internally for immediate-vs-blocking task fairness
-across *all* async code (fetch, streams, timers) -- gating it would break
-unrelated functionality, not just user-facing timers. Only
-`MonotonicClock::now()`/`resolution()` and the preview1
-`clock_time_get`/`clock_res_get` syscalls are gated (fixed-constant /
-trapping stubs in `runtime/feature_stubs.c`). Since the scheduler always
-needs monotonic-clock subscription, and the preview1-adapter's own
-initialization needs wall-clock regardless of whether the core module still
-calls `clock_time_get`, **neither** `wasi:clocks/monotonic-clock` nor
-`wasi:clocks/wall-clock` is removed from the import surface when `clocks`
-is disabled -- only the *user-facing* behavior (`setTimeout`/`setInterval`)
-changes (a deterministic, catchable `FeatureDisabled` `TypeError`, verified
-via `tests/feature-selection/run-runtime-tests.sh`'s `clocks-disabled`
-case). This is the reference's own disable-clocks behavior for
-`wasi:clocks/wall-clock` (kept) but a deviation for `monotonic-clock`
-(reference drops it; we keep it, for the reason above).
+User-declared non-feature imports remain external. Runtime-only filesystem,
+socket, environment, and exit imports are internalized when they are not part
+of the selected caller world. A legacy build without `-Dcomponent-wit` keeps
+its fixed export world; consequently its historical
+`wasi:http/incoming-handler` export remains, even in pure mode, while pure mode
+still has zero WASI imports. Export topology for a caller-supplied world is
+controlled by that world and matches the oracle.
 
-**D3 -- `http`+`fetch-event` both disabled still expose `wasi:http/types`
-and the `wasi:http/incoming-handler` export.** These are baked into a
-fixed, prebuilt component-type descriptor
-(`bindings_component_type.o`/equivalent) shared by every StarlingMonkey
-build, generated by a separate toolchain step outside this phase's scope
-(owned by the sibling `wit-imports`/`world-shell-integration` roadmap
-agents -- see this task's "Avoid overlap" instruction: "do not redesign
-typed JS dispatch or custom WIT import generation"). This repository's C++
-gating (`NS_DEF(builtins::web::fetch)`/`NS_DEF(builtins::web::fetch::fetch_event)`
-exclusion in `build.zig` when both features are disabled) successfully
-removes `wasi:http/outgoing-handler` and all fetch/Request/Response/Headers/
-FetchEvent JS bindings, but cannot change the component's fixed WIT world
-shape. The pre-existing `MOZ_RELEASE_ASSERT(REQUEST_HANDLER)` guard in
-`host_api.cpp`'s `exports_wasi_http_incoming_handler` (unmodified,
-pre-existing code) already makes any incoming HTTP request deterministically
-fail (`wasmtime serve` reports HTTP 500 with "guest never invoked
-`response-outparam::set`") if no handler was registered -- verified in
-`tests/feature-selection/run-runtime-tests.sh`.
+## Disabled behavior
 
-**D4 -- pure mode is not zero-import.** With all five features disabled,
-this repository's import surface loses every *prunable* import
-(`terminal-*`, `wasi:random/random`, `wasi:http/outgoing-handler`) but
-retains `wasi:cli/stdin`\|`stdout`\|`stderr` (D1), both clock imports (D2),
-`wasi:http/types` (D3), and structural imports this phase was not asked to
-gate (`wasi:filesystem/*`, `wasi:sockets/*`, `wasi:cli/environment`,
-`wasi:cli/exit`, `wasi:io/*`) -- these are part of StarlingMonkey's baseline
-WASI 0.2.10 closure regardless of feature selection. ComponentizeJS's own
-"disable all features" probe reaches **zero** imports only because its
-probed world exports nothing but a trivial `handler: func() -> u32` (no
-filesystem/sockets/environment usage at all) -- see
-`tests/feature-selection/reference/expected/import-surfaces.json`'s
-`disable-all` case. This is an architectural difference in scope (a fixed,
-comprehensive WASI-0.2.10-closure runtime vs. a bundler that only links in
-what the JS/WIT world actually needs), not a bug in this phase's pruning
-logic; a true zero-import StarlingMonkey pure mode would require
-demand-driven linking of the whole WASI closure, well beyond this phase's
-scope (build options + import pruning/stubbing + diagnostics only, per this
-task's boundaries).
+Surface removal does not silently route disabled operations to the host:
 
-**D5 -- stricter-than-reference build-time diagnostics.** ComponentizeJS
-0.21.0 silently ignores unknown feature names in
-`disableFeatures`/`enableFeatures`, and silently accepts (without error) the
-same feature name appearing in both lists -- confirmed by
-`tests/feature-selection/reference/probe.mjs`'s `unknown-feature` and
-`enable-and-disable-same` cases both succeeding (not throwing). This
-repository intentionally deviates by `@panic`ing deterministically at build
-time for both (see `build.zig`'s `parseFeatureList`/`resolveFeatures`),
-per this task's explicit requirement: "Do not silently fall back." A
-misconfigured build fails loudly and immediately rather than silently
-building a component with an unintended feature surface.
+- `stdio`: preview1 writes are successful no-ops.
+- `random`: `crypto.getRandomValues` uses a deterministic splitmix64 stream.
+- `clocks`: timer registration throws a catchable `FeatureDisabled`
+  `TypeError`; scheduler immediate tasks use an internal path and no longer
+  retain the monotonic-clock import.
+- `http`: outgoing requests fail through the existing catchable fetch error
+  path without calling the outgoing handler.
+- `fetch-event`: `addEventListener("fetch", ...)` throws a catchable
+  `FeatureDisabled` `TypeError`.
 
-**D6 -- pre-existing, unrelated bug discovered during this work (not
-fixed).** `builtins/web/performance.cpp`'s `Performance::timeOrigin` (a
-`std::optional<std::chrono::steady_clock::time_point>`) is declared but
-never assigned anywhere in the codebase. Any call to `performance.now()` or
-the `timeOrigin` getter crashes via `bad_optional_access` -> an `unreachable`
-wasm trap, **on the completely unmodified default build**, independent of
-any `clocks` feature-selection setting. This is out of scope for this task
-(not caused by, or tightly coupled to, this phase's changes) and is
-intentionally left unfixed; `performance.now()` must be avoided when testing
-`clocks`-disabled behavior (use `setTimeout`/`Date.now()` instead, as this
-phase's fixtures and tests do).
+Provider functions are trap stubs and are only a final structural backstop.
+The feature-specific C/C++ paths stop disabled operations before a provider is
+called. In pure mode no host diagnostic stream exists, so an unexpected
+provider call is necessarily trap-only.
 
-## 5. Implementation summary
+## Componentizers and packaging
 
-- `include/feature-defaults.h` (new, review follow-up): a shared header
-  that `#define`s each `STARLING_FEATURE_*` macro to `1` only when it
-  isn't already defined. Zig always threads explicit
-  `-DSTARLING_FEATURE_*=0/1` (see below), so under Zig this header is a
-  no-op; but CMake (and any other non-Zig compiler invocation) never
-  defined these macros at all, so `#if STARLING_FEATURE_*` /
-  `#if !STARLING_FEATURE_*` silently evaluated as `#if 0` / `#if !0`,
-  compiling every gated feature as *disabled* by default under CMake. This
-  header is included from every one of the five sources below that gates
-  behavior on these macros, restoring Zig's enabled-by-default contract
-  for CMake and any other build system without requiring changes to
-  CMakeLists.txt/cmake/*.cmake themselves. It lives in `include/`, which
-  is already on the include path for every affected target (both under
-  CMake -- `extension_api`'s `INTERFACE include`, `host_api`'s
-  `target_include_directories(host_api PRIVATE include)` -- and under Zig
-  -- `common_includes` in build.zig).
-- `build.zig` ("Platform feature selection" section): `FeatureName` enum,
-  `Features` struct, `parseFeatureList`/`resolveFeatures` (typed
-  `-Dfeature-*` booleans plus `-Ddisable-features`/`-Denable-features` CSV
-  lists, deterministic `@panic` diagnostics), `-DSTARLING_FEATURE_*=0/1`
-  macro threading into both C++ and C compile flags, conditional
-  `builtins_incl` generation (excludes the `fetch`/`fetch_event` builtin
-  namespaces entirely when both `http` and `fetch-event` are disabled), and
-  the `features.json` manifest artifact.
-- `runtime/feature_stubs.c` (new): preview1-level C symbol-override stubs
-  (`fd_write`, `fd_fdstat_get`, `clock_time_get`, `clock_res_get`,
-  `random_get`), each `#if !STARLING_FEATURE_*`-gated. Providing a strong C
-  definition for the exact symbol name Zig's bundled wasi-libc declares as
-  an `extern` import trampoline (in its auto-generated
-  `__wasilibc_real.c`) causes `wasm-ld` to resolve the call internally
-  instead of creating a wasm import -- the toolchain handles all
-  function-index assignment safely, with no manual WAT/binary patching.
-- `host-apis/wasi-0.2.0/host_api.cpp`: gated `Random::get_bytes`/`get_u32`,
-  `MonotonicClock::now`/`resolution` (see D2 for why
-  `subscribe`/`unsubscribe` stay ungated), `HttpOutgoingRequest::send`
-  (returns a generic internal error instead of ever calling
-  `wasi_http_outgoing_handler_handle`, letting `wasm-ld` drop the import).
-- `include/errors.h`: added `Errors::FeatureDisabled` (a `TypeError`
-  matching JS's own exception conventions, catchable via normal
-  `try`/`catch`).
-- `builtins/web/timers.cpp`: `setTimeout`/`setInterval` throw
-  `FeatureDisabled` when `clocks` is disabled.
-- `builtins/web/event/global-event-target.cpp`: `addEventListener('fetch',
-  ...)` throws `FeatureDisabled` when `fetch-event` is disabled (this check
-  lives in the always-compiled `event` builtin, so it remains present even
-  when the whole `fetch`/`fetch_event` builtin namespace is excluded by the
-  `http`+`fetch-event`-both-disabled case).
-- `builtins/web/fetch/fetch_event.cpp`: `install()` skips
-  `FetchEvent`/`HttpIncomingRequest::set_handler` registration when
-  `fetch-event` is disabled.
+Both production paths apply the same provider policy:
 
-## 6. Tests
+- installed `componentize.sh`;
+- native `starling-componentize`.
 
-- `tests/feature-selection/run-build-option-tests.sh` -- fast (~3s),
-  Node-free, part of `zig build test` (via the new `feature-selection-test`
-  step). Exercises `build.zig`'s option-parsing/validation logic via `zig
-  build --help` (which runs the full `build()` function, including all
-  `-Dfeature-*` parsing and `@panic` diagnostics, without compiling
-  anything). 16 cases: positive (single/combined typed options, CSV
-  disable/enable lists, redundant/non-conflicting combinations) and
-  negative (unknown feature name in either list, conflicting
-  enable+disable of the same feature).
-- `tests/feature-selection/run-runtime-tests.sh` -- full, real-build
-  component-level tests. NOT part of `zig build test` (each of the 8
-  combinations requires a full StarlingMonkey build; wired as the separate
-  `feature-selection-runtime-test` step, matching the `compat-bridge-test`
-  precedent). For each combination (`defaults`, `stdio-disabled`,
-  `random-disabled`, `clocks-disabled`, `http-disabled`,
-  `fetch-event-disabled`, `http-and-fetch-event-disabled`, `all-disabled`):
-  builds with the corresponding `-Dfeature-*` flags, checks
-  `features.json`, componentizes `tests/feature-selection/fixtures/probe.js`,
-  asserts the import/export surface via `wasm-tools component wit`
-  (including the documented residuals/deviations above), and invokes the
-  component via `wasmtime serve -S common --addr 0.0.0.0:0` + curl (the
-  same pattern as `tests/test.sh`) to assert on representative
-  enabled/disabled runtime behavior.
-- `tests/feature-selection/reference/` -- opt-in, Node-required,
-  never invoked by the above two scripts or by `componentize.sh`. Runs the
-  real pinned ComponentizeJS 0.21.0 `componentize()` API with the same
-  `disableFeatures`/`enableFeatures` options against a minimal WIT world,
-  for differential comparison against
-  `tests/feature-selection/reference/expected/import-surfaces.json` (the
-  source of the "Reference" column in the behavior matrix above).
-- `tests/feature-selection/run-macro-default-tests.sh` (new, review
-  follow-up) -- fast (~1s), Node-free, network-free, part of `zig build
-  test` (via `feature-selection-test`). Compiles small C and C++ probes
-  that `#include "feature-defaults.h"` using the pinned Zig toolchain's
-  bundled compiler (`zig cc`/`zig c++`, native host target -- no wasi-sdk
-  or network dependency), with `-Wall -Wextra -Werror`. 8 cases (C and C++
-  x 4 scenarios) proving: no explicit macros => all five default to `1`;
-  explicit `0` for all five => all stay `0`; a mixed
-  explicit/implicit combination => each macro is independent (explicitly
-  set ones keep their value, unset ones still default); and explicit `1`
-  for all five (mirroring Zig's own enabled-by-default `-D...=1`) compiles
-  with zero warnings, i.e. the header's `#ifndef` guards never trigger a
-  macro-redefinition warning against an already-authoritative define.
+The build installs `starling-feature-surface` and `feature-wit` beside the
+runtime, adapter, WABT, and wasm-tools. The shell pipeline invokes the helper
+after component creation. The native pipeline calls the same Zig module
+directly and records generated provider WIT/components in `--debug-bindings`
+output.
 
-### CMake validation (review follow-up)
+The selected preview1 adapter remains unchanged. Internal preview1 stubs remove
+feature syscalls before adaptation; generated preview2 provider adapters remove
+the remaining component-level closure after snapshotting. Default builds with
+no caller WIT and all features enabled are copied through unchanged.
 
-The five gated sources were also verified through a **real, from-scratch
-CMake configure** (`cmake -S . -B build-verify`, default `HOST_API`, which
-resolves to `wasi-0.2.10` and pulls in `host-apis/wasi-0.2.0/host_api.cpp`
-via a relative path -- see `host-apis/wasi-0.2.10/host_api.cmake`), using
-network access to fetch wasi-sdk, the prebuilt SpiderMonkey release
-tarball, and OpenSSL. This is a one-time, manually-run verification, not
-wired into any automated test tier: a full CMake configure needs network
-access and downloads on the order of several hundred MB (wasi-sdk +
-SpiderMonkey + OpenSSL), so it isn't "cheap" enough to run on every `zig
-build test`/CI invocation, unlike `run-macro-default-tests.sh` above.
+## Tests
 
-For each of `host-apis/wasi-0.2.0/host_api.cpp`,
-`builtins/web/timers.cpp`, `builtins/web/event/global-event-target.cpp`,
-and `builtins/web/fetch/fetch_event.cpp` (the four gated sources CMake
-actually compiles -- `runtime/feature_stubs.c` is Zig-only, referenced
-nowhere in `CMakeLists.txt`/`cmake/*.cmake`, since its `wasm-ld` symbol-
-override trick is specific to Zig's bundled wasi-libc), the exact command
-from the configured build's `compile_commands.json` was used to:
-
-1. **Compile as-is (no explicit `-D`)**: succeeded, and the enabled-path
-   code (e.g. `wasi_random_random_get_random_bytes`,
-   `wasi_clocks_monotonic_clock_now`, `handler_args.infallibleAppend`,
-   `JS_AtomizeAndPinString(engine->cx(), "fetch")`) was present in the
-   preprocessed output, while the corresponding disabled-path code (e.g.
-   the `stubbed_random_next` PRNG fallback, the `FeatureDisabled` throws)
-   was absent -- proving default-on under CMake's real flags/include
-   shape, matching Zig's default.
-2. **Compile with an explicit override** (e.g. `-DSTARLING_FEATURE_CLOCKS=0`
-   added to the real command for `timers.cpp`): succeeded with zero
-   warnings/errors despite CMake's own `-Werror` (`cmake/compile-
-   flags.cmake`), and the disabled-path code became present / enabled-path
-   code absent in the preprocessed output -- proving the override is
-   honored and the header never causes a redefinition diagnostic.
-
-`cmake --build . --target host_api` (the real static-library build, not
-just a manual compiler invocation) was also run standalone and succeeded.
-Full end-to-end CMake linking/componentizing was not attempted (would
-additionally require Rust/corrosion and Wasmtime/wasm-tools artifacts
-beyond what this check needed); this validation is scoped to compiling the
-five affected translation units through CMake's real configured
-flags/include shape, per the review requirement.
-
-Run everything:
+Fast tests:
 
 ```sh
-export ZIG_GLOBAL_CACHE_DIR=/work/StarlingMonkey-feature-selection/.zig-global-cache
-zig build test                                          # includes feature-selection-test
-zig build feature-selection-runtime-test                 # slow, full builds
+zig build feature-selection-test -Doptimize=ReleaseSmall
 ```
+
+This runs:
+
+- 16 build-option positive/negative cases;
+- 8 C/C++ default-macro cases;
+- exact frozen surface checks for defaults, every oracle disable case, and
+  pure mode.
+
+Full runtime tests:
+
+```sh
+zig build feature-selection-runtime-test -Doptimize=ReleaseSmall
+```
+
+The runtime matrix builds all eight production combinations, componentizes
+real JavaScript, validates resulting components, checks exact disabled
+interface absence (including zero-import pure mode), and exercises
+representative enabled and disabled behavior through Wasmtime.
+
+The opt-in reference probe under `tests/feature-selection/reference/` still
+runs the real pinned ComponentizeJS package and fails if its checked-in surface
+oracle drifts. Node.js is never used by production or normal tests.

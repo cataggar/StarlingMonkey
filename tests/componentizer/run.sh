@@ -330,15 +330,21 @@ if [ "$1" = "validate" ] && \
     printf 'preserve-backup-replacement\n' > "$storage/previous-component"
   ) </dev/null >/dev/null 2>&1 &
 fi
+out=""
+for ((i = 1; i <= $#; i++)); do
+  if [ "${!i}" = "-o" ] || [ "${!i}" = "--output" ]; then
+    j=$((i + 1))
+    out="${!j}"
+  fi
+done
 if [ "$1 $2" = "component new" ]; then
-  out=""
-  for ((i = 1; i <= $#; i++)); do
-    if [ "${!i}" = "--output" ]; then
-      j=$((i + 1))
-      out="${!j}"
+  input=""
+  for arg in "${@:3}"; do
+    if [ -f "$arg" ] && [ "$arg" != "$out" ]; then
+      input="$arg"
     fi
   done
-  cp "${!#}" "$out"
+  cp "$input" "$out"
 elif [ "$1 $2" = "metadata add" ]; then
   out=""
   for ((i = 1; i <= $#; i++)); do
@@ -348,6 +354,24 @@ elif [ "$1 $2" = "metadata add" ]; then
     fi
   done
   cp "${!#}" "$out"
+elif [ "$1 $2" = "component wit" ]; then
+  out_dir=""
+  for ((i = 1; i <= $#; i++)); do
+    if [ "${!i}" = "--out-dir" ]; then
+      j=$((i + 1))
+      out_dir="${!j}"
+    fi
+  done
+  if [ -n "$out_dir" ]; then
+    mkdir -p "$out_dir"
+    out="$out_dir/bindings.wit"
+  fi
+  cat > "$out" <<'WIT'
+package test:fake;
+world fake {}
+WIT
+elif [ "$1 $2" = "component embed" ]; then
+  printf 'dummy-core\n' > "$out"
 fi
 EOF
 
@@ -439,6 +463,7 @@ cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 if [ -z "${FAKE_OMIT_GENERATED_ADAPTER:-}" ]; then
   cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
 fi
+mkdir -p "$prefix/bin/feature-wit"
 mkdir -p "$prefix/bin/runtime-build-tools"
 cp "$FAKE_WASIP3_BINDGEN" "$prefix/bin/runtime-build-tools/wasip3-bindgen"
 cp "$FAKE_WASM_OPT" "$prefix/bin/runtime-build-tools/wasm-opt"

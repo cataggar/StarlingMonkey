@@ -89,7 +89,7 @@ build_combo() {
   local prefix="$BUILD_ROOT/$name"
   local log="$BUILD_ROOT/$name.build.log"
   rm -rf "$prefix"
-  if ! "$ZIG" build -Doptimize=ReleaseFast --prefix "$prefix" "$@" >"$log" 2>&1; then
+  if ! "$ZIG" build -Doptimize=ReleaseSmall --prefix "$prefix" "$@" >"$log" 2>&1; then
     echo "build failed for combo '$name' (see $log):" >&2
     tail -n 60 "$log" >&2
     return 1
@@ -178,7 +178,8 @@ check_combo() {
       assert_contains "$name/features.json" "$features_json" '"clocks": true'
       assert_contains "$name/features.json" "$features_json" '"http": true'
       assert_contains "$name/features.json" "$features_json" '"fetch-event": true'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       assert_contains "$name/imports" "$wit" "wasi:random/random@0.2.10"
       assert_contains "$name/imports" "$wit" "wasi:http/outgoing-handler@0.2.10"
@@ -192,20 +193,17 @@ check_combo() {
 
     stdio-disabled)
       assert_contains "$name/features.json" "$features_json" '"stdio": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-input@0.2.10"
       assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-output@0.2.10"
       assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-stdin@0.2.10"
       assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-stdout@0.2.10"
       assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-stderr@0.2.10"
-      # Documented residual (adapter-level, unavoidable -- see
-      # docs/feature-selection/README.md "Known deviations"): the
-      # preview1->preview2 adapter always imports these three regardless
-      # of whether the core module still calls fd_write/fd_fdstat_get.
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:cli/stdin@0.2.10"
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:cli/stdout@0.2.10"
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:cli/stderr@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:cli/stdin@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:cli/stdout@0.2.10"
+      assert_contains "$name/imports" "$wit" "wasi:cli/stderr@0.2.10"
       local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
       assert_contains "$name/serve" "$result" "STATUS:200"
       assert_contains "$name/serve" "$result" "random:ok:"
@@ -213,7 +211,8 @@ check_combo() {
 
     random-disabled)
       assert_contains "$name/features.json" "$features_json" '"random": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       assert_not_contains "$name/imports" "$wit" "wasi:random/random@0.2.10"
       local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
@@ -229,17 +228,11 @@ check_combo() {
 
     clocks-disabled)
       assert_contains "$name/features.json" "$features_json" '"clocks": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
-      # Documented deviation from the ComponentizeJS reference (which
-      # drops wasi:clocks/monotonic-clock when clocks is disabled): this
-      # repository deliberately keeps MonotonicClock::subscribe/unsubscribe
-      # real because the async task scheduler depends on them for
-      # unrelated fetch/stream fairness -- see
-      # docs/feature-selection/README.md "Known deviations". Both clock
-      # imports are therefore expected to remain present.
-      assert_contains "$name/imports (documented deviation)" "$wit" "wasi:clocks/monotonic-clock@0.2.10"
-      assert_contains "$name/imports (documented deviation)" "$wit" "wasi:clocks/wall-clock@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:clocks/monotonic-clock@0.2.10"
+      assert_contains "$name/imports" "$wit" "wasi:clocks/wall-clock@0.2.10"
       local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
       assert_contains "$name/serve" "$result" "STATUS:200"
       assert_contains "$name/serve" "$result" "clocks:caught:setTimeout is disabled by build configuration (feature-selection: clocks disabled)"
@@ -247,7 +240,8 @@ check_combo() {
 
     http-disabled)
       assert_contains "$name/features.json" "$features_json" '"http": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       assert_not_contains "$name/imports" "$wit" "wasi:http/outgoing-handler@0.2.10"
       assert_contains "$name/imports" "$wit" "wasi:http/types@0.2.10"
@@ -258,7 +252,8 @@ check_combo() {
 
     fetch-event-disabled)
       assert_contains "$name/features.json" "$features_json" '"fetch-event": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       # fetch-event alone does not change the HTTP import surface --
       # matches the ComponentizeJS reference exactly (see
@@ -283,23 +278,17 @@ check_combo() {
     http-and-fetch-event-disabled)
       assert_contains "$name/features.json" "$features_json" '"http": false'
       assert_contains "$name/features.json" "$features_json" '"fetch-event": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
       assert_not_contains "$name/imports" "$wit" "wasi:http/outgoing-handler@0.2.10"
-      # Documented residual (see docs/feature-selection/README.md "Known
-      # deviations"): wasi:http/types and the wasi:http/incoming-handler
-      # export remain even with both http and fetch-event disabled,
-      # because they are baked into the fixed, prebuilt component-type
-      # descriptor shared by every StarlingMonkey build (bindings_
-      # component_type.o), which is out of this phase's scope to modify
-      # (owned by the sibling wit-imports/promise agents). The
-      # pre-existing MOZ_RELEASE_ASSERT(REQUEST_HANDLER) guard in
-      # host_api.cpp already makes an incoming request deterministically
-      # fail regardless.
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:http/types@0.2.10"
-      assert_contains "$name/exports (documented residual)" "$wit" "wasi:http/incoming-handler@0.2.10"
-      local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
-      assert_contains "$name/serve (no handler registered)" "$result" "STATUS:500"
+      assert_not_contains "$name/imports" "$wit" "wasi:http/types@0.2.10"
+      assert_contains "$name/exports" "$wit" "wasi:http/incoming-handler@0.2.10"
+      if "$bin/wasm-tools" validate --features all "$bin/probe.wasm"; then
+        pass_case "$name/validate"
+      else
+        fail_case "$name/validate" "component validation failed"
+      fi
       componentize "$bin" "$HERE/fixtures/uncaught-fetch-event.js" "uncaught.wasm"
       local err; err="$(cat "$bin/uncaught.wasm.err.log" 2>/dev/null || true)"
       assert_contains "$name/diagnostic" "$err" "addEventListener('fetch', ...) is disabled by build configuration (feature-selection: fetch-event disabled)"
@@ -311,32 +300,16 @@ check_combo() {
       assert_contains "$name/features.json" "$features_json" '"clocks": false'
       assert_contains "$name/features.json" "$features_json" '"http": false'
       assert_contains "$name/features.json" "$features_json" '"fetch-event": false'
-      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm"
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
       local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
-      # Pure-mode "smallest viable import surface": every prunable import
-      # is gone (terminal-*, random/random, http/outgoing-handler).
-      assert_not_contains "$name/imports" "$wit" "wasi:cli/terminal-input@0.2.10"
-      assert_not_contains "$name/imports" "$wit" "wasi:random/random@0.2.10"
-      assert_not_contains "$name/imports" "$wit" "wasi:http/outgoing-handler@0.2.10"
-      # Documented structural residuals (adapter-level stdio/clocks
-      # imports and the fixed http/types+incoming-handler component
-      # shape; see docs/feature-selection/README.md "Known deviations").
-      # This is NOT a zero-import surface, unlike ComponentizeJS's
-      # disable-all probe (tests/feature-selection/reference/expected/
-      # import-surfaces.json), because StarlingMonkey's WASI closure
-      # includes many structural imports (filesystem, sockets, cli/
-      # environment+exit, the preview1 adapter's fixed baseline) that are
-      # out of this phase's scope (only stdio/random/clocks/http/
-      # fetch-event are gated).
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:cli/stdin@0.2.10"
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:clocks/monotonic-clock@0.2.10"
-      assert_contains "$name/imports (documented residual)" "$wit" "wasi:http/types@0.2.10"
-      # No working handler can be registered (fetch-event disabled); a
-      # live request must still fail deterministically (HTTP 500 via the
-      # pre-existing REQUEST_HANDLER_ONLY guard), not hang or corrupt
-      # state, even with stdio (and thus all diagnostic output) disabled.
-      local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
-      assert_contains "$name/serve (no handler registered)" "$result" "STATUS:500"
+      assert_not_contains "$name/imports" "$wit" "import wasi:"
+      assert_contains "$name/exports" "$wit" "wasi:http/incoming-handler@0.2.10"
+      if "$bin/wasm-tools" validate --features all "$bin/probe.wasm"; then
+        pass_case "$name/validate"
+      else
+        fail_case "$name/validate" "component validation failed"
+      fi
       ;;
 
     *)

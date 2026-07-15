@@ -11,10 +11,12 @@ command string):
 2. Pre-initialize the JavaScript module with Wizer.
 3. Strip and embed the selected component world with WABT.
 4. Adapt the reactor into a component.
-5. Add standard `language=JavaScript` and
+5. Generate and compose feature-surface providers so disabled/runtime-only
+   WASI interfaces do not leak into the caller's world.
+6. Add standard `language=JavaScript` and
    `processed-by=starling-componentize` producers metadata.
-6. Validate the completed candidate with `wasm-tools`.
-7. `fsync` and transactionally publish the requested outputs.
+7. Validate the completed candidate with `wasm-tools`.
+8. `fsync` and transactionally publish the requested outputs.
 
 Any failure before the durable publication commit leaves existing component
 and metadata outputs unchanged and never publishes a partial debug directory.
@@ -62,6 +64,8 @@ zig build componentizer-test -Doptimize=ReleaseSmall
 The default install places the CLI beside `wasmtime`, `wasm-tools`,
 `wabt`, `preview1-adapter.wasm`, and `starling-raw.wasm`. The bundled WABT
 contains the reactor adapter and typed-export fixes required by this pipeline.
+`starling-feature-surface` and the resolved `feature-wit` closure are installed
+beside them and are shared with the shell componentizer.
 The componentizer test target is the required gate: it runs unit and fake-tool
 coverage plus real WABT/Wizer relinks for two distinct WIT worlds.
 

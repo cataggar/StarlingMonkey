@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const diagnostics = @import("diagnostics.zig");
 const metadata = @import("metadata.zig");
+const feature_surface = @import("feature_surface");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -2202,6 +2203,10 @@ const Runtime = struct {
     adapter: Snapshot,
     component_wit: ?[]const u8,
     component_world: ?[]const u8,
+    surface_target_wit: ?[]const u8,
+    surface_target_world: ?[]const u8,
+    platform_wit: []const u8,
+    features: feature_surface.Features,
     bindings: ?[]const u8,
     dispatch_wit_digest: ?[]const u8,
     component_wit_digest: ?[]const u8,
@@ -2986,6 +2991,32 @@ fn execute(
         break :blk candidate_output;
     };
 
+    var surfaced = try createChildOutput(
+        allocator,
+        io,
+        &transaction,
+        "surfaced.wasm",
+    );
+    try feature_surface.apply(allocator, io, .{
+        .wasm_tools = tools.wasm_tools.path,
+        .platform_wit = runtime.platform_wit,
+        .component = candidate.path,
+        .output = surfaced.path,
+        .work_dir = transaction_storage,
+        .target_wit = runtime.surface_target_wit,
+        .target_world = runtime.surface_target_world,
+        .features = runtime.features,
+        .inspect_candidate = runtime.component_wit == null,
+        .cwd = cwd,
+        .verbose = config.verbose,
+        .command_log = &command_log,
+    });
+    try transaction.sealChildOutput(
+        allocator,
+        io,
+        &surfaced,
+    );
+
     var processed = try createChildOutput(
         allocator,
         io,
@@ -3026,7 +3057,7 @@ fn execute(
     metadata_args.appendSlice(allocator, &.{
         "--output",
         processed.path,
-        candidate.path,
+        surfaced.path,
     }) catch @panic("out of memory");
     diagnostic.begin(.metadata);
     try runCommand(
@@ -3178,8 +3209,45 @@ fn execute(
             try copyDebugFile(io, child_output.path, debug_dir_handle, "embedded.wasm");
             try transaction.recordStoragePath(allocator, io, "debug/embedded.wasm");
         }
+        try copyDebugFile(
+            io,
+            candidate.path,
+            debug_dir_handle,
+            "component-before-feature-surface.wasm",
+        );
+        try transaction.recordStoragePath(
+            allocator,
+            io,
+            "debug/component-before-feature-surface.wasm",
+        );
+        try copyDebugFile(io, surfaced.path, debug_dir_handle, "surfaced.wasm");
+        try transaction.recordStoragePath(allocator, io, "debug/surfaced.wasm");
         try copyDebugFile(io, processed.path, debug_dir_handle, "component.wasm");
         try transaction.recordStoragePath(allocator, io, "debug/component.wasm");
+        const provider_wit = try std.fs.path.join(
+            allocator,
+            &.{ transaction_storage, "feature-0-provider-wit", "component.wit" },
+        );
+        if (pathExists(io, provider_wit)) {
+            try copyDebugFile(io, provider_wit, debug_dir_handle, "feature-provider.wit");
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/feature-provider.wit",
+            );
+        }
+        const provider_component = try std.fs.path.join(
+            allocator,
+            &.{ transaction_storage, "feature-provider-a.wasm" },
+        );
+        if (pathExists(io, provider_component)) {
+            try copyDebugFile(io, provider_component, debug_dir_handle, "feature-provider.wasm");
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/feature-provider.wasm",
+            );
+        }
         if (runtime.bindings) |path| {
             try copyDebugFile(io, path, debug_dir_handle, "component-bindings.zig");
             try transaction.recordStoragePath(
@@ -3328,11 +3396,22 @@ fn externalRuntime(
             )
     else
         null;
+    const platform_wit = try siblingOrName(
+        allocator,
+        io,
+        executable_dir,
+        "feature-wit",
+        "feature-wit",
+    );
     return .{
         .engine = engine,
         .adapter = adapter,
         .component_wit = if (component_wit) |wit| wit.absolute else null,
         .component_world = config.component_world_name orelse config.world_name,
+        .surface_target_wit = component_wit,
+        .surface_target_world = config.component_world_name orelse config.world_name,
+        .platform_wit = platform_wit,
+        .features = resolveFeatures(config),
         .bindings = null,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
         .component_wit_digest = if (component_wit) |wit| wit.digest else null,
@@ -3787,11 +3866,24 @@ fn buildRuntime(
     );
     try verifyNoSymlinkTree(io, cache_bin.directory);
 
+    const features = resolveFeatures(config);
+    const platform_wit = try std.fs.path.join(
+        allocator,
+        &.{ prefix, "bin", "feature-wit" },
+    );
+    const runtime_component_wit = if (component_wit) |wit| wit.absolute else null;
+    const runtime_component_world = config.component_world_name orelse config.world_name;
+    const surface_target_wit = runtime_component_wit;
+    const surface_target_world = runtime_component_world;
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = if (component_wit) |wit| wit.absolute else null,
-        .component_world = config.component_world_name orelse config.world_name,
+        .component_wit = runtime_component_wit,
+        .component_world = runtime_component_world,
+        .surface_target_wit = surface_target_wit,
+        .surface_target_world = surface_target_world,
+        .platform_wit = platform_wit,
+        .features = features,
         .bindings = bindings,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
         .component_wit_digest = if (component_wit) |wit| wit.digest else null,
@@ -9657,6 +9749,29 @@ fn addMappedPreopen(
 
 fn joinComma(allocator: Allocator, values: []const []const u8) ![]const u8 {
     return std.mem.join(allocator, ",", values);
+}
+
+fn resolveFeatures(config: *const cli.Config) feature_surface.Features {
+    var features = feature_surface.Features{};
+    for (config.disable_features) |name| setFeature(&features, name, false);
+    for (config.enable_features) |name| setFeature(&features, name, true);
+    return features;
+}
+
+fn setFeature(features: *feature_surface.Features, name: []const u8, enabled: bool) void {
+    if (std.mem.eql(u8, name, "stdio")) {
+        features.stdio = enabled;
+    } else if (std.mem.eql(u8, name, "random")) {
+        features.random = enabled;
+    } else if (std.mem.eql(u8, name, "clocks")) {
+        features.clocks = enabled;
+    } else if (std.mem.eql(u8, name, "http")) {
+        features.http = enabled;
+    } else if (std.mem.eql(u8, name, "fetch-event")) {
+        features.fetch_event = enabled;
+    } else {
+        unreachable;
+    }
 }
 
 fn siblingOrName(
