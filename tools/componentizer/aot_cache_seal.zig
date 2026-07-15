@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (sealing) {
         if (manifest != null) usage();
-        aot_cache.seal(
+        aot_cache.sealWithHooks(
             allocator,
             init.io,
             engine orelse usage(),
@@ -52,6 +52,17 @@ pub fn main(init: std.process.Init) !void {
             primer orelse usage(),
             feature_abi orelse usage(),
             output orelse usage(),
+            .{
+                .directory = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_HOOK_DIR",
+                ),
+                .wait_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_WAIT_AT",
+                ),
+                .fail_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_FAIL",
+                ),
+            },
         ) catch |err| std.process.fatal("failed to seal AOT cache: {t}", .{err});
     } else {
         if (primer != null or canonical_cache != null or output != null) usage();

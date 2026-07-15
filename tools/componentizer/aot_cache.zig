@@ -16,6 +16,7 @@ pub const manifest_basename = "starling-ics.wevalcache.manifest";
 pub const default_min_stack_size: u64 = 8 * 1024 * 1024;
 
 pub const Error = error{
+    AotCacheTestFailure,
     CorruptCache,
     IncompleteCache,
     InvalidCacheFormat,
@@ -23,10 +24,12 @@ pub const Error = error{
     InvalidManifest,
     MissingCacheArtifact,
     SealPathAlias,
+    SealPathRace,
     SqliteUnavailable,
     StaleEngine,
     StaleFeatureAbi,
     StaleTool,
+    TransactionRecoveryRequired,
 };
 
 pub const Validated = struct {
@@ -82,8 +85,40 @@ pub fn seal(
     feature_abi: []const u8,
     manifest_path: []const u8,
 ) !void {
+    return sealWithHooks(
+        allocator,
+        io,
+        engine_path,
+        weval_path,
+        cache_path,
+        canonical_cache_path,
+        primer_path,
+        feature_abi,
+        manifest_path,
+        .{},
+    );
+}
+
+pub const SealHooks = struct {
+    directory: ?[]const u8 = null,
+    wait_at: ?[]const u8 = null,
+    fail_at: ?[]const u8 = null,
+};
+
+pub fn sealWithHooks(
+    allocator: Allocator,
+    io: Io,
+    engine_path: []const u8,
+    weval_path: []const u8,
+    cache_path: []const u8,
+    canonical_cache_path: ?[]const u8,
+    primer_path: []const u8,
+    feature_abi: []const u8,
+    manifest_path: []const u8,
+    hooks: SealHooks,
+) !void {
     try validateValue(feature_abi);
-    const paths = try resolveSealPaths(
+    var transaction = try SealTransaction.init(
         allocator,
         io,
         engine_path,
@@ -93,18 +128,35 @@ pub fn seal(
         primer_path,
         manifest_path,
     );
-    const engine_sha = try hashFileHex(allocator, io, paths.engine);
-    try verifyCacheDatabase(allocator, paths.source_cache, engine_sha);
-    try canonicalizeCacheDatabase(
+    defer transaction.deinit(io);
+    try transaction.rejectAliases();
+    try runSealHook(allocator, io, hooks, "after-preflight");
+
+    const engine_sha = try hashStableFileHex(allocator, io, transaction.engine);
+    var source_snapshot = try stageStableCopy(
         allocator,
         io,
-        paths.source_cache,
-        paths.canonical_cache,
+        transaction.cache_output.parent,
+        ".aot-source",
+        transaction.source_cache,
+    );
+    defer source_snapshot.deinit(io);
+    try verifyCacheDatabaseFile(io, source_snapshot.file, engine_sha);
+
+    var canonical = try stageCanonicalCache(
+        allocator,
+        io,
+        transaction.cache_output.parent,
+        source_snapshot.file,
         engine_sha,
     );
-    const weval_sha = try hashFileHex(allocator, io, paths.weval);
-    const cache_sha = try hashFileHex(allocator, io, paths.canonical_cache);
-    const primer_sha = try hashFileHex(allocator, io, paths.primer);
+    defer canonical.deinit(io);
+    const weval_sha = try hashStableFileHex(allocator, io, transaction.weval);
+    try runSealHook(allocator, io, hooks, "after-weval-hash");
+    const primer_sha = try hashStableFileHex(allocator, io, transaction.primer);
+    try runSealHook(allocator, io, hooks, "after-primer-hash");
+    const cache_sha = try hashFileHandleHex(allocator, io, canonical.file);
+    try runSealHook(allocator, io, hooks, "after-cache-hash");
     const key = try cacheKey(
         allocator,
         engine_sha,
@@ -137,123 +189,269 @@ pub fn seal(
             primer_sha,
         },
     );
-    try Dir.cwd().writeFile(io, .{ .sub_path = paths.manifest, .data = contents });
+    var manifest = try createPrivateFile(
+        allocator,
+        io,
+        transaction.manifest_output.parent,
+        ".aot-manifest",
+    );
+    defer manifest.deinit(io);
+    try manifest.file.writePositionalAll(io, contents, 0);
+    try manifest.file.sync(io);
+    manifest.identity = try manifest.file.stat(io);
+    manifest.name_identity = manifest.identity;
+    try runSealHook(allocator, io, hooks, "after-manifest-stage");
+
+    try publishBundle(
+        allocator,
+        io,
+        &transaction.cache_output,
+        &canonical,
+        &transaction.manifest_output,
+        &manifest,
+        hooks,
+    );
 }
 
-const SealPath = struct {
+const StableInput = struct {
     role: []const u8,
     supplied: []const u8,
     absolute: []const u8,
     resolved: []const u8,
-    inode: ?File.INode,
-    nlink: ?File.NLink,
-    size: ?u64,
-    mtime: ?i96,
-    ctime: ?i96,
+    file: File,
+    identity: File.Stat,
+
+    fn close(input: StableInput, io: Io) void {
+        input.file.close(io);
+    }
 };
 
-const SealPaths = struct {
-    engine: []const u8,
-    weval: []const u8,
-    source_cache: []const u8,
-    canonical_cache: []const u8,
-    primer: []const u8,
-    manifest: []const u8,
+const DestinationState = union(enum) {
+    missing,
+    existing: struct {
+        file: File,
+        identity: File.Stat,
+    },
+
+    fn close(state: DestinationState, io: Io) void {
+        switch (state) {
+            .missing => {},
+            .existing => |existing| existing.file.close(io),
+        }
+    }
 };
 
-fn resolveSealPaths(
-    allocator: Allocator,
-    io: Io,
-    engine_path: []const u8,
-    weval_path: []const u8,
-    cache_path: []const u8,
-    canonical_cache_path: ?[]const u8,
-    primer_path: []const u8,
-    manifest_path: []const u8,
-) !SealPaths {
-    const engine = try resolveSealPath(allocator, io, "engine", engine_path);
-    const weval = try resolveSealPath(allocator, io, "Weval binary", weval_path);
-    const source_cache = try resolveSealPath(
-        allocator,
-        io,
-        "source cache",
-        cache_path,
-    );
-    const primer = try resolveSealPath(allocator, io, "primer", primer_path);
-    const manifest = try resolveSealPath(
-        allocator,
-        io,
-        "manifest output",
-        manifest_path,
-    );
+const SealOutput = struct {
+    role: []const u8,
+    supplied: []const u8,
+    absolute: []const u8,
+    resolved: []const u8,
+    parent_path: []const u8,
+    basename: []const u8,
+    parent: Dir,
+    parent_identity: File.Stat,
+    initial: DestinationState,
 
-    if (canonical_cache_path) |output_path| {
-        const canonical_cache = try resolveSealPath(
+    fn deinit(output: SealOutput, io: Io) void {
+        output.initial.close(io);
+        output.parent.close(io);
+    }
+};
+
+const SealTransaction = struct {
+    engine: StableInput,
+    weval: StableInput,
+    source_cache: StableInput,
+    primer: StableInput,
+    cache_output: SealOutput,
+    manifest_output: SealOutput,
+    in_place: bool,
+
+    fn init(
+        allocator: Allocator,
+        io: Io,
+        engine_path: []const u8,
+        weval_path: []const u8,
+        cache_path: []const u8,
+        canonical_cache_path: ?[]const u8,
+        primer_path: []const u8,
+        manifest_path: []const u8,
+    ) !SealTransaction {
+        const engine = try openStableInput(allocator, io, "engine", engine_path);
+        errdefer engine.close(io);
+        const weval = try openStableInput(allocator, io, "Weval binary", weval_path);
+        errdefer weval.close(io);
+        const source_cache = try openStableInput(
+            allocator,
+            io,
+            "source cache",
+            cache_path,
+        );
+        errdefer source_cache.close(io);
+        const primer = try openStableInput(allocator, io, "primer", primer_path);
+        errdefer primer.close(io);
+        const cache_output = try openSealOutput(
             allocator,
             io,
             "canonical cache output",
-            output_path,
+            canonical_cache_path orelse cache_path,
         );
-        const all = [_]SealPath{
-            engine,
-            weval,
-            source_cache,
-            canonical_cache,
-            primer,
-            manifest,
-        };
-        try rejectSealPathAliases(&all);
+        errdefer cache_output.deinit(io);
+        const manifest_output = try openSealOutput(
+            allocator,
+            io,
+            "manifest output",
+            manifest_path,
+        );
+        errdefer manifest_output.deinit(io);
         return .{
-            .engine = engine.absolute,
-            .weval = weval.absolute,
-            .source_cache = source_cache.absolute,
-            .canonical_cache = canonical_cache.absolute,
-            .primer = primer.absolute,
-            .manifest = manifest.absolute,
+            .engine = engine,
+            .weval = weval,
+            .source_cache = source_cache,
+            .primer = primer,
+            .cache_output = cache_output,
+            .manifest_output = manifest_output,
+            .in_place = canonical_cache_path == null,
         };
     }
 
-    const all = [_]SealPath{ engine, weval, source_cache, primer, manifest };
-    try rejectSealPathAliases(&all);
-    return .{
-        .engine = engine.absolute,
-        .weval = weval.absolute,
-        .source_cache = source_cache.absolute,
-        .canonical_cache = source_cache.absolute,
-        .primer = primer.absolute,
-        .manifest = manifest.absolute,
-    };
-}
+    fn deinit(transaction: *SealTransaction, io: Io) void {
+        transaction.manifest_output.deinit(io);
+        transaction.cache_output.deinit(io);
+        transaction.primer.close(io);
+        transaction.source_cache.close(io);
+        transaction.weval.close(io);
+        transaction.engine.close(io);
+    }
 
-fn resolveSealPath(
+    fn rejectAliases(transaction: *const SealTransaction) Error!void {
+        const inputs = [_]*const StableInput{
+            &transaction.engine,
+            &transaction.weval,
+            &transaction.source_cache,
+            &transaction.primer,
+        };
+        for (inputs, 0..) |left, left_index| {
+            for (inputs[left_index + 1 ..]) |right| {
+                if (sameResolvedOrIdentity(
+                    left.resolved,
+                    left.identity,
+                    right.resolved,
+                    right.identity,
+                )) return reportAlias(left.role, left.supplied, right.role, right.supplied);
+            }
+        }
+        const outputs = [_]*const SealOutput{
+            &transaction.cache_output,
+            &transaction.manifest_output,
+        };
+        for (outputs, 0..) |output, output_index| {
+            for (inputs) |input| {
+                const safe_in_place = transaction.in_place and
+                    output == &transaction.cache_output and
+                    input == &transaction.source_cache;
+                if (safe_in_place) continue;
+                if (outputAliasesInput(output, input))
+                    return reportAlias(output.role, output.supplied, input.role, input.supplied);
+            }
+            for (outputs[output_index + 1 ..]) |right| {
+                if (outputsAlias(output, right))
+                    return reportAlias(output.role, output.supplied, right.role, right.supplied);
+            }
+        }
+    }
+};
+
+fn openStableInput(
     allocator: Allocator,
     io: Io,
     role: []const u8,
     supplied: []const u8,
-) !SealPath {
-    if (supplied.len == 0 or std.mem.indexOfScalar(u8, supplied, 0) != null)
-        return error.InvalidManifest;
-    const cwd = try Dir.cwd().realPathFileAlloc(io, ".", allocator);
-    const absolute = if (std.fs.path.isAbsolute(supplied))
-        try allocator.dupe(u8, supplied)
-    else
-        try joinUnresolved(allocator, cwd, supplied);
+) !StableInput {
+    const absolute = try absoluteSealPath(allocator, io, supplied);
+    var file = try Dir.openFileAbsolute(io, absolute, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const identity = try file.stat(io);
+    if (identity.kind != .file) return error.MissingCacheArtifact;
+    var resolved_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const resolved_len = try file.realPath(io, &resolved_buffer);
+    return .{
+        .role = role,
+        .supplied = supplied,
+        .absolute = absolute,
+        .resolved = try allocator.dupe(u8, resolved_buffer[0..resolved_len]),
+        .file = file,
+        .identity = identity,
+    };
+}
+
+fn openSealOutput(
+    allocator: Allocator,
+    io: Io,
+    role: []const u8,
+    supplied: []const u8,
+) !SealOutput {
+    const absolute = try absoluteSealPath(allocator, io, supplied);
+    const parent_path = std.fs.path.dirname(absolute) orelse return error.InvalidManifest;
+    const basename = std.fs.path.basename(absolute);
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or
+        std.mem.eql(u8, basename, "..")) return error.InvalidManifest;
+
+    var observed_parent = try Dir.openDirAbsolute(io, parent_path, .{});
+    defer observed_parent.close(io);
+    const observed_identity = try observed_parent.stat(io);
+    if (observed_identity.kind != .directory) return error.InvalidManifest;
+    var parent_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const parent_len = try observed_parent.realPath(io, &parent_buffer);
+    const canonical_parent_path = try allocator.dupe(u8, parent_buffer[0..parent_len]);
+    var parent = try Dir.openDirAbsolute(
+        io,
+        canonical_parent_path,
+        .{ .follow_symlinks = false, .iterate = true },
+    );
+    errdefer parent.close(io);
+    const parent_identity = try parent.stat(io);
+    if (!sameIdentity(observed_identity, parent_identity))
+        return error.SealPathAlias;
+
     const resolved = try resolveSealDestination(allocator, io, absolute, 0);
-    const stat = Dir.cwd().statFile(io, absolute, .{}) catch |err| switch (err) {
+    const initial_file = parent.openFile(io, basename, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = true,
+    }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
+    errdefer if (initial_file) |file| file.close(io);
+    const initial: DestinationState = if (initial_file) |file| .{
+        .existing = .{
+            .file = file,
+            .identity = try file.stat(io),
+        },
+    } else .missing;
     return .{
         .role = role,
         .supplied = supplied,
         .absolute = absolute,
         .resolved = resolved,
-        .inode = if (stat) |value| value.inode else null,
-        .nlink = if (stat) |value| value.nlink else null,
-        .size = if (stat) |value| value.size else null,
-        .mtime = if (stat) |value| value.mtime.nanoseconds else null,
-        .ctime = if (stat) |value| value.ctime.nanoseconds else null,
+        .parent_path = canonical_parent_path,
+        .basename = basename,
+        .parent = parent,
+        .parent_identity = parent_identity,
+        .initial = initial,
     };
+}
+
+fn absoluteSealPath(allocator: Allocator, io: Io, supplied: []const u8) ![]const u8 {
+    if (supplied.len == 0 or std.mem.indexOfScalar(u8, supplied, 0) != null)
+        return error.InvalidManifest;
+    if (std.fs.path.isAbsolute(supplied)) return allocator.dupe(u8, supplied);
+    const cwd = try Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    return joinUnresolved(allocator, cwd, supplied);
 }
 
 fn resolveSealDestination(
@@ -320,29 +518,613 @@ fn joinUnresolved(
     );
 }
 
-fn rejectSealPathAliases(paths: []const SealPath) Error!void {
-    for (paths, 0..) |left, left_index| {
-        for (paths[left_index + 1 ..]) |right| {
-            const same_resolved_path = std.mem.eql(u8, left.resolved, right.resolved);
-            const same_inode = if (left.inode) |left_inode|
-                if (right.inode) |right_inode|
-                    left_inode == right_inode and
-                        left.nlink.? > 1 and right.nlink.? > 1 and
-                        left.size.? == right.size.? and
-                        left.mtime.? == right.mtime.? and
-                        left.ctime.? == right.ctime.?
-                else
-                    false
-            else
-                false;
-            if (!same_resolved_path and !same_inode) continue;
-            std.debug.print(
-                "error: AOT cache seal path collision: {s} '{s}' aliases {s} '{s}'\n",
-                .{ left.role, left.supplied, right.role, right.supplied },
-            );
-            return error.SealPathAlias;
-        }
+fn sameIdentity(left: File.Stat, right: File.Stat) bool {
+    return left.kind == right.kind and
+        left.inode == right.inode and
+        left.nlink == right.nlink and
+        left.size == right.size and
+        left.mtime.nanoseconds == right.mtime.nanoseconds and
+        left.ctime.nanoseconds == right.ctime.nanoseconds;
+}
+
+fn sameObject(left: File.Stat, right: File.Stat) bool {
+    return left.kind == right.kind and left.inode == right.inode;
+}
+
+fn sameResolvedOrIdentity(
+    left_resolved: []const u8,
+    left_identity: File.Stat,
+    right_resolved: []const u8,
+    right_identity: File.Stat,
+) bool {
+    if (std.mem.eql(u8, left_resolved, right_resolved)) return true;
+    return left_identity.nlink > 1 and right_identity.nlink > 1 and
+        sameIdentity(left_identity, right_identity);
+}
+
+fn outputAliasesInput(output: *const SealOutput, input: *const StableInput) bool {
+    if (std.mem.eql(u8, output.resolved, input.resolved)) return true;
+    return switch (output.initial) {
+        .missing => false,
+        .existing => |existing| existing.identity.nlink > 1 and
+            input.identity.nlink > 1 and sameIdentity(existing.identity, input.identity),
+    };
+}
+
+fn outputsAlias(left: *const SealOutput, right: *const SealOutput) bool {
+    if (std.mem.eql(u8, left.resolved, right.resolved)) return true;
+    return switch (left.initial) {
+        .missing => false,
+        .existing => |left_existing| switch (right.initial) {
+            .missing => false,
+            .existing => |right_existing| left_existing.identity.nlink > 1 and
+                right_existing.identity.nlink > 1 and
+                sameIdentity(left_existing.identity, right_existing.identity),
+        },
+    };
+}
+
+fn reportAlias(
+    left_role: []const u8,
+    left_path: []const u8,
+    right_role: []const u8,
+    right_path: []const u8,
+) Error {
+    std.debug.print(
+        "error: AOT cache seal path collision: {s} '{s}' aliases {s} '{s}'\n",
+        .{ left_role, left_path, right_role, right_path },
+    );
+    return error.SealPathAlias;
+}
+
+fn runSealHook(
+    allocator: Allocator,
+    io: Io,
+    hooks: SealHooks,
+    phase: []const u8,
+) !void {
+    if (hooks.fail_at) |fail_at| {
+        if (std.mem.eql(u8, fail_at, phase)) return error.AotCacheTestFailure;
     }
+    const directory = hooks.directory orelse return;
+    if (hooks.wait_at) |wait_at| {
+        if (!std.mem.eql(u8, wait_at, phase)) return;
+    }
+    const ready = try std.fs.path.join(
+        allocator,
+        &.{ directory, try std.fmt.allocPrint(allocator, "{s}.ready", .{phase}) },
+    );
+    const proceed = try std.fs.path.join(
+        allocator,
+        &.{ directory, try std.fmt.allocPrint(allocator, "{s}.continue", .{phase}) },
+    );
+    try Dir.cwd().writeFile(io, .{ .sub_path = ready, .data = "ready\n" });
+    while (true) {
+        _ = Dir.cwd().statFile(io, proceed, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                try io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+}
+
+const PrivateFile = struct {
+    parent: Dir,
+    name: []const u8,
+    file: File,
+    identity: File.Stat,
+    name_identity: File.Stat,
+    name_exists: bool = true,
+    preserve: bool = false,
+
+    fn deinit(private: *PrivateFile, io: Io) void {
+        private.file.close(io);
+        if (private.name_exists and !private.preserve)
+            deleteOwnedFile(io, private.parent, private.name, private.name_identity);
+        private.name_exists = false;
+    }
+};
+
+fn createPrivateFile(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    prefix: []const u8,
+) !PrivateFile {
+    for (0..32) |_| {
+        var random: [16]u8 = undefined;
+        io.random(&random);
+        const random_hex = std.fmt.bytesToHex(random, .lower);
+        const name = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{s}",
+            .{ prefix, &random_hex },
+        );
+        var file = parent.createFile(io, name, .{
+            .read = true,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        errdefer file.close(io);
+        const identity = try file.stat(io);
+        return .{
+            .parent = parent,
+            .name = name,
+            .file = file,
+            .identity = identity,
+            .name_identity = identity,
+        };
+    }
+    return error.PathAlreadyExists;
+}
+
+fn stageStableCopy(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    prefix: []const u8,
+    source: StableInput,
+) !PrivateFile {
+    const before = try source.file.stat(io);
+    if (!sameIdentity(before, source.identity)) return error.SealPathRace;
+    var snapshot = try createPrivateFile(allocator, io, parent, prefix);
+    errdefer snapshot.deinit(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try source.file.readPositional(io, &.{&buffer}, offset);
+        if (count == 0) break;
+        try snapshot.file.writePositionalAll(io, buffer[0..count], offset);
+        offset += count;
+    }
+    const after = try source.file.stat(io);
+    if (!sameIdentity(before, after) or offset != before.size)
+        return error.SealPathRace;
+    try snapshot.file.sync(io);
+    snapshot.identity = try snapshot.file.stat(io);
+    snapshot.name_identity = snapshot.identity;
+    return snapshot;
+}
+
+fn stageCanonicalCache(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    source: File,
+    engine_sha: []const u8,
+) !PrivateFile {
+    var canonical = try createPrivateFile(
+        allocator,
+        io,
+        parent,
+        ".aot-canonical",
+    );
+    errdefer canonical.deinit(io);
+    try writeCanonicalCacheFiles(io, source, canonical.file);
+    try normalizeCanonicalHeaderFile(io, canonical.file);
+    try verifyCacheDatabaseFile(io, canonical.file, engine_sha);
+    try canonical.file.sync(io);
+    canonical.identity = try canonical.file.stat(io);
+    canonical.name_identity = canonical.identity;
+    return canonical;
+}
+
+fn hashStableFileHex(
+    allocator: Allocator,
+    io: Io,
+    input: StableInput,
+) ![]const u8 {
+    const before = try input.file.stat(io);
+    if (!sameIdentity(before, input.identity)) return error.SealPathRace;
+    const digest = try hashFileHandleHex(allocator, io, input.file);
+    const after = try input.file.stat(io);
+    if (!sameIdentity(before, after)) return error.SealPathRace;
+    return digest;
+}
+
+fn hashFileHandleHex(allocator: Allocator, io: Io, file: File) ![]const u8 {
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.MissingCacheArtifact;
+    var hasher = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try file.readPositional(io, &.{&buffer}, offset);
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    if (offset != stat.size) return error.SealPathRace;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &encoded);
+}
+
+fn publishBundle(
+    allocator: Allocator,
+    io: Io,
+    cache_output: *const SealOutput,
+    cache_stage: *PrivateFile,
+    manifest_output: *const SealOutput,
+    manifest_stage: *PrivateFile,
+    hooks: SealHooks,
+) !void {
+    if (!try destinationMatchesStart(io, cache_output) or
+        !try destinationMatchesStart(io, manifest_output))
+        return error.SealPathRace;
+
+    var journal = try createPrivateFile(
+        allocator,
+        io,
+        cache_output.parent,
+        ".aot-transaction",
+    );
+    var journal_closed = false;
+    defer if (!journal_closed) journal.deinit(io);
+    const journal_contents = try std.fmt.allocPrint(
+        allocator,
+        "state=prepared\ncache-parent={s}\ncache={s}\ncache-stage={s}\n" ++
+            "manifest-parent={s}\nmanifest={s}\nmanifest-stage={s}\n",
+        .{
+            cache_output.parent_path,
+            cache_output.basename,
+            cache_stage.name,
+            manifest_output.parent_path,
+            manifest_output.basename,
+            manifest_stage.name,
+        },
+    );
+    try journal.file.writePositionalAll(io, journal_contents, 0);
+    try journal.file.sync(io);
+    journal.identity = try journal.file.stat(io);
+    journal.name_identity = journal.identity;
+    try syncDir(io, cache_output.parent);
+    if (manifest_output.parent.handle != cache_output.parent.handle)
+        try syncDir(io, manifest_output.parent);
+
+    publishOne(allocator, io, cache_output, cache_stage) catch |err| {
+        if (err == error.TransactionRecoveryRequired) {
+            journal.preserve = true;
+            cache_stage.preserve = true;
+            manifest_stage.preserve = true;
+        }
+        return err;
+    };
+    syncDir(io, cache_output.parent) catch {
+        return preserveRecovery(&journal, cache_stage, manifest_stage);
+    };
+    runSealHook(allocator, io, hooks, "after-first-publish") catch |err| {
+        if (!rollbackOne(allocator, io, cache_output, cache_stage)) {
+            journal.preserve = true;
+            cache_stage.preserve = true;
+            manifest_stage.preserve = true;
+            return error.TransactionRecoveryRequired;
+        }
+        try syncDir(io, cache_output.parent);
+        return err;
+    };
+
+    if (!try destinationHasIdentity(io, cache_output, cache_stage.identity) or
+        !try destinationMatchesStart(io, manifest_output))
+    {
+        if (!rollbackOne(allocator, io, cache_output, cache_stage)) {
+            journal.preserve = true;
+            cache_stage.preserve = true;
+            manifest_stage.preserve = true;
+            return error.TransactionRecoveryRequired;
+        }
+        try syncDir(io, cache_output.parent);
+        return error.SealPathRace;
+    }
+
+    publishOne(allocator, io, manifest_output, manifest_stage) catch |err| {
+        if (!rollbackOne(allocator, io, cache_output, cache_stage)) {
+            journal.preserve = true;
+            cache_stage.preserve = true;
+            manifest_stage.preserve = true;
+            return error.TransactionRecoveryRequired;
+        }
+        try syncDir(io, cache_output.parent);
+        if (err == error.TransactionRecoveryRequired) {
+            journal.preserve = true;
+            manifest_stage.preserve = true;
+        }
+        return err;
+    };
+
+    syncDir(io, manifest_output.parent) catch {
+        return preserveRecovery(&journal, cache_stage, manifest_stage);
+    };
+    if (!try destinationHasIdentity(io, cache_output, cache_stage.identity) or
+        !try destinationHasIdentity(io, manifest_output, manifest_stage.identity))
+        return preserveRecovery(&journal, cache_stage, manifest_stage);
+
+    journal.deinit(io);
+    journal_closed = true;
+    try syncDir(io, cache_output.parent);
+    if (manifest_output.parent.handle != cache_output.parent.handle)
+        try syncDir(io, manifest_output.parent);
+}
+
+fn preserveRecovery(
+    journal: *PrivateFile,
+    cache_stage: *PrivateFile,
+    manifest_stage: *PrivateFile,
+) Error {
+    journal.preserve = true;
+    cache_stage.preserve = true;
+    manifest_stage.preserve = true;
+    return error.TransactionRecoveryRequired;
+}
+
+fn destinationMatchesStart(io: Io, output: *const SealOutput) !bool {
+    const current = output.parent.openFile(io, output.basename, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return output.initial == .missing,
+        else => return err,
+    };
+    defer current.close(io);
+    return switch (output.initial) {
+        .missing => false,
+        .existing => |existing| sameIdentity(
+            existing.identity,
+            try current.stat(io),
+        ),
+    };
+}
+
+fn destinationHasIdentity(
+    io: Io,
+    output: *const SealOutput,
+    identity: File.Stat,
+) !bool {
+    var current = output.parent.openFile(io, output.basename, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer current.close(io);
+    return sameObject(identity, try current.stat(io));
+}
+
+fn publishOne(
+    allocator: Allocator,
+    io: Io,
+    output: *const SealOutput,
+    staged: *PrivateFile,
+) !void {
+    if (!try destinationMatchesStart(io, output)) return error.SealPathRace;
+    switch (output.initial) {
+        .missing => {
+            try output.parent.renamePreserve(
+                staged.name,
+                output.parent,
+                output.basename,
+                io,
+            );
+            staged.name_exists = false;
+        },
+        .existing => |existing| {
+            try exchangeNames(
+                allocator,
+                staged.parent,
+                staged.name,
+                output.parent,
+                output.basename,
+            );
+            const displaced = statNoFollow(io, staged.parent, staged.name) catch {
+                return error.TransactionRecoveryRequired;
+            };
+            if (!sameObject(existing.identity, displaced)) {
+                exchangeNames(
+                    allocator,
+                    staged.parent,
+                    staged.name,
+                    output.parent,
+                    output.basename,
+                ) catch return error.TransactionRecoveryRequired;
+                const restored_stage = statNoFollow(
+                    io,
+                    staged.parent,
+                    staged.name,
+                ) catch return error.TransactionRecoveryRequired;
+                const restored_destination = statNoFollow(
+                    io,
+                    output.parent,
+                    output.basename,
+                ) catch return error.TransactionRecoveryRequired;
+                if (!sameObject(restored_stage, staged.identity) or
+                    !sameObject(restored_destination, displaced))
+                    return error.TransactionRecoveryRequired;
+                staged.name_identity = restored_stage;
+                return error.SealPathRace;
+            }
+            staged.name_identity = displaced;
+        },
+    }
+}
+
+fn rollbackOne(
+    allocator: Allocator,
+    io: Io,
+    output: *const SealOutput,
+    staged: *PrivateFile,
+) bool {
+    switch (output.initial) {
+        .missing => {
+            output.parent.renamePreserve(
+                output.basename,
+                staged.parent,
+                staged.name,
+                io,
+            ) catch return false;
+            staged.name_exists = true;
+            const displaced = statNoFollow(io, staged.parent, staged.name) catch
+                return false;
+            const artifact_identity = staged.file.stat(io) catch return false;
+            if (sameObject(displaced, artifact_identity)) {
+                staged.name_identity = displaced;
+                return true;
+            }
+            staged.parent.renamePreserve(
+                staged.name,
+                output.parent,
+                output.basename,
+                io,
+            ) catch return false;
+            staged.name_exists = false;
+            return false;
+        },
+        .existing => |existing| {
+            exchangeNames(
+                allocator,
+                staged.parent,
+                staged.name,
+                output.parent,
+                output.basename,
+            ) catch return false;
+            const displaced = statNoFollow(io, staged.parent, staged.name) catch
+                return false;
+            const artifact_identity = staged.file.stat(io) catch return false;
+            if (sameObject(displaced, artifact_identity)) {
+                staged.name_identity = displaced;
+                return true;
+            }
+            exchangeNames(
+                allocator,
+                staged.parent,
+                staged.name,
+                output.parent,
+                output.basename,
+            ) catch return false;
+            const restored_stage = statNoFollow(
+                io,
+                staged.parent,
+                staged.name,
+            ) catch return false;
+            const restored_destination = statNoFollow(
+                io,
+                output.parent,
+                output.basename,
+            ) catch return false;
+            if (!sameObject(restored_stage, existing.identity) or
+                !sameObject(restored_destination, displaced))
+                return false;
+            staged.name_identity = restored_stage;
+            return false;
+        },
+    }
+}
+
+fn statNoFollow(io: Io, parent: Dir, name: []const u8) !File.Stat {
+    var file = try parent.openFile(io, name, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = true,
+    });
+    defer file.close(io);
+    return file.stat(io);
+}
+
+fn deleteOwnedFile(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    identity: File.Stat,
+) void {
+    const current = statNoFollow(io, parent, name) catch return;
+    if (!sameIdentity(current, identity)) return;
+    parent.deleteFile(io, name) catch {};
+}
+
+fn syncDir(io: Io, dir: Dir) !void {
+    const file: File = .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try file.sync(io);
+}
+
+fn exchangeNames(
+    allocator: Allocator,
+    left_dir: Dir,
+    left_name: []const u8,
+    right_dir: Dir,
+    right_name: []const u8,
+) !void {
+    const left_z = try allocator.dupeSentinel(u8, left_name, 0);
+    const right_z = try allocator.dupeSentinel(u8, right_name, 0);
+    if (builtin.os.tag == .driverkit or builtin.os.tag == .ios or
+        builtin.os.tag == .maccatalyst or builtin.os.tag == .macos or
+        builtin.os.tag == .tvos or builtin.os.tag == .visionos or
+        builtin.os.tag == .watchos)
+    {
+        while (true) switch (std.c.errno(std.c.renameatx_np(
+            left_dir.handle,
+            left_z,
+            right_dir.handle,
+            right_z,
+            .{ .SWAP = true },
+        ))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .PERM => return error.PermissionDenied,
+            .BUSY => return error.FileBusy,
+            .DQUOT => return error.DiskQuota,
+            .LOOP => return error.SymLinkLoop,
+            .MLINK => return error.LinkQuotaExceeded,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .NOMEM => return error.SystemResources,
+            .NOSPC => return error.NoSpaceLeft,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .XDEV => return error.CrossDevice,
+            .OPNOTSUPP => return error.OperationUnsupported,
+            else => return error.Unexpected,
+        };
+    }
+    if (builtin.os.tag != .linux) return error.OperationUnsupported;
+    const linux = std.os.linux;
+    while (true) switch (linux.errno(linux.renameat2(
+        left_dir.handle,
+        left_z,
+        right_dir.handle,
+        right_z,
+        .{ .EXCHANGE = true },
+    ))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .BUSY => return error.FileBusy,
+        .DQUOT => return error.DiskQuota,
+        .ISDIR => return error.IsDir,
+        .LOOP => return error.SymLinkLoop,
+        .MLINK => return error.LinkQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTEMPTY => return error.DirNotEmpty,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .XDEV => return error.CrossDevice,
+        else => return error.Unexpected,
+    };
 }
 
 pub fn validate(
@@ -534,6 +1316,9 @@ const Sqlite = struct {
     column_blob: *const fn (*SqliteStmt, c_int) callconv(.c) ?*const anyopaque,
     column_bytes: *const fn (*SqliteStmt, c_int) callconv(.c) c_int,
     bind_blob: *const fn (*SqliteStmt, c_int, ?*const anyopaque, c_int, SqliteDestructor) callconv(.c) c_int,
+    deserialize: *const fn (*SqliteDb, [*:0]const u8, [*]u8, i64, i64, c_uint) callconv(.c) c_int,
+    serialize: *const fn (*SqliteDb, [*:0]const u8, *i64, c_uint) callconv(.c) ?[*]u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
 
     fn load() Error!Sqlite {
         const candidates: []const []const u8 = switch (builtin.os.tag) {
@@ -596,6 +1381,18 @@ const Sqlite = struct {
                 @FieldType(Sqlite, "bind_blob"),
                 "sqlite3_bind_blob",
             ) orelse return error.SqliteUnavailable,
+            .deserialize = library.lookup(
+                @FieldType(Sqlite, "deserialize"),
+                "sqlite3_deserialize",
+            ) orelse return error.SqliteUnavailable,
+            .serialize = library.lookup(
+                @FieldType(Sqlite, "serialize"),
+                "sqlite3_serialize",
+            ) orelse return error.SqliteUnavailable,
+            .free = library.lookup(
+                @FieldType(Sqlite, "free"),
+                "sqlite3_free",
+            ) orelse return error.SqliteUnavailable,
         };
     }
 
@@ -608,70 +1405,82 @@ const sqlite_ok = 0;
 const sqlite_open_readonly = 0x00000001;
 const sqlite_open_readwrite = 0x00000002;
 const sqlite_open_create = 0x00000004;
-const sqlite_open_exclusive = 0x00000010;
 const sqlite_integer = 1;
 const sqlite_blob = 4;
 const sqlite_row = 100;
 const sqlite_done = 101;
 const canonical_sqlite_version = [4]u8{ 0x00, 0x2e, 0x72, 0xa0 };
 
-fn canonicalizeCacheDatabase(
-    allocator: Allocator,
+const MemoryDatabase = struct {
+    db: *SqliteDb,
+    data: ?*anyopaque,
+
+    fn deinit(memory: *MemoryDatabase, sqlite: *const Sqlite) void {
+        _ = sqlite.close(memory.db);
+        std.c.free(memory.data);
+    }
+};
+
+fn openMemoryDatabaseFromFile(
     io: Io,
-    source_path: []const u8,
-    output_path: []const u8,
-    engine_sha: []const u8,
-) !void {
-    var random_bytes: [8]u8 = undefined;
-    io.random(&random_bytes);
-    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-    const temporary_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}.canonical-{s}",
-        .{ output_path, &random_hex },
-    );
-    defer Dir.deleteFileAbsolute(io, temporary_path) catch {};
+    sqlite: *const Sqlite,
+    file: File,
+) !MemoryDatabase {
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size == 0 or
+        stat.size > std.math.maxInt(i64) or stat.size > std.math.maxInt(usize))
+        return error.InvalidCacheFormat;
+    const allocation = std.c.malloc(@intCast(stat.size)) orelse
+        return error.OutOfMemory;
+    errdefer std.c.free(allocation);
+    const data: [*]u8 = @ptrCast(allocation);
+    if (try file.readPositionalAll(io, data[0..@intCast(stat.size)], 0) != stat.size)
+        return error.InvalidCacheFormat;
 
-    try writeCanonicalCache(allocator, source_path, temporary_path);
-    try normalizeCanonicalHeader(io, temporary_path);
-    try verifyCacheDatabase(allocator, temporary_path, engine_sha);
-
-    var canonical = try Dir.openFileAbsolute(io, temporary_path, .{});
-    defer canonical.close(io);
-    try canonical.sync(io);
-    try Dir.renameAbsolute(temporary_path, output_path, io);
+    var optional_db: ?*SqliteDb = null;
+    if (sqlite.open_v2(
+        ":memory:",
+        &optional_db,
+        sqlite_open_readwrite | sqlite_open_create,
+        null,
+    ) != sqlite_ok) {
+        if (optional_db) |db| _ = sqlite.close(db);
+        return error.InvalidCacheFormat;
+    }
+    const db = optional_db orelse return error.InvalidCacheFormat;
+    errdefer _ = sqlite.close(db);
+    if (sqlite.deserialize(
+        db,
+        "main",
+        data,
+        @intCast(stat.size),
+        @intCast(stat.size),
+        0,
+    ) != sqlite_ok) return error.InvalidCacheFormat;
+    return .{ .db = db, .data = allocation };
 }
 
-fn writeCanonicalCache(
-    allocator: Allocator,
-    source_path: []const u8,
-    output_path: []const u8,
+fn writeCanonicalCacheFiles(
+    io: Io,
+    source_file: File,
+    output_file: File,
 ) !void {
     var sqlite = try Sqlite.load();
     defer sqlite.deinit();
 
-    const source_path_z = allocator.dupeSentinel(u8, source_path, 0) catch
-        return error.InvalidCacheFormat;
-    var optional_source: ?*SqliteDb = null;
-    if (sqlite.open_v2(
-        source_path_z,
-        &optional_source,
-        sqlite_open_readonly,
-        null,
-    ) != sqlite_ok) {
-        if (optional_source) |db| _ = sqlite.close(db);
-        return error.InvalidCacheFormat;
-    }
-    const source = optional_source orelse return error.InvalidCacheFormat;
-    defer _ = sqlite.close(source);
+    var source_memory = try openMemoryDatabaseFromFile(
+        io,
+        &sqlite,
+        source_file,
+    );
+    defer source_memory.deinit(&sqlite);
+    const source = source_memory.db;
 
-    const output_path_z = allocator.dupeSentinel(u8, output_path, 0) catch
-        return error.InvalidCacheFormat;
     var optional_output: ?*SqliteDb = null;
     if (sqlite.open_v2(
-        output_path_z,
+        ":memory:",
         &optional_output,
-        sqlite_open_readwrite | sqlite_open_create | sqlite_open_exclusive,
+        sqlite_open_readwrite | sqlite_open_create,
         null,
     ) != sqlite_ok) {
         if (optional_output) |db| _ = sqlite.close(db);
@@ -758,14 +1567,23 @@ fn writeCanonicalCache(
         "CREATE INDEX idx ON weval_cache(module_hash, key)",
     );
     try execute(&sqlite, output, "COMMIT");
+    var serialized_size: i64 = 0;
+    const serialized = sqlite.serialize(
+        output,
+        "main",
+        &serialized_size,
+        0,
+    ) orelse return error.InvalidCacheFormat;
+    defer sqlite.free(serialized);
+    if (serialized_size < 0) return error.InvalidCacheFormat;
+    try output_file.writePositionalAll(
+        io,
+        serialized[0..@intCast(serialized_size)],
+        0,
+    );
 }
 
-fn normalizeCanonicalHeader(io: Io, path: []const u8) !void {
-    var file = try Dir.openFileAbsolute(io, path, .{
-        .mode = .read_write,
-        .allow_directory = false,
-    });
-    defer file.close(io);
+fn normalizeCanonicalHeaderFile(io: Io, file: File) !void {
     var header: [100]u8 = undefined;
     if (try file.readPositionalAll(io, &header, 0) != header.len)
         return error.InvalidCacheFormat;
@@ -787,6 +1605,31 @@ fn execute(sqlite: *const Sqlite, db: *SqliteDb, sql: []const u8) Error!void {
 }
 
 fn verifyCacheDatabase(
+    allocator: Allocator,
+    path: []const u8,
+    engine_sha: []const u8,
+) !void {
+    return verifyCacheDatabasePath(allocator, path, engine_sha);
+}
+
+fn verifyCacheDatabaseFile(
+    io: Io,
+    file: File,
+    engine_sha: []const u8,
+) !void {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, engine_sha) catch
+        return error.InvalidManifest;
+    var sqlite = try Sqlite.load();
+    defer sqlite.deinit();
+    var memory = try openMemoryDatabaseFromFile(io, &sqlite, file);
+    defer memory.deinit(&sqlite);
+    try verifyIntegrity(&sqlite, memory.db);
+    try verifySchema(&sqlite, memory.db);
+    try verifyLiveEngineRow(&sqlite, memory.db, &digest);
+}
+
+fn verifyCacheDatabasePath(
     allocator: Allocator,
     path: []const u8,
     engine_sha: []const u8,

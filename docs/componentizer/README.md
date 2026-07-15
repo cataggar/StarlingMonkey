@@ -127,6 +127,15 @@ engine digest in `weval_cache.module_hash`. The canonical database is checked
 the same way before publication, and validation repeats those checks. Bytes in
 deleted or unrelated rows cannot bind a cache to an engine.
 
+Sealing retains no-follow handles for every input and canonical output
+directory. SQLite reads verified private snapshots populated from those
+handles; both output files are completely built and synced before publication.
+Handle-relative no-replace renames or atomic exchanges compare the displaced
+object with the transaction-start identity. If manifest publication fails,
+the cache exchange is rolled back to the exact original object; an
+identity-protected transaction journal and backups remain only when a raced
+replacement makes automatic rollback unsafe.
+
 `--aot-cache-dir` selects a read-only cache bundle containing the two
 `starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
 with the manifest at `<path>.manifest`, for compatibility with callers that
@@ -160,8 +169,9 @@ zig build componentizer-test -Doptimize=ReleaseSmall
 zig build aot-engine-test -Doptimize=ReleaseSmall
 ```
 
-The first includes fake-tool positive and missing/stale/corrupt cache cases
-and a concurrent release-publication race. The second builds both real engine
+The first includes fake-tool positive and missing/stale/corrupt cache cases,
+descriptor/symlink/parent-retarget races, bundle rollback, and a concurrent
+release-publication race. The second builds both real engine
 variants, validates both components, primes clean caches in separate
 directories to prove byte-for-byte reproducibility, and invokes the same typed
 JavaScript exports through Wasmtime to prove Wizer/AOT behavioral equivalence.

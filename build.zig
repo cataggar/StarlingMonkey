@@ -285,6 +285,16 @@ pub fn build(b: *std.Build) void {
     aot_seal_alias_test.addArtifactArg(aot_cache_tool);
     aot_seal_alias_test_step.dependOn(&aot_seal_alias_test.step);
     componentizer_test_step.dependOn(aot_seal_alias_test_step);
+    const aot_seal_transaction_test_step = b.step(
+        "aot-seal-transaction-test",
+        "Race descriptor-anchored AOT seal publication and rollback",
+    );
+    const aot_seal_transaction_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-seal-transactions.sh" },
+    );
+    aot_seal_transaction_test.addArtifactArg(aot_cache_tool);
+    aot_seal_transaction_test_step.dependOn(&aot_seal_transaction_test.step);
+    componentizer_test_step.dependOn(aot_seal_transaction_test_step);
     const aot_shell_test_step = b.step(
         "aot-shell-test",
         "Test AOT shell tool resolution and recursive Zig forwarding",
