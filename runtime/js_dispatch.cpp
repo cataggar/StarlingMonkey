@@ -16,9 +16,11 @@
 #include "js/PropertyAndElement.h"
 #include "js/experimental/TypedData.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <print>
@@ -599,6 +601,46 @@ static constexpr JSClass resource_object_class{
     &resource_object_class_ops,
 };
 
+struct ResourceClassBinding {
+  std::string module_id;
+  std::string class_name;
+  std::string provider;
+  std::string name;
+  std::unique_ptr<JS::PersistentRootedObject> prototype;
+  std::unique_ptr<JS::PersistentRootedObject> constructor;
+};
+
+std::vector<std::unique_ptr<ResourceClassBinding>> resource_class_bindings;
+
+JSObject *resource_prototype(std::string_view provider, std::string_view name) {
+  for (const auto &binding : resource_class_bindings) {
+    if (binding->provider == provider && binding->name == name) {
+      return binding->prototype->get();
+    }
+  }
+  return nullptr;
+}
+
+ResourceClassBinding *resource_class(std::string_view module_id,
+                                     std::string_view resource_name) {
+  for (const auto &binding : resource_class_bindings) {
+    if (binding->module_id == module_id &&
+        binding->name == resource_name) {
+      return binding.get();
+    }
+  }
+  return nullptr;
+}
+
+ResourceClassBinding *resource_class_for_prototype(JSObject *prototype) {
+  for (const auto &binding : resource_class_bindings) {
+    if (binding->prototype->get() == prototype) {
+      return binding.get();
+    }
+  }
+  return nullptr;
+}
+
 const char *resource_error_message(starling::ResourceError error) {
   switch (error) {
   case starling::ResourceError::None:
@@ -660,7 +702,14 @@ bool encode_resource_to_js(JSContext *cx, const StarlingJsValue &value,
     return false;
   }
 
-  JS::RootedObject obj(cx, JS_NewObject(cx, &resource_object_class));
+  const std::string_view provider(
+      reinterpret_cast<const char *>(value.resource_provider_ptr),
+      value.resource_provider_len);
+  const std::string_view name(reinterpret_cast<const char *>(value.resource_name_ptr),
+                              value.resource_name_len);
+  JS::RootedObject proto(cx, resource_prototype(provider, name));
+  JS::RootedObject obj(
+      cx, JS_NewObjectWithGivenProto(cx, &resource_object_class, proto));
   if (!obj) {
     return false;
   }
@@ -668,11 +717,6 @@ bool encode_resource_to_js(JSContext *cx, const StarlingJsValue &value,
                       JS::PrivateValue(nullptr));
 
   auto &registry = api::Engine::get(cx)->resource_registry();
-  const std::string_view provider(
-      reinterpret_cast<const char *>(value.resource_provider_ptr),
-      value.resource_provider_len);
-  const std::string_view name(reinterpret_cast<const char *>(value.resource_name_ptr),
-                              value.resource_name_len);
   const starling::ResourceTokenResult acquired =
       *ownership == starling::ResourceOwnership::Own
           ? registry.acquire_owned(provider, name, value.resource_handle)
@@ -1252,8 +1296,7 @@ namespace {
 // used for export arguments/results -- with the roles reversed: arguments
 // come *from* JS (decode) and the result goes back *to* JS (encode).
 bool call_import_impl(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
-                      JS::CallArgs args) {
-  (void)receiver;
+                      JS::CallArgs args, bool prepend_this) {
   JS::RootedString key_str(cx, extra.toString());
   auto key_utf8 = core::encode(cx, key_str);
   if (!key_utf8.ptr) {
@@ -1263,7 +1306,33 @@ bool call_import_impl(JSContext *cx, JS::HandleObject receiver, JS::HandleValue 
 
   NativeArena arg_arena;
   std::vector<StarlingJsValue> argv;
-  argv.reserve(args.length());
+  argv.reserve(args.length() + prepend_this);
+  if (prepend_this) {
+    JS::RootedValue this_value(cx, args.thisv());
+    if (!this_value.isObject() ||
+        JS::GetClass(&this_value.toObject()) != &resource_object_class) {
+      JS_ReportErrorASCII(cx, "native dispatch: resource method receiver is invalid");
+      return false;
+    }
+    auto *binding = resource_class_for_prototype(receiver);
+    auto *data = static_cast<ResourceObjectData *>(
+        JS::GetReservedSlot(&this_value.toObject(),
+                            std::to_underlying(ResourceObjectSlot::Data))
+            .toPrivate());
+    const starling::ResourceDescriptor *descriptor =
+        data ? data->registry->descriptor(data->token.type_id) : nullptr;
+    if (!binding || !descriptor || descriptor->provider != binding->provider ||
+        descriptor->name != binding->name) {
+      JS_ReportErrorASCII(
+          cx, "native dispatch: resource method receiver has the wrong type");
+      return false;
+    }
+    StarlingJsValue encoded{};
+    if (!decode_from_js(cx, this_value, arg_arena, &encoded)) {
+      return false;
+    }
+    argv.push_back(encoded);
+  }
   for (unsigned i = 0; i < args.length(); ++i) {
     JS::RootedValue arg(cx, args.get(i));
     StarlingJsValue encoded{};
@@ -1281,6 +1350,7 @@ bool call_import_impl(JSContext *cx, JS::HandleObject receiver, JS::HandleValue 
       reinterpret_cast<const uint8_t *>(dispatch_key.data()), dispatch_key.size(), argv_ptr,
       argv.size(), &out_result, &out_arena);
   if (status != 0) {
+    starling_js_import_result_free(out_arena);
     // Build-time-impossible in practice (the dispatch key came straight from
     // the manifest this function was registered from), but reported
     // explicitly rather than silently returning `undefined` in case the
@@ -1303,8 +1373,9 @@ bool call_import_impl(JSContext *cx, JS::HandleObject receiver, JS::HandleValue 
   return true;
 }
 
-bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
-                 JS::CallArgs args) {
+bool call_import_scoped(JSContext *cx, JS::HandleObject receiver,
+                        JS::HandleValue extra, JS::CallArgs args,
+                        bool prepend_this) {
   auto *engine = api::Engine::get(cx);
   if (!reclaim_pending_dispatch_arena()) {
     return false;
@@ -1314,7 +1385,7 @@ bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra
     return false;
   }
   registry.enter_dispatch();
-  const bool result = call_import_impl(cx, receiver, extra, args);
+  const bool result = call_import_impl(cx, receiver, extra, args, prepend_this);
   const bool outermost = registry.leave_dispatch();
   if (outermost && !starling::drain_resource_drops(engine)) {
     return false;
@@ -1322,32 +1393,167 @@ bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra
   return result;
 }
 
-// Splits one manifest TSV line "<module-id>\t<js-name>\t<dispatch-key>\t<arity>"
-// into its four columns. Returns false (rather than asserting) on a
-// malformed line so a corrupt/mismatched manifest is an actionable JS
-// exception rather than an out-of-bounds read.
-bool parse_manifest_line(std::string_view line, std::string_view *module_id,
-                         std::string_view *js_name, std::string_view *dispatch_key,
-                         unsigned *arity) {
-  size_t t1 = line.find('\t');
-  if (t1 == std::string_view::npos) return false;
-  size_t t2 = line.find('\t', t1 + 1);
-  if (t2 == std::string_view::npos) return false;
-  size_t t3 = line.find('\t', t2 + 1);
-  if (t3 == std::string_view::npos) return false;
+bool call_import(JSContext *cx, JS::HandleObject receiver, JS::HandleValue extra,
+                 JS::CallArgs args) {
+  return call_import_scoped(cx, receiver, extra, args, false);
+}
 
-  *module_id = line.substr(0, t1);
-  *js_name = line.substr(t1 + 1, t2 - t1 - 1);
-  *dispatch_key = line.substr(t2 + 1, t3 - t2 - 1);
-  if (module_id->empty() || js_name->empty() || dispatch_key->empty()) return false;
-  std::string_view arity_str = line.substr(t3 + 1);
+bool call_resource_method(JSContext *cx, JS::HandleObject receiver,
+                          JS::HandleValue extra, JS::CallArgs args) {
+  return call_import_scoped(cx, receiver, extra, args, true);
+}
+
+bool call_resource_constructor(JSContext *cx, JS::HandleObject receiver,
+                               JS::HandleValue extra, JS::CallArgs args) {
+  if (!args.isConstructing()) {
+    JS_ReportErrorASCII(cx, "native dispatch: resource constructor requires 'new'");
+    return false;
+  }
+  return call_import(cx, receiver, extra, args);
+}
+
+bool call_unavailable_resource_constructor(JSContext *cx,
+                                           JS::HandleObject receiver,
+                                           JS::HandleValue extra,
+                                           JS::CallArgs args) {
+  (void)receiver;
+  (void)extra;
+  (void)args;
+  JS_ReportErrorASCII(cx, "native dispatch: this resource has no constructor");
+  return false;
+}
+
+template <InternalMethod fun>
+JSObject *create_resource_constructor(JSContext *cx,
+                                      JS::HandleObject receiver,
+                                      JS::HandleValue extra, unsigned arity,
+                                      const char *name) {
+  JSFunction *function = js::NewFunctionWithReserved(
+      cx, internal_method<fun>, arity, JSFUN_CONSTRUCTOR, name);
+  if (!function) {
+    return nullptr;
+  }
+  JS::RootedObject function_obj(cx, JS_GetFunctionObject(function));
+  js::SetFunctionNativeReserved(function_obj, 0,
+                                JS::ObjectValue(*receiver));
+  js::SetFunctionNativeReserved(function_obj, 1, extra);
+  return function_obj;
+}
+
+bool define_unique_property(JSContext *cx, JS::HandleObject target,
+                            const char *name, JS::HandleValue value,
+                            unsigned attrs) {
+  bool exists = false;
+  if (!JS_HasOwnProperty(cx, target, name, &exists)) {
+    return false;
+  }
+  if (exists) {
+    JS_ReportErrorUTF8(cx,
+                       "duplicate JavaScript import binding '%s' in WIT "
+                       "import manifest",
+                       name);
+    return false;
+  }
+  return JS_DefineProperty(cx, target, name, value, attrs);
+}
+
+bool make_dispatch_key(JSContext *cx, const std::string &dispatch_key,
+                       JS::MutableHandleValue extra) {
+  JS::RootedString key_str(
+      cx, JS_NewStringCopyN(cx, dispatch_key.data(), dispatch_key.size()));
+  if (!key_str) {
+    return false;
+  }
+  extra.setString(key_str);
+  return true;
+}
+
+enum class ImportManifestKind {
+  Function,
+  Resource,
+  Constructor,
+  Method,
+  Static,
+};
+
+struct ImportManifestEntry {
+  ImportManifestKind kind;
+  std::string module_id;
+  std::string class_name;
+  std::string js_name;
+  std::string provider;
+  std::string resource_name;
+  std::string dispatch_key;
+  unsigned arity = 0;
+};
+
+bool parse_manifest_arity(std::string_view text, unsigned *arity) {
+  if (text.empty()) {
+    return false;
+  }
   unsigned value = 0;
-  for (char c : arity_str) {
-    if (c < '0' || c > '9') return false;
-    value = value * 10 + static_cast<unsigned>(c - '0');
+  for (char c : text) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    const unsigned digit = static_cast<unsigned>(c - '0');
+    if (value > (std::numeric_limits<unsigned>::max() - digit) / 10) {
+      return false;
+    }
+    value = value * 10 + digit;
   }
   *arity = value;
   return true;
+}
+
+bool parse_manifest_line(std::string_view line, ImportManifestEntry *entry) {
+  std::vector<std::string_view> fields;
+  size_t pos = 0;
+  while (true) {
+    const size_t tab = line.find('\t', pos);
+    fields.push_back(line.substr(pos, tab == std::string_view::npos
+                                         ? line.size() - pos
+                                         : tab - pos));
+    if (tab == std::string_view::npos) {
+      break;
+    }
+    pos = tab + 1;
+  }
+  for (const auto field : fields) {
+    if (field.empty()) {
+      return false;
+    }
+  }
+
+  if (fields.size() == 4 && fields[0] != "R") {
+    entry->kind = ImportManifestKind::Function;
+    entry->module_id = fields[0];
+    entry->js_name = fields[1];
+    entry->dispatch_key = fields[2];
+    return parse_manifest_arity(fields[3], &entry->arity);
+  }
+  if (fields.size() == 4 && fields[0] == "R") {
+    entry->kind = ImportManifestKind::Resource;
+    entry->module_id = fields[1];
+    entry->provider = fields[1];
+    entry->resource_name = fields[2];
+    entry->class_name = fields[3];
+    return true;
+  }
+  if (fields.size() == 6 &&
+      (fields[0] == "C" || fields[0] == "M" || fields[0] == "S")) {
+    entry->kind = fields[0] == "C"
+                      ? ImportManifestKind::Constructor
+                      : fields[0] == "M" ? ImportManifestKind::Method
+                                          : ImportManifestKind::Static;
+    entry->module_id = fields[1];
+    entry->provider = fields[1];
+    entry->resource_name = fields[2];
+    entry->js_name = fields[3];
+    entry->dispatch_key = fields[4];
+    return parse_manifest_arity(fields[5], &entry->arity);
+  }
+  return false;
 }
 
 } // namespace
@@ -1365,66 +1571,207 @@ bool install(api::Engine *engine) {
   JSContext *cx = engine->cx();
   size_t manifest_len = 0;
   const uint8_t *manifest_ptr = starling_js_imports_manifest(&manifest_len);
+  resource_class_bindings.clear();
   if (!manifest_ptr || manifest_len == 0) {
     return true; // Nothing to bridge -- default behavior is unaffected.
   }
   std::string_view manifest(reinterpret_cast<const char *>(manifest_ptr), manifest_len);
 
-  std::string current_id;
-  JS::RootedObject current_obj(cx);
-
+  std::vector<ImportManifestEntry> entries;
   size_t pos = 0;
   while (pos < manifest.size()) {
-    size_t nl = manifest.find('\n', pos);
-    if (nl == std::string_view::npos) break;
-    std::string_view line = manifest.substr(pos, nl - pos);
-    pos = nl + 1;
-    if (line.empty()) continue;
-
-    std::string_view module_id, js_name, dispatch_key;
-    unsigned arity = 0;
-    if (!parse_manifest_line(line, &module_id, &js_name, &dispatch_key, &arity)) {
-      JS_ReportErrorUTF8(cx, "malformed js_import_manifest line: '%.*s'", (int)line.size(),
-                         line.data());
-      return false;
+    const size_t nl = manifest.find('\n', pos);
+    const std::string_view line =
+        manifest.substr(pos, nl == std::string_view::npos
+                                 ? manifest.size() - pos
+                                 : nl - pos);
+    pos = nl == std::string_view::npos ? manifest.size() : nl + 1;
+    if (line.empty()) {
+      continue;
     }
 
-    if (current_id.empty() || current_id != module_id) {
-      if (!current_id.empty()) {
-        JS::RootedValue module_val(cx, JS::ObjectValue(*current_obj));
-        if (!engine->define_builtin_module(current_id.c_str(), module_val)) {
-          return false;
+    ImportManifestEntry entry;
+    if (!parse_manifest_line(line, &entry)) {
+      JS_ReportErrorUTF8(cx, "malformed js_import_manifest line: '%.*s'",
+                         static_cast<int>(line.size()), line.data());
+      return false;
+    }
+    entries.push_back(std::move(entry));
+  }
+
+  std::vector<std::string> module_ids;
+  for (const auto &entry : entries) {
+    bool known = false;
+    for (const auto &module_id : module_ids) {
+      if (module_id == entry.module_id) {
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      module_ids.push_back(entry.module_id);
+    }
+  }
+
+  for (const auto &module_id : module_ids) {
+    JS::RootedObject module(cx, JS_NewPlainObject(cx));
+    if (!module) {
+      return false;
+    }
+    std::vector<std::string> replaced_intrinsic_statics;
+
+    for (const auto &resource : entries) {
+      if (resource.module_id != module_id ||
+          resource.kind != ImportManifestKind::Resource) {
+        continue;
+      }
+      if (resource_class(module_id, resource.resource_name)) {
+        JS_ReportErrorUTF8(cx,
+                           "duplicate resource class '%s' in WIT import "
+                           "module '%s'",
+                           resource.class_name.c_str(), module_id.c_str());
+        return false;
+      }
+
+      const ImportManifestEntry *constructor_entry = nullptr;
+      for (const auto &candidate : entries) {
+        if (candidate.module_id == module_id &&
+            candidate.resource_name == resource.resource_name &&
+            candidate.kind == ImportManifestKind::Constructor) {
+          if (constructor_entry) {
+            JS_ReportErrorUTF8(
+                cx, "duplicate constructor for resource class '%s'",
+                resource.class_name.c_str());
+            return false;
+          }
+          constructor_entry = &candidate;
         }
       }
-      current_id.assign(module_id);
-      current_obj = JS_NewPlainObject(cx);
-      if (!current_obj) {
+
+      JS::RootedObject prototype(cx, JS_NewPlainObject(cx));
+      if (!prototype) {
+        return false;
+      }
+
+      JS::RootedValue extra(cx);
+      JS::RootedObject constructor(cx);
+      if (constructor_entry) {
+        if (!make_dispatch_key(cx, constructor_entry->dispatch_key, &extra)) {
+          return false;
+        }
+        constructor = create_resource_constructor<call_resource_constructor>(
+            cx, module, extra, constructor_entry->arity,
+            resource.class_name.c_str());
+      } else {
+        extra.setUndefined();
+        constructor =
+            create_resource_constructor<call_unavailable_resource_constructor>(
+                cx, module, extra, 0, resource.class_name.c_str());
+      }
+      if (!constructor) {
+        return false;
+      }
+
+      JS::RootedValue prototype_value(cx, JS::ObjectValue(*prototype));
+      if (!JS_DefineProperty(cx, constructor, "prototype", prototype_value,
+                             JSPROP_PERMANENT)) {
+        return false;
+      }
+      JS::RootedValue constructor_value(cx, JS::ObjectValue(*constructor));
+      if (!define_unique_property(cx, prototype, "constructor",
+                                  constructor_value, 0) ||
+          !define_unique_property(cx, module, resource.class_name.c_str(),
+                                  constructor_value, JSPROP_ENUMERATE)) {
+        return false;
+      }
+
+      auto binding = std::make_unique<ResourceClassBinding>();
+      binding->module_id = module_id;
+      binding->class_name = resource.class_name;
+      binding->provider = resource.provider;
+      binding->name = resource.resource_name;
+      binding->prototype =
+          std::make_unique<JS::PersistentRootedObject>(cx, prototype);
+      binding->constructor =
+          std::make_unique<JS::PersistentRootedObject>(cx, constructor);
+      resource_class_bindings.push_back(std::move(binding));
+    }
+
+    for (const auto &entry : entries) {
+      if (entry.module_id != module_id) {
+        continue;
+      }
+      if (entry.kind == ImportManifestKind::Resource ||
+          entry.kind == ImportManifestKind::Constructor) {
+        continue;
+      }
+
+      JS::RootedValue extra(cx);
+      if (!make_dispatch_key(cx, entry.dispatch_key, &extra)) {
+        return false;
+      }
+
+      JS::RootedObject target(cx, module);
+      JS::RootedObject function(cx);
+      unsigned attrs = JSPROP_ENUMERATE;
+      bool replace_function_intrinsic = false;
+      if (entry.kind == ImportManifestKind::Function) {
+        function = create_internal_method<call_import>(
+            cx, module, extra, entry.arity, entry.js_name.c_str());
+      } else {
+        ResourceClassBinding *binding =
+            resource_class(module_id, entry.resource_name);
+        if (!binding) {
+          JS_ReportErrorUTF8(
+              cx, "resource member '%s.%s' has no resource declaration",
+              entry.resource_name.c_str(), entry.js_name.c_str());
+          return false;
+        }
+        attrs = 0;
+        if (entry.kind == ImportManifestKind::Method) {
+          target = binding->prototype->get();
+          function = create_internal_method<call_resource_method>(
+              cx, target, extra, entry.arity, entry.js_name.c_str());
+        } else {
+          target = binding->constructor->get();
+          function = create_internal_method<call_import>(
+              cx, target, extra, entry.arity, entry.js_name.c_str());
+          replace_function_intrinsic =
+              entry.js_name == "name" || entry.js_name == "length";
+          if (replace_function_intrinsic) {
+            const std::string member_key =
+                entry.resource_name + "\n" + entry.js_name;
+            if (std::find(replaced_intrinsic_statics.begin(),
+                          replaced_intrinsic_statics.end(),
+                          member_key) != replaced_intrinsic_statics.end()) {
+              JS_ReportErrorUTF8(
+                  cx,
+                  "duplicate JavaScript import binding '%s' in WIT import "
+                  "manifest",
+                  entry.js_name.c_str());
+              return false;
+            }
+            replaced_intrinsic_statics.push_back(member_key);
+          }
+        }
+      }
+      if (!function) {
+        return false;
+      }
+      JS::RootedValue function_value(cx, JS::ObjectValue(*function));
+      const bool defined =
+          replace_function_intrinsic
+              ? JS_DefineProperty(cx, target, entry.js_name.c_str(),
+                                  function_value, attrs)
+              : define_unique_property(cx, target, entry.js_name.c_str(),
+                                       function_value, attrs);
+      if (!defined) {
         return false;
       }
     }
 
-    std::string dispatch_key_str(dispatch_key);
-    JS::RootedString key_str(cx,
-                             JS_NewStringCopyN(cx, dispatch_key_str.data(), dispatch_key_str.size()));
-    if (!key_str) {
-      return false;
-    }
-    JS::RootedValue extra(cx, JS::StringValue(key_str));
-    std::string js_name_str(js_name);
-    JS::RootedObject method(cx, create_internal_method<call_import>(cx, current_obj, extra, arity,
-                                                                    js_name_str.c_str()));
-    if (!method) {
-      return false;
-    }
-    JS::RootedValue method_val(cx, JS::ObjectValue(*method));
-    if (!JS_DefineProperty(cx, current_obj, js_name_str.c_str(), method_val, JSPROP_ENUMERATE)) {
-      return false;
-    }
-  }
-
-  if (!current_id.empty()) {
-    JS::RootedValue module_val(cx, JS::ObjectValue(*current_obj));
-    if (!engine->define_builtin_module(current_id.c_str(), module_val)) {
+    JS::RootedValue module_value(cx, JS::ObjectValue(*module));
+    if (!engine->define_builtin_module(module_id.c_str(), module_value)) {
       return false;
     }
   }

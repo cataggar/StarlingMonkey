@@ -139,7 +139,11 @@ pub fn decodeResource(
     descriptor: wit_types.ResourceDescriptor,
     ownership: ResourceOwnership,
 ) i32 {
-    if (value.tag != .resource or value.resource_ownership != ownership) {
+    // An owned JavaScript wrapper may be passed to a borrow parameter without
+    // transferring it; the active dispatch keeps the wrapper and token alive.
+    const ownership_matches = value.resource_ownership == ownership or
+        (ownership == .borrow and value.resource_ownership == .own);
+    if (value.tag != .resource or !ownership_matches) {
         @panic("native dispatch: resource identity or ownership mismatch");
     }
     const provider_ptr = value.resource_provider_ptr orelse
@@ -1019,12 +1023,21 @@ fn collectOwnedResources(
     comptime T: type,
     decoded: T,
     value: *const NativeValue,
-    resources: *std.ArrayListUnmanaged(ResourceToken),
+    owned_resources: *std.ArrayListUnmanaged(ResourceToken),
+    borrowed_owned_resources: *std.ArrayListUnmanaged(ResourceToken),
     allocator: std.mem.Allocator,
 ) void {
     if (comptime wit_types.resourceInfo(T)) |info| {
         if (info.ownership == .own) {
-            resources.append(allocator, .{
+            owned_resources.append(allocator, .{
+                .type_id = value.resource_type_id,
+                .handle = value.resource_handle,
+                .generation = value.resource_generation,
+                .ownership = .own,
+                .borrow_epoch = 0,
+            }) catch @panic("OOM");
+        } else if (value.resource_ownership == .own) {
+            borrowed_owned_resources.append(allocator, .{
                 .type_id = value.resource_type_id,
                 .handle = value.resource_handle,
                 .generation = value.resource_generation,
@@ -1042,7 +1055,14 @@ fn collectOwnedResources(
             const items = value.list_ptr orelse
                 @panic("native dispatch: decoded list is missing its item pointer");
             for (decoded, items[0..value.list_len]) |item, *native_item| {
-                collectOwnedResources(p.child, item, native_item, resources, allocator);
+                collectOwnedResources(
+                    p.child,
+                    item,
+                    native_item,
+                    owned_resources,
+                    borrowed_owned_resources,
+                    allocator,
+                );
             }
         },
         .optional => |o| {
@@ -1055,7 +1075,14 @@ fn collectOwnedResources(
                     @panic("native dispatch: decoded nested option is missing its value")
             else
                 value;
-            collectOwnedResources(o.child, present, inner, resources, allocator);
+            collectOwnedResources(
+                o.child,
+                present,
+                inner,
+                owned_resources,
+                borrowed_owned_resources,
+                allocator,
+            );
         },
         .@"union" => |u| {
             const active = std.meta.activeTag(decoded);
@@ -1067,7 +1094,8 @@ fn collectOwnedResources(
                         field_type,
                         @field(decoded, name),
                         inner,
-                        resources,
+                        owned_resources,
+                        borrowed_owned_resources,
                         allocator,
                     );
                 }
@@ -1083,7 +1111,8 @@ fn collectOwnedResources(
                         field_type,
                         @field(decoded, name),
                         &items[i],
-                        resources,
+                        owned_resources,
+                        borrowed_owned_resources,
                         allocator,
                     );
                 }
@@ -1097,7 +1126,8 @@ fn collectOwnedResources(
                     field_type,
                     @field(decoded, name),
                     field_value,
-                    resources,
+                    owned_resources,
+                    borrowed_owned_resources,
                     allocator,
                 );
             }
@@ -1115,11 +1145,33 @@ pub fn commitNativeResources(
     value: *const NativeValue,
     allocator: std.mem.Allocator,
 ) bool {
-    var resources: std.ArrayListUnmanaged(ResourceToken) = .empty;
-    defer resources.deinit(allocator);
-    collectOwnedResources(T, decoded, value, &resources, allocator);
-    if (resources.items.len == 0 or builtin.is_test) return true;
-    return starling_js_resource_transfer_many(resources.items.ptr, resources.items.len) == 0;
+    var owned_resources: std.ArrayListUnmanaged(ResourceToken) = .empty;
+    defer owned_resources.deinit(allocator);
+    var borrowed_owned_resources: std.ArrayListUnmanaged(ResourceToken) = .empty;
+    defer borrowed_owned_resources.deinit(allocator);
+    collectOwnedResources(
+        T,
+        decoded,
+        value,
+        &owned_resources,
+        &borrowed_owned_resources,
+        allocator,
+    );
+    for (owned_resources.items) |owned| {
+        for (borrowed_owned_resources.items) |borrowed| {
+            if (owned.type_id == borrowed.type_id and
+                owned.handle == borrowed.handle and
+                owned.generation == borrowed.generation)
+            {
+                return false;
+            }
+        }
+    }
+    if (owned_resources.items.len == 0 or builtin.is_test) return true;
+    return starling_js_resource_transfer_many(
+        owned_resources.items.ptr,
+        owned_resources.items.len,
+    ) == 0;
 }
 
 fn callNative(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
@@ -1365,6 +1417,10 @@ test "resource metadata preserves provider, name, handle, and ownership" {
     try std.testing.expect(typeNeedsNative(Borrowed));
     try std.testing.expectEqual(NativeTag.resource, first.tag);
     try std.testing.expectEqual(@as(i32, 1), decodeNative(First, &first, arena.allocator()).handle);
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        decodeNative(Borrowed, &first, arena.allocator()).handle,
+    );
     try std.testing.expectEqualStrings(
         First.__wit_resource.provider,
         first.resource_provider_ptr.?[0..first.resource_provider_len],
@@ -1392,7 +1448,7 @@ test "resource metadata preserves provider, name, handle, and ownership" {
     borrowed_native.resource_type_id = 5;
     borrowed_native.resource_generation = 9;
     borrowed_native.resource_borrow_epoch = 2;
-    const fields = [_]NativeField{
+    var fields = [_]NativeField{
         .{ .name_ptr = "owned".ptr, .name_len = "owned".len, .value = &owned_native },
         .{ .name_ptr = "borrowed".ptr, .name_len = "borrowed".len, .value = &borrowed_native },
     };
@@ -1404,16 +1460,28 @@ test "resource metadata preserves provider, name, handle, and ownership" {
     const Bundle = struct { owned: First, borrowed: Borrowed };
     var transfers: std.ArrayListUnmanaged(ResourceToken) = .empty;
     defer transfers.deinit(arena.allocator());
+    var borrowed_owned: std.ArrayListUnmanaged(ResourceToken) = .empty;
+    defer borrowed_owned.deinit(arena.allocator());
     collectOwnedResources(
         Bundle,
         .{ .owned = .{ .handle = 1 }, .borrowed = .{ .handle = 1 } },
         &native_bundle,
         &transfers,
+        &borrowed_owned,
         arena.allocator(),
     );
     try std.testing.expectEqual(@as(usize, 1), transfers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), borrowed_owned.items.len);
     try std.testing.expectEqual(@as(u32, 5), transfers.items[0].type_id);
     try std.testing.expectEqual(@as(u64, 9), transfers.items[0].generation);
+
+    fields[1].value = &owned_native;
+    try std.testing.expect(!commitNativeResources(
+        Bundle,
+        .{ .owned = .{ .handle = 1 }, .borrowed = .{ .handle = 1 } },
+        &native_bundle,
+        arena.allocator(),
+    ));
 }
 
 test "encodes and decodes exact u64 values beyond 2^53" {

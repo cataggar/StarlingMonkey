@@ -33,8 +33,10 @@
 // through the generic, reflection-based `lowerAggregateParam` path. The
 // World-level functions are bridged as ComponentizeJS-compatible ESM default
 // imports (module=<WIT function>, export=default) over canonical `$root` core
-// imports. The only WIT shapes this bridge does not support are resources,
-// async imports, and a `flags` type with more than 32 labels -- see
+// imports. Imported resources use provider-qualified JavaScript classes with
+// generated constructors, prototype methods, statics, own/borrow parameters,
+// and finalizer-driven canonical drops. The remaining unsupported WIT shapes
+// are async imports and a `flags` type with more than 32 labels -- see
 // tests/compat/manifest.json's
 // `wit-imports-flags-over-32-labels-unsupported` known_deviation.
 package test:wit-imports@1.2.3;
@@ -44,6 +46,19 @@ interface host {
         x: u32,
         y: u32,
     }
+
+    resource counter {
+        constructor(initial: u32);
+        from-double: static func(value: u32) -> counter;
+        name: static func(value: u32) -> u32;
+        length: static func(value: u32) -> u32;
+        increment: func(by: u32) -> u32;
+        value: func() -> u32;
+    }
+
+    read-counter: func(value: borrow<counter>) -> u32;
+    take-counter: func(value: counter) -> u32;
+    counter-drop-count: func() -> u32;
 
     // Exact s64/u64 BigInt round trips through the reverse (import) bridge.
     add: func(a: s64, b: s64) -> s64;
@@ -210,6 +225,11 @@ interface api {
     // confirm the canonical-ABI import actually ran (not a no-op stub).
     run-note: func() -> bool;
     run-note-count: func() -> u32;
+    run-counter: func(initial: u32) -> list<u32>;
+    run-counter-drop-count: func() -> u32;
+    run-counter-moved: func(initial: u32) -> u32;
+    run-counter-wrong-receiver: func() -> u32;
+    run-counter-without-new: func(initial: u32) -> u32;
 
     // Root-function import coverage: arguments/results, repeated calls, a
     // void result observed as JavaScript `undefined`, and host trapping.

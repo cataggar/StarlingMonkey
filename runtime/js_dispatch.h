@@ -188,6 +188,11 @@ extern "C" STARLING_ENGINE_EXPORT uint32_t starling_js_resource_validate(
 extern "C" STARLING_ENGINE_EXPORT uint32_t
 starling_js_resource_transfer_many(const starling::ResourceToken *tokens, size_t len);
 
+// Drains all JavaScript-owned WIT resources at a depth-zero embedding
+// lifecycle checkpoint. The wasm export uses the corresponding kebab-case
+// name so component worlds can expose it directly when needed.
+extern "C" STARLING_ENGINE_EXPORT bool starling_js_shutdown_resources();
+
 // ---------------------------------------------------------------------------
 // Ownership/type contract (read this before touching either side of the
 // bridge):
@@ -337,9 +342,9 @@ bool starling_validate_required_exports();
 // JavaScript. These three symbols are emitted by the WABT `wasip3-bindgen`
 // generator's `--js-imports` mode (see component_bindgen.zig's
 // `emitJsImportBridge`) whenever the world imports at least one interface
-// function whose full parameter/result type graph is representable by the
-// same tagged-value vocabulary as the export bridge above (bool/integers/
-// f32/f64/string/option<T>/list<T>/record, recursively). `js_dispatch.cpp`
+// function or resource whose full parameter/result type graph is representable
+// by the same tagged-value vocabulary as the export bridge above (including
+// provider-qualified own/borrow resource handles). `js_dispatch.cpp`
 // provides weak default fallbacks (see the `.cpp` file) so a build with no
 // eligible imports -- or without `--dispatch`/`--js-imports` at all -- still
 // links, with an empty manifest and a dispatch function that always reports
@@ -348,17 +353,23 @@ bool starling_validate_required_exports();
 //
 // `wit_imports::install` (js_dispatch.cpp) parses the manifest, groups entries
 // by JavaScript module id, and registers each builtin ES module via
-// `Engine::define_builtin_module`. Interface imports expose named functions;
-// a world-level function `foo` exposes `default` from module `foo`, matching
-// ComponentizeJS 0.21. Arguments are built from JS values via the same
-// `decode_from_js` used for export results, and results use the same
-// `encode_to_js` used for export arguments.
+// `Engine::define_builtin_module`. Interface resources expose constructable
+// classes with prototype methods and static methods; resource values returned
+// by any import receive the prototype selected by their exact provider/name.
+// Interface imports expose named functions; a world-level function `foo`
+// exposes `default` from module `foo`, matching ComponentizeJS 0.21. Arguments
+// are built from JS values via the same `decode_from_js` used for export
+// results, and results use the same `encode_to_js` used for export arguments.
 
-// Returns a pointer to a TSV byte string, one line per JS-bridged import:
-// "<module-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". Interface
-// entries use `<iface-id>, <WIT function>, <iface-id>#<WIT function>`;
-// root entries use `<WIT function>, default, $root#<WIT function>`. `*out_len`
-// is set to its length. The static returned buffer must not be freed.
+// Returns a pointer to a TSV byte string. Ordinary function lines retain
+// "<module-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". Resource
+// classes use "R\t<provider>\t<resource>\t<class-name>\n"; constructors,
+// methods, and statics use
+// "C|M|S\t<provider>\t<resource>\t<js-name>\t<dispatch-key>\t<arity>\n".
+// Interface function entries use `<iface-id>, <WIT function>,
+// <iface-id>#<WIT function>`; root entries use `<WIT function>, default,
+// $root#<WIT function>`. `*out_len` is set to its length. The static returned
+// buffer must not be freed.
 extern "C" STARLING_ENGINE_EXPORT const uint8_t *starling_js_imports_manifest(size_t *out_len);
 
 // Looks up the manifest line's dispatch key (`<iface>#<function>` or

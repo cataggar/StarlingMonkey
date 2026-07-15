@@ -97,14 +97,14 @@
       },
       {
         "id": "no-variants-enums-flags-results-resources",
-        "summary": "NARROWED as of sync-value-parity: enums, flags, variants and result<T,E> (both nested and as an export's own top-level return type) are now represented by the native tagged-value bridge and build-verified end to end (tests/compat/fixtures/advanced-types). Only resources, futures and streams remain entirely unrepresented (still out of scope; see feature_matrix resources, phase 4).",
+        "summary": "NARROWED as of imported-resource parity: enums, flags, variants and result<T,E> are represented by the native tagged-value bridge, and host-provided resources are represented by provider-qualified JavaScript classes with own/borrow lifetime tracking. JavaScript-backed exported resources, futures, and streams remain unrepresented (see feature_matrix resources, phase 4).",
         "phase_addressed": 2,
         "confidence": "build-verified",
         "evidence": "tests/compat/fixtures/advanced-types; tests/compat/runtime (bridge/advanced-types); expected/advanced-types.json; tests/e2e/native-dispatch/run.sh"
       },
       {
         "id": "wit-imports-flags-over-32-labels-unsupported",
-        "summary": "The pinned cataggar/wabt generator and ComponentizeJS 0.21.0 both support flags through 32 labels and reject flags with more than 32 labels. StarlingMonkey's generator rejection is deterministic and names the type/interface/label count; the reference fails component construction with 'cannot have more than 32 flags'. Multiword flags are therefore a shared limitation rather than a 0.21 compatibility gap. Root-level imports are now supported; resources remain a separate StarlingMonkey gap. Canonical async functions, futures, and streams are also rejected by the pinned reference and are follow-on features rather than 0.21 release requirements.",
+        "summary": "The pinned cataggar/wabt generator and ComponentizeJS 0.21.0 both support flags through 32 labels and reject flags with more than 32 labels. StarlingMonkey's generator rejection is deterministic and names the type/interface/label count; the reference fails component construction with 'cannot have more than 32 flags'. Multiword flags are therefore a shared limitation rather than a 0.21 compatibility gap. Root-level functions and host-provided resources are now supported; JavaScript-backed exported resources remain the resource gap. Canonical async functions, futures, and streams are also rejected by the pinned reference and are follow-on features rather than 0.21 release requirements.",
         "phase_addressed": "feat/js-bridge-parity-integration",
         "confidence": "reference-verified; StarlingMonkey source-verified with existing <=32 runtime coverage",
         "evidence": "tests/compat/reference/contracts/run.mjs and expected-0.21.0.json verify ComponentizeJS 0.21.0 at 32/33/64/65 labels. The pinned cataggar/wabt commit b44a99b91bc45f74cd52c0cbf63e93a66c461ccf enforces the same `labels.len <= 32` boundary in component_bindgen.zig and generates root-function import wrappers/manifests; tests/e2e/wit-imports runtime-verifies root imports and the supported three-label flags representation but does not itself exercise the 32-label boundary."
@@ -278,14 +278,15 @@
       "category": "resources",
       "status": "unsupported",
       "phase": 4,
-      "fixtures": []
+      "fixtures": [],
+      "notes": "Host-provided imported resources are supported and runtime-verified by tests/e2e/wit-imports (constructors, methods, statics, borrow preservation, owned transfer, stale/wrong receiver rejection, and canonical drops). This category remains unsupported until JavaScript-backed exported resources are implemented and added to the differential compat fixture set."
     },
     {
       "category": "imports",
       "status": "supported",
       "phase": 3,
       "fixtures": [],
-      "notes": "Reverse direction (JavaScript imports a host-provided WIT interface or root function) via WABT `--js-imports`-generated canonical-ABI wrappers (runtime/js_dispatch.{h,cpp,zig}'s wit_imports::install/starling_js_import_dispatch), sharing the same encode_to_js/decode_from_js and STARLING_JS_* tag vocabulary as the export bridge above with the encode/decode roles reversed -- bool/integers/f32/f64/char/string/list<u8>/list/option/record/tuple/enum/flags/variant/result and a void result (JS `undefined`, never `false`/`null`) are all bridgeable. Not part of this compat harness (which only drives the export direction); see the dedicated tests/e2e/wit-imports/ fixture and its `zig build wit-imports-e2e-test` suite, run separately from compat-test/compat-bridge-test. Resource-typed and async imports are rejected at build time by the WABT bindgen fork rather than silently omitted; see README.md's 'WIT interface imports' section."
+      "notes": "Reverse direction (JavaScript imports a host-provided WIT interface, resource, or root function) via WABT `--js-imports`-generated canonical-ABI wrappers (runtime/js_dispatch.{h,cpp,zig}'s wit_imports::install/starling_js_import_dispatch), sharing the same encode_to_js/decode_from_js and STARLING_JS_* tag vocabulary as the export bridge above with the encode/decode roles reversed. Provider-qualified resource classes support constructors, methods, statics, own/borrow parameters and results, atomic ownership transfer, and canonical drops. Not part of this compat harness (which only drives the export direction); see tests/e2e/wit-imports and `zig build wit-imports-e2e-test`. Async imports are rejected at build time rather than silently omitted."
     },
     {
       "category": "promise-exports",
@@ -1184,7 +1185,7 @@
       "world": "js-exports",
       "js_file": "component.js",
       "expected_file": "expected/advanced-types.json",
-      "description": "char, list<u8>, tuple, enum, flags, variant, result<T,E> (both nested inside a record and as an export's own top-level return type), and multi-word-identifier naming edge cases (kebab-case WIT names resolved as camelCase JS export/property identifiers). Closes feature_matrix categories char/tuple/enum/flags/variant/result/kebab-case-and-naming for everything except resources/futures/streams (still phase 4+, out of scope).",
+      "description": "char, list<u8>, tuple, enum, flags, variant, result<T,E> (both nested inside a record and as an export's own top-level return type), and multi-word-identifier naming edge cases (kebab-case WIT names resolved as camelCase JS export/property identifiers). Closes feature_matrix categories char/tuple/enum/flags/variant/result/kebab-case-and-naming; JavaScript-backed exported resources, futures, and streams remain phase 4+.",
       "runtime_verification": "build-verified (tests/compat/runtime/run-bridge-tests.sh, 2026-... see git history for this fixture's commit)",
       "notes": "Wrong-type/out-of-range/invalid-discriminant negative cases for these same value classes are covered at a finer grain (per exact trap condition) by tests/e2e/native-dispatch/run.sh (51/51 checks) rather than duplicated here as additional full-reactor-build negative fixtures, since a compat fixture here is all-positive or all-negative per tests/compat/runtime/lib/run_bridge_tests.py's run_positive_fixture/run_negative_fixture split, and this suite's per-fixture build cost (~15-20 minutes, see run_bridge_tests.py's own docstring) makes one-condition-per-fixture impractical; this fixture instead focuses on positive value-shape parity against the real ComponentizeJS reference through the same Wasmtime host.",
       "cases": [

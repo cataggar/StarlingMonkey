@@ -724,8 +724,10 @@ pub fn build(b: *std.Build) void {
     // type the native bridge supports (char/option<char>, list<u8> bytes
     // including a nested/optional case, tuple, enum/option<enum>,
     // flags/option<flags>, variant with void and payload cases, and
-    // result<T,E> both-payload and void-ok-payload forms), each through a
-    // real host-side transform, now that cataggar/wabt PR #335 (see
+    // result<T,E> both-payload and void-ok-payload forms), plus imported
+    // resources through constructors, methods, statics, borrow parameters,
+    // owned transfers, stale-handle rejection, and resource drops. Each runs
+    // through a real host-side transform, now that cataggar/wabt PR #335 (see
     // build.zig.zon's `.wasip3` pin) fixed the reverse (`--js-imports`)
     // bridge's type gate and lowering for all of them. Root-function coverage
     // verifies the default-import convention, arguments/results,

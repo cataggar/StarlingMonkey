@@ -102,6 +102,14 @@ extern "C" bool exports_wasi_cli_run_run() {
   return starling::shutdown_resources(ENGINE);
 }
 
+// Embedders that invoke JavaScript-backed exports directly need an explicit
+// depth-zero lifecycle checkpoint without entering the one-shot WASI CLI path.
+extern "C" STARLING_ENGINE_EXPORT
+    __attribute__((export_name("starling-js-shutdown-resources")))
+bool starling_js_shutdown_resources() {
+  return ENGINE && starling::shutdown_resources(ENGINE);
+}
+
 /**
  * Initialize the runtime with the configuration provided via an environment variable.
  *

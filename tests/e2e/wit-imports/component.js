@@ -62,6 +62,10 @@ import {
   "identity-shape" as identityShape,
   "checked-div" as checkedDiv,
   "validate-non-negative" as validateNonNegative,
+  Counter,
+  "read-counter" as readCounter,
+  "take-counter" as takeCounter,
+  "counter-drop-count" as counterDropCount,
 } from "test:wit-imports/host@1.2.3";
 
 // Frozen ComponentizeJS 0.21 root-function convention: each world-level
@@ -135,6 +139,42 @@ function runNoteCount() {
   return noteCount();
 }
 export { runNoteCount as "run-note-count" };
+
+function runCounter(initial) {
+  const counter = new Counter(initial);
+  const doubled = Counter.fromDouble(initial);
+  return [
+    counter.increment(2),
+    readCounter(counter),
+    counter.value(),
+    doubled.value(),
+    takeCounter(doubled),
+    Counter.name(9),
+    Counter.length(10),
+  ];
+}
+export { runCounter as "run-counter" };
+
+export function runCounterDropCount() {
+  return counterDropCount();
+}
+
+function runCounterMoved(initial) {
+  const counter = new Counter(initial);
+  takeCounter(counter);
+  return counter.value();
+}
+export { runCounterMoved as "run-counter-moved" };
+
+function runCounterWrongReceiver() {
+  return Counter.prototype.value.call({});
+}
+export { runCounterWrongReceiver as "run-counter-wrong-receiver" };
+
+function runCounterWithoutNew(initial) {
+  return Counter(initial).value();
+}
+export { runCounterWithoutNew as "run-counter-without-new" };
 
 function runRootAdd(value) {
   return addOne(value);
@@ -327,6 +367,11 @@ export const api = {
   "run-boom": runBoom,
   "run-note": runNote,
   "run-note-count": runNoteCount,
+  "run-counter": runCounter,
+  "run-counter-drop-count": runCounterDropCount,
+  "run-counter-moved": runCounterMoved,
+  "run-counter-wrong-receiver": runCounterWrongReceiver,
+  "run-counter-without-new": runCounterWithoutNew,
   "run-root-add": runRootAdd,
   "run-root-repeated": runRootRepeated,
   "run-root-note": runRootNote,

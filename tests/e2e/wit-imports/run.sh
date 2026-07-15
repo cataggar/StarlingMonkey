@@ -192,6 +192,11 @@ cat > "$CALLS_JSON" <<'EOF'
   {"function": "run-root-chain", "args": [{"tag": "item", "val": {"x": 5, "y": 8}}]},
   {"function": "root-add", "args": [20, 22], "interface": null},
   {"function": "kebab-interface-add", "args": [41], "interface": "test:wit-imports/incoming-handler@1.2.3"},
+  {"function": "run-counter", "args": [40]},
+  {"function": "starling-js-shutdown-resources", "args": [], "interface": null},
+  {"function": "run-counter-drop-count", "args": []},
+  {"function": "starling-js-shutdown-resources", "args": [], "interface": null},
+  {"function": "run-counter-drop-count", "args": []},
   {"function": "run-boom", "args": []}
 ]
 EOF
@@ -325,8 +330,17 @@ assert_field "root function export remains callable beside the api namespace" 47
 assert_field "kebab-case versioned interface resolves through camelCase namespace/member fallback" 48 \
   "rec['value']" "42"
 
-assert_field "run-boom host trap propagates" 49 "rec['ok']" "False"
-assert_field "run-boom trap message names the deliberate host error" 49 \
+assert_field "resource constructor, method, borrow, and returned prototype work together" 49 \
+  "rec['value']" "[42, 42, 42, 80, 80, 10, 12]"
+
+assert_field "resource shutdown succeeds" 50 "rec['ok']" "True"
+assert_field "resource shutdown performs one canonical host drop" 51 "rec['value']" "1"
+assert_field "repeated resource shutdown succeeds" 52 "rec['ok']" "True"
+assert_field "repeated resource shutdown does not duplicate the canonical drop" 53 \
+  "rec['value']" "1"
+
+assert_field "run-boom host trap propagates" 54 "rec['ok']" "False"
+assert_field "run-boom trap message names the deliberate host error" 54 \
   "'boom: deliberate host-side trap' in rec['trap']" "True"
 
 echo "[wit-imports e2e] invoking root-boom in a fresh instance"
@@ -337,6 +351,22 @@ OUTPUT_JSON="$PREFIX/root_trap_output.json"
 assert_field "root-boom host trap propagates" 0 "rec['ok']" "False"
 assert_field "root-boom trap names the world-level host function" 0 \
   "'root-boom: deliberate host-side trap' in rec['trap']" "True"
+
+echo "[wit-imports e2e] checking resource misuse diagnostics in fresh instances"
+for resource_case in moved wrong-receiver without-new; do
+  RESOURCE_TRAP_CALLS_JSON="$PREFIX/resource_${resource_case}_calls.json"
+  resource_args='[7]'
+  if [ "$resource_case" = "wrong-receiver" ]; then
+    resource_args='[]'
+  fi
+  echo "[{\"function\":\"run-counter-${resource_case}\",\"args\":${resource_args}}]" \
+    > "$RESOURCE_TRAP_CALLS_JSON"
+  RESOURCE_TRAP_OUTPUT_JSON="$PREFIX/resource_${resource_case}_output.json"
+  "$INVOKER" "$COMPONENT" "$RESOURCE_TRAP_CALLS_JSON" > "$RESOURCE_TRAP_OUTPUT_JSON"
+  OUTPUT_JSON="$RESOURCE_TRAP_OUTPUT_JSON"
+  assert_field "resource ${resource_case} misuse traps" 0 "rec['ok']" "False"
+done
+OUTPUT_JSON="$PREFIX/output.json"
 
 echo "[wit-imports e2e] checking literal member precedence over camelCase"
 LITERAL_COMPONENT="$PREFIX/wit-imports-literal-names.wasm"

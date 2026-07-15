@@ -29,10 +29,10 @@
 // the exact same `{"ok": ..., ...}` shape as compat-invoker.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use wasmtime::component::{Component, Linker, Type, Val};
+use wasmtime::component::{Component, Linker, ResourceDynamic, ResourceType, Type, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -397,6 +397,27 @@ fn wasm_err(msg: impl Into<String>) -> wasmtime::Error {
     wasmtime::Error::msg(msg.into())
 }
 
+const COUNTER_RESOURCE_TYPE: u32 = 0x4354_5253;
+
+fn counter_rep(
+    store: wasmtime::StoreContextMut<'_, Host>,
+    resource: &wasmtime::component::ResourceAny,
+    expect_owned: bool,
+) -> wasmtime::Result<u32> {
+    let counter = (*resource).try_into_resource_dynamic(store)?;
+    if counter.ty() != COUNTER_RESOURCE_TYPE {
+        return Err(wasm_err("counter: wrong dynamic resource type"));
+    }
+    if counter.owned() != expect_owned {
+        return Err(wasm_err(if expect_owned {
+            "counter: expected own<counter>"
+        } else {
+            "counter: expected borrow<counter>"
+        }));
+    }
+    Ok(counter.rep())
+}
+
 fn add_root_imports(linker: &mut Linker<Host>, include_root_boom: bool) -> Result<()> {
     let mut root = linker.root();
 
@@ -513,6 +534,172 @@ fn add_root_imports(linker: &mut Linker<Host>, include_root_boom: bool) -> Resul
 
 fn add_host_import(linker: &mut Linker<Host>, include_boom: bool) -> Result<()> {
     let mut host = linker.instance("test:wit-imports/host@1.2.3")?;
+
+    let counter_values = Arc::new(Mutex::new(HashMap::<u32, u32>::new()));
+    let next_counter = Arc::new(AtomicU32::new(1));
+    let counter_drop_count = Arc::new(AtomicU32::new(0));
+
+    host.resource(
+        "counter",
+        ResourceType::host_dynamic(COUNTER_RESOURCE_TYPE),
+        {
+            let counter_values = counter_values.clone();
+            let counter_drop_count = counter_drop_count.clone();
+            move |_store, rep| -> wasmtime::Result<()> {
+                let removed = counter_values
+                    .lock()
+                    .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                    .remove(&rep);
+                if removed.is_none() {
+                    return Err(wasm_err("counter: duplicate or unknown canonical drop"));
+                }
+                counter_drop_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    )?;
+
+    host.func_new("[constructor]counter", {
+        let counter_values = counter_values.clone();
+        let next_counter = next_counter.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::U32(initial)] = args else {
+                return Err(wasm_err("[constructor]counter: expected (u32)"));
+            };
+            let rep = next_counter.fetch_add(1, Ordering::Relaxed);
+            counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                .insert(rep, *initial);
+            results[0] = Val::Resource(
+                ResourceDynamic::new_own(rep, COUNTER_RESOURCE_TYPE)
+                    .try_into_resource_any(store)?,
+            );
+            Ok(())
+        }
+    })?;
+
+    host.func_new("[static]counter.from-double", {
+        let counter_values = counter_values.clone();
+        let next_counter = next_counter.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::U32(value)] = args else {
+                return Err(wasm_err("[static]counter.from-double: expected (u32)"));
+            };
+            let rep = next_counter.fetch_add(1, Ordering::Relaxed);
+            counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                .insert(rep, value.wrapping_mul(2));
+            results[0] = Val::Resource(
+                ResourceDynamic::new_own(rep, COUNTER_RESOURCE_TYPE)
+                    .try_into_resource_any(store)?,
+            );
+            Ok(())
+        }
+    })?;
+
+    host.func_new(
+        "[static]counter.name",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::U32(value)] = args else {
+                return Err(wasm_err("[static]counter.name: expected (u32)"));
+            };
+            results[0] = Val::U32(value.wrapping_add(1));
+            Ok(())
+        },
+    )?;
+
+    host.func_new(
+        "[static]counter.length",
+        |_store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::U32(value)] = args else {
+                return Err(wasm_err("[static]counter.length: expected (u32)"));
+            };
+            results[0] = Val::U32(value.wrapping_add(2));
+            Ok(())
+        },
+    )?;
+
+    host.func_new("[method]counter.increment", {
+        let counter_values = counter_values.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::Resource(resource), Val::U32(by)] = args else {
+                return Err(wasm_err(
+                    "[method]counter.increment: expected (borrow<counter>, u32)",
+                ));
+            };
+            let rep = counter_rep(store, resource, false)?;
+            let mut values = counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?;
+            let value = values
+                .get_mut(&rep)
+                .ok_or_else(|| wasm_err("counter: unknown/dropped representation"))?;
+            *value = value.wrapping_add(*by);
+            results[0] = Val::U32(*value);
+            Ok(())
+        }
+    })?;
+
+    host.func_new("[method]counter.value", {
+        let counter_values = counter_values.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::Resource(resource)] = args else {
+                return Err(wasm_err("[method]counter.value: expected borrow<counter>"));
+            };
+            let rep = counter_rep(store, resource, false)?;
+            let value = *counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                .get(&rep)
+                .ok_or_else(|| wasm_err("counter: unknown/dropped representation"))?;
+            results[0] = Val::U32(value);
+            Ok(())
+        }
+    })?;
+
+    host.func_new("read-counter", {
+        let counter_values = counter_values.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::Resource(resource)] = args else {
+                return Err(wasm_err("read-counter: expected borrow<counter>"));
+            };
+            let rep = counter_rep(store, resource, false)?;
+            let value = *counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                .get(&rep)
+                .ok_or_else(|| wasm_err("counter: unknown/dropped representation"))?;
+            results[0] = Val::U32(value);
+            Ok(())
+        }
+    })?;
+
+    host.func_new("take-counter", {
+        let counter_values = counter_values.clone();
+        move |store, _ty, args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            let [Val::Resource(resource)] = args else {
+                return Err(wasm_err("take-counter: expected own<counter>"));
+            };
+            let rep = counter_rep(store, resource, true)?;
+            let value = counter_values
+                .lock()
+                .map_err(|_| wasm_err("counter: state lock poisoned"))?
+                .remove(&rep)
+                .ok_or_else(|| wasm_err("counter: unknown/dropped representation"))?;
+            results[0] = Val::U32(value);
+            Ok(())
+        }
+    })?;
+
+    host.func_new("counter-drop-count", {
+        let counter_drop_count = counter_drop_count.clone();
+        move |_store, _ty, _args: &[Val], results: &mut [Val]| -> wasmtime::Result<()> {
+            results[0] = Val::U32(counter_drop_count.load(Ordering::SeqCst));
+            Ok(())
+        }
+    })?;
 
     host.func_new(
         "add",

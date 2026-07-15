@@ -239,17 +239,21 @@ a component instantiated against a linker that doesn't implement a required
 import fails deterministically at instantiation time with an actionable
 diagnostic (this is enforced by the host, e.g. Wasmtime, not silently
 skipped). Root-level function imports are also generated as default ES module
-imports and use the same typed bridge. Resource-typed and async imports are not
-yet supported; the WABT bindgen fork used by this build (`cataggar/wabt`, see
-`build.zig.zon`'s `.wasip3` dependency) rejects those with a build-time
-diagnostic rather than silently omitting them.
+imports and use the same typed bridge. Imported resources are exposed as
+provider-qualified JavaScript classes with constructors, prototype methods,
+statics, own/borrow parameters and results, atomic ownership transfer, and
+deferred canonical drops. Canonical async imports remain unsupported; the WABT
+bindgen fork used by this build (`cataggar/wabt`, see `build.zig.zon`'s
+`.wasip3` dependency) rejects them with a build-time diagnostic rather than
+silently omitting them.
 
 See `tests/e2e/wit-imports/` for the full fixture (a custom
 `test:wit-imports/host@1.2.3` interface implemented by a Wasmtime host, and
 `test:wit-imports/api@1.2.3` exported back to it) and run its E2E suite,
 which builds the fixture, componentizes it, and drives every export/import
 call (including repeated calls, exact BigInt arithmetic, nested records,
-host-trap propagation, and the missing-import diagnostic) through a
+resource classes and misuse diagnostics, host-trap propagation, and the
+missing-import diagnostic) through a
 purpose-built Wasmtime 42 host, with:
 
 ```console
