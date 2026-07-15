@@ -11,12 +11,15 @@ command string):
 2. Pre-initialize the JavaScript module with Wizer.
 3. Strip and embed the selected component world with WABT.
 4. Adapt the reactor into a component.
-5. Validate the candidate with `wasm-tools`.
-6. `fsync` and atomically rename the candidate over the requested output.
+5. Add standard `language=JavaScript` and
+   `processed-by=starling-componentize` producers metadata.
+6. Validate the completed candidate with `wasm-tools`.
+7. `fsync` and transactionally publish the requested outputs.
 
-Any failure before the final rename leaves an existing output unchanged. The
-temporary transaction directory is created beside the output so publication
-cannot cross filesystems.
+Any failure leaves existing component and metadata outputs unchanged and never
+publishes a partial debug directory. The temporary transaction directory is
+created beside the output; optional metadata and debug destinations must use
+that same parent so publication and rollback cannot cross filesystems.
 
 ## Building
 
@@ -67,7 +70,54 @@ has finished consuming the cached engine, adapter, and generated bindings.
 
 Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
 and feature selection. Build-changing feature/debug options are rejected with
-that override.
+that override. Public imports metadata for a WIT-selected run requires the
+generated bindings retained by the native runtime build, so `--metadata-out`
+with both `--engine` and `--wit` is rejected rather than reporting an
+incomplete imports list.
+
+## Diagnostics
+
+Human errors use stable codes and name the failing pipeline phase, for example:
+
+```text
+error[SMC4101] embed: wabt component embed did not complete successfully (CommandFailed)
+```
+
+Codes are assigned by phase: `SMC0001` arguments, `SMC1001` inputs,
+`SMC2001` runtime build, `SMC3001` initialization/export preflight,
+`SMC4001` strip, `SMC4101` embed, `SMC4201` adapt, `SMC4301` metadata,
+`SMC5001` validation, `SMC6001` debug preparation, and `SMC7001`
+publication. Messages include a phase-specific recovery hint and captured tool
+details where available.
+
+Pass `--diagnostic-format json` (or `--json-diagnostics`) for deterministic
+JSON Lines on stderr. Each object uses schema
+`starling-componentize-diagnostic/v1` and contains `severity`, `code`, `phase`,
+`message`, `cause`, `detail`, and `hint`, plus typed `command`, `exit_code`,
+and `signal` process fields; a successful run emits `SMC0000`. Child output is
+captured in this mode, so the diagnostic stream is not mixed with ad hoc
+subprocess text.
+
+## Imports and provenance metadata
+
+`--metadata-out <file>` writes `starling-componentize-metadata/v1` JSON next
+to the component. Its `imports` array uses ComponentizeJS 0.21's public
+`[[specifier, binding], ...]` convention, including default-import records for
+world-level functions. The typed `bindings` array adds function arity,
+canonical dispatch keys, resource classes, and constructor/method/static
+operations without requiring consumers to parse runtime TSV or stderr.
+`imports_complete` distinguishes a verified empty list from debug metadata
+produced with an external engine whose generated bindings are unavailable.
+
+The `provenance` object records the selected dispatch and component worlds,
+content hashes of both complete WIT layouts, the resolved feature booleans,
+SHA-256 hashes of every invoked tool, source/initializer/runtime-argument
+hashes, engine/adapter hashes, and the exact published component hash.
+Canonical aggregate hashes cover worlds, features, and tools. It contains no
+timestamps, random transaction names, or host paths, so its provenance fields
+are deterministic even if an underlying snapshot tool emits byte-distinct
+components. The component itself also receives standard WebAssembly producers
+metadata compatible with `wasm-tools metadata show`.
 
 ## Runtime and tool options
 
@@ -92,12 +142,12 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--wizer-bin` selects a standalone Wizer and uses its native
 `--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
 
-`--debug-bindings` preserves runtime arguments, generated bindings (when the
-CLI builds the runtime), and each pipeline intermediate in `<output>.debug`.
-`--debug-dir` chooses another directory. Debug files are replaced by name but
-the CLI never recursively deletes a user-provided directory. A debug directory
-that contains the requested component output is rejected so debug publication
-cannot violate output atomicity.
+`--debug-bindings` explicitly requests runtime arguments, generated bindings
+(when the CLI builds the runtime), imports/provenance JSON, a path-sanitized
+command log, and each pipeline intermediate in `<output>.debug`. `--debug-dir`
+chooses another directory and also enables the dump. For collision safety the
+destination must not already exist and cannot contain an input or output; the
+complete staged directory is published only after validation.
 
 The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
 them explicitly. Weval execution and cache controls belong to the separate

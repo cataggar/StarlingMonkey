@@ -16,7 +16,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="$ROOT/tests/componentizer/.real-cache"
 WORK="$CACHE/work with spaces"
 OUTPUT="$WORK/native component.wasm"
+METADATA="$WORK/native component metadata.json"
 CACHED_OUTPUT="$WORK/native component cached.wasm"
+CACHED_METADATA="$WORK/native component cached metadata.json"
 FAILURE_OUTPUT="$WORK/unchanged-on-failure.wasm"
 V2_OUTPUT="$WORK/native component v2.wasm"
 DEBUG_DIR="$WORK/debug bindings"
@@ -58,18 +60,57 @@ WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --preview2-adapter "$ADAPTER" \
   --debug-dir "$DEBUG_DIR" \
+  --metadata-out "$METADATA" \
   --out "$OUTPUT" \
   "$ROOT/tests/fixtures/js-dispatch.js"
 "$WASM_TOOLS" validate --features all "$OUTPUT"
 test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' "$OUTPUT")" = 5
 test -s "$DEBUG_DIR/component-bindings.zig"
 test -s "$DEBUG_DIR/commands.txt"
+test -s "$DEBUG_DIR/imports.json"
+test -s "$METADATA"
+python3 - "$METADATA" <<'PY'
+import json, re, sys
+metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+assert metadata["schema"] == "starling-componentize-metadata/v1"
+assert metadata["processed_by"]["name"] == "starling-componentize"
+assert re.fullmatch(r"[0-9a-f]{64}", metadata["provenance"]["worlds_sha256"])
+assert re.fullmatch(r"[0-9a-f]{64}", metadata["provenance"]["tools_sha256"])
+PY
+"$WASM_TOOLS" metadata show "$OUTPUT" > "$WORK/embedded metadata.txt"
+grep -Fq 'language' "$WORK/embedded metadata.txt"
+grep -Fq 'JavaScript' "$WORK/embedded metadata.txt"
+grep -Fq 'processed-by' "$WORK/embedded metadata.txt"
+grep -Fq 'starling-componentize' "$WORK/embedded metadata.txt"
 
 # A second identical WIT selection reuses the same monolithic Zig cache entry.
-componentize "$ROOT/tests/fixtures/js-dispatch.js" "$CACHED_OUTPUT"
+"$COMPONENTIZER" \
+  --build-root "$ROOT" \
+  --cache-dir "$CACHE/runtime cache" \
+  --zig-bin "$ZIG" \
+  --wit "$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js" \
+  --world-name js-exports \
+  --component-wit "$ROOT/host-apis/wasi-0.2.10/wit" \
+  --component-world-name js-dispatch \
+  --wasmtime-bin "$WASMTIME" \
+  --wabt-bin "$WABT" \
+  --wasm-tools-bin "$WASM_TOOLS" \
+  --preview2-adapter "$ADAPTER" \
+  --metadata-out "$CACHED_METADATA" \
+  --out "$CACHED_OUTPUT" \
+  "$ROOT/tests/fixtures/js-dispatch.js"
 "$WASM_TOOLS" validate --features all "$CACHED_OUTPUT"
 test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' "$CACHED_OUTPUT")" = 5
 test "$(find "$CACHE/runtime cache/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
+python3 - "$OUTPUT" "$METADATA" "$CACHED_OUTPUT" "$CACHED_METADATA" <<'PY'
+import hashlib, json, sys
+first = json.load(open(sys.argv[2], encoding="utf-8"))
+second = json.load(open(sys.argv[4], encoding="utf-8"))
+for component_path, metadata in ((sys.argv[1], first), (sys.argv[3], second)):
+    component_hash = hashlib.sha256(open(component_path, "rb").read()).hexdigest()
+    assert metadata.pop("component_sha256") == component_hash
+assert first == second
+PY
 
 # A different dispatch and component world must produce an observably
 # different relink rather than reusing or restaging the first runtime.

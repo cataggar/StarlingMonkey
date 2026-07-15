@@ -173,11 +173,23 @@ pub fn build(b: *std.Build) void {
     componentizer_test_mod.addOptions("build_options", componentizer_options);
     const componentizer_tests = b.addTest(.{ .root_module = componentizer_test_mod });
     const run_componentizer_tests = b.addRunArtifact(componentizer_tests);
+    const componentizer_metadata_test_mod = b.createModule(.{
+        .root_source_file = b.path("tools/componentizer/metadata.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const componentizer_metadata_tests = b.addTest(.{
+        .root_module = componentizer_metadata_test_mod,
+    });
+    const run_componentizer_metadata_tests = b.addRunArtifact(
+        componentizer_metadata_tests,
+    );
     const componentizer_test_step = b.step(
         "componentizer-test",
         "Run native componentizer unit and fake-tool orchestration tests",
     );
     componentizer_test_step.dependOn(&run_componentizer_tests.step);
+    componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
