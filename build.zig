@@ -707,8 +707,10 @@ pub fn build(b: *std.Build) void {
         if (is_debug) @panic("-Daot-engine does not support Debug builds");
         const weval_dep = b.lazyDependency("weval", .{}) orelse
             @panic("the pinned Weval artifact is required for -Daot-engine");
+        const cache_primer = b.path("tools/componentizer/aot-cache-primer.js");
         const prime_cache = std.Build.Step.Run.create(b, "prime Weval IC cache");
         prime_cache.addFileArg(weval_dep.path("weval"));
+        prime_cache.addFileInput(cache_primer);
         prime_cache.addArgs(&.{
             "weval",
             "-w",
@@ -739,7 +741,7 @@ pub fn build(b: *std.Build) void {
         seal_cache.addArg("--cache");
         seal_cache.addFileArg(cache);
         seal_cache.addArg("--primer");
-        seal_cache.addFileArg(b.path("tools/componentizer/aot-cache-primer.js"));
+        seal_cache.addFileArg(cache_primer);
         seal_cache.addArgs(&.{ "--feature-abi", feature_abi, "--out" });
         const manifest = seal_cache.addOutputFileArg("starling-ics.wevalcache.manifest");
 

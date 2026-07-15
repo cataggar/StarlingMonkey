@@ -19,11 +19,19 @@ WORK="$CACHE/work with spaces"
 WIZER_OUTPUT="$WORK/wizer component.wasm"
 AOT_OUTPUT="$WORK/aot component.wasm"
 AOT_CACHED_OUTPUT="$WORK/aot cached component.wasm"
+AOT_REPRIMED_OUTPUT="$WORK/aot reprimed component.wasm"
 SOURCE="$ROOT/tests/fixtures/js-dispatch.js"
+PRIMER="$ROOT/tools/componentizer/aot-cache-primer.js"
+PRIMER_BACKUP="$CACHE/aot-cache-primer.js.original"
 
 rm -rf "$CACHE"
 mkdir -p "$WORK"
-trap 'rm -rf "$CACHE"' EXIT
+cp -p "$PRIMER" "$PRIMER_BACKUP"
+cleanup() {
+  cp -p "$PRIMER_BACKUP" "$PRIMER"
+  rm -rf "$CACHE"
+}
+trap cleanup EXIT
 
 componentize() {
   local mode="$1" output="$2"
@@ -90,5 +98,35 @@ AOT_BUNDLE="$(dirname "${manifests[0]}")"
 test -s "$AOT_BUNDLE/starling-raw.wasm"
 test -s "$AOT_BUNDLE/starling-ics.wevalcache"
 grep -Fq 'engine_abi=spidermonkey-pbl-weval-aot-ics-v1' "${manifests[0]}"
+
+OLD_CACHE_SHA="$(sha256sum "$AOT_BUNDLE/starling-ics.wevalcache" | cut -d ' ' -f 1)"
+OLD_PRIMER_SHA="$(sed -n 's/^primer_sha256=//p' "${manifests[0]}")"
+test "$OLD_PRIMER_SHA" = "$(sha256sum "$PRIMER" | cut -d ' ' -f 1)"
+
+cat > "$PRIMER" <<'EOF'
+function reviewFindingPrimer(value) {
+  return { next: value + 1 }.next;
+}
+function main() {
+  let value = 0;
+  for (let i = 0; i < 20000; i++) {
+    value = reviewFindingPrimer(value);
+  }
+  if (value !== 20000) {
+    throw new Error("cache primer failed");
+  }
+}
+EOF
+componentize aot "$AOT_REPRIMED_OUTPUT"
+"$WASM_TOOLS" validate --features all "$AOT_REPRIMED_OUTPUT"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' "$AOT_REPRIMED_OUTPUT")" = 5
+
+NEW_CACHE_SHA="$(sha256sum "$AOT_BUNDLE/starling-ics.wevalcache" | cut -d ' ' -f 1)"
+NEW_MANIFEST_CACHE_SHA="$(sed -n 's/^cache_sha256=//p' "${manifests[0]}")"
+NEW_MANIFEST_PRIMER_SHA="$(sed -n 's/^primer_sha256=//p' "${manifests[0]}")"
+test "$NEW_CACHE_SHA" != "$OLD_CACHE_SHA"
+test "$NEW_MANIFEST_CACHE_SHA" = "$NEW_CACHE_SHA"
+test "$NEW_MANIFEST_PRIMER_SHA" != "$OLD_PRIMER_SHA"
+test "$NEW_MANIFEST_PRIMER_SHA" = "$(sha256sum "$PRIMER" | cut -d ' ' -f 1)"
 
 echo "Wizer/AOT behavioral equivalence passed"
