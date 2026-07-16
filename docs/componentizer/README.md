@@ -159,16 +159,30 @@ defaults to a bundle beside the engine. `--weval-bin` must identify the exact
 binary in the seal. Missing artifacts, malformed manifests, non-SQLite or
 checksum-corrupt caches, and engine/tool/feature mismatches all fail before
 initialization or output publication; there is no Wizer fallback.
-The validated engine, Weval executable, cache, and manifest are copied into a
-private per-run snapshot. Weval consumes those same snapshot bytes, closing
-the validation/reopen replacement window, and the snapshot is removed on
-success or failure.
+The validated engine, cache, and manifest are copied into a private per-run
+snapshot. The Weval snapshot scope is the selected executable's canonical
+containing directory and all descendants (at most 4,096 entries, 32 levels,
+and 1 GiB of regular-file data). Descriptor-relative, no-follow traversal
+copies stable regular files, directories, and relative symlinks; dangling,
+absolute, package-escaping, and special-file layouts are rejected. The
+selected basename and internal symlink target are retained, so scripts using
+`dirname "$0"`, argv[0]-dispatched tools, and `$ORIGIN` sibling libraries see
+their original relative layout. Read and execute permissions are preserved
+while write bits are removed.
+
+Cache validation hashes the snapshot regular file actually reached by the
+selected executable, while execution uses the selected snapshot path. A
+content/metadata digest of the complete private package is checked immediately
+before and after execution. Thus neither Weval nor its sibling closure is
+reopened from the mutable source package after validation, and snapshots are
+removed on success or failure.
 
 Executable AOT snapshots are never placed under the output tree. Candidate
-roots are probed with an actual private executable before use. If explicit
-runtime/temp variables are absent, supported Unix hosts also try the platform
-default temporary directory (`/tmp`) before the current directory, so
-read-only installations and no-execute output mounts still work.
+roots inside the source package are excluded and every candidate is probed
+with an actual private executable before use. If explicit runtime/temp
+variables are absent, supported Unix hosts also try the platform default
+temporary directory (`/tmp`) before the current directory, so read-only
+installations and no-execute output mounts still work.
 The required CI gate provisions a real `noexec` tmpfs and fails if it cannot;
 local runs explicitly report `SKIP` rather than treating an ordinary
 filesystem probe as coverage.
@@ -193,13 +207,14 @@ zig build componentizer-test -Doptimize=ReleaseSmall
 zig build aot-engine-test -Doptimize=ReleaseSmall
 ```
 
-The first includes fake-tool positive and missing/stale/corrupt cache cases,
-descriptor/symlink/parent-retarget races, bundle rollback, and a concurrent
-release-publication race. The second builds both real engine
-variants, validates both components, primes clean caches in separate
-directories to prove byte-for-byte reproducibility, and invokes the same typed
-JavaScript exports through Wasmtime to prove Wizer/AOT behavioral equivalence.
-Its fixtures and cache/output paths include spaces.
+The first includes shell-sibling, argv[0], real ELF `$ORIGIN`, symlink-selected
+executable, immutable-package mutation, noexec output/cwd, missing/stale/corrupt
+cache, descriptor/symlink/parent-retarget race, bundle rollback, and concurrent
+release-publication coverage. The second builds both real engine variants,
+validates both components, primes clean caches in separate directories to
+prove byte-for-byte reproducibility, and invokes the same typed JavaScript
+exports through Wasmtime to prove Wizer/AOT behavioral equivalence. Its
+fixtures and cache/output paths include spaces.
 
 Release packaging must keep the cache and manifest together. The repository's
 packaging gate builds through Zig and validates both the engine module and the

@@ -310,16 +310,23 @@ for ((i = 1; i <= $#; i++)); do
 done
 if [ "${EXPECT_AOT_SNAPSHOT:-0}" = 1 ]; then
   test "$0" != "$ORIGINAL_AOT_WEVAL"
+  test "$(basename "$0")" = "$(basename "$ORIGINAL_AOT_WEVAL")"
   test "$input" != "$ORIGINAL_AOT_ENGINE"
   test "$cache" != "$ORIGINAL_AOT_CACHE"
-  test "$(dirname "$0")" = "$(dirname "$input")"
   test "$(dirname "$input")" = "$(dirname "$cache")"
+  test "$(dirname "$(dirname "$0")")" = "$(dirname "$input")"
   test "$(stat -c %a "$(dirname "$input")")" = 500
+  case "$(stat -c %A "$0")" in
+    *w*) exit 30 ;;
+  esac
   printf 'replacement engine\n' > "$ORIGINAL_AOT_ENGINE"
   printf 'replacement cache\n' > "$ORIGINAL_AOT_CACHE"
   printf '# replaced after validation\n' > "$ORIGINAL_AOT_WEVAL"
+  printf 'replacement sibling\n' > "$ORIGINAL_AOT_SIBLING"
   cmp "$input" "$EXPECTED_AOT_ENGINE"
   cmp "$cache" "$EXPECTED_AOT_CACHE"
+  test "$(cat "$(dirname "$0")/$(basename "$ORIGINAL_AOT_SIBLING")")" = \
+    "snapshot sibling"
 fi
 if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
   case "$0" in
@@ -328,8 +335,10 @@ if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
       exit 28
       ;;
   esac
-  test "$(stat -c %a "$(dirname "$0")")" = 500
-  test "$(stat -c %a "$0")" = 500
+  test "$(stat -c %a "$(dirname "$(dirname "$0")")")" = 500
+  case "$(stat -c %A "$0")" in
+    *w*) exit 31 ;;
+  esac
 fi
 if [ -n "${EXPECT_AOT_EXEC_STAGE_ROOT:-}" ]; then
   case "$0" in
@@ -1656,6 +1665,157 @@ assert db.execute("pragma integrity_check").fetchone() == ("ok",)
 db.close()
 PY
 
+seal_fixture_bundle() {
+  local weval="$1" bundle="$2"
+  mkdir "$bundle"
+  cp "$AOT_BUNDLE/starling-ics.wevalcache" \
+    "$bundle/starling-ics.wevalcache"
+  "$CACHE_TOOL" seal \
+    --engine "$ENGINE" \
+    --weval "$weval" \
+    --cache "$bundle/starling-ics.wevalcache" \
+    --primer "$SOURCE" \
+    --feature-abi 'starling-features-v1;fake=1' \
+    --out "$bundle/starling-ics.wevalcache.manifest"
+}
+
+run_fixture_aot() {
+  local weval="$1" bundle="$2" output="$3"
+  "$COMPONENTIZER" \
+    --aot \
+    --engine "$ENGINE" \
+    --aot-cache-dir "$bundle" \
+    --weval-bin "$weval" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$output" \
+    "$SOURCE"
+  cmp "$ENGINE" "$output"
+}
+
+WRAPPER_PACKAGE="$SCRATCH/wrapper weval package"
+WRAPPER_BUNDLE="$WORK/wrapper weval bundle"
+WRAPPER_OUTPUT="$WORK/wrapper weval output.wasm"
+mkdir "$WRAPPER_PACKAGE"
+cat > "$WRAPPER_PACKAGE/weval sibling" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+input=""
+for ((i = 1; i <= $#; i++)); do
+  case "${!i}" in
+    -o)
+      j=$((i + 1))
+      out="${!j}"
+      ;;
+    -i)
+      j=$((i + 1))
+      input="${!j}"
+      ;;
+  esac
+done
+cp "$input" "$out"
+EOF
+cat > "$WRAPPER_PACKAGE/wrapper weval" <<'EOF'
+#!/bin/sh
+set -eu
+test "$(basename "$0")" = "wrapper weval"
+exec "$(dirname "$0")/weval sibling" "$@"
+EOF
+chmod +x "$WRAPPER_PACKAGE/weval sibling" "$WRAPPER_PACKAGE/wrapper weval"
+seal_fixture_bundle "$WRAPPER_PACKAGE/wrapper weval" "$WRAPPER_BUNDLE"
+run_fixture_aot \
+  "$WRAPPER_PACKAGE/wrapper weval" \
+  "$WRAPPER_BUNDLE" \
+  "$WRAPPER_OUTPUT"
+
+ELF_PACKAGE="$SCRATCH/ELF weval package with spaces"
+ELF_BUNDLE="$WORK/ELF weval bundle"
+ELF_OUTPUT="$WORK/ELF weval output.wasm"
+mkdir -p "$ELF_PACKAGE/bin"
+cat > "$ELF_PACKAGE/libweval_fixture.c" <<'EOF'
+const char *weval_fixture_marker(void) {
+  return "origin-relative-library";
+}
+EOF
+cat > "$ELF_PACKAGE/weval_fixture.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern const char *weval_fixture_marker(void);
+
+static int copy_file(const char *input, const char *output) {
+  FILE *source = fopen(input, "rb");
+  if (source == NULL) return 74;
+  FILE *destination = fopen(output, "wb");
+  if (destination == NULL) {
+    fclose(source);
+    return 75;
+  }
+  char buffer[8192];
+  size_t count;
+  while ((count = fread(buffer, 1, sizeof(buffer), source)) != 0) {
+    if (fwrite(buffer, 1, count, destination) != count) return 76;
+  }
+  if (ferror(source)) return 77;
+  return fclose(source) != 0 || fclose(destination) != 0 ? 78 : 0;
+}
+
+int main(int argc, char **argv) {
+  const char *basename = strrchr(argv[0], '/');
+  basename = basename == NULL ? argv[0] : basename + 1;
+  if (strcmp(basename, "weval argv0 alias") != 0) return 70;
+  if (strcmp(weval_fixture_marker(), "origin-relative-library") != 0) return 71;
+  if (argc < 2 || strcmp(argv[1], "weval") != 0) return 72;
+  const char *input = NULL;
+  const char *output = NULL;
+  for (int i = 2; i + 1 < argc; ++i) {
+    if (strcmp(argv[i], "-i") == 0) input = argv[++i];
+    else if (strcmp(argv[i], "-o") == 0) output = argv[++i];
+  }
+  if (input == NULL || output == NULL) return 73;
+  return copy_file(input, output);
+}
+EOF
+cc -fPIC -shared \
+  -o "$ELF_PACKAGE/bin/libweval_fixture.so" \
+  "$ELF_PACKAGE/libweval_fixture.c"
+cc -o "$ELF_PACKAGE/bin/weval-real" \
+  "$ELF_PACKAGE/weval_fixture.c" \
+  -L"$ELF_PACKAGE/bin" \
+  -Wl,-rpath,'$ORIGIN' \
+  -lweval_fixture
+ln -s "bin/weval-real" "$ELF_PACKAGE/weval argv0 alias"
+seal_fixture_bundle "$ELF_PACKAGE/bin/weval-real" "$ELF_BUNDLE"
+run_fixture_aot \
+  "$ELF_PACKAGE/weval argv0 alias" \
+  "$ELF_BUNDLE" \
+  "$ELF_OUTPUT"
+
+UNSAFE_PACKAGE="$SCRATCH/unsafe weval package"
+UNSAFE_BUNDLE="$WORK/unsafe weval bundle"
+UNSAFE_OUTPUT="$WORK/unsafe weval output.wasm"
+mkdir "$UNSAFE_PACKAGE"
+cp "$TOOLS/fake weval" "$UNSAFE_PACKAGE/weval"
+printf 'outside package\n' > "$SCRATCH/outside package sibling"
+ln -s "../outside package sibling" "$UNSAFE_PACKAGE/escaping sibling"
+seal_fixture_bundle "$UNSAFE_PACKAGE/weval" "$UNSAFE_BUNDLE"
+printf 'preserved unsafe output\n' > "$UNSAFE_OUTPUT"
+if run_fixture_aot \
+  "$UNSAFE_PACKAGE/weval" \
+  "$UNSAFE_BUNDLE" \
+  "$UNSAFE_OUTPUT" >"$SCRATCH/unsafe-weval.log" 2>&1
+then
+  echo "FAIL: escaping Weval package symlink was accepted" >&2
+  exit 1
+fi
+grep -Fq UnsafeWevalPackage "$SCRATCH/unsafe-weval.log"
+test "$(cat "$UNSAFE_OUTPUT")" = "preserved unsafe output"
+
 NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
 mkdir "$NOEXEC_OUTPUT_DIR"
 mount_noexec=(mount)
@@ -1902,12 +2062,14 @@ cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
 
 RACE_ENGINE="$WORK/race engine.wasm"
 RACE_WEVAL="$TOOLS/race weval"
+RACE_SIBLING="$TOOLS/race sibling"
 RACE_BUNDLE="$WORK/race cache bundle"
 RACE_ENGINE_BASELINE="$WORK/race engine baseline.wasm"
 RACE_CACHE_BASELINE="$WORK/race cache baseline.sqlite"
 RACE_OUTPUT="$WORK/race output component.wasm"
 cp "$ENGINE" "$RACE_ENGINE"
 cp "$TOOLS/fake weval" "$RACE_WEVAL"
+printf 'snapshot sibling\n' > "$RACE_SIBLING"
 cp -R "$AOT_BUNDLE" "$RACE_BUNDLE"
 cp "$RACE_ENGINE" "$RACE_ENGINE_BASELINE"
 cp "$RACE_BUNDLE/starling-ics.wevalcache" "$RACE_CACHE_BASELINE"
@@ -1915,6 +2077,7 @@ EXPECT_AOT_SNAPSHOT=1 \
 ORIGINAL_AOT_ENGINE="$RACE_ENGINE" \
 ORIGINAL_AOT_CACHE="$RACE_BUNDLE/starling-ics.wevalcache" \
 ORIGINAL_AOT_WEVAL="$RACE_WEVAL" \
+ORIGINAL_AOT_SIBLING="$RACE_SIBLING" \
 EXPECTED_AOT_ENGINE="$RACE_ENGINE_BASELINE" \
 EXPECTED_AOT_CACHE="$RACE_CACHE_BASELINE" \
 "$COMPONENTIZER" \
@@ -1932,6 +2095,7 @@ EXPECTED_AOT_CACHE="$RACE_CACHE_BASELINE" \
 cmp "$RACE_ENGINE_BASELINE" "$RACE_OUTPUT"
 test "$(cat "$RACE_ENGINE")" = "replacement engine"
 test "$(cat "$RACE_BUNDLE/starling-ics.wevalcache")" = "replacement cache"
+test "$(cat "$RACE_SIBLING")" = "replacement sibling"
 
 AOT_FAILURE_OUTPUT="$WORK/aot failure output.wasm"
 printf 'preserved-aot-output\n' > "$AOT_FAILURE_OUTPUT"
@@ -1954,6 +2118,9 @@ fi
 test "$(cat "$AOT_FAILURE_OUTPUT")" = "preserved-aot-output"
 if find "$WORK" -maxdepth 1 -name '.*.starling-componentize-*' | grep -q .; then
   echo "FAIL: AOT componentization left private transaction artifacts" >&2
+  while IFS= read -r artifact; do
+    find "$artifact" -maxdepth 2 -ls >&2
+  done < <(find "$WORK" -maxdepth 1 -name '.*.starling-componentize-*')
   exit 1
 fi
 

@@ -2219,6 +2219,9 @@ const AotCache = struct {
 const AotSnapshot = struct {
     engine: []const u8,
     weval: []const u8,
+    weval_provenance: []const u8,
+    weval_package_root: []const u8,
+    weval_package_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     bundle: AotCache,
 };
 
@@ -2265,12 +2268,18 @@ const WizerTool = struct {
     wasmtime_subcommand: bool,
 };
 
+const WevalTool = struct {
+    selected: []const u8,
+    package_root: []const u8,
+    provenance: []const u8,
+};
+
 const Tools = struct {
     wizer: WizerTool,
     wabt: Snapshot,
     wasm_tools: Snapshot,
     wizer: ?WizerTool,
-    weval: ?[]const u8,
+    weval: ?WevalTool,
     wabt: ?[]const u8,
     wasm_tools: []const u8,
 };
@@ -2865,7 +2874,7 @@ fn execute(
             environ,
             cwd,
             executable_dir,
-            tools.weval.?,
+            tools.weval.?.package_root,
             std.fs.path.dirname(resolved_output) orelse return error.InvalidPath,
         )
     else
@@ -3112,7 +3121,7 @@ fn execute(
     else
         .default_dir;
     try Dir.createDirAbsolute(io, transaction_dir, private_permissions);
-    defer Dir.cwd().deleteTree(io, transaction_dir) catch {};
+    defer removePrivateTree(io, transaction_dir);
 
     const aot_snapshot = if (config.aot) blk: {
         const bundle = runtime.aot_cache orelse return error.MissingAotCache;
@@ -3128,7 +3137,7 @@ fn execute(
             allocator,
             io,
             snapshot.engine,
-            snapshot.weval,
+            snapshot.weval_provenance,
             snapshot.bundle,
         ) catch |err| {
             std.debug.print(
@@ -3352,6 +3361,11 @@ fn execute(
                     .{config.aot_min_stack_size orelse aot_cache.default_min_stack_size},
                 ),
             );
+            try verifyWevalPackageSnapshot(
+                allocator,
+                io,
+                aot_snapshot.?,
+            );
         }
         try runCommand(
             allocator,
@@ -3364,6 +3378,9 @@ fn execute(
             config.verbose,
             &command_log,
         );
+        if (aot_snapshot) |snapshot| {
+            try verifyWevalPackageSnapshot(allocator, io, snapshot);
+        }
     } else {
         try Dir.copyFileAbsolute(runtime.engine, initialized, io, .{});
     }
@@ -5698,13 +5715,27 @@ fn resolveTools(
     const weval = if (!config.aot or !needs_initialization)
         null
     else if (config.weval_bin) |path|
-        try resolveExecutable(allocator, io, environ, cwd, path)
+        try resolveWevalExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("WEVAL_BIN")) |path|
-        try resolveExecutable(allocator, io, environ, cwd, path)
+        try resolveWevalExecutable(allocator, io, environ, cwd, path)
     else blk: {
         const sibling = try std.fs.path.join(allocator, &.{ executable_dir, "weval" });
-        if (pathExists(io, sibling)) break :blk sibling;
-        break :blk try resolveExecutable(allocator, io, environ, cwd, "weval");
+        if (pathExists(io, sibling)) {
+            break :blk try resolveWevalExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                sibling,
+            );
+        }
+        break :blk try resolveWevalExecutable(
+            allocator,
+            io,
+            environ,
+            cwd,
+            "weval",
+        );
     };
     return .{
         .wizer = wizer,
@@ -5765,16 +5796,16 @@ fn snapshotAotInputs(
     io: Io,
     transaction_dir: []const u8,
     engine: []const u8,
-    weval: []const u8,
+    weval: WevalTool,
     bundle: AotCache,
 ) !AotSnapshot {
     const snapshot_engine = try std.fs.path.join(
         allocator,
         &.{ transaction_dir, "validated-engine.wasm" },
     );
-    const snapshot_weval = try std.fs.path.join(
+    const snapshot_package_root = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "validated-weval" },
+        &.{ transaction_dir, "weval-package" },
     );
     const snapshot_cache = try std.fs.path.join(
         allocator,
@@ -5785,9 +5816,14 @@ fn snapshotAotInputs(
         &.{ transaction_dir, aot_cache.manifest_basename },
     );
     try Dir.copyFileAbsolute(engine, snapshot_engine, io, .{});
-    try Dir.copyFileAbsolute(weval, snapshot_weval, io, .{});
     try Dir.copyFileAbsolute(bundle.cache, snapshot_cache, io, .{});
     try Dir.copyFileAbsolute(bundle.manifest, snapshot_manifest, io, .{});
+    const snapshot_weval = try snapshotWevalPackage(
+        allocator,
+        io,
+        weval,
+        snapshot_package_root,
+    );
     const readonly_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
         File.Permissions.fromMode(0o400)
     else
@@ -5799,7 +5835,6 @@ fn snapshotAotInputs(
     for ([_][]const u8{ snapshot_engine, snapshot_cache, snapshot_manifest }) |path| {
         try setRegularFilePermissions(io, path, readonly_permissions);
     }
-    try setRegularFilePermissions(io, snapshot_weval, executable_permissions);
     var snapshot_dir = try Dir.openDirAbsolute(
         io,
         transaction_dir,
@@ -5809,14 +5844,670 @@ fn snapshotAotInputs(
     if ((try snapshot_dir.stat(io)).kind != .directory)
         return error.InvalidPath;
     try snapshot_dir.setPermissions(io, executable_permissions);
+    const package_digest = try hashWevalPackage(
+        allocator,
+        io,
+        snapshot_package_root,
+    );
     return .{
         .engine = snapshot_engine,
-        .weval = snapshot_weval,
+        .weval = snapshot_weval.selected,
+        .weval_provenance = snapshot_weval.provenance,
+        .weval_package_root = snapshot_package_root,
+        .weval_package_digest = package_digest,
         .bundle = .{
             .cache = snapshot_cache,
             .manifest = snapshot_manifest,
             .expected_feature_abi = bundle.expected_feature_abi,
         },
+    };
+}
+
+const weval_package_max_entries = 4096;
+const weval_package_max_depth = 32;
+const weval_package_max_bytes: u64 = 1024 * 1024 * 1024;
+
+const SnapshotWeval = struct {
+    selected: []const u8,
+    provenance: []const u8,
+};
+
+const PackageCopyState = struct {
+    allocator: Allocator,
+    io: Io,
+    entries: usize = 0,
+    bytes: u64 = 0,
+    symlinks: std.ArrayList([]const u8) = .empty,
+};
+
+const PackageIdentity = struct {
+    stat: File.Stat,
+    filesystem: u128,
+};
+
+fn snapshotWevalPackage(
+    allocator: Allocator,
+    io: Io,
+    weval: WevalTool,
+    destination_path: []const u8,
+) !SnapshotWeval {
+    var source = try Dir.openDirAbsolute(
+        io,
+        weval.package_root,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    const source_identity = try packageDirectoryIdentity(io, source);
+    if (source_identity.stat.kind != .directory)
+        return error.UnsafeWevalPackage;
+
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    try Dir.createDirAbsolute(io, destination_path, private_permissions);
+    var destination = try Dir.openDirAbsolute(
+        io,
+        destination_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer destination.close(io);
+
+    var state: PackageCopyState = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer state.symlinks.deinit(allocator);
+    try copyWevalPackageDirectory(
+        &state,
+        source,
+        destination,
+        "",
+        0,
+        source_identity,
+    );
+
+    for (state.symlinks.items) |relative| {
+        const snapshot_link = try std.fs.path.join(
+            allocator,
+            &.{ destination_path, relative },
+        );
+        const resolved = Dir.realPathFileAbsoluteAlloc(
+            io,
+            snapshot_link,
+            allocator,
+        ) catch return error.UnsafeWevalPackage;
+        if (!pathContains(destination_path, resolved))
+            return error.UnsafeWevalPackage;
+    }
+
+    const selected = try std.fs.path.join(
+        allocator,
+        &.{ destination_path, std.fs.path.basename(weval.selected) },
+    );
+    const provenance = Dir.realPathFileAbsoluteAlloc(
+        io,
+        selected,
+        allocator,
+    ) catch return error.UnsafeWevalPackage;
+    if (!pathContains(destination_path, provenance))
+        return error.UnsafeWevalPackage;
+    const source_relative = try std.fs.path.relative(
+        allocator,
+        weval.package_root,
+        null,
+        weval.package_root,
+        weval.provenance,
+    );
+    const snapshot_relative = try std.fs.path.relative(
+        allocator,
+        destination_path,
+        null,
+        destination_path,
+        provenance,
+    );
+    if (!std.mem.eql(u8, source_relative, snapshot_relative))
+        return error.WevalPackageRace;
+    try requireExecutableFile(allocator, io, selected);
+    return .{ .selected = selected, .provenance = provenance };
+}
+
+fn copyWevalPackageDirectory(
+    state: *PackageCopyState,
+    source: Dir,
+    destination: Dir,
+    relative_dir: []const u8,
+    depth: usize,
+    initial_identity: PackageIdentity,
+) anyerror!void {
+    if (depth > weval_package_max_depth)
+        return error.WevalPackageTooDeep;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(state.allocator);
+    var iterator = source.iterate();
+    while (try iterator.next(state.io)) |entry| {
+        if (state.entries >= weval_package_max_entries)
+            return error.WevalPackageTooLarge;
+        state.entries += 1;
+        names.append(
+            state.allocator,
+            try state.allocator.dupe(u8, entry.name),
+        ) catch @panic("out of memory");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+
+    for (names.items) |name| {
+        const relative = if (relative_dir.len == 0)
+            try state.allocator.dupe(u8, name)
+        else
+            try std.fs.path.join(state.allocator, &.{ relative_dir, name });
+        const identity = try packagePathIdentity(state.io, source, name);
+        switch (identity.stat.kind) {
+            .file => try copyWevalPackageFile(
+                state,
+                source,
+                destination,
+                name,
+                identity,
+            ),
+            .directory => try copyWevalPackageSubdirectory(
+                state,
+                source,
+                destination,
+                name,
+                relative,
+                depth,
+                identity,
+            ),
+            .sym_link => try copyWevalPackageSymlink(
+                state,
+                source,
+                destination,
+                name,
+                relative,
+                identity,
+            ),
+            else => return error.UnsafeWevalPackage,
+        }
+        try verifyPackageNameIdentity(
+            state.io,
+            source,
+            name,
+            identity,
+        );
+    }
+    const final_identity = try packageDirectoryIdentity(state.io, source);
+    if (!sameStablePackageIdentity(initial_identity, final_identity))
+        return error.WevalPackageRace;
+    try destination.setPermissions(
+        state.io,
+        immutablePackagePermissions(initial_identity.stat.permissions),
+    );
+    try syncPackageDirectory(state.io, destination);
+}
+
+fn copyWevalPackageFile(
+    state: *PackageCopyState,
+    source: Dir,
+    destination: Dir,
+    name: []const u8,
+    identity: PackageIdentity,
+) !void {
+    if (identity.stat.size > weval_package_max_bytes - state.bytes)
+        return error.WevalPackageTooLarge;
+    state.bytes += identity.stat.size;
+    var input = try source.openFile(state.io, name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer input.close(state.io);
+    const opened_identity = try packageFileIdentity(state.io, input);
+    if (!sameStablePackageIdentity(identity, opened_identity))
+        return error.WevalPackageRace;
+    var output = try destination.createFile(state.io, name, .{
+        .read = true,
+        .exclusive = true,
+    });
+    defer output.close(state.io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try input.readPositional(
+            state.io,
+            &.{&buffer},
+            offset,
+        );
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+        try output.writePositionalAll(state.io, buffer[0..count], offset);
+        offset += count;
+    }
+    if (offset != identity.stat.size)
+        return error.WevalPackageRace;
+    const final_input = try packageFileIdentity(state.io, input);
+    if (!sameStablePackageIdentity(identity, final_input))
+        return error.WevalPackageRace;
+    try output.setPermissions(
+        state.io,
+        immutablePackagePermissions(identity.stat.permissions),
+    );
+    try output.sync(state.io);
+    var source_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&source_digest);
+    const destination_digest = try hashPackageFile(state.io, output);
+    if (!std.mem.eql(u8, &source_digest, &destination_digest))
+        return error.WevalPackageRace;
+}
+
+fn copyWevalPackageSubdirectory(
+    state: *PackageCopyState,
+    source: Dir,
+    destination: Dir,
+    name: []const u8,
+    relative: []const u8,
+    depth: usize,
+    identity: PackageIdentity,
+) anyerror!void {
+    var input = try source.openDir(state.io, name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer input.close(state.io);
+    const opened_identity = try packageDirectoryIdentity(state.io, input);
+    if (!sameStablePackageIdentity(identity, opened_identity))
+        return error.WevalPackageRace;
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    try destination.createDir(state.io, name, private_permissions);
+    var output = try destination.openDir(state.io, name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer output.close(state.io);
+    try copyWevalPackageDirectory(
+        state,
+        input,
+        output,
+        relative,
+        depth + 1,
+        opened_identity,
+    );
+}
+
+fn copyWevalPackageSymlink(
+    state: *PackageCopyState,
+    source: Dir,
+    destination: Dir,
+    name: []const u8,
+    relative: []const u8,
+    identity: PackageIdentity,
+) !void {
+    var target_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const target_len = try source.readLink(
+        state.io,
+        name,
+        &target_buffer,
+    );
+    const target = target_buffer[0..target_len];
+    if (target.len == 0 or std.fs.path.isAbsolute(target))
+        return error.UnsafeWevalPackage;
+    var verify_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const verify_len = try source.readLink(
+        state.io,
+        name,
+        &verify_buffer,
+    );
+    if (!std.mem.eql(u8, target, verify_buffer[0..verify_len]))
+        return error.WevalPackageRace;
+    try verifyPackageNameIdentity(state.io, source, name, identity);
+    try destination.symLink(state.io, target, name, .{});
+    state.symlinks.append(
+        state.allocator,
+        try state.allocator.dupe(u8, relative),
+    ) catch @panic("out of memory");
+}
+
+fn verifyPackageNameIdentity(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    expected: PackageIdentity,
+) !void {
+    var current = parent.openFile(io, name, .{
+        .path_only = true,
+        .allow_directory = true,
+        .follow_symlinks = false,
+    }) catch return error.WevalPackageRace;
+    defer current.close(io);
+    const identity = PackageIdentity{
+        .stat = try current.stat(io),
+        .filesystem = try packageFilesystemId(current),
+    };
+    if (!sameStablePackageIdentity(expected, identity))
+        return error.WevalPackageRace;
+}
+
+fn packagePathIdentity(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+) !PackageIdentity {
+    var file = try parent.openFile(io, name, .{
+        .path_only = true,
+        .allow_directory = true,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    return packageFileIdentity(io, file);
+}
+
+fn packageFileIdentity(io: Io, file: File) !PackageIdentity {
+    return .{
+        .stat = try file.stat(io),
+        .filesystem = try packageFilesystemId(file),
+    };
+}
+
+fn packageDirectoryIdentity(io: Io, dir: Dir) !PackageIdentity {
+    const file: File = .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    return packageFileIdentity(io, file);
+}
+
+fn sameStablePackageIdentity(
+    left: PackageIdentity,
+    right: PackageIdentity,
+) bool {
+    return left.filesystem == right.filesystem and
+        left.stat.kind == right.stat.kind and
+        left.stat.inode == right.stat.inode and
+        left.stat.nlink == right.stat.nlink and
+        left.stat.size == right.stat.size and
+        left.stat.permissions == right.stat.permissions and
+        left.stat.mtime.nanoseconds == right.stat.mtime.nanoseconds and
+        left.stat.ctime.nanoseconds == right.stat.ctime.nanoseconds;
+}
+
+fn immutablePackagePermissions(
+    permissions: File.Permissions,
+) File.Permissions {
+    if (!File.Permissions.has_executable_bit) return permissions;
+    return File.Permissions.fromMode(
+        permissions.toMode() & ~@as(std.posix.mode_t, 0o222),
+    );
+}
+
+fn hashPackageFile(io: Io, file: File) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const before = try file.stat(io);
+    if (before.kind != .file) return error.UnsafeWevalPackage;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try file.readPositional(io, &.{&buffer}, offset);
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    if (offset != before.size)
+        return error.WevalPackageRace;
+    const after = try file.stat(io);
+    if (before.inode != after.inode or before.size != after.size or
+        before.mtime.nanoseconds != after.mtime.nanoseconds or
+        before.ctime.nanoseconds != after.ctime.nanoseconds)
+        return error.WevalPackageRace;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn syncPackageDirectory(io: Io, dir: Dir) !void {
+    const file: File = .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try file.sync(io);
+}
+
+const PackageHashState = struct {
+    allocator: Allocator,
+    io: Io,
+    hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
+    entries: usize = 0,
+    bytes: u64 = 0,
+};
+
+fn hashWevalPackage(
+    allocator: Allocator,
+    io: Io,
+    package_root: []const u8,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var root = try Dir.openDirAbsolute(
+        io,
+        package_root,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer root.close(io);
+    const identity = try packageDirectoryIdentity(io, root);
+    var state: PackageHashState = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    hashPackageIdentity(&state.hasher, 'd', "", identity.stat);
+    try hashWevalPackageDirectory(&state, root, "", 0, identity);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    state.hasher.final(&digest);
+    return digest;
+}
+
+fn verifyWevalPackageSnapshot(
+    allocator: Allocator,
+    io: Io,
+    snapshot: AotSnapshot,
+) !void {
+    const digest = try hashWevalPackage(
+        allocator,
+        io,
+        snapshot.weval_package_root,
+    );
+    if (!std.mem.eql(u8, &digest, &snapshot.weval_package_digest))
+        return error.WevalPackageRace;
+}
+
+fn hashWevalPackageDirectory(
+    state: *PackageHashState,
+    directory: Dir,
+    relative_dir: []const u8,
+    depth: usize,
+    initial_identity: PackageIdentity,
+) anyerror!void {
+    if (depth > weval_package_max_depth)
+        return error.WevalPackageTooDeep;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(state.allocator);
+    var iterator = directory.iterate();
+    while (try iterator.next(state.io)) |entry| {
+        if (state.entries >= weval_package_max_entries)
+            return error.WevalPackageTooLarge;
+        state.entries += 1;
+        names.append(
+            state.allocator,
+            try state.allocator.dupe(u8, entry.name),
+        ) catch @panic("out of memory");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+
+    for (names.items) |name| {
+        const relative = if (relative_dir.len == 0)
+            try state.allocator.dupe(u8, name)
+        else
+            try std.fs.path.join(state.allocator, &.{ relative_dir, name });
+        const identity = try packagePathIdentity(
+            state.io,
+            directory,
+            name,
+        );
+        switch (identity.stat.kind) {
+            .file => {
+                if (identity.stat.size > weval_package_max_bytes - state.bytes)
+                    return error.WevalPackageTooLarge;
+                state.bytes += identity.stat.size;
+                hashPackageIdentity(
+                    &state.hasher,
+                    'f',
+                    relative,
+                    identity.stat,
+                );
+                var file = try directory.openFile(state.io, name, .{
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                });
+                defer file.close(state.io);
+                const opened = try packageFileIdentity(state.io, file);
+                if (!sameStablePackageIdentity(identity, opened))
+                    return error.WevalPackageRace;
+                const digest = try hashPackageFile(state.io, file);
+                const final = try packageFileIdentity(state.io, file);
+                if (!sameStablePackageIdentity(identity, final))
+                    return error.WevalPackageRace;
+                state.hasher.update(&digest);
+            },
+            .directory => {
+                hashPackageIdentity(
+                    &state.hasher,
+                    'd',
+                    relative,
+                    identity.stat,
+                );
+                var child = try directory.openDir(state.io, name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(state.io);
+                const opened = try packageDirectoryIdentity(state.io, child);
+                if (!sameStablePackageIdentity(identity, opened))
+                    return error.WevalPackageRace;
+                try hashWevalPackageDirectory(
+                    state,
+                    child,
+                    relative,
+                    depth + 1,
+                    opened,
+                );
+            },
+            .sym_link => {
+                hashPackageIdentity(
+                    &state.hasher,
+                    'l',
+                    relative,
+                    identity.stat,
+                );
+                var target_buffer: [Dir.max_path_bytes]u8 = undefined;
+                const target_len = try directory.readLink(
+                    state.io,
+                    name,
+                    &target_buffer,
+                );
+                const target = target_buffer[0..target_len];
+                if (target.len == 0 or std.fs.path.isAbsolute(target))
+                    return error.UnsafeWevalPackage;
+                hashPackageBytes(&state.hasher, target);
+            },
+            else => return error.UnsafeWevalPackage,
+        }
+        try verifyPackageNameIdentity(
+            state.io,
+            directory,
+            name,
+            identity,
+        );
+    }
+    const final_identity = try packageDirectoryIdentity(state.io, directory);
+    if (!sameStablePackageIdentity(initial_identity, final_identity))
+        return error.WevalPackageRace;
+}
+
+fn hashPackageIdentity(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    kind: u8,
+    relative: []const u8,
+    stat: File.Stat,
+) void {
+    hasher.update(&.{kind});
+    hashPackageBytes(hasher, relative);
+    hashPackageU128(hasher, @intCast(stat.inode));
+    hashPackageU128(hasher, @intCast(stat.nlink));
+    hashPackageU128(hasher, stat.size);
+    hashPackageU128(hasher, @intFromEnum(stat.permissions));
+    hashPackageU128(
+        hasher,
+        @bitCast(@as(i128, stat.mtime.nanoseconds)),
+    );
+    hashPackageU128(
+        hasher,
+        @bitCast(@as(i128, stat.ctime.nanoseconds)),
+    );
+}
+
+fn hashPackageBytes(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    hashPackageU128(hasher, value.len);
+    hasher.update(value);
+}
+
+fn hashPackageU128(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    value: u128,
+) void {
+    var encoded: [16]u8 = undefined;
+    std.mem.writeInt(u128, &encoded, value, .little);
+    hasher.update(&encoded);
+}
+
+const package_c_fstat = struct {
+    extern "c" fn fstat(fd: std.c.fd_t, stat: *std.c.Stat) c_int;
+}.fstat;
+
+fn packageFilesystemId(file: File) !u128 {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx = std.mem.zeroes(linux.Statx);
+        var request = linux.STATX.BASIC_STATS;
+        request.MNT_ID = true;
+        while (true) switch (linux.errno(linux.statx(
+            file.handle,
+            "",
+            linux.AT.EMPTY_PATH,
+            request,
+            &statx,
+        ))) {
+            .SUCCESS => return (@as(u128, statx.dev_major) << 64) |
+                @as(u128, statx.dev_minor),
+            .INTR => continue,
+            else => return error.Unexpected,
+        };
+    }
+    if (comptime builtin.os.tag == .windows) return 0;
+    var native: std.c.Stat = undefined;
+    while (true) switch (std.c.errno(package_c_fstat(file.handle, &native))) {
+        .SUCCESS => return @intCast(native.dev),
+        .INTR => continue,
+        else => return error.Unexpected,
     };
 }
 
@@ -5838,14 +6529,10 @@ fn createAotStagingDir(
     environ: *std.process.Environ.Map,
     cwd: []const u8,
     executable_dir: []const u8,
-    weval: []const u8,
+    weval_package_root: []const u8,
     output_parent: []const u8,
 ) ![]const u8 {
     var candidates: std.ArrayList([]const u8) = .empty;
-    candidates.append(
-        allocator,
-        std.fs.path.dirname(weval) orelse return error.InvalidPath,
-    ) catch @panic("out of memory");
     candidates.append(allocator, executable_dir) catch @panic("out of memory");
     for ([_][]const u8{
         "ZIG_GLOBAL_CACHE_DIR",
@@ -5883,6 +6570,7 @@ fn createAotStagingDir(
             allocator,
         ) catch continue;
         if (pathContains(output_parent, root)) continue;
+        if (pathContains(weval_package_root, root)) continue;
         var random_bytes: [8]u8 = undefined;
         io.random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -5953,6 +6641,10 @@ fn probeExecutableStagingDir(
 }
 
 fn removeAotStagingDir(io: Io, path: []const u8) void {
+    removePrivateTree(io, path);
+}
+
+fn removePrivateTree(io: Io, path: []const u8) void {
     if (File.Permissions.has_executable_bit) {
         var dir = Dir.openDirAbsolute(
             io,
@@ -5960,12 +6652,39 @@ fn removeAotStagingDir(io: Io, path: []const u8) void {
             .{ .iterate = true, .follow_symlinks = false },
         ) catch {
             Dir.cwd().deleteTree(io, path) catch {};
+            Dir.deleteDirAbsolute(io, path) catch {};
             return;
         };
-        dir.setPermissions(io, File.Permissions.fromMode(0o700)) catch {};
+        makeAotStagingTreeRemovable(io, dir);
         dir.close(io);
     }
-    Dir.cwd().deleteTree(io, path) catch {};
+    Dir.cwd().deleteTree(io, path) catch |err| {
+        std.debug.print("error: private tree cleanup failed for {s}: {t}\n", .{
+            path,
+            err,
+        });
+    };
+    Dir.deleteDirAbsolute(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.debug.print(
+            "error: private directory cleanup failed for {s}: {t}\n",
+            .{ path, err },
+        ),
+    };
+}
+
+fn makeAotStagingTreeRemovable(io: Io, dir: Dir) void {
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        var child = dir.openDir(io, entry.name, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch continue;
+        makeAotStagingTreeRemovable(io, child);
+        child.close(io);
+    }
+    dir.setPermissions(io, File.Permissions.fromMode(0o700)) catch {};
 }
 
 fn resolvedFeatureAbi(
@@ -6033,6 +6752,78 @@ fn resolveExecutable(
         return Dir.realPathFileAbsoluteAlloc(io, absolute, allocator);
     }
     return error.MissingBuildArtifact;
+}
+
+fn resolveWevalExecutable(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    name: []const u8,
+) !WevalTool {
+    if (std.fs.path.isAbsolute(name) or
+        std.mem.indexOfScalar(u8, name, std.fs.path.sep) != null)
+    {
+        return describeWevalExecutable(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, name),
+        );
+    }
+    const path_value = environ.get("PATH") orelse
+        return error.MissingBuildArtifact;
+    var entries = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (entries.next()) |entry| {
+        const directory = if (entry.len == 0) cwd else entry;
+        const candidate = try std.fs.path.join(
+            allocator,
+            &.{ directory, name },
+        );
+        const absolute = if (std.fs.path.isAbsolute(candidate))
+            candidate
+        else
+            try absolutePath(allocator, cwd, candidate);
+        const stat = Dir.cwd().statFile(io, absolute, .{}) catch continue;
+        if (stat.kind != .file) continue;
+        if (!hasEffectiveExecuteAccess(allocator, io, absolute)) continue;
+        return describeWevalExecutable(allocator, io, absolute);
+    }
+    return error.MissingBuildArtifact;
+}
+
+fn describeWevalExecutable(
+    allocator: Allocator,
+    io: Io,
+    absolute: []const u8,
+) !WevalTool {
+    const parent_path = std.fs.path.dirname(absolute) orelse
+        return error.UnsafeWevalPackage;
+    const basename = std.fs.path.basename(absolute);
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or
+        std.mem.eql(u8, basename, ".."))
+        return error.UnsafeWevalPackage;
+    const package_root = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        parent_path,
+        allocator,
+    );
+    const selected = try std.fs.path.join(
+        allocator,
+        &.{ package_root, basename },
+    );
+    try requireExecutableFile(allocator, io, selected);
+    const provenance = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        selected,
+        allocator,
+    );
+    if (!pathContains(package_root, provenance))
+        return error.UnsafeWevalPackage;
+    return .{
+        .selected = selected,
+        .package_root = package_root,
+        .provenance = provenance,
+    };
 }
 
 fn requireExecutableFile(
