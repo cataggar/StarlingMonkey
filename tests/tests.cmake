@@ -4,6 +4,21 @@ find_program(BASH_PROGRAM bash)
 include("wasmtime")
 include("weval")
 
+add_test(
+    NAME wac-platform-selection
+    COMMAND ${BASH_PROGRAM} ${CMAKE_SOURCE_DIR}/tests/cmake/run-wac-tests.sh
+)
+if(WEVAL)
+    add_test(
+        NAME weval-install-package
+        COMMAND
+            ${BASH_PROGRAM}
+            ${CMAKE_SOURCE_DIR}/tests/cmake/run-weval-install-test.sh
+            ${CMAKE_BINARY_DIR}
+    )
+    set_tests_properties(weval-install-package PROPERTIES TIMEOUT 300)
+endif()
+
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(resource-registry-tests
         ${CMAKE_SOURCE_DIR}/runtime/resource_registry.cpp
@@ -31,8 +46,20 @@ add_test(
         ${CMAKE_BINARY_DIR}
         ${CMAKE_BINARY_DIR}/wasm-tools
         "${FEATURE_SURFACE_CASE}"
+        "${HOST_API_VERSION}"
 )
 set_tests_properties(componentize-exact-surface PROPERTIES TIMEOUT 180)
+
+if(FEATURE_TUPLE STREQUAL "11111")
+    add_test(
+        NAME runtime-eval-cli
+        COMMAND
+            ${BASH_PROGRAM}
+            ${CMAKE_SOURCE_DIR}/tests/runtime-eval/run.sh
+            ${CMAKE_BINARY_DIR}
+    )
+    set_tests_properties(runtime-eval-cli PROPERTIES TIMEOUT 180)
+endif()
 
 function(test_e2e TEST_NAME)
     get_target_property(RUNTIME_DIR starling-raw.wasm BINARY_DIR)

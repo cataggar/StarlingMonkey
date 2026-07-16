@@ -188,6 +188,7 @@ check_combo() {
       assert_contains "$name/serve" "$result" "STATUS:200"
       assert_contains "$name/serve" "$result" "random:ok:"
       assert_contains "$name/serve" "$result" "clocks:ok"
+      assert_contains "$name/serve" "$result" "abort-timeout:ok"
       assert_contains "$name/serve" "$result" "http:"
       ;;
 
@@ -236,6 +237,7 @@ check_combo() {
       local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
       assert_contains "$name/serve" "$result" "STATUS:200"
       assert_contains "$name/serve" "$result" "clocks:caught:setTimeout is disabled by build configuration (feature-selection: clocks disabled)"
+      assert_contains "$name/serve" "$result" "abort-timeout:caught:AbortSignal.timeout is disabled by build configuration (feature-selection: clocks disabled)"
       ;;
 
     http-disabled)
@@ -309,6 +311,15 @@ check_combo() {
         pass_case "$name/validate"
       else
         fail_case "$name/validate" "component validation failed"
+      fi
+      componentize "$bin" "$HERE/fixtures/immediate-stream.js" "immediate-stream.wasm" ||
+        { fail_case "$name/immediate-stream" "clock-independent stream task failed"; return; }
+      local stream_wit; stream_wit="$(wit_surface "$bin" "$bin/immediate-stream.wasm")"
+      assert_not_contains "$name/immediate-stream imports" "$stream_wit" "import wasi:"
+      if "$bin/wasmtime" run -S cli "$bin/immediate-stream.wasm"; then
+        pass_case "$name/immediate-stream"
+      else
+        fail_case "$name/immediate-stream" "zero-import immediate stream component trapped"
       fi
       if STARLINGMONKEY_CONFIG=--invalid-if-visible \
           "$bin/wasmtime" run -S cli -S inherit-env "$bin/probe.wasm" \

@@ -132,7 +132,10 @@ namespace builtins::web::timers {
 
 template <bool repeat>
 bool set_timeout_or_interval(JSContext *cx, HandleObject handler, JS::HandleValueVector handle_args,
-                             int32_t delay_ms, int32_t *timer_id) {
+                             int32_t delay_ms, int32_t *timer_id, const char *operation) {
+#if !STARLING_FEATURE_CLOCKS
+  return api::throw_error(cx, api::Errors::FeatureDisabled, operation, "clocks");
+#else
   delay_ms = std::max(delay_ms, 0);
 
   // Convert delay from milliseconds to nanoseconds, as that's what Timers operate on.
@@ -142,16 +145,17 @@ bool set_timeout_or_interval(JSContext *cx, HandleObject handler, JS::HandleValu
 
   *timer_id = timer->timer_id();
   return true;
+#endif
 }
 
 bool set_timeout(JSContext *cx, HandleObject handler, JS::HandleValueVector handle_args,
-                 int32_t delay_ms, int32_t *timer_id) {
-  return set_timeout_or_interval<false>(cx, handler, handle_args, delay_ms, timer_id);
+                 int32_t delay_ms, int32_t *timer_id, const char *operation) {
+  return set_timeout_or_interval<false>(cx, handler, handle_args, delay_ms, timer_id, operation);
 }
 
 bool set_interval(JSContext *cx, HandleObject handler, JS::HandleValueVector handle_args,
                   int32_t delay_ms, int32_t *timer_id) {
-  return set_timeout_or_interval<true>(cx, handler, handle_args, delay_ms, timer_id);
+  return set_timeout_or_interval<true>(cx, handler, handle_args, delay_ms, timer_id, "setInterval");
 }
 
 /**
@@ -164,10 +168,8 @@ template <bool repeat> bool setTimeout_or_interval(JSContext *cx, const unsigned
 #if !STARLING_FEATURE_CLOCKS
   // `clocks` disabled (cataggar/StarlingMonkey#6 Phase 6): fail
   // deterministically at the JS call site rather than falling through to
-  // MonotonicClock::subscribe/unsubscribe, which the async task scheduler
-  // also relies on internally for immediate-vs-blocking task fairness (see
-  // docs/feature-selection/README.md "clocks" -- those two primitives are
-  // deliberately left real/ungated to avoid breaking unrelated async code).
+  // MonotonicClock::subscribe. Clock-independent stream work uses the
+  // scheduler's distinct IMMEDIATE_TASK_HANDLE path.
   return api::throw_error(cx, api::Errors::FeatureDisabled, repeat ? "setInterval" : "setTimeout",
                           "clocks");
 #else
@@ -197,7 +199,8 @@ template <bool repeat> bool setTimeout_or_interval(JSContext *cx, const unsigned
   }
 
   int32_t timer_id = 0;
-  if (!set_timeout_or_interval<repeat>(cx, handler, handler_args, delay_ms, &timer_id)) {
+  if (!set_timeout_or_interval<repeat>(cx, handler, handler_args, delay_ms, &timer_id,
+                                       repeat ? "setInterval" : "setTimeout")) {
     return false;
   }
 

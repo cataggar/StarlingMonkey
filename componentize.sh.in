@@ -41,15 +41,28 @@ fi
 
 IN_FILE=""
 OUT_FILE=""
-LEGACY_SCRIPT_PARAM=""
+LEGACY_SCRIPT=0
 STARLING_ARGS=""
 VERBOSE=0
+
+append_starling_arg() {
+  local value="$1"
+  if [[ -z "$value" || "$value" == *'"'* || "$value" == *$'\n'* ||
+        "$value" == *$'\r'* || "$value" == *$'\t'* || "$value" == *\\ ]]; then
+    echo "Runtime argument cannot be represented safely: $value" >&2
+    exit 1
+  fi
+  if [[ -n "$STARLING_ARGS" ]]; then
+    STARLING_ARGS+=" "
+  fi
+  STARLING_ARGS+="\"$value\""
+}
 
 while [ $# -gt 0 ]
 do
     case "$1" in
         --legacy-script)
-            LEGACY_SCRIPT_PARAM="$1 "
+            LEGACY_SCRIPT=1
             IN_FILE="$2"
             shift 2
             ;;
@@ -58,19 +71,22 @@ do
             shift 2
             ;;
         -i|--initializer-script-path)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --strip-path-prefix)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --wpt-mode)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
-            shift 2
+            append_starling_arg "$1"
+            shift
             ;;
         --init-location)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --js-heap-limit-mib)
@@ -78,11 +94,12 @@ do
               echo "Missing value for --js-heap-limit-mib" >&2
               exit 1
             fi
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         -v|--verbose)
-            STARLING_ARGS="$1 $STARLING_ARGS"
+            append_starling_arg "$1"
             VERBOSE=1
             shift
             ;;
@@ -120,7 +137,10 @@ if [[ -n "$IN_FILE" ]]; then
   fi
   echo "Componentizing $IN_FILE into $OUT_FILE"
 
-  STARLING_ARGS="$STARLING_ARGS $LEGACY_SCRIPT_PARAM$IN_FILE"
+  if [[ $LEGACY_SCRIPT -ne 0 ]]; then
+    append_starling_arg "--legacy-script"
+  fi
+  append_starling_arg "$IN_FILE"
   if [[ $VERBOSE -ne 0 ]]; then
       echo "Componentizing with args $STARLING_ARGS"
   fi
@@ -179,9 +199,16 @@ surface_args=(
   --output "$surfaced"
   --work-dir "$surface_work"
   --features "$feature_tuple"
-  --target-wit "$surface_target_wit"
-  --target-world "$surface_target_world"
 )
+if [[ -n "$IN_FILE" ]]; then
+  surface_args+=(
+    --runtime-config snapshotted
+    --target-wit "$surface_target_wit"
+    --target-world "$surface_target_world"
+  )
+else
+  surface_args+=(--runtime-config external)
+fi
 "$feature_surface" "${surface_args[@]}"
 mv "$surfaced" "$OUT_FILE"
 

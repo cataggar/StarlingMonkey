@@ -6,7 +6,7 @@
 namespace builtins::web::timers {
 
 bool set_timeout(JSContext *cx, HandleObject handler, JS::HandleValueVector args, int32_t delay_ms,
-                 int32_t *timer_id);
+                 int32_t *timer_id, const char *operation = "setTimeout");
 
 bool set_interval(JSContext *cx, HandleObject handler, JS::HandleValueVector args, int32_t delay_ms,
                   int32_t *timer_id);

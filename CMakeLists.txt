@@ -19,6 +19,12 @@ else()
     set(HOST_API ${CMAKE_CURRENT_SOURCE_DIR}/host-apis/wasi-0.2.10)
 endif()
 message(STATUS "Using host API: ${HOST_API}")
+get_filename_component(HOST_API_NAME "${HOST_API}" NAME)
+if(HOST_API_NAME MATCHES "^wasi-(.+)$")
+    set(HOST_API_VERSION "${CMAKE_MATCH_1}")
+else()
+    set(HOST_API_VERSION "")
+endif()
 
 # Ensure that the CPM cache is created outside the build dir, even if no location is specified by the developer.
 if(NOT DEFINED ENV{CPM_SOURCE_CACHE})
@@ -28,6 +34,7 @@ include("CPM")
 include("toolchain")
 
 project(StarlingMonkey)
+find_program(BASH_PROGRAM NAMES bash REQUIRED)
 
 option(FEATURE_STDIO "Enable WASI stdio capabilities" ON)
 option(FEATURE_RANDOM "Enable WASI random capabilities" ON)
@@ -38,10 +45,26 @@ option(FEATURE_FETCH_EVENT "Enable incoming FetchEvent handling" ON)
 foreach(FEATURE_NAME STDIO RANDOM CLOCKS HTTP FETCH_EVENT)
     if(FEATURE_${FEATURE_NAME})
         set(FEATURE_${FEATURE_NAME}_VALUE 1)
+        set(FEATURE_${FEATURE_NAME}_JSON true)
     else()
         set(FEATURE_${FEATURE_NAME}_VALUE 0)
+        set(FEATURE_${FEATURE_NAME}_JSON false)
     endif()
 endforeach()
+
+file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/features.json"
+    CONTENT
+"{
+  \"host-api\": \"${HOST_API_NAME}\",
+  \"stdio\": ${FEATURE_STDIO_JSON},
+  \"random\": ${FEATURE_RANDOM_JSON},
+  \"clocks\": ${FEATURE_CLOCKS_JSON},
+  \"http\": ${FEATURE_HTTP_JSON},
+  \"fetch-event\": ${FEATURE_FETCH_EVENT_JSON}
+}
+"
+)
 
 set(FEATURE_SURFACE_CASE "")
 set(FEATURE_TUPLE
@@ -151,16 +174,31 @@ endif()
 if(WEVAL)
     include("weval")
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/null.js "function main() {}")
+    set(WEVAL_CACHE_FILE "starling-ics.wevalcache")
+    set(WEVAL_CACHE_PATH "${CMAKE_CURRENT_BINARY_DIR}/${WEVAL_CACHE_FILE}")
+    set(WEVAL_CACHE_STAMP "${WEVAL_CACHE_PATH}.stamp")
+    add_custom_command(
+        OUTPUT "${WEVAL_CACHE_STAMP}"
+        BYPRODUCTS "${WEVAL_CACHE_PATH}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        COMMAND
+            ${BASH_PROGRAM} "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-weval-cache.sh"
+            "${WEVAL_BIN}"
+            "${CMAKE_CURRENT_BINARY_DIR}/starling-raw.wasm"
+            "${CMAKE_CURRENT_BINARY_DIR}/null.js"
+            "${WEVAL_CACHE_PATH}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${WEVAL_CACHE_STAMP}"
+        DEPENDS
+            starling-raw.wasm
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-weval-cache.sh"
+            "${CMAKE_CURRENT_BINARY_DIR}/null.js"
+        VERBATIM
+    )
     add_custom_target(
         starling-ics.wevalcache
         ALL
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-        COMMAND rm -f starling-ics.wevalcache
-        COMMAND echo ./null.js | ${WEVAL_BIN} weval --dir . --show-stats --cache starling-ics.wevalcache -w -i starling-raw.wasm -o /dev/null
-        DEPENDS starling-raw.wasm
-        VERBATIM
+        DEPENDS "${WEVAL_CACHE_STAMP}"
     )
-    set(WEVAL_CACHE_FILE "starling-ics.wevalcache")
     set(AOT 1)
 else()
     set(AOT 0)
@@ -169,14 +207,38 @@ endif()
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")
 set(WAC_BIN "${CMAKE_CURRENT_BINARY_DIR}/wac")
-set(WAC_URL "https://github.com/bytecodealliance/wac/releases/download/v0.10.1/wac-cli-x86_64-unknown-linux-musl")
-set(WAC_SHA256 "250c11762916ba733c7d22b62487580f21270ec9dde4f13460ea69d300e25406")
+include("wac")
+set(WAC_HOST_PROCESSOR "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+if(WAC_HOST_PROCESSOR STREQUAL "")
+    cmake_host_system_information(RESULT WAC_HOST_PROCESSOR QUERY OS_PLATFORM)
+endif()
+starling_select_wac_artifact(
+    WAC_URL
+    WAC_SHA256
+    "${CMAKE_HOST_SYSTEM_NAME}"
+    "${WAC_HOST_PROCESSOR}"
+)
+message(STATUS "Using WAC artifact: ${WAC_URL}")
 execute_process(
     COMMAND
         bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/download-wac.sh"
-        "${WAC_URL}" "${WAC_SHA256}" "${WAC_BIN}"
+        "${WAC_URL}" "${WAC_SHA256}" "${WAC_BIN}" "${CMAKE_COMMAND}"
     COMMAND_ERROR_IS_FATAL ANY
 )
+execute_process(
+    COMMAND "${WAC_BIN}" --version
+    OUTPUT_VARIABLE WAC_ACTUAL_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_VARIABLE WAC_VERSION_ERROR
+    RESULT_VARIABLE WAC_VERSION_RESULT
+)
+if(NOT WAC_VERSION_RESULT EQUAL 0 OR
+   NOT WAC_ACTUAL_VERSION MATCHES "${STARLING_WAC_VERSION}")
+    message(FATAL_ERROR
+        "Downloaded WAC artifact is not executable for this host: "
+        "${WAC_VERSION_ERROR}${WAC_ACTUAL_VERSION}"
+    )
+endif()
 if(DEFINED ENV{ZIG})
     set(ZIG_PROGRAM "$ENV{ZIG}")
 else()
@@ -300,6 +362,10 @@ install(
     DESTINATION bin
 )
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${ADAPTER_FILE}" DESTINATION bin)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/features.json" DESTINATION bin)
+if(WEVAL)
+    install(FILES "${WEVAL_CACHE_PATH}" DESTINATION bin)
+endif()
 install(
     DIRECTORY
         "${FEATURE_WIT_DIR}"

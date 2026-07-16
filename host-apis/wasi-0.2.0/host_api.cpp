@@ -179,7 +179,7 @@ int32_t MonotonicClock::subscribe(const uint64_t when, const bool absolute) {
 #else
   (void)when;
   (void)absolute;
-  return IMMEDIATE_TASK_HANDLE;
+  MOZ_CRASH("MonotonicClock::subscribe: clocks feature is disabled");
 #endif
 }
 
@@ -189,6 +189,17 @@ void MonotonicClock::unsubscribe(const int32_t handle_id) {
 #else
   (void)handle_id;
 #endif
+}
+
+vector<std::string> environment_get_arguments() {
+  bindings_list_string_t raw_args = {};
+  wasi_cli_environment_get_arguments(&raw_args);
+  std::vector<std::string> args = {};
+  args.reserve(raw_args.len);
+  for (size_t i = 0; i < raw_args.len; i++) {
+    args.emplace_back(reinterpret_cast<char *>(raw_args.ptr[i].ptr), raw_args.ptr[i].len);
+  }
+  return args;
 }
 
 HttpHeaders::HttpHeaders(std::unique_ptr<HandleState> state)

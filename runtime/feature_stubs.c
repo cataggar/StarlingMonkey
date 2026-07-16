@@ -53,11 +53,29 @@
 
 #include "feature-defaults.h"
 
-// The frozen component surface has no wasi:cli/environment import. Runtime
-// configuration is supplied through STARLINGMONKEY_CONFIG during
-// initialization, so preview1 process arguments and environment variables are
-// intentionally empty after snapshotting.
+// Keep real preview1 argument/environment imports in the raw runtime, but
+// return an empty process view after Wizer has explicitly frozen the runtime
+// configuration. This lets general starling.wasm continue to receive host CLI
+// configuration while surfaced snapshots can safely internalize the imports.
+extern _Bool starling_uses_snapshotted_configuration(void);
+
+extern int32_t starling_wasi_args_get(int32_t argv, int32_t argv_buf)
+    __attribute__((__import_module__("wasi_snapshot_preview1"), __import_name__("args_get")));
+extern int32_t starling_wasi_args_sizes_get(int32_t argc_ptr, int32_t argv_buf_size_ptr)
+    __attribute__((__import_module__("wasi_snapshot_preview1"),
+                   __import_name__("args_sizes_get")));
+extern int32_t starling_wasi_environ_get(int32_t environ, int32_t environ_buf)
+    __attribute__((__import_module__("wasi_snapshot_preview1"),
+                   __import_name__("environ_get")));
+extern int32_t starling_wasi_environ_sizes_get(int32_t environ_count_ptr,
+                                                int32_t environ_buf_size_ptr)
+    __attribute__((__import_module__("wasi_snapshot_preview1"),
+                   __import_name__("environ_sizes_get")));
+
 int32_t __imported_wasi_snapshot_preview1_args_get(int32_t argv, int32_t argv_buf) {
+  if (!starling_uses_snapshotted_configuration()) {
+    return starling_wasi_args_get(argv, argv_buf);
+  }
   (void)argv;
   (void)argv_buf;
   return __WASI_ERRNO_SUCCESS;
@@ -65,12 +83,18 @@ int32_t __imported_wasi_snapshot_preview1_args_get(int32_t argv, int32_t argv_bu
 
 int32_t __imported_wasi_snapshot_preview1_args_sizes_get(int32_t argc_ptr,
                                                          int32_t argv_buf_size_ptr) {
+  if (!starling_uses_snapshotted_configuration()) {
+    return starling_wasi_args_sizes_get(argc_ptr, argv_buf_size_ptr);
+  }
   *(uint32_t *)(uintptr_t)argc_ptr = 0;
   *(uint32_t *)(uintptr_t)argv_buf_size_ptr = 0;
   return __WASI_ERRNO_SUCCESS;
 }
 
 int32_t __imported_wasi_snapshot_preview1_environ_get(int32_t environ, int32_t environ_buf) {
+  if (!starling_uses_snapshotted_configuration()) {
+    return starling_wasi_environ_get(environ, environ_buf);
+  }
   (void)environ;
   (void)environ_buf;
   return __WASI_ERRNO_SUCCESS;
@@ -78,6 +102,9 @@ int32_t __imported_wasi_snapshot_preview1_environ_get(int32_t environ, int32_t e
 
 int32_t __imported_wasi_snapshot_preview1_environ_sizes_get(int32_t environ_count_ptr,
                                                             int32_t environ_buf_size_ptr) {
+  if (!starling_uses_snapshotted_configuration()) {
+    return starling_wasi_environ_sizes_get(environ_count_ptr, environ_buf_size_ptr);
+  }
   *(uint32_t *)(uintptr_t)environ_count_ptr = 0;
   *(uint32_t *)(uintptr_t)environ_buf_size_ptr = 0;
   return __WASI_ERRNO_SUCCESS;

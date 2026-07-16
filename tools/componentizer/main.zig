@@ -3007,6 +3007,7 @@ fn execute(
         .target_wit = runtime.surface_target_wit,
         .target_world = runtime.surface_target_world,
         .features = runtime.features,
+        .runtime_config = .snapshotted,
         .inspect_candidate = true,
         .cwd = cwd,
         .verbose = config.verbose,
@@ -3730,6 +3731,7 @@ fn buildRuntime(
             "-Dpreview1-adapter={s}",
             .{adapter_input.path},
         ),
+        try std.fmt.allocPrint(allocator, "-Dhost-api={s}", .{build_options.host_api}),
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
         argv.appendSlice(allocator, &.{
@@ -4764,8 +4766,9 @@ fn runtimeKey(
     zig: ZigSnapshot,
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hasher, "schema", "1");
+    hashField(&hasher, "schema", "2");
     hashField(&hasher, "version", build_options.version);
+    hashField(&hasher, "host-api", build_options.host_api);
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");

@@ -161,6 +161,11 @@ pub fn build(b: *std.Build) void {
         @panic("StarlingMonkey v0.4 requires Zig " ++ required_zig_version);
     }
     const optimize = b.standardOptimizeOption(.{});
+    const host_api_name = b.option(
+        []const u8,
+        "host-api",
+        "Host API implementation under host-apis/",
+    ) orelse "wasi-0.2.10";
     const download_wac = b.addSystemCommand(&.{
         "bash",
         "tools/download-wac.sh",
@@ -176,6 +181,7 @@ pub fn build(b: *std.Build) void {
     const componentizer_options = b.addOptions();
     componentizer_options.addOption([]const u8, "version", "0.3.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    componentizer_options.addOption([]const u8, "host_api", host_api_name);
     const componentizer_mod = b.createModule(.{
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
@@ -244,6 +250,7 @@ pub fn build(b: *std.Build) void {
         &.{ "bash", "tests/componentizer/run.sh" },
     );
     componentizer_orchestration.addArtifactArg(componentizer);
+    componentizer_orchestration.addArg(host_api_name);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
@@ -268,8 +275,14 @@ pub fn build(b: *std.Build) void {
     }
     componentizer_e2e.addArtifactArg(wabt);
     componentizer_e2e.addFileArg(
-        b.path("host-apis/wasi-0.2.10/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+        b.path(b.pathJoin(&.{
+            "host-apis",
+            host_api_name,
+            "preview1-adapter-release",
+            "wasi_snapshot_preview1.wasm",
+        })),
     );
+    componentizer_e2e.addArg(host_api_name);
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
 
@@ -277,7 +290,6 @@ pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
 
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
-    const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
     const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
     const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
@@ -665,6 +677,7 @@ pub fn build(b: *std.Build) void {
     // humans inspecting `zig-out/bin/` to see what a given build selected.
     const features_json = b.fmt(
         \\{{
+        \\  "host-api": "{s}",
         \\  "stdio": {},
         \\  "random": {},
         \\  "clocks": {},
@@ -672,7 +685,7 @@ pub fn build(b: *std.Build) void {
         \\  "fetch-event": {}
         \\}}
         \\
-    , .{ features.stdio, features.random, features.clocks, features.http, features.fetch_event });
+    , .{ host_api_name, features.stdio, features.random, features.clocks, features.http, features.fetch_event });
     const features_json_file = b.addWriteFiles().add("features.json", features_json);
     b.getInstallStep().dependOn(&b.addInstallBinFile(features_json_file, "features.json").step);
 
@@ -790,6 +803,15 @@ pub fn build(b: *std.Build) void {
     suite.addDirectoryArg(b.graph.path(.install_prefix, "bin"));
     suite.step.dependOn(b.getInstallStep());
     test_step.dependOn(&suite.step);
+    const runtime_eval_test_step = b.step(
+        "runtime-eval-test",
+        "Run real unsnapshotted runtime CLI invocation tests",
+    );
+    const runtime_eval = b.addSystemCommand(&.{ "bash", "tests/runtime-eval/run.sh" });
+    runtime_eval.addDirectoryArg(b.graph.path(.install_prefix, "bin"));
+    runtime_eval.step.dependOn(b.getInstallStep());
+    runtime_eval_test_step.dependOn(&runtime_eval.step);
+    test_step.dependOn(runtime_eval_test_step);
 
     // Typed native JS dispatch bridge E2E coverage: builds a dedicated
     // dispatch-enabled runtime, componentizes tests/fixtures/js-dispatch.js,

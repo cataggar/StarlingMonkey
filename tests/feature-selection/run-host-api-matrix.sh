@@ -6,6 +6,7 @@ MODE="${1:-zig}"
 ZIG="${2:-${ZIG:-zig}}"
 VERSIONS=(0.2.0 0.2.2 0.2.3 0.2.10)
 BUILD_ROOT="$ROOT/tests/feature-selection/.build/host-api-matrix/$MODE"
+SHARED_NATIVE_CACHE="$BUILD_ROOT/shared native cache"
 FIXTURE="$ROOT/tests/feature-selection/fixtures/probe.js"
 PURE_FLAGS=(
   -Dfeature-stdio=false
@@ -33,7 +34,24 @@ check_component() {
       -- --invalid-if-visible
 }
 
+check_wit_versions() {
+  local version="$1" directory="$2"
+  python3 - "$directory" "$version" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+versions = set()
+for path in root.rglob("*.wit"):
+    versions.update(re.findall(r"\bwasi:[^\s@;]+@(\d+\.\d+\.\d+)", path.read_text()))
+if versions != {expected}:
+    raise SystemExit(f"{root}: expected only WASI {expected}, found {sorted(versions)}")
+PY
+}
+
+version_index=0
 for version in "${VERSIONS[@]}"; do
+  version_index=$((version_index + 1))
   echo "== $MODE wasi-$version pure production surface =="
   case "$MODE" in
     zig)
@@ -41,25 +59,77 @@ for version in "${VERSIONS[@]}"; do
       "$ZIG" build install --prefix "$prefix" -Doptimize=ReleaseSmall \
         -Dhost-api="wasi-$version" "${PURE_FLAGS[@]}"
       runtime="$prefix/bin"
-      component="$prefix/pure.wasm"
+      grep -q "\"host-api\": \"wasi-$version\"" "$runtime/features.json"
+      check_wit_versions "$version" "$runtime/feature-wit"
+      check_wit_versions "$version" "$runtime/component-wit"
+      component="$prefix/pure-shell.wasm"
       WABT="$ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
         "$runtime/componentize.sh" "$FIXTURE" -o "$component"
+      native_component="$prefix/pure-native.wasm"
+      native_cache="$SHARED_NATIVE_CACHE"
+      WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
+        --build-root "$ROOT" \
+        --cache-dir "$native_cache" \
+        --zig-bin "$ZIG" \
+        --wasmtime-bin "$runtime/wasmtime" \
+        --wac-bin "$runtime/wac" \
+        --wasm-tools-bin "$runtime/wasm-tools" \
+        --disable stdio,random,clocks,http,fetch-event \
+        --out "$native_component" \
+        "$FIXTURE"
+      nested_runtime=""
+      for manifest in "$native_cache"/runtimes/*/bin/features.json; do
+        if grep -q "\"host-api\": \"wasi-$version\"" "$manifest"; then
+          nested_runtime="$(dirname "$manifest")"
+          break
+        fi
+      done
+      test -n "$nested_runtime"
+      grep -q "\"host-api\": \"wasi-$version\"" "$nested_runtime/features.json"
+      check_wit_versions "$version" "$nested_runtime/feature-wit"
+      check_wit_versions "$version" "$nested_runtime/component-wit"
+      test "$(find "$native_cache/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
+        -eq "$version_index"
+      nested_adapter_version="$("$runtime/wasm-tools" component wit \
+        "$nested_runtime/preview1-adapter.wasm" |
+        sed -n 's/.*import wasi:cli\/environment@\([^;]*\);.*/\1/p' | head -1)"
+      test "$nested_adapter_version" = "$version"
+      check_component "$version" "$runtime" "$native_component"
       ;;
     cmake)
       prefix="$BUILD_ROOT/wasi-$version"
-      HOST_API="wasi-$version" ZIG="$ZIG" cmake -S "$ROOT" -B "$prefix" \
+      build_dir="$prefix/build"
+      install_dir="$prefix/install root"
+      HOST_API="wasi-$version" ZIG="$ZIG" cmake -S "$ROOT" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
         -DFEATURE_STDIO=OFF \
         -DFEATURE_RANDOM=OFF \
         -DFEATURE_CLOCKS=OFF \
         -DFEATURE_HTTP=OFF \
         -DFEATURE_FETCH_EVENT=OFF
-      cmake --build "$prefix" --parallel 2 --target starling-raw.wasm \
-        starling-feature-surface-helper
-      runtime="$prefix"
-      component="$prefix/pure.wasm"
+      cmake --build "$build_dir" --parallel 2 --target install
+      runtime="$install_dir/bin"
+      grep -q "\"host-api\": \"wasi-$version\"" "$runtime/features.json"
+      check_wit_versions "$version" "$runtime/feature-wit"
+      check_wit_versions "$version" "$runtime/component-wit"
+      component="$prefix/pure-shell.wasm"
       WABT="$ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
         "$runtime/componentize.sh" "$FIXTURE" -o "$component"
+      ctest --test-dir "$build_dir" -R '^componentize-exact-surface$' \
+        --output-on-failure
+      HOST_API="wasi-$version" ZIG="$ZIG" cmake -S "$ROOT" -B "$build_dir" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DFEATURE_STDIO=ON \
+        -DFEATURE_RANDOM=ON \
+        -DFEATURE_CLOCKS=ON \
+        -DFEATURE_HTTP=ON \
+        -DFEATURE_FETCH_EVENT=ON
+      cmake --build "$build_dir" --parallel 2 --target starling-raw.wasm \
+        starling-feature-surface-helper
+      ctest --test-dir "$build_dir" -R '^componentize-exact-surface$' \
+        --output-on-failure
       ;;
     *)
       echo "unknown mode: $MODE (expected zig or cmake)" >&2

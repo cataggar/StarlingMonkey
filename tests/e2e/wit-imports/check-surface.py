@@ -3,6 +3,28 @@ import re
 import sys
 
 
+EXPECTED_WASI_IMPORTS = {
+    "wasi:io/error@0.2.10",
+    "wasi:io/poll@0.2.10",
+    "wasi:io/streams@0.2.10",
+    "wasi:cli/stdin@0.2.10",
+    "wasi:cli/stdout@0.2.10",
+    "wasi:cli/stderr@0.2.10",
+    "wasi:cli/terminal-input@0.2.10",
+    "wasi:cli/terminal-output@0.2.10",
+    "wasi:cli/terminal-stdin@0.2.10",
+    "wasi:cli/terminal-stdout@0.2.10",
+    "wasi:cli/terminal-stderr@0.2.10",
+    "wasi:clocks/monotonic-clock@0.2.10",
+    "wasi:clocks/wall-clock@0.2.10",
+    "wasi:filesystem/types@0.2.10",
+    "wasi:filesystem/preopens@0.2.10",
+    "wasi:random/random@0.2.10",
+    "wasi:http/types@0.2.10",
+    "wasi:http/outgoing-handler@0.2.10",
+}
+
+
 def root_declarations(path):
     lines = open(path, encoding="utf-8").read().splitlines()
     start = next(i for i, line in enumerate(lines) if line == "world root {")
@@ -51,6 +73,26 @@ def custom_api(path):
     return functions, resources, type_names, used_names
 
 
+def wasi_imports(path):
+    text = open(path, encoding="utf-8").read()
+    return set(re.findall(r"^\s*import (wasi:[^;]+);", text, re.MULTILINE))
+
+
+def assert_exact_wasi_imports(path):
+    actual = wasi_imports(path)
+    if actual != EXPECTED_WASI_IMPORTS:
+        raise SystemExit(
+            f"{path}: unexpected post-link WASI imports\n"
+            f"missing={sorted(EXPECTED_WASI_IMPORTS - actual)}\n"
+            f"unexpected={sorted(actual - EXPECTED_WASI_IMPORTS)}"
+        )
+
+
+if sys.argv[1:2] == ["--wasi-only"]:
+    assert_exact_wasi_imports(sys.argv[2])
+    print("PASS exact post-link WASI import set")
+    raise SystemExit(0)
+
 before, after = sys.argv[1:3]
 if root_declarations(before) != root_declarations(after):
     raise SystemExit("custom root import/export names or signatures changed")
@@ -62,11 +104,10 @@ if before_functions != after_functions or before_resources != after_resources:
 if not (before_types | before_used) <= after_types:
     raise SystemExit("a custom alias/type name was lost while plugging providers")
 
-before_text = open(before, encoding="utf-8").read()
-after_text = open(after, encoding="utf-8").read()
-before_wasi = set(re.findall(r"^\s*import (wasi:[^;]+);", before_text, re.MULTILINE))
-after_wasi = set(re.findall(r"^\s*import (wasi:[^;]+);", after_text, re.MULTILINE))
+before_wasi = wasi_imports(before)
+after_wasi = wasi_imports(after)
+assert_exact_wasi_imports(after)
 if not after_wasi < before_wasi:
     raise SystemExit("expected only a strict subset of WASI imports after surfacing")
 
-print("PASS exact custom import/export signatures preserved; only WASI imports were internalized")
+print("PASS exact custom/resource topology and complete post-link WASI import set")

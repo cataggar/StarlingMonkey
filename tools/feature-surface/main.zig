@@ -11,6 +11,7 @@ const Args = struct {
     target_wit: ?[]const u8 = null,
     target_world: ?[]const u8 = null,
     features: surface.Features = .{},
+    runtime_config: surface.RuntimeConfig = .snapshotted,
     inspect_candidate: bool = true,
     verbose: bool = false,
 };
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
         .target_wit = args.target_wit,
         .target_world = args.target_world,
         .features = args.features,
+        .runtime_config = args.runtime_config,
         .inspect_candidate = args.inspect_candidate,
         .cwd = cwd,
         .verbose = args.verbose,
@@ -61,6 +63,14 @@ fn parse(argv: []const []const u8) !Args {
             args.target_world = try value(argv, &i);
         } else if (std.mem.eql(u8, arg, "--features")) {
             args.features = try parseFeatures(try value(argv, &i));
+        } else if (std.mem.eql(u8, arg, "--runtime-config")) {
+            const mode = try value(argv, &i);
+            args.runtime_config = if (std.mem.eql(u8, mode, "external"))
+                .external
+            else if (std.mem.eql(u8, mode, "snapshotted"))
+                .snapshotted
+            else
+                return error.InvalidRuntimeConfig;
         } else if (std.mem.eql(u8, arg, "--no-inspect-candidate")) {
             args.inspect_candidate = false;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -135,9 +145,12 @@ test "parses feature tuple and target" {
         "probe",
         "--features",
         "0,1,0,1,0",
+        "--runtime-config",
+        "external",
     };
     const args = try parse(&argv);
     try std.testing.expect(!args.features.stdio);
     try std.testing.expect(args.features.random);
     try std.testing.expectEqualStrings("probe", args.target_world.?);
+    try std.testing.expectEqual(surface.RuntimeConfig.external, args.runtime_config);
 }

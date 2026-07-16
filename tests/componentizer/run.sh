@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <starling-componentize>" >&2
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 <starling-componentize> <host-api>" >&2
   exit 2
 fi
 
 COMPONENTIZER="$(realpath "$1")"
+EXPECTED_HOST_API="$2"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 BARRIERS="$SCRATCH/test barriers"
@@ -477,6 +478,7 @@ printf '%s|%s|%s\n' "$local_cache_real" \
   >> "$FAKE_ZIG_ENV_LOG"
 printf 'local-cache-write\n' > "$ZIG_LOCAL_CACHE_DIR/fake-zig-local"
 printf 'global-cache-write\n' > "$ZIG_GLOBAL_CACHE_DIR/fake-zig-global"
+printf '%s\n' "$*" >> "$FAKE_ZIG_ARGS_LOG"
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 if [ -z "${FAKE_OMIT_GENERATED_ADAPTER:-}" ]; then
@@ -515,6 +517,7 @@ export FAKE_BINDINGS="$SCRATCH/component-bindings.zig"
 export FAKE_WASIP3_BINDGEN="$TOOLS/fake wasip3-bindgen"
 export FAKE_WASM_OPT="$TOOLS/fake wasm-opt"
 export FAKE_ZIG_LIB_DIR="$SCRATCH/fake zig direct/lib"
+export FAKE_ZIG_ARGS_LOG="$SCRATCH/zig args.log"
 export STARLINGMONKEY_CONFIG="--ambient-config-must-not-reach-wizer"
 mkdir -p "$FAKE_ZIG_LIB_DIR"
 printf 'immutable-zig-lib\n' > "$FAKE_ZIG_LIB_DIR/marker"
@@ -3626,6 +3629,7 @@ while IFS='|' read -r local_cache global_cache zig_lib; do
       ;;
   esac
 done < "$FAKE_ZIG_ENV_LOG"
+test "$(grep -c -- "-Dhost-api=$EXPECTED_HOST_API" "$FAKE_ZIG_ARGS_LOG")" -eq 5
 cmp "$ENGINE" "$BUILD_OUTPUT_1"
 cmp "$ENGINE" "$BUILD_OUTPUT_2"
 cmp "$ENGINE" "$BUILD_OUTPUT_3"

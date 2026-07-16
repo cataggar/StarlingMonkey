@@ -101,7 +101,10 @@ zig-out/bin/starling-componentize \
 ```
 
 WIT files are content-hashed and staged under the build root. Runtime prefixes
-are keyed by the two WIT closures, worlds, feature selection, and build mode.
+are keyed by the componentizer's embedded host API, the two WIT closures,
+worlds, feature selection, and build mode. Every nested build receives that
+exact `-Dhost-api`; an installed componentizer cannot silently fall back to a
+different adapter/provider identity.
 The CLI still invokes `zig build` on every run so source/toolchain changes
 cannot reuse stale output; Zig's own dependency cache makes an unchanged
 monolithic relink a fast cache hit. JavaScript source is deliberately excluded

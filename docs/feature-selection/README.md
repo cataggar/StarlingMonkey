@@ -69,7 +69,10 @@ The native E2E runs both `starling-componentize` and its installed
 
 User-declared non-feature imports remain external. Runtime-only filesystem,
 socket, environment, and exit imports are internalized when they are not part
-of the selected caller world. A legacy build without `-Dcomponent-wit` keeps
+of a specialized caller world. The componentizers explicitly mark Wizer
+outputs as snapshotted; an output-only `componentize.sh -o starling.wasm`
+instead preserves external CLI arguments/environment for runtime evaluation.
+A legacy build without `-Dcomponent-wit` keeps
 its fixed export world; consequently its historical
 `wasi:http/incoming-handler` export remains, even in pure mode, while pure mode
 still has zero WASI imports. Export topology for a caller-supplied world is
@@ -82,8 +85,9 @@ Surface removal does not silently route disabled operations to the host:
 - `stdio`: preview1 writes are successful no-ops.
 - `random`: `crypto.getRandomValues` uses a deterministic splitmix64 stream.
 - `clocks`: timer registration throws a catchable `FeatureDisabled`
-  `TypeError`; scheduler immediate tasks use an internal path and no longer
-  retain the monotonic-clock import.
+  `TypeError`, including internal users such as `AbortSignal.timeout`;
+  scheduler immediate stream tasks use a distinct internal handle and no
+  longer retain the monotonic-clock import.
 - `http`: outgoing requests fail through the existing catchable fetch error
   path without calling the outgoing handler.
 - `fetch-event`: `addEventListener("fetch", ...)` throws a catchable

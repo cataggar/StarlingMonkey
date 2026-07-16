@@ -134,6 +134,15 @@ for production in shell native; do
     "$PREFIX/$production-before.wit" "$PREFIX/$production-after.wit"
 done
 
+echo "[wit-imports e2e] proving the exact WASI oracle rejects a residual import"
+if negative_output="$(python3 "$SCRIPT_DIR/check-surface.py" --wasi-only \
+    "$SCRIPT_DIR/fixtures/unexpected-wasi-import.wit" 2>&1)"; then
+  echo "FAIL: exact surface oracle accepted an unexpected WASI import" >&2
+  exit 1
+fi
+grep -q "wasi:sockets/network@0.2.10" <<<"$negative_output"
+echo "PASS exact surface oracle rejects an unexpected residual WASI import"
+
 echo "[wit-imports e2e] confirming test:wit-imports/host@1.2.3 is a real component-level import"
 "$BIN/wasm-tools" component wit "$COMPONENT" | grep -q 'import test:wit-imports/host@1.2.3;' || {
   echo "FAIL: componentized output does not declare test:wit-imports/host@1.2.3 as an import"

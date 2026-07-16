@@ -20,6 +20,11 @@ pub const Features = struct {
     }
 };
 
+pub const RuntimeConfig = enum {
+    external,
+    snapshotted,
+};
+
 pub const Options = struct {
     wac: []const u8,
     wasm_tools: []const u8,
@@ -30,6 +35,7 @@ pub const Options = struct {
     target_wit: ?[]const u8,
     target_world: ?[]const u8,
     features: Features,
+    runtime_config: RuntimeConfig = .snapshotted,
     inspect_candidate: bool = true,
     cwd: []const u8,
     verbose: bool = false,
@@ -151,11 +157,23 @@ pub fn apply(
     const demand_driven = options.target_wit != null;
     var preserved: std.ArrayList([]const u8) = .empty;
     for (platform_imports) |name| {
-        if (!shouldProvide(name, target_imports, options.features, demand_driven)) {
+        if (!shouldProvide(
+            name,
+            target_imports,
+            options.features,
+            demand_driven,
+            options.runtime_config,
+        )) {
             preserved.append(allocator, name) catch @panic("out of memory");
         }
         if ((options.features.pure() or contains(actual_imports, name)) and
-            shouldProvide(name, target_imports, options.features, demand_driven) and
+            shouldProvide(
+                name,
+                target_imports,
+                options.features,
+                demand_driven,
+                options.runtime_config,
+            ) and
             !contains(provided.items, name))
         {
             provided.append(allocator, name) catch @panic("out of memory");
@@ -312,6 +330,7 @@ fn buildProvider(
             target_imports,
             options.features,
             demand_driven,
+            options.runtime_config,
         ) and
             !contains(residuals.items, name))
         {
@@ -338,6 +357,7 @@ fn shouldProvide(
     target_imports: []const []const u8,
     features: Features,
     demand_driven: bool,
+    runtime_config: RuntimeConfig,
 ) bool {
     const target_requires = contains(target_imports, name);
 
@@ -378,10 +398,13 @@ fn shouldProvide(
         return (demand_driven and !features.stdio) or features.pure();
     }
     if (std.mem.startsWith(u8, name, "wasi:sockets/") or
-        interface(name, "wasi:cli/environment") or
         interface(name, "wasi:cli/exit"))
     {
         if (target_requires) return false;
+        return demand_driven or features.pure();
+    }
+    if (interface(name, "wasi:cli/environment")) {
+        if (runtime_config == .external or target_requires) return false;
         return demand_driven or features.pure();
     }
 
@@ -581,42 +604,49 @@ test "disabled feature policy matches the frozen minimal-world surfaces" {
         no_target,
         .{ .random = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(shouldProvide(
         "wasi:clocks/monotonic-clock@0.2.10",
         no_target,
         .{ .clocks = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(!shouldProvide(
         "wasi:clocks/wall-clock@0.2.10",
         no_target,
         .{ .clocks = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(shouldProvide(
         "wasi:cli/stdin@0.2.10",
         no_target,
         .{ .stdio = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(!shouldProvide(
         "wasi:cli/stderr@0.2.10",
         no_target,
         .{ .stdio = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(shouldProvide(
         "wasi:http/outgoing-handler@0.2.10",
         no_target,
         .{ .http = false },
         minimal,
+        .snapshotted,
     ));
     try std.testing.expect(!shouldProvide(
         "wasi:http/types@0.2.10",
         no_target,
         .{ .http = false },
         minimal,
+        .snapshotted,
     ));
 }
 
@@ -635,8 +665,21 @@ test "pure mode provides every residual for a world without WASI imports" {
         "wasi:cli/environment@0.2.10",
     };
     for (imports) |name| {
-        try std.testing.expect(shouldProvide(name, &.{}, features, true));
+        try std.testing.expect(shouldProvide(
+            name,
+            &.{},
+            features,
+            true,
+            .snapshotted,
+        ));
     }
+    try std.testing.expect(!shouldProvide(
+        "wasi:cli/environment@0.2.10",
+        &.{},
+        features,
+        true,
+        .external,
+    ));
 }
 
 test "provider WIT exports only selected interfaces" {
