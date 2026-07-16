@@ -11,9 +11,66 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="$ROOT/tests/componentizer/.scratch"
 TOOLS="$SCRATCH/fake tools"
 WORK="$SCRATCH/work with spaces"
-rm -rf "$SCRATCH"
+SOURCE_RACER_PID=""
+SOURCE_COMPONENTIZER_PID=""
+SNAPSHOT_TEST_PID=""
+terminate_and_reap() {
+  local pid="${1:-}"
+  if [ -z "$pid" ]; then
+    return
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+pid_is_live() {
+  local state
+  state="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+  case "$state" in
+    Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+wait_for_marker() {
+  local marker="$1" pid="$2" label="$3"
+  local deadline=$((SECONDS + 30))
+  while [ ! -e "$marker" ]; do
+    if ! pid_is_live "$pid"; then
+      echo "FAIL: $label exited before creating $marker" >&2
+      return 1
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "FAIL: timed out waiting for $label marker $marker" >&2
+      return 1
+    fi
+    sleep 0.001
+  done
+}
+cleanup_scratch() {
+  terminate_and_reap "$SOURCE_RACER_PID"
+  terminate_and_reap "$SOURCE_COMPONENTIZER_PID"
+  terminate_and_reap "$SNAPSHOT_TEST_PID"
+  SOURCE_RACER_PID=""
+  SOURCE_COMPONENTIZER_PID=""
+  SNAPSHOT_TEST_PID=""
+  if [ -e "$SCRATCH" ]; then
+    chmod -R u+w "$SCRATCH" 2>/dev/null || true
+    rm -rf "$SCRATCH"
+  fi
+}
+remove_tree() {
+  local path
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      chmod -R u+w "$path" 2>/dev/null || true
+    fi
+  done
+  command rm -rf -- "$@"
+}
+cleanup_scratch
 mkdir -p "$TOOLS" "$WORK/wit package"
-trap 'rm -rf "$SCRATCH"' EXIT
+trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
 ENGINE="$WORK/fake engine.wasm"
@@ -32,8 +89,8 @@ cat > "$TOOLS/fake wizer" <<'EOF'
 set -euo pipefail
 for fd in /proc/self/fd/*; do
   case "$(readlink "$fd" 2>/dev/null || true)" in
-    *".starling-componentize-lock-"*)
-      echo "publication lock descriptor leaked into Wizer" >&2
+    *".starling-componentize-lock-"*|*/locks/*.lock)
+      echo "lock descriptor leaked into Wizer" >&2
       exit 26
       ;;
   esac
@@ -162,6 +219,19 @@ EOF
 cat > "$TOOLS/fake wasm-tools" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+transaction_storage() {
+  local fd target
+  for fd in /proc/self/fd/*; do
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    case "$target" in
+      *".starling-componentize-"*/data/component.wasm)
+        dirname "$target"
+        return
+        ;;
+    esac
+  done
+  return 1
+}
 stage="$1${2:+ $2}"
 if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ] || \
    { [ "${FAKE_FAIL_STAGE:-}" = "validate" ] && [ "$1" = "validate" ]; }; then
@@ -185,21 +255,21 @@ if [ "$1" = "validate" ] && [ -n "${FAKE_RACE_DESTINATION:-}" ]; then
   esac
 fi
 if [ "$1" = "validate" ] && [ -n "${FAKE_REPLACED_TRANSACTION:-}" ]; then
-  storage="$(dirname "${!#}")"
+  storage="$(transaction_storage)"
   transaction="$(dirname "$storage")"
   mv "$transaction" "$FAKE_REPLACED_TRANSACTION"
   mkdir "$transaction"
   printf 'preserve-replacement\n' > "$transaction/sentinel"
 fi
 if [ "$1" = "validate" ] && [ -n "${FAKE_ADD_TRANSACTION_ENTRY:-}" ]; then
-  storage="$(dirname "${!#}")"
+  storage="$(transaction_storage)"
   mkdir "$storage/inputs/late-unowned-tree"
   printf 'preserve-unowned\n' > \
     "$storage/inputs/late-unowned-tree/sentinel"
 fi
 if [ "$1" = "validate" ] && \
    [ -n "${FAKE_REPLACE_TRANSACTION_INPUTS:-}" ]; then
-  storage="$(dirname "${!#}")"
+  storage="$(transaction_storage)"
   mv "$storage/inputs" "$FAKE_REPLACE_TRANSACTION_INPUTS"
   mkdir "$storage/inputs"
   printf 'preserve-owned-replacement\n' > "$storage/inputs/sentinel"
@@ -210,7 +280,7 @@ if [ "$1" = "validate" ] && [ -n "${FAKE_RETARGET_PARENT_LINK:-}" ]; then
 fi
 if [ "$1" = "validate" ] && \
    [ -n "${FAKE_REPLACE_COMPONENT_BACKUP:-}" ]; then
-  storage="$(dirname "${!#}")"
+  storage="$(transaction_storage)"
   (
     while [ ! -e "$storage/previous-component" ]; do
       sleep 0.001
@@ -245,8 +315,8 @@ cat > "$TOOLS/fake zig" <<'EOF'
 set -euo pipefail
 for fd in /proc/self/fd/*; do
   case "$(readlink "$fd" 2>/dev/null || true)" in
-    *".starling-componentize-lock-"*)
-      echo "publication lock descriptor leaked into Zig" >&2
+    *".starling-componentize-lock-"*|*/locks/*.lock)
+      echo "lock descriptor leaked into Zig" >&2
       exit 26
       ;;
   esac
@@ -292,9 +362,10 @@ fi
 prefix_real="$(realpath "$prefix")"
 local_cache_real="$(realpath "$ZIG_LOCAL_CACHE_DIR")"
 global_cache_real="$(realpath "$ZIG_GLOBAL_CACHE_DIR")"
+zig_lib_real="$(realpath "$ZIG_LIB_DIR")"
 printf '%s\n' "$prefix_real" >> "$FAKE_ZIG_PREFIX_LOG"
 printf '%s|%s|%s\n' "$local_cache_real" \
-  "$global_cache_real" "$ZIG_LIB_DIR" \
+  "$global_cache_real" "$zig_lib_real" \
   >> "$FAKE_ZIG_ENV_LOG"
 printf 'local-cache-write\n' > "$ZIG_LOCAL_CACHE_DIR/fake-zig-local"
 printf 'global-cache-write\n' > "$ZIG_GLOBAL_CACHE_DIR/fake-zig-global"
@@ -749,6 +820,58 @@ for document in (exact, alias):
 assert exact == alias
 PY
 
+NESTED_SHARED_ROOT="$SCRATCH/nested shared root"
+NESTED_SHARED_SOURCE="$NESTED_SHARED_ROOT/deep/branch/main.js"
+NESTED_SHARED_INITIALIZER="$NESTED_SHARED_ROOT/initializer.js"
+NESTED_SHARED_ALIASES="$SCRATCH/nested shared aliases"
+mkdir -p "$(dirname "$NESTED_SHARED_SOURCE")" "$NESTED_SHARED_ALIASES"
+printf 'export const nestedShared = true;\n' > "$NESTED_SHARED_SOURCE"
+printf 'globalThis.nestedInitialized = true;\n' > \
+  "$NESTED_SHARED_INITIALIZER"
+printf 'export const sibling = true;\n' > \
+  "$NESTED_SHARED_ROOT/deep/sibling.js"
+ln -s "$NESTED_SHARED_SOURCE" "$NESTED_SHARED_ALIASES/source.js"
+ln -s "$NESTED_SHARED_INITIALIZER" \
+  "$NESTED_SHARED_ALIASES/initializer.js"
+for nested_case in exact repeat aliases; do
+  nested_source="$NESTED_SHARED_SOURCE"
+  nested_initializer="$NESTED_SHARED_INITIALIZER"
+  if [ "$nested_case" = aliases ]; then
+    nested_source="$NESTED_SHARED_ALIASES/source.js"
+    nested_initializer="$NESTED_SHARED_ALIASES/initializer.js"
+  fi
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --initializer-script-path "$nested_initializer" \
+    --metadata-out "$WORK/nested shared $nested_case.json" \
+    --out "$WORK/nested shared $nested_case.wasm" \
+    "$nested_source"
+done
+python3 - "$NESTED_SHARED_SOURCE" \
+  "$WORK/nested shared exact.json" \
+  "$WORK/nested shared repeat.json" \
+  "$WORK/nested shared aliases.json" <<'PY'
+import hashlib, json, sys
+source = open(sys.argv[1], "rb").read()
+documents = [json.load(open(path, encoding="utf-8")) for path in sys.argv[2:]]
+inputs = [document["provenance"]["inputs"] for document in documents]
+assert all(value["source_tree"]["entry"] == "deep/branch/main.js"
+           for value in inputs), inputs
+assert all(value["initializer_tree"]["entry"] == "initializer.js"
+           for value in inputs), inputs
+assert all(value["initializer_tree"]["shares_source_tree"] is True
+           for value in inputs), inputs
+assert all(value["source_sha256"] == hashlib.sha256(source).hexdigest()
+           for value in inputs), inputs
+assert len({value["source_tree"]["sha256"] for value in inputs}) == 1, inputs
+assert all(value["initializer_tree"]["sha256"] ==
+           value["source_tree"]["sha256"] for value in inputs), inputs
+assert documents[0] == documents[1] == documents[2]
+PY
+
 UNREADABLE_SOURCE="$WORK/unreadable source.js"
 UNREADABLE_ERROR="$SCRATCH/unreadable-source.jsonl"
 printf 'export const unreadable = true;\n' > "$UNREADABLE_SOURCE"
@@ -783,30 +906,67 @@ with open(sys.argv[1], "w", encoding="utf-8") as source:
     source.write("// immutable input race padding\n" * 500000)
     source.write("export const raced = true;\n")
 PY
-python3 - "$WORK" "$RACED_SOURCE" "$RACED_ORIGINAL" <<'PY' &
-import os, sys, time
-work, source, original = sys.argv[1:]
-prefix = ".raced source.wasm.starling-componentize-"
-while not any(name.startswith(prefix) for name in os.listdir(work)):
-    time.sleep(0.0001)
-os.rename(source, original)
-with open(source, "w", encoding="utf-8") as replacement:
-    replacement.write("export const replacement = true;\n")
-PY
-racer=$!
-if "$COMPONENTIZER" \
+"$COMPONENTIZER" \
   --json-diagnostics \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
   --wizer-bin "$TOOLS/fake wizer" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$WORK/raced source.wasm" \
-  "$RACED_SOURCE" >/dev/null 2> "$RACED_ERROR"
-then
+  "$RACED_SOURCE" >/dev/null 2> "$RACED_ERROR" &
+SOURCE_COMPONENTIZER_PID=$!
+python3 - "$WORK" "$RACED_SOURCE" "$RACED_ORIGINAL" \
+  "$SOURCE_COMPONENTIZER_PID" <<'PY' &
+import os, sys, time
+work, source, original, componentizer = sys.argv[1:]
+componentizer = int(componentizer)
+prefix = ".raced source.wasm.starling-componentize-"
+deadline = time.monotonic() + 30
+while not any(name.startswith(prefix) for name in os.listdir(work)):
+    if time.monotonic() >= deadline:
+        raise SystemExit("timed out waiting for raced-source transaction")
+    try:
+        os.kill(componentizer, 0)
+    except ProcessLookupError:
+        raise SystemExit("componentizer exited before raced-source transaction")
+    time.sleep(0.0001)
+os.rename(source, original)
+with open(source, "w", encoding="utf-8") as replacement:
+    replacement.write("export const replacement = true;\n")
+PY
+SOURCE_RACER_PID=$!
+source_race_deadline=$((SECONDS + 35))
+while pid_is_live "$SOURCE_COMPONENTIZER_PID"; do
+  if [ -n "$SOURCE_RACER_PID" ] && ! pid_is_live "$SOURCE_RACER_PID"; then
+    if ! wait "$SOURCE_RACER_PID"; then
+      SOURCE_RACER_PID=""
+      terminate_and_reap "$SOURCE_COMPONENTIZER_PID"
+      SOURCE_COMPONENTIZER_PID=""
+      echo "FAIL: raced-source synchronizer exited early" >&2
+      exit 1
+    fi
+    SOURCE_RACER_PID=""
+  fi
+  if [ "$SECONDS" -ge "$source_race_deadline" ]; then
+    terminate_and_reap "$SOURCE_COMPONENTIZER_PID"
+    SOURCE_COMPONENTIZER_PID=""
+    terminate_and_reap "$SOURCE_RACER_PID"
+    SOURCE_RACER_PID=""
+    echo "FAIL: raced-source regression exceeded its deadline" >&2
+    exit 1
+  fi
+  sleep 0.01
+done
+if wait "$SOURCE_COMPONENTIZER_PID"; then
+  SOURCE_COMPONENTIZER_PID=""
   echo "FAIL: raced source unexpectedly componentized" >&2
   exit 1
 fi
-wait "$racer"
+SOURCE_COMPONENTIZER_PID=""
+if [ -n "$SOURCE_RACER_PID" ]; then
+  wait "$SOURCE_RACER_PID"
+  SOURCE_RACER_PID=""
+fi
 python3 - "$RACED_ERROR" <<'PY'
 import json, sys
 diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1209,7 +1369,7 @@ test -n "$REPLACEMENT_ROOT"
 test "$(cat "$REPLACEMENT_ROOT/sentinel")" = "preserve-replacement"
 test -f "$REPLACED_OWNED/data/component.wasm"
 test ! -e "$REPLACED_OUTPUT"
-rm -rf "$REPLACEMENT_ROOT" "$REPLACED_OWNED"
+remove_tree "$REPLACEMENT_ROOT" "$REPLACED_OWNED"
 
 IDENTITY_OUTPUT="$WORK/identity cleanup.wasm"
 FAKE_ADD_TRANSACTION_ENTRY=1 "$COMPONENTIZER" \
@@ -1225,25 +1385,38 @@ test -n "$IDENTITY_ROOT"
 test "$(cat "$IDENTITY_ROOT/data/inputs/late-unowned-tree/sentinel")" = \
   "preserve-unowned"
 cmp "$ENGINE" "$IDENTITY_OUTPUT"
-rm -rf "$IDENTITY_ROOT"
+remove_tree "$IDENTITY_ROOT"
 
 CHANGED_INPUT_OUTPUT="$WORK/changed owned input.wasm"
 CHANGED_INPUT_SAVED="$SCRATCH/changed-owned-input-original"
-FAKE_REPLACE_TRANSACTION_INPUTS="$CHANGED_INPUT_SAVED" "$COMPONENTIZER" \
+CHANGED_INPUT_ERROR="$SCRATCH/changed-owned-input.jsonl"
+if FAKE_REPLACE_TRANSACTION_INPUTS="$CHANGED_INPUT_SAVED" "$COMPONENTIZER" \
+  --json-diagnostics \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
   --wizer-bin "$TOOLS/fake wizer" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$CHANGED_INPUT_OUTPUT" \
-  "$SOURCE"
+  "$SOURCE" >/dev/null 2> "$CHANGED_INPUT_ERROR"
+then
+  echo "FAIL: replaced immutable input snapshot reported success" >&2
+  exit 1
+fi
 CHANGED_INPUT_ROOT="$(find "$WORK" -maxdepth 1 -type d \
   -name '.changed owned input.wasm.starling-componentize-*' -print -quit)"
 test -n "$CHANGED_INPUT_ROOT"
 test "$(cat "$CHANGED_INPUT_ROOT/data/inputs/sentinel")" = \
   "preserve-owned-replacement"
 test -f "$CHANGED_INPUT_SAVED/source/source module.js"
-cmp "$ENGINE" "$CHANGED_INPUT_OUTPUT"
-rm -rf "$CHANGED_INPUT_ROOT" "$CHANGED_INPUT_SAVED"
+test ! -e "$CHANGED_INPUT_OUTPUT"
+python3 - "$CHANGED_INPUT_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC5001", diagnostic
+assert diagnostic["phase"] == "validate", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+remove_tree "$CHANGED_INPUT_ROOT" "$CHANGED_INPUT_SAVED"
 
 PUBLICATION_A="$SCRATCH/publication-a"
 PUBLICATION_B="$SCRATCH/publication-b"
@@ -1440,7 +1613,7 @@ assert diagnostic["phase"] == "publish", diagnostic
 assert diagnostic["cause"] == "RollbackIncomplete", diagnostic
 assert "transaction storage was retained" in diagnostic["message"], diagnostic
 PY
-rm -rf "$ROLLBACK_RACE_ROOT"
+remove_tree "$ROLLBACK_RACE_ROOT"
 
 BACKUP_RACE_OUTPUT="$WORK/backup identity race.wasm"
 BACKUP_RACE_DEBUG="$WORK/backup identity race.debug"
@@ -1480,7 +1653,7 @@ test "$(cat "$BACKUP_RACE_DEBUG/commands.txt/sentinel")" = \
   "preserve-generated-tree"
 test "$(cat "$BACKUP_RACE_DEBUG/unrelated-3999")" = "preserve-3999"
 test ! -e "$BACKUP_RACE_OUTPUT"
-rm -rf "$BACKUP_RACE_ROOT" "$BACKUP_RACE_DEBUG"
+remove_tree "$BACKUP_RACE_ROOT" "$BACKUP_RACE_DEBUG"
 
 for commit_artifact in component metadata debug; do
   for commit_action in replacement removal; do
@@ -1541,7 +1714,7 @@ for commit_artifact in component metadata debug; do
         printf 'replacement-%s\n' "$commit_slug" > "$commit_destination"
       fi
     elif [ "$commit_artifact" = debug ]; then
-      rm -rf "$commit_destination"
+      remove_tree "$commit_destination"
     else
       rm "$commit_destination"
     fi
@@ -1603,10 +1776,139 @@ PY
           ;;
       esac
     fi
-    rm -rf "$commit_root" "$commit_debug" "$commit_saved"
+    remove_tree "$commit_root" "$commit_debug" "$commit_saved"
     rm -f "$commit_output" "$commit_metadata" \
       "$commit_barrier.ready" "$commit_barrier.release"
   done
+done
+
+publication_fault_rollback() {
+  local fault="$1" slug="${1//[^a-zA-Z0-9]/-}"
+  local fault_output="$WORK/fault-$slug.wasm"
+  local fault_metadata="$WORK/fault-$slug.json"
+  local fault_debug="$WORK/fault-$slug.debug"
+  local fault_error="$SCRATCH/fault-$slug.jsonl"
+  printf 'old-component-%s\n' "$fault" > "$fault_output"
+  printf 'old-metadata-%s\n' "$fault" > "$fault_metadata"
+  mkdir "$fault_debug"
+  printf 'old-debug-%s\n' "$fault" > "$fault_debug/unrelated.txt"
+  if STARLING_COMPONENTIZER_TEST_PUBLICATION_FAULT="$fault" \
+    "$COMPONENTIZER" \
+      --json-diagnostics \
+      --engine "$ENGINE" \
+      --preview2-adapter "$ADAPTER" \
+      --wizer-bin "$TOOLS/fake wizer" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --metadata-out "$fault_metadata" \
+      --debug-dir "$fault_debug" \
+      --out "$fault_output" \
+      "$SOURCE" >/dev/null 2> "$fault_error"
+  then
+    echo "FAIL: pre-commit publication fault $fault reported success" >&2
+    exit 1
+  fi
+  test "$(cat "$fault_output")" = "old-component-$fault"
+  test "$(cat "$fault_metadata")" = "old-metadata-$fault"
+  test "$(cat "$fault_debug/unrelated.txt")" = "old-debug-$fault"
+  python3 - "$fault_error" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "CommandFailed", diagnostic
+PY
+  if find "$WORK" -maxdepth 1 -type d \
+    -name ".fault-$slug.wasm.starling-componentize-*" | grep -q .; then
+    echo "FAIL: exact rollback for $fault retained a transaction" >&2
+    exit 1
+  fi
+  remove_tree "$fault_debug"
+  rm -f "$fault_output" "$fault_metadata"
+}
+
+publication_rollback_faults=(
+  backup-component-after-rename
+  backup-component-after-stat
+  backup-component-after-identity
+  backup-component-after-record
+  backup-metadata-after-rename
+  backup-metadata-after-stat
+  backup-metadata-after-identity
+  backup-metadata-after-record
+  backup-debug-after-rename
+  backup-debug-after-stat
+  backup-debug-after-identity
+  backup-debug-after-record
+  backup-debug-after-open-backup
+  backup-debug-after-open-staged
+  backup-debug-after-scan
+  backup-debug-after-verify
+  backup-debug-after-record-tree
+  backup-debug-after-copy
+  backup-debug-after-final-verify
+  final-recovery-attached
+  final-recovery-component
+  final-recovery-metadata
+  final-recovery-debug
+  final-recovery-after
+  final-publication-before
+  final-publication-parent-before
+  final-lock-before
+  final-component
+  final-metadata
+  final-debug
+  final-lock-after
+  final-publication-after
+  final-before-commit
+)
+for publication_fault in "${publication_rollback_faults[@]}"; do
+  publication_fault_rollback "$publication_fault"
+done
+
+for cleanup_fault in \
+  cleanup-component-before cleanup-component-after \
+  cleanup-metadata-before cleanup-metadata-after \
+  cleanup-debug-before cleanup-debug-after
+do
+  cleanup_slug="${cleanup_fault//[^a-zA-Z0-9]/-}"
+  cleanup_output="$WORK/cleanup-$cleanup_slug.wasm"
+  cleanup_metadata="$WORK/cleanup-$cleanup_slug.json"
+  cleanup_debug="$WORK/cleanup-$cleanup_slug.debug"
+  cleanup_log="$SCRATCH/cleanup-$cleanup_slug.jsonl"
+  printf 'old-component-%s\n' "$cleanup_fault" > "$cleanup_output"
+  printf 'old-metadata-%s\n' "$cleanup_fault" > "$cleanup_metadata"
+  mkdir "$cleanup_debug"
+  printf 'old-debug-%s\n' "$cleanup_fault" > \
+    "$cleanup_debug/unrelated.txt"
+  STARLING_COMPONENTIZER_TEST_PUBLICATION_FAULT="$cleanup_fault" \
+    "$COMPONENTIZER" \
+      --json-diagnostics \
+      --engine "$ENGINE" \
+      --preview2-adapter "$ADAPTER" \
+      --wizer-bin "$TOOLS/fake wizer" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --metadata-out "$cleanup_metadata" \
+      --debug-dir "$cleanup_debug" \
+      --out "$cleanup_output" \
+      "$SOURCE" >/dev/null 2> "$cleanup_log"
+  cmp "$ENGINE" "$cleanup_output"
+  cmp "$ENGINE" "$cleanup_debug/component.wasm"
+  test "$(cat "$cleanup_debug/unrelated.txt")" = "old-debug-$cleanup_fault"
+  python3 - "$cleanup_log" "$cleanup_output" "$cleanup_metadata" <<'PY'
+import hashlib, json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC0000", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+component = open(sys.argv[2], "rb").read()
+document = json.load(open(sys.argv[3], encoding="utf-8"))
+assert document["component_sha256"] == hashlib.sha256(component).hexdigest()
+PY
+  cleanup_root="$(find "$WORK" -maxdepth 1 -type d \
+    -name ".cleanup-$cleanup_slug.wasm.starling-componentize-*" \
+    -print -quit)"
+  test -n "$cleanup_root"
+  remove_tree "$cleanup_root" "$cleanup_debug"
+  rm -f "$cleanup_output" "$cleanup_metadata"
 done
 
 CONCURRENT_BUNDLE_OUTPUT="$WORK/concurrent bundle.wasm"
@@ -1616,10 +1918,12 @@ CONCURRENT_BUNDLE_ENGINE_A="$SCRATCH/concurrent-engine-a.wasm"
 CONCURRENT_BUNDLE_ENGINE_B="$SCRATCH/concurrent-engine-b.wasm"
 CONCURRENT_BUNDLE_LOG_A="$SCRATCH/concurrent-bundle-a.jsonl"
 CONCURRENT_BUNDLE_LOG_B="$SCRATCH/concurrent-bundle-b.jsonl"
-CONCURRENT_BUNDLE_BARRIER="$SCRATCH/concurrent-bundle-a"
+CONCURRENT_BUNDLE_BARRIER_A="$SCRATCH/concurrent-bundle-a-lock"
+CONCURRENT_BUNDLE_BARRIER_B="$SCRATCH/concurrent-bundle-b-lock"
 printf 'concurrent-engine-a\n' > "$CONCURRENT_BUNDLE_ENGINE_A"
 printf 'concurrent-engine-b\n' > "$CONCURRENT_BUNDLE_ENGINE_B"
-STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER="$CONCURRENT_BUNDLE_BARRIER" \
+STARLING_COMPONENTIZER_TEST_LOCK_BARRIER="$CONCURRENT_BUNDLE_BARRIER_A" \
+STARLING_COMPONENTIZER_TEST_LOCK_BARRIER_MODE=after \
 "$COMPONENTIZER" \
   --json-diagnostics \
   --engine "$CONCURRENT_BUNDLE_ENGINE_A" \
@@ -1631,18 +1935,10 @@ STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER="$CONCURRENT_BUNDLE_BARRIER" \
   --out "$CONCURRENT_BUNDLE_OUTPUT" \
   "$SOURCE" >/dev/null 2> "$CONCURRENT_BUNDLE_LOG_A" &
 concurrent_bundle_pid_a=$!
-for _ in $(seq 1 30000); do
-  if [ -e "$CONCURRENT_BUNDLE_BARRIER.ready" ]; then
-    break
-  fi
-  if ! kill -0 "$concurrent_bundle_pid_a" 2>/dev/null; then
-    wait "$concurrent_bundle_pid_a" 2>/dev/null || true
-    echo "FAIL: first concurrent publisher missed its commit barrier" >&2
-    exit 1
-  fi
-  sleep 0.001
-done
-test -e "$CONCURRENT_BUNDLE_BARRIER.ready"
+wait_for_marker "$CONCURRENT_BUNDLE_BARRIER_A.acquired" \
+  "$concurrent_bundle_pid_a" "first publication locker"
+STARLING_COMPONENTIZER_TEST_LOCK_BARRIER="$CONCURRENT_BUNDLE_BARRIER_B" \
+STARLING_COMPONENTIZER_TEST_LOCK_BARRIER_MODE=before \
 "$COMPONENTIZER" \
   --json-diagnostics \
   --engine "$CONCURRENT_BUNDLE_ENGINE_B" \
@@ -1654,10 +1950,16 @@ test -e "$CONCURRENT_BUNDLE_BARRIER.ready"
   --out "$CONCURRENT_BUNDLE_OUTPUT" \
   "$SOURCE" >/dev/null 2> "$CONCURRENT_BUNDLE_LOG_B" &
 concurrent_bundle_pid_b=$!
-sleep 0.05
-kill -0 "$concurrent_bundle_pid_b" 2>/dev/null
-: > "$CONCURRENT_BUNDLE_BARRIER.release"
+wait_for_marker "$CONCURRENT_BUNDLE_BARRIER_B.before" \
+  "$concurrent_bundle_pid_b" "second publication locker"
+: > "$CONCURRENT_BUNDLE_BARRIER_B.enter"
+wait_for_marker "$CONCURRENT_BUNDLE_BARRIER_B.attempting" \
+  "$concurrent_bundle_pid_b" "second publication lock attempt"
+test ! -e "$CONCURRENT_BUNDLE_BARRIER_B.acquired"
+: > "$CONCURRENT_BUNDLE_BARRIER_A.release"
 wait "$concurrent_bundle_pid_a"
+wait_for_marker "$CONCURRENT_BUNDLE_BARRIER_B.acquired" \
+  "$concurrent_bundle_pid_b" "second publication lock acquisition"
 wait "$concurrent_bundle_pid_b"
 cmp "$CONCURRENT_BUNDLE_ENGINE_B" "$CONCURRENT_BUNDLE_OUTPUT"
 cmp "$CONCURRENT_BUNDLE_ENGINE_B" \
@@ -2012,7 +2314,7 @@ assert clean_b["provenance"]["tools_sha256"] != \
     changed["provenance"]["tools_sha256"]
 PY
 
-rm -rf "$CACHE"
+remove_tree "$CACHE"
 export FAKE_ZIG_ACTIVE_DIR="$SCRATCH/fake-zig-active"
 export FAKE_ZIG_DELAY=1
 build_with_fake_zig "$WORK/concurrent output 1.wasm" &
@@ -2025,11 +2327,18 @@ unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
 test "${#prefixes[@]}" -eq 14
-test "${prefixes[0]}" = "${prefixes[1]}"
-test "${prefixes[0]}" != "${prefixes[2]}"
-for prefix in "${prefixes[@]:3}"; do
-  test "${prefixes[2]}" = "$prefix"
+for prefix in "${prefixes[@]}"; do
+  case "$prefix" in
+    *".starling-componentize-"*/data/runtime-prefix) ;;
+    *)
+      echo "FAIL: Zig build escaped its private anchored prefix: $prefix" >&2
+      exit 1
+      ;;
+  esac
 done
+test "$(printf '%s\n' "${prefixes[@]}" | sort -u | wc -l)" -eq 14
+test "$(find "$CACHE/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
+  -ge 1
 cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
 cmp "$ENGINE" "$WORK/concurrent output 2.wasm"
 while IFS='|' read -r local_cache global_cache zig_lib; do
@@ -2114,7 +2423,7 @@ cache_identity_race() {
   local race_output="$WORK/cache identity $race_kind.wasm"
   local race_error="$SCRATCH/cache-identity-$race_kind.jsonl"
   local race_barrier="$SCRATCH/cache-identity-$race_kind"
-  rm -rf "$race_cache" "$race_held" "$race_target"
+  remove_tree "$race_cache" "$race_held" "$race_target"
   FAKE_ZIG_BARRIER="$race_barrier" "$COMPONENTIZER" \
     --json-diagnostics \
     --build-root "$ROOT" \
@@ -2151,14 +2460,25 @@ cache_identity_race() {
     printf 'user-root-replacement\n' > "$race_cache/sentinel"
   else
     local child="$race_kind"
-    if [ "$race_kind" = runtime-prefix ]; then
+    if [ "$race_kind" = runtime-prefix ] ||
+       [ "$race_kind" = runtime-bin ] ||
+       [ "$race_kind" = runtime-artifact ]; then
       child="runtimes/$(basename "$(find "$race_cache/runtimes" \
         -mindepth 1 -maxdepth 1 -type d -print -quit)")"
     fi
-    mv "$race_cache/$child" "$race_held"
+    if [ "$race_kind" = runtime-bin ]; then
+      child="$child/bin"
+    fi
     mkdir "$race_target"
     printf 'user-child-replacement\n' > "$race_target/sentinel"
-    ln -s "$race_target" "$race_cache/$child"
+    if [ "$race_kind" = runtime-artifact ]; then
+      printf 'external-artifact\n' > "$race_target/external.wasm"
+      ln -s "$race_target/external.wasm" \
+        "$race_cache/$child/bin/starling-raw.wasm"
+    else
+      mv "$race_cache/$child" "$race_held"
+      ln -s "$race_target" "$race_cache/$child"
+    fi
   fi
   : > "$race_barrier.release"
   if wait "$race_pid"; then
@@ -2180,17 +2500,297 @@ PY
     test -f "$race_held/zig-global-cache/fake-zig-global"
   else
     test "$(cat "$race_target/sentinel")" = "user-child-replacement"
-    test "$(find "$race_target" -mindepth 1 ! -name sentinel | wc -l)" -eq 0
+    if [ "$race_kind" = runtime-artifact ]; then
+      test "$(cat "$race_target/external.wasm")" = "external-artifact"
+    else
+      test "$(find "$race_target" -mindepth 1 ! -name sentinel | wc -l)" -eq 0
+    fi
   fi
-  rm -rf "$race_cache" "$race_held" "$race_target"
+  remove_tree "$race_cache" "$race_held" "$race_target"
   rm -f "$race_barrier.ready" "$race_barrier.release"
 }
 
 cache_identity_race root
 cache_identity_race runtimes
 cache_identity_race runtime-prefix
+cache_identity_race runtime-bin
+cache_identity_race runtime-artifact
 cache_identity_race locks
 cache_identity_race zig-global-cache
 cache_identity_race zig-local-cache
+
+SNAPSHOT_SOURCE_ROOT="$SCRATCH/stable snapshot source"
+SNAPSHOT_SOURCE="$SNAPSHOT_SOURCE_ROOT/main.js"
+mkdir "$SNAPSHOT_SOURCE_ROOT"
+printf 'export const stableSnapshot = true;\n' > "$SNAPSHOT_SOURCE"
+
+SNAPSHOT_WIZER_OUTPUT="$WORK/snapshot-wizer.wasm"
+SNAPSHOT_WIZER_METADATA="$WORK/snapshot-wizer.json"
+SNAPSHOT_WIZER_BARRIER="$SCRATCH/snapshot-wizer"
+SNAPSHOT_WIZER_EXTERNAL="$SCRATCH/snapshot-wizer-external"
+printf 'external-output\n' > "$SNAPSHOT_WIZER_EXTERNAL"
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_WIZER_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$SNAPSHOT_WIZER_METADATA" \
+  --out "$SNAPSHOT_WIZER_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2>&1 &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_WIZER_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "Wizer snapshot substitution"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-wizer.wasm.starling-componentize-*' -print -quit)"
+test -n "$snapshot_root"
+snapshot_storage="$snapshot_root/data"
+mkdir "$SCRATCH/snapshot-wizer-saved"
+mv "$snapshot_storage/wizer" "$SCRATCH/snapshot-wizer-saved/wizer"
+mv "$snapshot_storage/engine.wasm" \
+  "$SCRATCH/snapshot-wizer-saved/engine.wasm"
+mv "$snapshot_storage/inputs/source" \
+  "$snapshot_storage/inputs/source.saved"
+mv "$snapshot_storage/initialized.wasm" \
+  "$SCRATCH/snapshot-wizer-saved/initialized.wasm"
+printf '#!/usr/bin/env bash\nexit 97\n' > "$snapshot_storage/wizer"
+chmod +x "$snapshot_storage/wizer"
+printf 'substituted-engine\n' > "$snapshot_storage/engine.wasm"
+mkdir "$snapshot_storage/inputs/source"
+printf 'export const substituted = true;\n' > \
+  "$snapshot_storage/inputs/source/main.js"
+ln -s "$SNAPSHOT_WIZER_EXTERNAL" "$snapshot_storage/initialized.wasm"
+: > "$SNAPSHOT_WIZER_BARRIER.release"
+wait_for_marker "$SNAPSHOT_WIZER_BARRIER.complete" \
+  "$SNAPSHOT_TEST_PID" "Wizer snapshot completion"
+test "$(cat "$SNAPSHOT_WIZER_EXTERNAL")" = "external-output"
+rm -f "$snapshot_storage/wizer" "$snapshot_storage/engine.wasm" \
+  "$snapshot_storage/initialized.wasm"
+remove_tree "$snapshot_storage/inputs/source"
+mv "$SCRATCH/snapshot-wizer-saved/wizer" "$snapshot_storage/wizer"
+mv "$SCRATCH/snapshot-wizer-saved/engine.wasm" \
+  "$snapshot_storage/engine.wasm"
+mv "$snapshot_storage/inputs/source.saved" \
+  "$snapshot_storage/inputs/source"
+mv "$SCRATCH/snapshot-wizer-saved/initialized.wasm" \
+  "$snapshot_storage/initialized.wasm"
+: > "$SNAPSHOT_WIZER_BARRIER.verify"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$SNAPSHOT_WIZER_OUTPUT"
+python3 - "$SNAPSHOT_SOURCE" "$ENGINE" "$SNAPSHOT_WIZER_METADATA" <<'PY'
+import hashlib, json, sys
+digest = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()
+document = json.load(open(sys.argv[3], encoding="utf-8"))
+inputs = document["provenance"]["inputs"]
+assert inputs["source_sha256"] == digest(sys.argv[1]), inputs
+assert inputs["engine_sha256"] == digest(sys.argv[2]), inputs
+PY
+
+SNAPSHOT_WASM_OUTPUT="$WORK/snapshot-wasm-tools.wasm"
+SNAPSHOT_WASM_METADATA="$WORK/snapshot-wasm-tools.json"
+SNAPSHOT_WASM_BARRIER="$SCRATCH/snapshot-wasm-tools"
+SNAPSHOT_WASM_EXTERNAL="$SCRATCH/snapshot-wasm-tools-external"
+printf 'external-output\n' > "$SNAPSHOT_WASM_EXTERNAL"
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_WASM_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE="wasm-tools component new" \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$SNAPSHOT_WASM_METADATA" \
+  --out "$SNAPSHOT_WASM_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2>&1 &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_WASM_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "wasm-tools snapshot substitution"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-wasm-tools.wasm.starling-componentize-*' -print -quit)"
+snapshot_storage="$snapshot_root/data"
+mkdir "$SCRATCH/snapshot-wasm-tools-saved"
+for snapshot_name in wasm-tools preview2-adapter.wasm initialized.wasm \
+  candidate.wasm
+do
+  mv "$snapshot_storage/$snapshot_name" \
+    "$SCRATCH/snapshot-wasm-tools-saved/$snapshot_name"
+done
+printf '#!/usr/bin/env bash\nexit 97\n' > "$snapshot_storage/wasm-tools"
+chmod +x "$snapshot_storage/wasm-tools"
+printf 'substituted-adapter\n' > "$snapshot_storage/preview2-adapter.wasm"
+printf 'substituted-initialized\n' > "$snapshot_storage/initialized.wasm"
+ln -s "$SNAPSHOT_WASM_EXTERNAL" "$snapshot_storage/candidate.wasm"
+: > "$SNAPSHOT_WASM_BARRIER.release"
+wait_for_marker "$SNAPSHOT_WASM_BARRIER.complete" \
+  "$SNAPSHOT_TEST_PID" "wasm-tools snapshot completion"
+test "$(cat "$SNAPSHOT_WASM_EXTERNAL")" = "external-output"
+rm -f "$snapshot_storage/wasm-tools" \
+  "$snapshot_storage/preview2-adapter.wasm" \
+  "$snapshot_storage/initialized.wasm" "$snapshot_storage/candidate.wasm"
+for snapshot_name in wasm-tools preview2-adapter.wasm initialized.wasm \
+  candidate.wasm
+do
+  mv "$SCRATCH/snapshot-wasm-tools-saved/$snapshot_name" \
+    "$snapshot_storage/$snapshot_name"
+done
+: > "$SNAPSHOT_WASM_BARRIER.verify"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$SNAPSHOT_WASM_OUTPUT"
+python3 - "$ADAPTER" "$SNAPSHOT_WASM_METADATA" <<'PY'
+import hashlib, json, sys
+expected = hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()
+document = json.load(open(sys.argv[2], encoding="utf-8"))
+assert document["provenance"]["inputs"]["preview2_adapter_sha256"] == expected
+PY
+
+SNAPSHOT_WIT_OUTPUT="$WORK/snapshot-wit.wasm"
+SNAPSHOT_WIT_DEBUG="$WORK/snapshot-wit.debug"
+SNAPSHOT_WIT_BARRIER="$SCRATCH/snapshot-wit"
+SNAPSHOT_WIT_EXTERNAL="$SCRATCH/snapshot-wit-external"
+SNAPSHOT_WIT_LOG="$SCRATCH/snapshot-wit.log"
+printf 'external-output\n' > "$SNAPSHOT_WIT_EXTERNAL"
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_WIT_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE="wabt component embed" \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --debug-dir "$SNAPSHOT_WIT_DEBUG" \
+  --out "$SNAPSHOT_WIT_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2> "$SNAPSHOT_WIT_LOG" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_WIT_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "WIT snapshot substitution"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-wit.wasm.starling-componentize-*' -print -quit)"
+snapshot_storage="$snapshot_root/data"
+mkdir "$SCRATCH/snapshot-wit-saved"
+mv "$snapshot_storage/wabt" "$SCRATCH/snapshot-wit-saved/wabt"
+mv "$snapshot_storage/dispatch-wit" \
+  "$snapshot_storage/dispatch-wit.saved"
+mv "$snapshot_storage/stripped.wasm" \
+  "$SCRATCH/snapshot-wit-saved/stripped.wasm"
+mv "$snapshot_storage/embedded.wasm" \
+  "$SCRATCH/snapshot-wit-saved/embedded.wasm"
+printf '#!/usr/bin/env bash\nexit 97\n' > "$snapshot_storage/wabt"
+chmod +x "$snapshot_storage/wabt"
+mkdir "$snapshot_storage/dispatch-wit"
+printf 'package test:substituted;\nworld substituted {}\n' > \
+  "$snapshot_storage/dispatch-wit/world.wit"
+printf 'substituted-stripped\n' > "$snapshot_storage/stripped.wasm"
+ln -s "$SNAPSHOT_WIT_EXTERNAL" "$snapshot_storage/embedded.wasm"
+: > "$SNAPSHOT_WIT_BARRIER.release"
+wait_for_marker "$SNAPSHOT_WIT_BARRIER.complete" \
+  "$SNAPSHOT_TEST_PID" "WIT snapshot completion"
+test "$(cat "$SNAPSHOT_WIT_EXTERNAL")" = "external-output"
+rm -f "$snapshot_storage/wabt" "$snapshot_storage/stripped.wasm" \
+  "$snapshot_storage/embedded.wasm"
+remove_tree "$snapshot_storage/dispatch-wit"
+mv "$SCRATCH/snapshot-wit-saved/wabt" "$snapshot_storage/wabt"
+mv "$snapshot_storage/dispatch-wit.saved" \
+  "$snapshot_storage/dispatch-wit"
+mv "$SCRATCH/snapshot-wit-saved/stripped.wasm" \
+  "$snapshot_storage/stripped.wasm"
+mv "$SCRATCH/snapshot-wit-saved/embedded.wasm" \
+  "$snapshot_storage/embedded.wasm"
+: > "$SNAPSHOT_WIT_BARRIER.verify"
+if ! wait "$SNAPSHOT_TEST_PID"; then
+  cat "$SNAPSHOT_WIT_LOG" >&2
+  echo "FAIL: stable WIT snapshot run failed" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$SNAPSHOT_WIT_OUTPUT"
+python3 - "$WIT/world.wit" "$SNAPSHOT_WIT_DEBUG/metadata.json" <<'PY'
+import hashlib, json, sys
+hasher = hashlib.sha256()
+hasher.update(b"world.wit\0")
+hasher.update(open(sys.argv[1], "rb").read())
+hasher.update(b"\xff")
+document = json.load(open(sys.argv[2], encoding="utf-8"))
+assert document["provenance"]["dispatch_world"]["wit_sha256"] == \
+    hasher.hexdigest()
+PY
+
+SNAPSHOT_ZIG_CACHE="$SCRATCH/snapshot-zig-cache"
+SNAPSHOT_ZIG_OUTPUT="$WORK/snapshot-zig.wasm"
+SNAPSHOT_ZIG_METADATA="$WORK/snapshot-zig.json"
+SNAPSHOT_ZIG_BARRIER="$SCRATCH/snapshot-zig"
+SNAPSHOT_ZIG_EXTERNAL="$SCRATCH/snapshot-zig-external"
+mkdir "$SNAPSHOT_ZIG_EXTERNAL"
+printf 'external-prefix\n' > "$SNAPSHOT_ZIG_EXTERNAL/sentinel"
+FAKE_ZIG_BARRIER="$SNAPSHOT_ZIG_BARRIER-child" \
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_ZIG_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE="zig build runtime" \
+"$COMPONENTIZER" \
+  --build-root "$ROOT" \
+  --cache-dir "$SNAPSHOT_ZIG_CACHE" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$SNAPSHOT_ZIG_METADATA" \
+  --out "$SNAPSHOT_ZIG_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2>&1 &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_ZIG_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "Zig snapshot substitution"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-zig.wasm.starling-componentize-*' -print -quit)"
+snapshot_storage="$snapshot_root/data"
+mkdir "$SCRATCH/snapshot-zig-saved"
+mv "$snapshot_storage/zig-install/bin/zig" \
+  "$SCRATCH/snapshot-zig-saved/zig"
+mv "$snapshot_storage/dispatch-wit" \
+  "$snapshot_storage/dispatch-wit.saved"
+mv "$snapshot_storage/runtime-prefix" \
+  "$snapshot_storage/runtime-prefix.saved"
+printf '#!/usr/bin/env bash\nexit 97\n' > \
+  "$snapshot_storage/zig-install/bin/zig"
+chmod +x "$snapshot_storage/zig-install/bin/zig"
+mkdir "$snapshot_storage/dispatch-wit"
+printf 'package test:substituted;\nworld substituted {}\n' > \
+  "$snapshot_storage/dispatch-wit/world.wit"
+ln -s "$SNAPSHOT_ZIG_EXTERNAL" "$snapshot_storage/runtime-prefix"
+: > "$SNAPSHOT_ZIG_BARRIER.release"
+wait_for_marker "$SNAPSHOT_ZIG_BARRIER-child.ready" \
+  "$SNAPSHOT_TEST_PID" "stable Zig child"
+: > "$SNAPSHOT_ZIG_BARRIER-child.release"
+wait_for_marker "$SNAPSHOT_ZIG_BARRIER.complete" \
+  "$SNAPSHOT_TEST_PID" "Zig snapshot completion"
+test "$(cat "$SNAPSHOT_ZIG_EXTERNAL/sentinel")" = "external-prefix"
+rm -f "$snapshot_storage/zig-install/bin/zig" \
+  "$snapshot_storage/runtime-prefix"
+remove_tree "$snapshot_storage/dispatch-wit"
+mv "$SCRATCH/snapshot-zig-saved/zig" \
+  "$snapshot_storage/zig-install/bin/zig"
+mv "$snapshot_storage/dispatch-wit.saved" \
+  "$snapshot_storage/dispatch-wit"
+mv "$snapshot_storage/runtime-prefix.saved" \
+  "$snapshot_storage/runtime-prefix"
+: > "$SNAPSHOT_ZIG_BARRIER.verify"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$SNAPSHOT_ZIG_OUTPUT"
+python3 - "$TOOLS/fake zig" "$SNAPSHOT_ZIG_METADATA" <<'PY'
+import hashlib, json, sys
+expected = hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()
+document = json.load(open(sys.argv[2], encoding="utf-8"))
+tools = {tool["name"]: tool for tool in document["provenance"]["tools"]}
+assert tools["zig"]["sha256"] == expected, tools["zig"]
+PY
+
+if find "$WORK" -type d -name '.*.starling-componentize-*' | grep -q .; then
+  echo "FAIL: successful componentizations retained transaction storage" >&2
+  exit 1
+fi
 
 echo "native componentizer fake-tool tests passed"

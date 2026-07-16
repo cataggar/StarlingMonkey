@@ -23,9 +23,15 @@ FAILURE_OUTPUT="$WORK/unchanged-on-failure.wasm"
 V2_OUTPUT="$WORK/native component v2.wasm"
 DEBUG_DIR="$WORK/debug bindings"
 
-rm -rf "$CACHE"
+cleanup_cache() {
+  if [ -e "$CACHE" ]; then
+    chmod -R u+w "$CACHE" 2>/dev/null || true
+    rm -rf "$CACHE"
+  fi
+}
+cleanup_cache
 mkdir -p "$WORK"
-trap 'rm -rf "$CACHE"' EXIT
+trap cleanup_cache EXIT
 
 componentize() {
   local source="$1" output="$2"

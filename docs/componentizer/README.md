@@ -16,19 +16,23 @@ command string):
 6. Validate the completed candidate with `wasm-tools`.
 7. `fsync` and transactionally publish the requested outputs.
 
-Any failure leaves existing component and metadata outputs unchanged and never
-publishes a partial debug directory. The temporary transaction directory is
+Any failure before the durable publication commit leaves existing component
+and metadata outputs unchanged and never publishes a partial debug directory.
+The temporary transaction directory is
 created beside the output through a held handle to its canonical parent.
 Backup, publication, rollback, and cleanup stay relative to that handle and
 check recorded no-follow identities. Persistent per-destination advisory locks,
 opened no-follow beneath the held parent and inherited by no child tool,
-serialize overlapping bundles. Immediately before commit cleanup and again
-before success, the parent, locks, component, metadata, and optional debug
-directory must retain their exact identities. A mismatch rolls back only exact
-owned entries and retains recoverable transaction state rather than touching a
-replacement. Cleanup removes only pre-recorded entries, aborts on additions or
-replacements, and never recursively removes an unrecognized tree. Optional
-metadata and debug destinations must use that same parent so publication and
+serialize overlapping bundles. Immediately before the explicit commit point,
+the parent, locks, recovery anchors,
+component, metadata, and optional debug directory must retain their exact
+identities. A mismatch rolls back only exact owned entries and retains
+recoverable transaction state rather than touching a replacement. No error is
+reported after commit. Backup cleanup then removes only pre-recorded entries;
+if that cleanup cannot finish, publication remains successful and the
+transaction is retained for recovery instead of attempting a post-commit
+rollback. Optional metadata and debug destinations must use that same parent
+so publication and
 rollback cannot cross filesystems.
 
 ## Building
@@ -82,8 +86,11 @@ source snapshotting and retained through an opened directory handle. Runtime,
 lock, and Zig local/global-cache directories are created and checked no-follow
 relative to held ancestors. Zig receives private handle-backed paths for the
 runtime prefix and both caches; canonical cache paths remain in diagnostics.
-Root or descendant replacement is detected before and after the child and
-cannot redirect writes into the replacement. Only the exact effective-cache
+The private prefix and its `bin` directory are held independently, while every
+consumed runtime artifact is opened no-follow relative to the held `bin`.
+Cache `bin` and artifact symlinks are rejected before and after the build, so
+root or descendant replacement cannot redirect writes or reads into a
+replacement. Only the exact effective-cache
 directory identity is excluded if it is nested inside a snapshotted source
 tree.
 
@@ -162,8 +169,13 @@ timestamps, random transaction names, or host paths, so its provenance fields
 are deterministic even if an underlying snapshot tool emits byte-distinct
 components. Files, complete JavaScript source-directory trees, WIT trees, and
 executables are copied to immutable per-run snapshots in controlled transaction
-storage before use; hashes are computed while creating those snapshots, and
-every child executes or consumes the corresponding snapshot. This retains
+storage before use; hashes are computed while creating those snapshots. On
+Linux, no-follow file and directory handles remain open and children receive
+intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
+pre-created output files. Handles are identity-checked immediately around each
+spawn; publication and cache lock descriptors remain close-on-exec. Thus a
+snapshot name can be replaced and restored without the substituted bytes ever
+being executed, consumed, or written. This retains
 relative sibling and nested-module visibility even for read-only source trees.
 Source-tree traversal order, permissions, timestamps, and absolute root
 location do not affect tree hashes. Relative symlinks that remain within the
@@ -210,10 +222,11 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--preview2-adapter`. `--wasmtime-bin` selects Wasmtime's `wizer` subcommand;
 `--wizer-bin` selects a standalone Wizer and uses its native
 `--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
-For runtime builds, the selected Zig reports its library directory through
-`zig env` unless a valid `ZIG_LIB_DIR` is explicit. The executable and complete
-library tree are copied together into transaction storage, and the build runs
-only that executable with `ZIG_LIB_DIR` fixed to the immutable copy. This
+For runtime builds, a valid `ZIG_LIB_DIR` takes precedence; standard archive
+and installed layouts are resolved next, with stable `zig env` execution as a
+fallback. The executable and complete library tree are copied together into
+transaction storage, and the build runs only that executable with
+`ZIG_LIB_DIR` fixed to the immutable copy. This
 supports archive layouts, installed `bin/zig` plus `lib/zig` layouts, symlinked
 executables, and paths containing spaces without consulting the original
 installation after snapshot validation.
