@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -10,6 +11,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 
 const PipelineError = error{
+    CacheDirectoryChanged,
     CommandFailed,
     DebugOutputCollision,
     EmptyRuntimeArgument,
@@ -82,6 +84,53 @@ const OwnedEntry = struct {
 const EffectiveCache = struct {
     path: []const u8,
     identity: EntryIdentity,
+    directory: Dir,
+
+    fn verifyCanonical(self: *const EffectiveCache, io: Io) !void {
+        if (!self.identity.matches(try self.directory.stat(io))) {
+            return error.CacheDirectoryChanged;
+        }
+        const canonical = Dir.cwd().statFile(
+            io,
+            self.path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.CacheDirectoryChanged,
+            else => return err,
+        };
+        if (!self.identity.matches(canonical)) {
+            return error.CacheDirectoryChanged;
+        }
+    }
+};
+
+const CacheDirectory = struct {
+    name: []const u8,
+    path: []const u8,
+    identity: EntryIdentity,
+    directory: Dir,
+
+    fn close(self: CacheDirectory, io: Io) void {
+        self.directory.close(io);
+    }
+
+    fn verify(
+        self: *const CacheDirectory,
+        parent: Dir,
+        io: Io,
+    ) !void {
+        if (!self.identity.matches(try self.directory.stat(io)) or
+            !try entryHasIdentity(parent, io, self.name, self.identity))
+        {
+            return error.CacheDirectoryChanged;
+        }
+    }
+};
+
+const CacheLock = struct {
+    name: []const u8,
+    identity: EntryIdentity,
+    file: File,
 };
 
 const InputExclusion = struct {
@@ -716,7 +765,7 @@ fn execute(
         try resolveAndValidateRoot(allocator, io, cwd, root)
     else
         null;
-    const effective_cache: ?EffectiveCache =
+    var effective_cache: ?EffectiveCache =
         if (config.cache_dir != null or config.engine == null)
             try resolveEffectiveCache(
                 allocator,
@@ -727,6 +776,29 @@ fn execute(
             )
         else
             null;
+    defer if (effective_cache) |cache| cache.directory.close(io);
+
+    var publication_destinations: [3][]const u8 = undefined;
+    var publication_destination_count: usize = 0;
+    publication_destinations[publication_destination_count] = output_name;
+    publication_destination_count += 1;
+    if (metadata_output) |path| {
+        publication_destinations[publication_destination_count] =
+            std.fs.path.basename(path);
+        publication_destination_count += 1;
+    }
+    if (debug_dir) |path| {
+        publication_destinations[publication_destination_count] =
+            std.fs.path.basename(path);
+        publication_destination_count += 1;
+    }
+    var publication_locks = try PublicationLocks.acquire(
+        allocator,
+        io,
+        publication_directory,
+        publication_destinations[0..publication_destination_count],
+    );
+    defer publication_locks.deinit(io);
 
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
@@ -770,26 +842,32 @@ fn execute(
             }) catch @panic("out of memory");
         }
     }
-    input_exclusions.append(allocator, .{ .path = resolved_output }) catch
-        @panic("out of memory");
+    try appendInputExclusion(
+        allocator,
+        io,
+        &input_exclusions,
+        resolved_output,
+    );
     if (metadata_output) |path| {
-        input_exclusions.append(allocator, .{ .path = path }) catch
-            @panic("out of memory");
+        try appendInputExclusion(allocator, io, &input_exclusions, path);
     }
     if (debug_dir) |path| {
-        input_exclusions.append(allocator, .{ .path = path }) catch
-            @panic("out of memory");
+        for (debug_generated_names) |name| {
+            try appendInputExclusion(
+                allocator,
+                io,
+                &input_exclusions,
+                try std.fs.path.join(allocator, &.{ path, name }),
+            );
+        }
     }
-    if (!std.mem.eql(u8, publication_parent, source_parent) and
-        (initializer_parent == null or
-            !std.mem.eql(u8, publication_parent, initializer_parent.?)))
-    {
-        input_exclusions.append(
-            allocator,
-            .{ .path = publication_parent },
-        ) catch
-            @panic("out of memory");
-    }
+    try appendPublicationLockExclusions(
+        allocator,
+        io,
+        &input_exclusions,
+        publication_directory,
+        publication_parent,
+    );
 
     const input_snapshots = try snapshotInputs(
         allocator,
@@ -824,7 +902,7 @@ fn execute(
             build_root.?,
             executable_dir,
             config,
-            effective_cache.?.path,
+            &effective_cache.?,
             diagnostic,
             &transaction,
         );
@@ -1270,7 +1348,9 @@ fn execute(
         &transaction_safe_to_remove,
         source,
         resolved_output,
+        environ,
         diagnostic,
+        &publication_locks,
     );
 }
 
@@ -1363,11 +1443,12 @@ fn buildRuntime(
     build_root: []const u8,
     executable_dir: []const u8,
     config: *const cli.Config,
-    cache_dir: []const u8,
+    cache: *const EffectiveCache,
     diagnostic: *diagnostics.Context,
     transaction: *Transaction,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
+    try cache.verifyCanonical(io);
 
     var dispatch_wit: ?StagedWit = null;
     var component_wit: ?StagedWit = null;
@@ -1405,20 +1486,52 @@ fn buildRuntime(
         if (dispatch_wit) |wit| wit.digest else null,
         if (component_wit) |wit| wit.digest else null,
     );
-    const prefix = try std.fs.path.join(
+    var runtimes = try ensureCacheDirectory(
         allocator,
-        &.{ cache_dir, "runtimes", key },
+        io,
+        cache.directory,
+        cache.path,
+        "runtimes",
     );
-    const lock_dir = try std.fs.path.join(allocator, &.{ cache_dir, "locks" });
-    try Dir.cwd().createDirPath(io, lock_dir);
-    const lock_path = try std.fs.path.join(
+    defer runtimes.close(io);
+    var prefix = try ensureCacheDirectory(
         allocator,
-        &.{ lock_dir, try std.fmt.allocPrint(allocator, "{s}.lock", .{key}) },
+        io,
+        runtimes.directory,
+        runtimes.path,
+        key,
     );
-    const lock_file = try Dir.createFileAbsolute(io, lock_path, .{ .truncate = false });
+    defer prefix.close(io);
+    var locks = try ensureCacheDirectory(
+        allocator,
+        io,
+        cache.directory,
+        cache.path,
+        "locks",
+    );
+    defer locks.close(io);
+    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{key});
+    const cache_lock = try acquireCacheLock(io, locks.directory, lock_name);
+    const lock_file = cache_lock.file;
     errdefer lock_file.close(io);
-    try lock_file.lock(io, .exclusive);
     errdefer lock_file.unlock(io);
+
+    var zig_global = try ensureCacheDirectory(
+        allocator,
+        io,
+        cache.directory,
+        cache.path,
+        "zig-global-cache",
+    );
+    defer zig_global.close(io);
+    var zig_local = try ensureCacheDirectory(
+        allocator,
+        io,
+        cache.directory,
+        cache.path,
+        "zig-local-cache",
+    );
+    defer zig_local.close(io);
 
     const zig_source = if (config.zig_bin) |path|
         try absolutePath(allocator, cwd, path)
@@ -1436,13 +1549,36 @@ fn buildRuntime(
         transaction,
     );
     const zig = zig_install.executable;
+    try verifyCacheLayout(
+        cache,
+        &runtimes,
+        &prefix,
+        &locks,
+        cache_lock,
+        &zig_global,
+        &zig_local,
+        io,
+    );
+
+    const prefix_child_path = try cacheDirectoryChildPath(
+        allocator,
+        prefix,
+    );
+    const zig_global_child_path = try cacheDirectoryChildPath(
+        allocator,
+        zig_global,
+    );
+    const zig_local_child_path = try cacheDirectoryChildPath(
+        allocator,
+        zig_local,
+    );
 
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(allocator, &.{
         zig.path,
         "build",
         "--prefix",
-        prefix,
+        prefix_child_path,
         if (config.use_debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseSmall",
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
@@ -1482,23 +1618,32 @@ fn buildRuntime(
             @panic("out of memory");
     }
 
-    const zig_global_cache = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, "zig-global-cache" },
-    );
-    const zig_local_cache = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, "zig-local-cache" },
-    );
-    try Dir.cwd().createDirPath(io, zig_global_cache);
-    try Dir.cwd().createDirPath(io, zig_local_cache);
     var build_env = std.process.Environ.Map.init(allocator);
     try copyEnvironment(&build_env, environ);
-    try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_cache);
-    try build_env.put("ZIG_LOCAL_CACHE_DIR", zig_local_cache);
+    try build_env.put("ZIG_GLOBAL_CACHE_DIR", zig_global_child_path);
+    try build_env.put("ZIG_LOCAL_CACHE_DIR", zig_local_child_path);
     try build_env.put("ZIG_LIB_DIR", zig_install.lib_dir);
     var command_log: std.ArrayList(u8) = .empty;
-    try runCommand(
+    const child_directories = [_]Dir{
+        prefix.directory,
+        zig_global.directory,
+        zig_local.directory,
+    };
+    var inherited_count: usize = 0;
+    defer {
+        while (inherited_count > 0) {
+            inherited_count -= 1;
+            setDirectoryInherited(
+                child_directories[inherited_count],
+                false,
+            ) catch {};
+        }
+    }
+    for (child_directories) |directory| {
+        try setDirectoryInherited(directory, true);
+        inherited_count += 1;
+    }
+    try runCommandRedacted(
         allocator,
         io,
         "zig build runtime",
@@ -1509,12 +1654,34 @@ fn buildRuntime(
         config.verbose,
         &command_log,
         diagnostic,
-        transaction_dir,
+        &.{
+            .{ .path = transaction_dir, .replacement = "<transaction>" },
+            .{ .path = prefix_child_path, .replacement = prefix.path },
+            .{ .path = zig_global_child_path, .replacement = zig_global.path },
+            .{ .path = zig_local_child_path, .replacement = zig_local.path },
+        },
+    );
+    while (inherited_count > 0) {
+        inherited_count -= 1;
+        try setDirectoryInherited(
+            child_directories[inherited_count],
+            false,
+        );
+    }
+    try verifyCacheLayout(
+        cache,
+        &runtimes,
+        &prefix,
+        &locks,
+        cache_lock,
+        &zig_global,
+        &zig_local,
+        io,
     );
 
     const engine_built = try std.fs.path.join(
         allocator,
-        &.{ prefix, "bin", "starling-raw.wasm" },
+        &.{ prefix_child_path, "bin", "starling-raw.wasm" },
     );
     const engine = try snapshotFile(
         allocator,
@@ -1528,7 +1695,7 @@ fn buildRuntime(
     else blk: {
         const installed = try std.fs.path.join(
             allocator,
-            &.{ prefix, "bin", "preview1-adapter.wasm" },
+            &.{ prefix_child_path, "bin", "preview1-adapter.wasm" },
         );
         if (pathExists(io, installed)) break :blk installed;
         break :blk try siblingOrName(
@@ -1549,7 +1716,7 @@ fn buildRuntime(
     const bindings = if (needs_bindings) blk: {
         const path = try std.fs.path.join(
             allocator,
-            &.{ prefix, "bin", "component-bindings.zig" },
+            &.{ prefix_child_path, "bin", "component-bindings.zig" },
         );
         break :blk (try snapshotFile(
             allocator,
@@ -1564,9 +1731,19 @@ fn buildRuntime(
         io,
         try std.fs.path.join(
             allocator,
-            &.{ prefix, "bin", "runtime-build-tools.json" },
+            &.{ prefix_child_path, "bin", "runtime-build-tools.json" },
         ),
         transaction,
+    );
+    try verifyCacheLayout(
+        cache,
+        &runtimes,
+        &prefix,
+        &locks,
+        cache_lock,
+        &zig_global,
+        &zig_local,
+        io,
     );
 
     return .{
@@ -2958,6 +3135,68 @@ fn statEntry(directory: Dir, io: Io, name: []const u8) !?File.Stat {
     };
 }
 
+fn appendInputExclusion(
+    allocator: Allocator,
+    io: Io,
+    exclusions: *std.ArrayList(InputExclusion),
+    path: []const u8,
+) !void {
+    const stat = Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    exclusions.append(allocator, .{
+        .path = try allocator.dupe(u8, path),
+        .identity = if (stat) |entry|
+            EntryIdentity.fromStat(entry)
+        else
+            null,
+    }) catch @panic("out of memory");
+}
+
+fn appendPublicationLockExclusions(
+    allocator: Allocator,
+    io: Io,
+    exclusions: *std.ArrayList(InputExclusion),
+    publication: Dir,
+    publication_parent: []const u8,
+) !void {
+    var iterator = publication.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (!isPublicationLockName(entry.name)) continue;
+        const stat = try publication.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind != .file) continue;
+        exclusions.append(allocator, .{
+            .path = try std.fs.path.join(
+                allocator,
+                &.{ publication_parent, entry.name },
+            ),
+            .identity = EntryIdentity.fromStat(stat),
+        }) catch @panic("out of memory");
+    }
+}
+
+fn isPublicationLockName(name: []const u8) bool {
+    const prefix = ".starling-componentize-lock-";
+    if (!std.mem.startsWith(u8, name, prefix) or
+        name.len != prefix.len + std.crypto.hash.sha2.Sha256.digest_length * 2)
+    {
+        return false;
+    }
+    for (name[prefix.len..]) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
 fn entryHasIdentity(
     directory: Dir,
     io: Io,
@@ -3029,6 +3268,146 @@ fn verifyDirectoryEntries(
     if (seen != expected.len) return error.TransactionChanged;
 }
 
+const PublicationLock = struct {
+    name: []const u8,
+    identity: EntryIdentity,
+    file: File,
+};
+
+const PublicationLocks = struct {
+    entries: []PublicationLock,
+
+    fn acquire(
+        allocator: Allocator,
+        io: Io,
+        publication: Dir,
+        destinations: []const []const u8,
+    ) !PublicationLocks {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (destinations) |destination| {
+            const name = try publicationLockName(allocator, destination);
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, name)) break;
+            } else {
+                names.append(allocator, name) catch @panic("out of memory");
+            }
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.lessThan);
+
+        var acquired: std.ArrayList(PublicationLock) = .empty;
+        errdefer {
+            var index = acquired.items.len;
+            while (index > 0) {
+                index -= 1;
+                acquired.items[index].file.unlock(io);
+                acquired.items[index].file.close(io);
+            }
+        }
+        for (names.items) |name| {
+            acquired.append(
+                allocator,
+                try acquirePublicationLock(io, publication, name),
+            ) catch @panic("out of memory");
+        }
+        return .{
+            .entries = acquired.toOwnedSlice(allocator) catch
+                @panic("out of memory"),
+        };
+    }
+
+    fn deinit(self: *PublicationLocks, io: Io) void {
+        var index = self.entries.len;
+        while (index > 0) {
+            index -= 1;
+            self.entries[index].file.unlock(io);
+            self.entries[index].file.close(io);
+        }
+    }
+
+    fn verify(
+        self: *const PublicationLocks,
+        publication: Dir,
+        io: Io,
+    ) !void {
+        for (self.entries) |entry| {
+            if (!entry.identity.matches(try entry.file.stat(io)) or
+                !try entryHasIdentity(
+                    publication,
+                    io,
+                    entry.name,
+                    entry.identity,
+                ))
+            {
+                return error.TransactionChanged;
+            }
+        }
+    }
+};
+
+fn publicationLockName(
+    allocator: Allocator,
+    destination: []const u8,
+) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("starling-componentizer-publication-lock-v1\x00");
+    hasher.update(destination);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(
+        allocator,
+        ".starling-componentize-lock-{s}",
+        .{&hex},
+    );
+}
+
+fn acquirePublicationLock(
+    io: Io,
+    publication: Dir,
+    name: []const u8,
+) !PublicationLock {
+    while (true) {
+        var file = publication.openFile(io, name, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+        }) catch |open_error| switch (open_error) {
+            error.FileNotFound => publication.createFile(io, name, .{
+                .read = true,
+                .truncate = false,
+                .exclusive = true,
+                .lock = .exclusive,
+                .permissions = .fromMode(0o600),
+            }) catch |create_error| switch (create_error) {
+                error.PathAlreadyExists => continue,
+                else => return create_error,
+            },
+            else => return open_error,
+        };
+        errdefer {
+            file.unlock(io);
+            file.close(io);
+        }
+        try setFileInherited(file, false);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.TransactionChanged;
+        const identity = EntryIdentity.fromStat(stat);
+        if (!try entryHasIdentity(publication, io, name, identity)) {
+            return error.TransactionChanged;
+        }
+        return .{
+            .name = name,
+            .identity = identity,
+            .file = file,
+        };
+    }
+}
+
 fn publishArtifacts(
     allocator: Allocator,
     io: Io,
@@ -3042,7 +3421,9 @@ fn publishArtifacts(
     transaction_safe_to_remove: *bool,
     source: []const u8,
     resolved_output: []const u8,
+    environ: *std.process.Environ.Map,
     diagnostic: *diagnostics.Context,
+    publication_locks: *const PublicationLocks,
 ) !void {
     _ = component_staged;
     var component = ArtifactState{
@@ -3059,6 +3440,8 @@ fn publishArtifacts(
         .destination = debug_output,
         .staged = if (debug_staged != null) "debug" else null,
     };
+    try transaction.verifyCanonicalPublication(io);
+    try publication_locks.verify(transaction.publication, io);
 
     publishArtifactsAttempt(
         allocator,
@@ -3083,7 +3466,7 @@ fn publishArtifacts(
         return publish_error;
     };
 
-    transaction.verifyCanonicalPublication(io) catch |path_error| {
+    waitForCommitTestBarrier(allocator, io, environ) catch |barrier_error| {
         rollbackPublication(
             allocator,
             io,
@@ -3095,18 +3478,39 @@ fn publishArtifacts(
             transaction_safe_to_remove.* = false;
             return error.RollbackIncomplete;
         };
-        return path_error;
+        return barrier_error;
     };
-    diagnostic.reportSuccess(source, resolved_output);
+    verifyPublishedBundle(
+        transaction,
+        publication_locks,
+        component,
+        metadata_state,
+        debug_state,
+        io,
+    ) catch |verification_error| {
+        rollbackPublication(
+            allocator,
+            io,
+            transaction,
+            component,
+            metadata_state,
+            debug_state,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+            return error.RollbackIncomplete;
+        };
+        return verification_error;
+    };
 
+    var cleanup_error: ?anyerror = null;
     if (component.backup) |identity| {
         removeExactEntry(
             io,
             transaction.storage,
             component.backup_name,
             identity,
-        ) catch {
-            transaction_safe_to_remove.* = false;
+        ) catch |err| if (cleanup_error == null) {
+            cleanup_error = err;
         };
     }
     if (metadata_state) |state| {
@@ -3116,20 +3520,113 @@ fn publishArtifacts(
                 transaction.storage,
                 state.backup_name,
                 identity,
-            ) catch {
-                transaction_safe_to_remove.* = false;
+            ) catch |err| if (cleanup_error == null) {
+                cleanup_error = err;
             };
         }
     }
     if (debug_state.backup) |backup| {
         finalizeDebugBackup(
+            allocator,
             io,
             transaction,
             backup,
-        ) catch {
-            transaction_safe_to_remove.* = false;
+        ) catch |err| if (cleanup_error == null) {
+            cleanup_error = err;
         };
     }
+    if (cleanup_error != null) {
+        transaction_safe_to_remove.* = false;
+        return error.RollbackIncomplete;
+    }
+
+    verifyPublishedBundle(
+        transaction,
+        publication_locks,
+        component,
+        metadata_state,
+        debug_state,
+        io,
+    ) catch |verification_error| {
+        rollbackPublication(
+            allocator,
+            io,
+            transaction,
+            component,
+            metadata_state,
+            debug_state,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+            return error.RollbackIncomplete;
+        };
+        return verification_error;
+    };
+    diagnostic.reportSuccess(source, resolved_output);
+}
+
+fn verifyPublishedBundle(
+    transaction: *const Transaction,
+    publication_locks: *const PublicationLocks,
+    component: ArtifactState,
+    metadata_state: ?ArtifactState,
+    debug_state: DebugPublication,
+    io: Io,
+) !void {
+    try transaction.verifyCanonicalPublication(io);
+    try publication_locks.verify(transaction.publication, io);
+    const component_identity = component.published orelse
+        return error.TransactionChanged;
+    if (!try entryHasIdentity(
+        transaction.publication,
+        io,
+        component.destination,
+        component_identity,
+    )) return error.TransactionChanged;
+    if (metadata_state) |state| {
+        const identity = state.published orelse
+            return error.TransactionChanged;
+        if (!try entryHasIdentity(
+            transaction.publication,
+            io,
+            state.destination,
+            identity,
+        )) return error.TransactionChanged;
+    }
+    if (debug_state.staged != null) {
+        const identity = debug_state.published orelse
+            return error.TransactionChanged;
+        if (!try entryHasIdentity(
+            transaction.publication,
+            io,
+            debug_state.destination.?,
+            identity,
+        )) return error.TransactionChanged;
+    }
+    try publication_locks.verify(transaction.publication, io);
+    try transaction.verifyCanonicalPublication(io);
+}
+
+fn waitForCommitTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+) !void {
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const ready = try std.fmt.allocPrint(allocator, "{s}.ready", .{base});
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{base});
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
 }
 
 fn publishArtifactsAttempt(
@@ -3220,16 +3717,8 @@ fn isGeneratedDebugName(name: []const u8) bool {
     return false;
 }
 
-const DebugMovedEntry = struct {
-    name: []const u8,
-    identity: EntryIdentity,
-    generated: bool,
-};
-
 const DebugBackup = struct {
     identity: EntryIdentity,
-    old_generated_identity: EntryIdentity,
-    moved: []const DebugMovedEntry,
 };
 
 const DebugPublication = struct {
@@ -3318,15 +3807,6 @@ fn prepareDebugDestination(
         return error.TransactionChanged;
     }
     try transaction.recordStoragePath(allocator, io, "previous-debug");
-    try transaction.createStorageDir(
-        allocator,
-        io,
-        "previous-debug-generated",
-        .fromMode(0o700),
-    );
-    const old_generated_identity = transaction.ownedIdentity(
-        "previous-debug-generated",
-    ).?;
 
     var backup_dir = try transaction.storage.openDir(
         io,
@@ -3340,29 +3820,25 @@ fn prepareDebugDestination(
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer staged_dir.close(io);
-    var old_generated_dir = try transaction.storage.openDir(
-        io,
-        "previous-debug-generated",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer old_generated_dir.close(io);
-
-    var iterator = backup_dir.iterate();
-    var moved: std.ArrayList(DebugMovedEntry) = .empty;
-    var moved_count: usize = 0;
     var prepared = false;
     errdefer if (!prepared) {
-        undoDebugPreparation(
+        restoreBackup(
             io,
             transaction,
             destination,
+            "previous-debug",
             backup_identity,
-            old_generated_identity,
-            moved.items[0..moved_count],
         ) catch {
             transaction_safe_to_remove.* = false;
         };
     };
+    const DebugEntry = struct {
+        name: []const u8,
+        identity: EntryIdentity,
+        generated: bool,
+    };
+    var entries: std.ArrayList(DebugEntry) = .empty;
+    var iterator = backup_dir.iterate();
     while (try iterator.next(io)) |entry| {
         const stat = try backup_dir.statFile(
             io,
@@ -3373,119 +3849,221 @@ fn prepareDebugDestination(
         if (generated and stat.kind != .file and stat.kind != .sym_link) {
             return error.DebugOutputCollision;
         }
-        moved.append(allocator, .{
+        entries.append(allocator, .{
             .name = try allocator.dupe(u8, entry.name),
             .identity = EntryIdentity.fromStat(stat),
             .generated = generated,
         }) catch @panic("out of memory");
     }
+    try verifyDirectoryEntries(io, backup_dir, entries.items);
+    try recordDebugBackupTree(
+        allocator,
+        io,
+        transaction,
+        backup_dir,
+        "previous-debug",
+    );
 
-    try verifyDirectoryEntries(io, backup_dir, moved.items);
-    for (moved.items) |entry| {
-        const target = if (entry.generated)
-            old_generated_dir
-        else
-            staged_dir;
-        try backup_dir.renamePreserve(entry.name, target, entry.name, io);
-        const moved_stat = try target.statFile(
+    for (entries.items) |entry| {
+        if (entry.generated) continue;
+        try copyDebugBackupEntry(
+            allocator,
+            io,
+            transaction,
+            backup_dir,
+            staged_dir,
+            entry.name,
+            entry.name,
+            entry.identity,
+        );
+    }
+    try verifyDirectoryEntries(io, backup_dir, entries.items);
+    prepared = true;
+    return .{ .identity = backup_identity };
+}
+
+fn recordDebugBackupTree(
+    allocator: Allocator,
+    io: Io,
+    transaction: *Transaction,
+    directory: Dir,
+    relative: []const u8,
+) !void {
+    const Entry = struct {
+        name: []const u8,
+        identity: EntryIdentity,
+    };
+    var entries: std.ArrayList(Entry) = .empty;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        const stat = try directory.statFile(
             io,
             entry.name,
             .{ .follow_symlinks = false },
         );
-        if (!entry.identity.matches(moved_stat)) {
-            target.renamePreserve(
-                entry.name,
-                backup_dir,
-                entry.name,
-                io,
-            ) catch {};
-            return error.TransactionChanged;
-        }
-        moved_count += 1;
-        try transaction.recordStoragePath(
-            allocator,
-            io,
-            try std.fs.path.join(
-                allocator,
-                &.{
-                    if (entry.generated)
-                        "previous-debug-generated"
-                    else
-                        "debug",
-                    entry.name,
-                },
-            ),
-        );
+        entries.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .identity = EntryIdentity.fromStat(stat),
+        }) catch @panic("out of memory");
     }
-    var final_iterator = backup_dir.iterate();
-    if (try final_iterator.next(io) != null) return error.TransactionChanged;
-    prepared = true;
-    return .{
-        .identity = backup_identity,
-        .old_generated_identity = old_generated_identity,
-        .moved = moved.toOwnedSlice(allocator) catch @panic("out of memory"),
-    };
+    try verifyDirectoryEntries(io, directory, entries.items);
+    for (entries.items) |entry| {
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ relative, entry.name },
+        );
+        try transaction.recordStoragePath(allocator, io, path);
+        if (entry.identity.kind == .directory) {
+            var child = try directory.openDir(
+                io,
+                entry.name,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            defer child.close(io);
+            if (!entry.identity.matches(try child.stat(io))) {
+                return error.TransactionChanged;
+            }
+            try recordDebugBackupTree(
+                allocator,
+                io,
+                transaction,
+                child,
+                path,
+            );
+        }
+    }
+    try verifyDirectoryEntries(io, directory, entries.items);
 }
 
-fn undoDebugPreparation(
+fn copyDebugBackupEntry(
+    allocator: Allocator,
     io: Io,
     transaction: *Transaction,
-    destination: []const u8,
-    backup_identity: EntryIdentity,
-    old_generated_identity: EntryIdentity,
-    moved: []const DebugMovedEntry,
+    source: Dir,
+    destination: Dir,
+    name: []const u8,
+    relative: []const u8,
+    expected: EntryIdentity,
 ) !void {
-    var backup_dir = try transaction.storage.openDir(
+    const source_stat = try source.statFile(
         io,
-        "previous-debug",
-        .{ .iterate = true, .follow_symlinks = false },
+        name,
+        .{ .follow_symlinks = false },
     );
-    defer backup_dir.close(io);
-    var staged_dir = try transaction.storage.openDir(
-        io,
-        "debug",
-        .{ .iterate = true, .follow_symlinks = false },
+    if (!expected.matches(source_stat)) return error.TransactionChanged;
+    const owned_path = try std.fs.path.join(
+        allocator,
+        &.{ "debug", relative },
     );
-    defer staged_dir.close(io);
-    var old_generated_dir = try transaction.storage.openDir(
-        io,
-        "previous-debug-generated",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer old_generated_dir.close(io);
-    var index = moved.len;
-    while (index > 0) {
-        index -= 1;
-        const entry = moved[index];
-        const source = if (entry.generated) old_generated_dir else staged_dir;
-        if (!try entryHasIdentity(source, io, entry.name, entry.identity)) {
-            return error.TransactionChanged;
-        }
-        try source.renamePreserve(entry.name, backup_dir, entry.name, io);
-        if (!try entryHasIdentity(
-            backup_dir,
-            io,
-            entry.name,
-            entry.identity,
-        )) return error.TransactionChanged;
+    switch (expected.kind) {
+        .file => {
+            var source_file = try source.openFile(io, name, .{
+                .allow_directory = false,
+                .follow_symlinks = false,
+            });
+            defer source_file.close(io);
+            if (!expected.matches(try source_file.stat(io))) {
+                return error.TransactionChanged;
+            }
+            var destination_file = try destination.createFile(
+                io,
+                name,
+                .{ .exclusive = true },
+            );
+            defer destination_file.close(io);
+            var buffer: [64 * 1024]u8 = undefined;
+            while (true) {
+                const count = source_file.readStreaming(
+                    io,
+                    &.{&buffer},
+                ) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => return err,
+                };
+                if (count == 0) continue;
+                try destination_file.writeStreamingAll(io, buffer[0..count]);
+            }
+            try destination_file.setPermissions(io, source_stat.permissions);
+            try destination_file.sync(io);
+            try transaction.recordStoragePath(allocator, io, owned_path);
+        },
+        .sym_link => {
+            var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const target_len = try source.readLink(io, name, &target_buffer);
+            if (!expected.matches(try source.statFile(
+                io,
+                name,
+                .{ .follow_symlinks = false },
+            ))) return error.TransactionChanged;
+            try destination.symLink(
+                io,
+                target_buffer[0..target_len],
+                name,
+                .{},
+            );
+            try transaction.recordStoragePath(allocator, io, owned_path);
+        },
+        .directory => {
+            try destination.createDir(io, name, .fromMode(0o700));
+            try transaction.recordStoragePath(allocator, io, owned_path);
+            var source_child = try source.openDir(
+                io,
+                name,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            defer source_child.close(io);
+            if (!expected.matches(try source_child.stat(io))) {
+                return error.TransactionChanged;
+            }
+            var destination_child = try destination.openDir(
+                io,
+                name,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            defer destination_child.close(io);
+            const Child = struct {
+                name: []const u8,
+                identity: EntryIdentity,
+            };
+            var children: std.ArrayList(Child) = .empty;
+            var iterator = source_child.iterate();
+            while (try iterator.next(io)) |entry| {
+                const stat = try source_child.statFile(
+                    io,
+                    entry.name,
+                    .{ .follow_symlinks = false },
+                );
+                children.append(allocator, .{
+                    .name = try allocator.dupe(u8, entry.name),
+                    .identity = EntryIdentity.fromStat(stat),
+                }) catch @panic("out of memory");
+            }
+            try verifyDirectoryEntries(io, source_child, children.items);
+            for (children.items) |entry| {
+                try copyDebugBackupEntry(
+                    allocator,
+                    io,
+                    transaction,
+                    source_child,
+                    destination_child,
+                    entry.name,
+                    try std.fs.path.join(
+                        allocator,
+                        &.{ relative, entry.name },
+                    ),
+                    entry.identity,
+                );
+            }
+            try verifyDirectoryEntries(io, source_child, children.items);
+            try destination_child.setPermissions(io, source_stat.permissions);
+        },
+        else => return error.DebugOutputCollision,
     }
-    var old_generated_iterator = old_generated_dir.iterate();
-    if (try old_generated_iterator.next(io) != null) {
-        return error.TransactionChanged;
-    }
-    try removeExactEntry(
+    if (!expected.matches(try source.statFile(
         io,
-        transaction.storage,
-        "previous-debug-generated",
-        old_generated_identity,
-    );
-    try restoreBackup(
-        io,
-        transaction,
-        destination,
-        "previous-debug",
-        backup_identity,
-    );
+        name,
+        .{ .follow_symlinks = false },
+    ))) return error.TransactionChanged;
 }
 
 fn publishEntry(
@@ -3680,40 +4258,6 @@ fn restoreDebugBackup(
     destination: []const u8,
     backup: DebugBackup,
 ) !void {
-    var backup_dir = try transaction.storage.openDir(
-        io,
-        "previous-debug",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer backup_dir.close(io);
-    if (!backup.identity.matches(try backup_dir.stat(io))) {
-        return error.TransactionChanged;
-    }
-    var staged_dir = try transaction.storage.openDir(
-        io,
-        "debug",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer staged_dir.close(io);
-    var old_generated_dir = try transaction.storage.openDir(
-        io,
-        "previous-debug-generated",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer old_generated_dir.close(io);
-    for (backup.moved) |entry| {
-        const source = if (entry.generated) old_generated_dir else staged_dir;
-        if (!try entryHasIdentity(source, io, entry.name, entry.identity)) {
-            return error.TransactionChanged;
-        }
-        try source.renamePreserve(entry.name, backup_dir, entry.name, io);
-        if (!try entryHasIdentity(
-            backup_dir,
-            io,
-            entry.name,
-            entry.identity,
-        )) return error.TransactionChanged;
-    }
     _ = allocator;
     try restoreBackup(
         io,
@@ -3725,6 +4269,7 @@ fn restoreDebugBackup(
 }
 
 fn finalizeDebugBackup(
+    allocator: Allocator,
     io: Io,
     transaction: *Transaction,
     backup: DebugBackup,
@@ -3738,35 +4283,18 @@ fn finalizeDebugBackup(
     if (!backup.identity.matches(try backup_dir.stat(io))) {
         return error.TransactionChanged;
     }
-    var backup_iterator = backup_dir.iterate();
-    if (try backup_iterator.next(io) != null) return error.TransactionChanged;
-
-    var old_generated = try transaction.storage.openDir(
+    try backup_dir.setPermissions(io, .fromMode(0o700));
+    try transaction.verifyOwnedDirectory(
+        allocator,
         io,
-        "previous-debug-generated",
-        .{ .iterate = true, .follow_symlinks = false },
+        backup_dir,
+        "previous-debug",
     );
-    defer old_generated.close(io);
-    if (!backup.old_generated_identity.matches(try old_generated.stat(io))) {
-        return error.TransactionChanged;
-    }
-    for (backup.moved) |entry| {
-        if (!entry.generated) continue;
-        try removeExactEntry(io, old_generated, entry.name, entry.identity);
-    }
-    var final_iterator = old_generated.iterate();
-    if (try final_iterator.next(io) != null) return error.TransactionChanged;
-    if (!try entryHasIdentity(
-        transaction.storage,
+    try transaction.removeOwnedDirectory(
+        allocator,
         io,
-        "previous-debug-generated",
-        backup.old_generated_identity,
-    )) return error.TransactionChanged;
-    try removeExactEntry(
-        io,
-        transaction.storage,
-        "previous-debug-generated",
-        backup.old_generated_identity,
+        backup_dir,
+        "previous-debug",
     );
     if (!try entryHasIdentity(
         transaction.storage,
@@ -3860,6 +4388,29 @@ fn validateRuntimeText(text: []const u8) !void {
 const child_output_limit = 16 * 1024;
 const child_capture_limit = child_output_limit + std.fs.max_path_bytes;
 
+const Redaction = struct {
+    path: []const u8,
+    replacement: []const u8,
+};
+
+fn applyRedactions(
+    allocator: Allocator,
+    input: []const u8,
+    redactions: []const Redaction,
+) ![]const u8 {
+    var stable = try allocator.dupe(u8, input);
+    for (redactions) |redaction| {
+        stable = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            stable,
+            redaction.path,
+            redaction.replacement,
+        );
+    }
+    return stable;
+}
+
 const BoundedChildOutput = struct {
     bytes: std.ArrayList(u8) = .empty,
     truncated: bool = false,
@@ -3899,18 +4450,13 @@ const BoundedChildOutput = struct {
         self: *const BoundedChildOutput,
         allocator: Allocator,
         stream_name: []const u8,
-        redact_path: ?[]const u8,
+        redactions: []const Redaction,
     ) ![]const u8 {
-        const stable = if (redact_path) |path|
-            try std.mem.replaceOwned(
-                u8,
-                allocator,
-                self.bytes.items,
-                path,
-                "<transaction>",
-            )
-        else
-            try allocator.dupe(u8, self.bytes.items);
+        const stable = try applyRedactions(
+            allocator,
+            self.bytes.items,
+            redactions,
+        );
         if (!self.truncated and stable.len <= child_output_limit) return stable;
         defer allocator.free(stable);
         const marker = try std.fmt.allocPrint(
@@ -3947,27 +4493,66 @@ fn runCommand(
     diagnostic: *diagnostics.Context,
     redact_path: ?[]const u8,
 ) !void {
+    if (redact_path) |path| {
+        return runCommandRedacted(
+            allocator,
+            io,
+            stage,
+            argv,
+            cwd,
+            environ,
+            stdin_path,
+            verbose,
+            command_log,
+            diagnostic,
+            &.{.{ .path = path, .replacement = "<transaction>" }},
+        );
+    }
+    return runCommandRedacted(
+        allocator,
+        io,
+        stage,
+        argv,
+        cwd,
+        environ,
+        stdin_path,
+        verbose,
+        command_log,
+        diagnostic,
+        &.{},
+    );
+}
+
+fn runCommandRedacted(
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+    diagnostic: *diagnostics.Context,
+    redactions: []const Redaction,
+) !void {
     command_log.appendSlice(allocator, stage) catch @panic("out of memory");
     command_log.append(allocator, '\n') catch @panic("out of memory");
     for (argv) |arg| {
+        const stable_arg = try applyRedactions(allocator, arg, redactions);
         command_log.appendSlice(allocator, "  ") catch @panic("out of memory");
-        command_log.appendSlice(allocator, arg) catch @panic("out of memory");
+        command_log.appendSlice(allocator, stable_arg) catch @panic("out of memory");
         command_log.append(allocator, '\n') catch @panic("out of memory");
     }
     if (verbose and diagnostic.format == .human) {
         const header = try std.fmt.allocPrint(allocator, "[{s}]\n", .{stage});
         try File.stderr().writeStreamingAll(io, header);
         for (argv) |arg| {
-            const stable_arg = if (redact_path) |path|
-                try std.mem.replaceOwned(
-                    u8,
-                    allocator,
-                    arg,
-                    path,
-                    "<transaction>",
-                )
-            else
-                arg;
+            const stable_arg = try applyRedactions(
+                allocator,
+                arg,
+                redactions,
+            );
             const line = try std.fmt.allocPrint(
                 allocator,
                 "  {s}\n",
@@ -4018,7 +4603,7 @@ fn runCommand(
         const stderr = multi_reader.reader(1);
         const stdout_chunk = stdout.buffered();
         const stderr_chunk = stderr.buffered();
-        if (diagnostic.format == .human and redact_path == null) {
+        if (diagnostic.format == .human and redactions.len == 0) {
             if (stdout_chunk.len != 0) {
                 try File.stdout().writeStreamingAll(io, stdout_chunk);
             }
@@ -4033,11 +4618,11 @@ fn runCommand(
     }
     try multi_reader.checkAnyError();
     const term = try child.wait(io);
-    if (diagnostic.format == .human and redact_path != null) {
+    if (diagnostic.format == .human and redactions.len != 0) {
         const stdout = try stdout_capture.render(
             allocator,
             "stdout",
-            redact_path,
+            redactions,
         );
         if (stdout.len != 0) {
             try File.stdout().writeStreamingAll(io, stdout);
@@ -4046,7 +4631,7 @@ fn runCommand(
             const stderr = try stderr_capture.render(
                 allocator,
                 "stderr",
-                redact_path,
+                redactions,
             );
             if (stderr.len != 0) {
                 try File.stderr().writeStreamingAll(io, stderr);
@@ -4057,7 +4642,7 @@ fn runCommand(
         const stderr = try stderr_capture.render(
             allocator,
             "stderr",
-            redact_path,
+            redactions,
         );
         diagnostic.commandFailed(stage, term, stderr, null);
         return error.CommandFailed;
@@ -4282,15 +4867,180 @@ fn resolveEffectiveCache(
         );
     try Dir.cwd().createDirPath(io, requested);
     const resolved = try Dir.realPathFileAbsoluteAlloc(io, requested, allocator);
-    const stat = try Dir.cwd().statFile(
+    var directory = try Dir.openDirAbsolute(
+        io,
+        resolved,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    errdefer directory.close(io);
+    const stat = try directory.stat(io);
+    if (stat.kind != .directory) return error.InvalidPath;
+    const canonical = try Dir.cwd().statFile(
         io,
         resolved,
         .{ .follow_symlinks = false },
     );
-    if (stat.kind != .directory) return error.InvalidPath;
+    const identity = EntryIdentity.fromStat(stat);
+    if (!identity.matches(canonical)) return error.CacheDirectoryChanged;
     return .{
         .path = resolved,
-        .identity = EntryIdentity.fromStat(stat),
+        .identity = identity,
+        .directory = directory,
+    };
+}
+
+fn ensureCacheDirectory(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    parent_path: []const u8,
+    name: []const u8,
+) !CacheDirectory {
+    const initial = parent.statFile(
+        io,
+        name,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (initial == null) {
+        parent.createDir(io, name, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    const entry = try parent.statFile(
+        io,
+        name,
+        .{ .follow_symlinks = false },
+    );
+    if (entry.kind != .directory) return error.CacheDirectoryChanged;
+    var directory = try parent.openDir(
+        io,
+        name,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    errdefer directory.close(io);
+    const identity = EntryIdentity.fromStat(try directory.stat(io));
+    if (!identity.matches(entry) or
+        !try entryHasIdentity(parent, io, name, identity))
+    {
+        return error.CacheDirectoryChanged;
+    }
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .path = try std.fs.path.join(allocator, &.{ parent_path, name }),
+        .identity = identity,
+        .directory = directory,
+    };
+}
+
+fn acquireCacheLock(
+    io: Io,
+    locks: Dir,
+    name: []const u8,
+) !CacheLock {
+    while (true) {
+        var file = locks.openFile(io, name, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+        }) catch |open_error| switch (open_error) {
+            error.FileNotFound => locks.createFile(io, name, .{
+                .read = true,
+                .truncate = false,
+                .exclusive = true,
+                .lock = .exclusive,
+                .permissions = .fromMode(0o600),
+            }) catch |create_error| switch (create_error) {
+                error.PathAlreadyExists => continue,
+                else => return create_error,
+            },
+            else => return open_error,
+        };
+        errdefer {
+            file.unlock(io);
+            file.close(io);
+        }
+        try setFileInherited(file, false);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.CacheDirectoryChanged;
+        const identity = EntryIdentity.fromStat(stat);
+        if (!try entryHasIdentity(locks, io, name, identity)) {
+            return error.CacheDirectoryChanged;
+        }
+        return .{
+            .name = name,
+            .identity = identity,
+            .file = file,
+        };
+    }
+}
+
+fn verifyCacheLayout(
+    cache: *const EffectiveCache,
+    runtimes: *const CacheDirectory,
+    prefix: *const CacheDirectory,
+    locks: *const CacheDirectory,
+    cache_lock: CacheLock,
+    zig_global: *const CacheDirectory,
+    zig_local: *const CacheDirectory,
+    io: Io,
+) !void {
+    try cache.verifyCanonical(io);
+    try runtimes.verify(cache.directory, io);
+    try prefix.verify(runtimes.directory, io);
+    try locks.verify(cache.directory, io);
+    if (!cache_lock.identity.matches(try cache_lock.file.stat(io)) or
+        !try entryHasIdentity(
+            locks.directory,
+            io,
+            cache_lock.name,
+            cache_lock.identity,
+        ))
+    {
+        return error.CacheDirectoryChanged;
+    }
+    try zig_global.verify(cache.directory, io);
+    try zig_local.verify(cache.directory, io);
+    try cache.verifyCanonical(io);
+}
+
+fn cacheDirectoryChildPath(
+    allocator: Allocator,
+    directory: CacheDirectory,
+) ![]const u8 {
+    if (builtin.os.tag != .linux) {
+        return allocator.dupe(u8, directory.path);
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "/proc/self/fd/{d}",
+        .{directory.directory.handle},
+    );
+}
+
+fn setDirectoryInherited(directory: Dir, inherited: bool) !void {
+    return setHandleInherited(directory.handle, inherited);
+}
+
+fn setFileInherited(file: File, inherited: bool) !void {
+    return setHandleInherited(file.handle, inherited);
+}
+
+fn setHandleInherited(handle: std.posix.fd_t, inherited: bool) !void {
+    if (builtin.os.tag != .linux) return;
+    const flags: usize = if (inherited) 0 else std.posix.FD_CLOEXEC;
+    while (true) switch (std.posix.errno(std.posix.system.fcntl(
+        handle,
+        std.posix.F.SETFD,
+        flags,
+    ))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
@@ -4404,7 +5154,7 @@ test "child output capture retains a bounded marked tail" {
     const rendered = try capture.render(
         std.testing.allocator,
         "stderr",
-        null,
+        &.{},
     );
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(rendered.len <= child_output_limit);

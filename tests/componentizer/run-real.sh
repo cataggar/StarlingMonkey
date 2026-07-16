@@ -154,6 +154,97 @@ PY
 chmod 755 "$RELATIVE_DIR" "$RELATIVE_DIR/nested"
 chmod 644 "$RELATIVE_SOURCE" "$RELATIVE_DIR/nested/sibling.js"
 
+GENERATED_ROOT="$WORK/generated destination relative modules"
+GENERATED_DIST="$GENERATED_ROOT/dist"
+GENERATED_SOURCE="$GENERATED_ROOT/main.js"
+GENERATED_OUTPUT="$GENERATED_DIST/app.wasm"
+GENERATED_METADATA="$GENERATED_DIST/app.json"
+GENERATED_DEBUG="$GENERATED_DIST/app.debug"
+GENERATED_FIRST_METADATA="$WORK/generated destination first.json"
+GENERATED_SECOND_METADATA="$WORK/generated destination second.json"
+GENERATED_CHANGED_METADATA="$WORK/generated destination changed.json"
+mkdir -p "$GENERATED_DEBUG" "$GENERATED_DIST/app.debug-lookalike"
+cat > "$GENERATED_DIST/helper.js" <<'EOF'
+export const helper = 1;
+EOF
+cat > "$GENERATED_DEBUG/debug-helper.js" <<'EOF'
+export const debugHelper = 2;
+EOF
+cat > "$GENERATED_DIST/app.wasm.lookalike.js" <<'EOF'
+export const wasmLookalike = 3;
+EOF
+cat > "$GENERATED_DIST/app.json.lookalike.js" <<'EOF'
+export const metadataLookalike = 4;
+EOF
+cat > "$GENERATED_DIST/app.debug-lookalike/module.js" <<'EOF'
+export const debugLookalike = 5;
+EOF
+cat > "$GENERATED_DIST/.starling-componentize-lock-user.js" <<'EOF'
+export const lockLookalike = 6;
+EOF
+{
+  cat <<'EOF'
+import { helper } from "./dist/helper.js";
+import { debugHelper } from "./dist/app.debug/debug-helper.js";
+import { wasmLookalike } from "./dist/app.wasm.lookalike.js";
+import { metadataLookalike } from "./dist/app.json.lookalike.js";
+import { debugLookalike } from "./dist/app.debug-lookalike/module.js";
+import { lockLookalike } from "./dist/.starling-componentize-lock-user.js";
+export function add(a, b) {
+  return a + b + helper + debugHelper + wasmLookalike +
+    metadataLookalike + debugLookalike + lockLookalike;
+}
+EOF
+  tail -n +5 "$ROOT/tests/fixtures/js-dispatch.js"
+} > "$GENERATED_SOURCE"
+
+generated_destination_componentize() {
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
+    --build-root "$ROOT" \
+    --cache-dir "$CACHE/runtime cache" \
+    --zig-bin "$ZIG" \
+    --wit "$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js" \
+    --world-name js-exports \
+    --component-wit "$ROOT/host-apis/wasi-0.2.10/wit" \
+    --component-world-name js-dispatch \
+    --wasmtime-bin "$WASMTIME" \
+    --wabt-bin "$WABT" \
+    --wasm-tools-bin "$WASM_TOOLS" \
+    --preview2-adapter "$ADAPTER" \
+    --debug-dir "$GENERATED_DEBUG" \
+    --metadata-out "$GENERATED_METADATA" \
+    --out "$GENERATED_OUTPUT" \
+    "$GENERATED_SOURCE"
+}
+
+generated_destination_componentize
+cp "$GENERATED_METADATA" "$GENERATED_FIRST_METADATA"
+"$WASM_TOOLS" validate --features all "$GENERATED_OUTPUT"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
+  "$GENERATED_OUTPUT")" = 26
+generated_destination_componentize
+cp "$GENERATED_METADATA" "$GENERATED_SECOND_METADATA"
+cat > "$GENERATED_DIST/helper.js" <<'EOF'
+export const helper = 11;
+EOF
+generated_destination_componentize
+cp "$GENERATED_METADATA" "$GENERATED_CHANGED_METADATA"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
+  "$GENERATED_OUTPUT")" = 36
+test -f "$GENERATED_DEBUG/debug-helper.js"
+test -f "$GENERATED_DIST/app.debug-lookalike/module.js"
+python3 - "$GENERATED_FIRST_METADATA" "$GENERATED_SECOND_METADATA" \
+  "$GENERATED_CHANGED_METADATA" <<'PY'
+import json, sys
+digests = [
+    json.load(open(path, encoding="utf-8"))["provenance"]["inputs"]
+    ["source_tree"]["sha256"]
+    for path in sys.argv[1:]
+]
+assert digests[0] == digests[1], digests
+assert digests[1] != digests[2], digests
+PY
+
 # A second identical WIT selection reuses the same monolithic Zig cache entry.
 "$COMPONENTIZER" \
   --build-root "$ROOT" \

@@ -20,13 +20,16 @@ Any failure leaves existing component and metadata outputs unchanged and never
 publishes a partial debug directory. The temporary transaction directory is
 created beside the output through a held handle to its canonical parent.
 Backup, publication, rollback, and cleanup stay relative to that handle and
-check recorded no-follow identities. Immediately before success and backup
-finalization, the canonical parent path must still identify the held directory;
-otherwise publication is rolled back through the handle without touching a
-replacement at the stale path. Cleanup removes only pre-recorded entries,
-aborts on additions or replacements, and never recursively removes an
-unrecognized tree. Optional metadata and debug destinations must use that same
-parent so publication and rollback cannot cross filesystems.
+check recorded no-follow identities. Persistent per-destination advisory locks,
+opened no-follow beneath the held parent and inherited by no child tool,
+serialize overlapping bundles. Immediately before commit cleanup and again
+before success, the parent, locks, component, metadata, and optional debug
+directory must retain their exact identities. A mismatch rolls back only exact
+owned entries and retains recoverable transaction state rather than touching a
+replacement. Cleanup removes only pre-recorded entries, aborts on additions or
+replacements, and never recursively removes an unrecognized tree. Optional
+metadata and debug destinations must use that same parent so publication and
+rollback cannot cross filesystems.
 
 ## Building
 
@@ -75,9 +78,14 @@ from the runtime key. Per-input and per-runtime advisory locks make concurrent
 uses of one cache safe, and the runtime lock remains held until componentization
 has finished consuming the cached engine, adapter, and generated bindings.
 The effective default or explicit componentizer cache is canonicalized before
-source snapshotting. Runtime outputs and Zig local/global caches all remain
-beneath it, and only that exact directory identity is excluded if it is nested
-inside a snapshotted source tree.
+source snapshotting and retained through an opened directory handle. Runtime,
+lock, and Zig local/global-cache directories are created and checked no-follow
+relative to held ancestors. Zig receives private handle-backed paths for the
+runtime prefix and both caches; canonical cache paths remain in diagnostics.
+Root or descendant replacement is detected before and after the child and
+cannot redirect writes into the replacement. Only the exact effective-cache
+directory identity is excluded if it is nested inside a snapshotted source
+tree.
 
 Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
 and feature selection. Build-changing feature/debug options are rejected with
@@ -162,9 +170,13 @@ location do not affect tree hashes. Relative symlinks that remain within the
 staged tree are preserved and hashed by target; absolute or escaping symlinks
 are rejected so a child cannot consume mutable files outside its snapshot.
 The current transaction directory and, when nested, the exact effective cache
-directory are excluded after no-follow identity verification; unrelated names
-that resemble transaction or cache names remain ordinary hashed and staged
-source entries.
+directory are excluded after no-follow identity verification. Component,
+metadata, publication-lock, and generated debug entries are excluded only by
+their exact normalized path and current no-follow identity (or exact name while
+not yet created). Their parent directories and unrelated debug contents remain
+hashed and staged, so modules beside or inside destination directories keep
+working. Unrelated names that resemble transaction, output, or cache names
+remain ordinary hashed and staged source entries.
 Source and initializer snapshots are mapped to their original logical paths for
 Wizer, and the runtime-argument hash covers the exact stable byte stream
 supplied to Wizer.
@@ -213,8 +225,10 @@ chooses another directory and also enables the dump. The destination cannot
 contain an input or output. Routine reruns transactionally replace only the
 known generated files while preserving unrelated files, symlinks, and
 directory trees; a directory at a generated filename is rejected rather than
-removed recursively. The complete merged directory is published only after
-validation, with rollback on any publication failure.
+removed recursively. Before publication, the complete old debug directory is
+retained as the rollback anchor while unrelated entries are identity-checked
+and copied into the staged merge. The complete merged directory is published
+only after validation, with rollback on any publication failure.
 
 The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
 them explicitly. Weval execution and cache controls belong to the separate

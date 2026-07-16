@@ -30,6 +30,14 @@ EOF
 cat > "$TOOLS/fake wizer" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+for fd in /proc/self/fd/*; do
+  case "$(readlink "$fd" 2>/dev/null || true)" in
+    *".starling-componentize-lock-"*)
+      echo "publication lock descriptor leaked into Wizer" >&2
+      exit 26
+      ;;
+  esac
+done
 if [ "${FAKE_FAIL_STAGE:-}" = "wizer" ]; then
   echo "injected wizer failure" >&2
   exit 23
@@ -74,6 +82,26 @@ if [ -n "${FAKE_ASSERT_CACHE_SNAPSHOT:-}" ]; then
   done
   test ! -e "$snapshot/$FAKE_EXCLUDED_CACHE_RELATIVE"
   test -f "$snapshot/$FAKE_CACHE_LOOKALIKE_RELATIVE"
+fi
+if [ -n "${FAKE_ASSERT_GENERATED_SIBLINGS:-}" ]; then
+  snapshot=""
+  for arg in "$@"; do
+    case "$arg" in
+      *::*)
+        snapshot="${arg%%::*}"
+        break
+        ;;
+    esac
+  done
+  test -f "$snapshot/dist/helper.js"
+  test -f "$snapshot/dist/app.debug/debug-helper.js"
+  test -f "$snapshot/dist/app.wasm.lookalike.js"
+  test -f "$snapshot/dist/app.json.lookalike.js"
+  test -f "$snapshot/dist/app.debug-lookalike/module.js"
+  test -f "$snapshot/dist/.starling-componentize-lock-user.js"
+  test ! -e "$snapshot/dist/app.wasm"
+  test ! -e "$snapshot/dist/app.json"
+  test ! -e "$snapshot/dist/app.debug/commands.txt"
 fi
 cat > "$FAKE_RUNTIME_ARGS_LOG"
 if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
@@ -215,11 +243,26 @@ EOF
 cat > "$TOOLS/fake zig" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+for fd in /proc/self/fd/*; do
+  case "$(readlink "$fd" 2>/dev/null || true)" in
+    *".starling-componentize-lock-"*)
+      echo "publication lock descriptor leaked into Zig" >&2
+      exit 26
+      ;;
+  esac
+done
 if [ "${1:-}" = "env" ]; then
   test -d "$FAKE_ZIG_LIB_DIR"
   printf '.{\n    .lib_dir = "%s",\n}\n' "$FAKE_ZIG_LIB_DIR"
   exit 0
 fi
+prefix=""
+for ((i = 1; i <= $#; i++)); do
+  if [ "${!i}" = "--prefix" ]; then
+    j=$((i + 1))
+    prefix="${!j}"
+  fi
+done
 if [ "${FAKE_FAIL_STAGE:-}" = "zig build" ]; then
   if [ -n "${FAKE_ECHO_RUNTIME_PATHS:-}" ]; then
     printf 'runtime stdout executable=%s argv=%s\n' "$0" "$*"
@@ -240,17 +283,21 @@ if [ -n "${FAKE_MUTATE_ZIG_LIB_DIR:-}" ]; then
   printf 'mutated-original\n' > "$FAKE_MUTATE_ZIG_LIB_DIR/marker"
 fi
 test "$(cat "$ZIG_LIB_DIR/marker")" = "immutable-zig-lib"
-prefix=""
-for ((i = 1; i <= $#; i++)); do
-  if [ "${!i}" = "--prefix" ]; then
-    j=$((i + 1))
-    prefix="${!j}"
-  fi
-done
-printf '%s\n' "$prefix" >> "$FAKE_ZIG_PREFIX_LOG"
-printf '%s|%s|%s\n' "${ZIG_LOCAL_CACHE_DIR-unset}" \
-  "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LIB_DIR" \
+if [ -n "${FAKE_ZIG_BARRIER:-}" ]; then
+  printf 'ready\n' > "$FAKE_ZIG_BARRIER.ready"
+  while [ ! -e "$FAKE_ZIG_BARRIER.release" ]; do
+    sleep 0.001
+  done
+fi
+prefix_real="$(realpath "$prefix")"
+local_cache_real="$(realpath "$ZIG_LOCAL_CACHE_DIR")"
+global_cache_real="$(realpath "$ZIG_GLOBAL_CACHE_DIR")"
+printf '%s\n' "$prefix_real" >> "$FAKE_ZIG_PREFIX_LOG"
+printf '%s|%s|%s\n' "$local_cache_real" \
+  "$global_cache_real" "$ZIG_LIB_DIR" \
   >> "$FAKE_ZIG_ENV_LOG"
+printf 'local-cache-write\n' > "$ZIG_LOCAL_CACHE_DIR/fake-zig-local"
+printf 'global-cache-write\n' > "$ZIG_GLOBAL_CACHE_DIR/fake-zig-global"
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
@@ -507,6 +554,74 @@ source_provenance() {
     --out "$output" \
     "$source"
 }
+
+GENERATED_SIBLING_ROOT="$SCRATCH/generated destination siblings"
+GENERATED_SIBLING_SOURCE="$GENERATED_SIBLING_ROOT/main.js"
+GENERATED_SIBLING_DIST="$GENERATED_SIBLING_ROOT/dist"
+GENERATED_SIBLING_OUTPUT="$GENERATED_SIBLING_DIST/app.wasm"
+GENERATED_SIBLING_METADATA="$GENERATED_SIBLING_DIST/app.json"
+GENERATED_SIBLING_DEBUG="$GENERATED_SIBLING_DIST/app.debug"
+mkdir -p "$GENERATED_SIBLING_DEBUG" \
+  "$GENERATED_SIBLING_DIST/app.debug-lookalike"
+cat > "$GENERATED_SIBLING_SOURCE" <<'EOF'
+import { helper } from "./dist/helper.js";
+import { debugHelper } from "./dist/app.debug/debug-helper.js";
+import { wasmLookalike } from "./dist/app.wasm.lookalike.js";
+import { metadataLookalike } from "./dist/app.json.lookalike.js";
+import { debugLookalike } from "./dist/app.debug-lookalike/module.js";
+import { lockLookalike } from "./dist/.starling-componentize-lock-user.js";
+export const generatedSiblingTotal =
+  helper + debugHelper + wasmLookalike + metadataLookalike + debugLookalike +
+  lockLookalike;
+EOF
+printf 'export const helper = 1;\n' > "$GENERATED_SIBLING_DIST/helper.js"
+printf 'export const debugHelper = 2;\n' > \
+  "$GENERATED_SIBLING_DEBUG/debug-helper.js"
+printf 'export const wasmLookalike = 3;\n' > \
+  "$GENERATED_SIBLING_DIST/app.wasm.lookalike.js"
+printf 'export const metadataLookalike = 4;\n' > \
+  "$GENERATED_SIBLING_DIST/app.json.lookalike.js"
+printf 'export const debugLookalike = 5;\n' > \
+  "$GENERATED_SIBLING_DIST/app.debug-lookalike/module.js"
+printf 'export const lockLookalike = 6;\n' > \
+  "$GENERATED_SIBLING_DIST/.starling-componentize-lock-user.js"
+printf 'old-component\n' > "$GENERATED_SIBLING_OUTPUT"
+printf 'old-metadata\n' > "$GENERATED_SIBLING_METADATA"
+printf 'old-generated-command\n' > "$GENERATED_SIBLING_DEBUG/commands.txt"
+
+generated_sibling_run() {
+  local suffix="$1"
+  FAKE_ASSERT_GENERATED_SIBLINGS=1 "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --metadata-out "$GENERATED_SIBLING_METADATA" \
+    --debug-dir "$GENERATED_SIBLING_DEBUG" \
+    --out "$GENERATED_SIBLING_OUTPUT" \
+    "$GENERATED_SIBLING_SOURCE"
+  cp "$GENERATED_SIBLING_METADATA" \
+    "$SCRATCH/generated-sibling-$suffix.json"
+}
+
+generated_sibling_run first
+generated_sibling_run second
+printf 'export const helper = 11;\n' > "$GENERATED_SIBLING_DIST/helper.js"
+generated_sibling_run changed
+test -f "$GENERATED_SIBLING_DEBUG/debug-helper.js"
+test -f "$GENERATED_SIBLING_DIST/app.debug-lookalike/module.js"
+python3 - "$SCRATCH/generated-sibling-first.json" \
+  "$SCRATCH/generated-sibling-second.json" \
+  "$SCRATCH/generated-sibling-changed.json" <<'PY'
+import json, sys
+digests = [
+    json.load(open(path, encoding="utf-8"))["provenance"]["inputs"]
+    ["source_tree"]["sha256"]
+    for path in sys.argv[1:]
+]
+assert digests[0] == digests[1], digests
+assert digests[1] != digests[2], digests
+PY
 
 FAKE_ASSERT_SNAPSHOT_NAMES=1 source_provenance "$PROVENANCE_A/main.js" \
   "$WORK/provenance clean a.wasm" "$WORK/provenance clean a.json"
@@ -1367,6 +1482,198 @@ test "$(cat "$BACKUP_RACE_DEBUG/unrelated-3999")" = "preserve-3999"
 test ! -e "$BACKUP_RACE_OUTPUT"
 rm -rf "$BACKUP_RACE_ROOT" "$BACKUP_RACE_DEBUG"
 
+for commit_artifact in component metadata debug; do
+  for commit_action in replacement removal; do
+    commit_slug="$commit_artifact-$commit_action"
+    commit_output="$WORK/commit $commit_slug.wasm"
+    commit_metadata="$WORK/commit $commit_slug.json"
+    commit_debug="$WORK/commit $commit_slug.debug"
+    commit_error="$SCRATCH/commit-$commit_slug.jsonl"
+    commit_barrier="$SCRATCH/commit-$commit_slug-barrier"
+    commit_saved="$SCRATCH/commit-$commit_slug-published"
+    printf 'old-component-%s\n' "$commit_slug" > "$commit_output"
+    printf 'old-metadata-%s\n' "$commit_slug" > "$commit_metadata"
+    mkdir "$commit_debug"
+    printf 'old-debug-%s\n' "$commit_slug" > "$commit_debug/unrelated.txt"
+
+    STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER="$commit_barrier" \
+    "$COMPONENTIZER" \
+      --json-diagnostics \
+      --engine "$ENGINE" \
+      --preview2-adapter "$ADAPTER" \
+      --wizer-bin "$TOOLS/fake wizer" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --metadata-out "$commit_metadata" \
+      --debug-dir "$commit_debug" \
+      --out "$commit_output" \
+      "$SOURCE" >/dev/null 2> "$commit_error" &
+    commit_pid=$!
+    commit_ready=0
+    for _ in $(seq 1 30000); do
+      if [ -e "$commit_barrier.ready" ]; then
+        commit_ready=1
+        break
+      fi
+      if ! kill -0 "$commit_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.001
+    done
+    if [ "$commit_ready" -ne 1 ]; then
+      wait "$commit_pid" 2>/dev/null || true
+      echo "FAIL: commit barrier was not reached for $commit_slug" >&2
+      exit 1
+    fi
+
+    commit_destination="$commit_output"
+    if [ "$commit_artifact" = metadata ]; then
+      commit_destination="$commit_metadata"
+    elif [ "$commit_artifact" = debug ]; then
+      commit_destination="$commit_debug"
+    fi
+    if [ "$commit_action" = replacement ]; then
+      mv "$commit_destination" "$commit_saved"
+      if [ "$commit_artifact" = debug ]; then
+        mkdir "$commit_destination"
+        printf 'replacement-debug-%s\n' "$commit_slug" > \
+          "$commit_destination/sentinel"
+      else
+        printf 'replacement-%s\n' "$commit_slug" > "$commit_destination"
+      fi
+    elif [ "$commit_artifact" = debug ]; then
+      rm -rf "$commit_destination"
+    else
+      rm "$commit_destination"
+    fi
+    : > "$commit_barrier.release"
+    if wait "$commit_pid"; then
+      echo "FAIL: $commit_slug after publication reported success" >&2
+      exit 1
+    fi
+
+    python3 - "$commit_error" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "RollbackIncomplete", diagnostic
+PY
+    if [ "$commit_action" = replacement ]; then
+      if [ "$commit_artifact" = debug ]; then
+        test "$(cat "$commit_debug/sentinel")" = \
+          "replacement-debug-$commit_slug"
+      else
+        test "$(cat "$commit_destination")" = \
+          "replacement-$commit_slug"
+      fi
+    else
+      test "$(cat "$commit_output")" = "old-component-$commit_slug"
+      test "$(cat "$commit_metadata")" = "old-metadata-$commit_slug"
+      test "$(cat "$commit_debug/unrelated.txt")" = \
+        "old-debug-$commit_slug"
+    fi
+    if [ "$commit_artifact" != component ]; then
+      test "$(cat "$commit_output")" = "old-component-$commit_slug"
+    fi
+    if [ "$commit_artifact" != metadata ]; then
+      test "$(cat "$commit_metadata")" = "old-metadata-$commit_slug"
+    fi
+    if [ "$commit_artifact" != debug ]; then
+      test "$(cat "$commit_debug/unrelated.txt")" = \
+        "old-debug-$commit_slug"
+    fi
+    commit_root="$(find "$WORK" -maxdepth 1 -type d \
+      -name ".commit $commit_slug.wasm.starling-componentize-*" \
+      -print -quit)"
+    test -n "$commit_root"
+    test -d "$commit_root/data"
+    if [ "$commit_action" = replacement ]; then
+      case "$commit_artifact" in
+        component)
+          test "$(cat "$commit_root/data/previous-component")" = \
+            "old-component-$commit_slug"
+          ;;
+        metadata)
+          test "$(cat "$commit_root/data/previous-metadata")" = \
+            "old-metadata-$commit_slug"
+          ;;
+        debug)
+          test "$(cat "$commit_root/data/previous-debug/unrelated.txt")" = \
+            "old-debug-$commit_slug"
+          ;;
+      esac
+    fi
+    rm -rf "$commit_root" "$commit_debug" "$commit_saved"
+    rm -f "$commit_output" "$commit_metadata" \
+      "$commit_barrier.ready" "$commit_barrier.release"
+  done
+done
+
+CONCURRENT_BUNDLE_OUTPUT="$WORK/concurrent bundle.wasm"
+CONCURRENT_BUNDLE_METADATA="$WORK/concurrent bundle.json"
+CONCURRENT_BUNDLE_DEBUG="$WORK/concurrent bundle.debug"
+CONCURRENT_BUNDLE_ENGINE_A="$SCRATCH/concurrent-engine-a.wasm"
+CONCURRENT_BUNDLE_ENGINE_B="$SCRATCH/concurrent-engine-b.wasm"
+CONCURRENT_BUNDLE_LOG_A="$SCRATCH/concurrent-bundle-a.jsonl"
+CONCURRENT_BUNDLE_LOG_B="$SCRATCH/concurrent-bundle-b.jsonl"
+CONCURRENT_BUNDLE_BARRIER="$SCRATCH/concurrent-bundle-a"
+printf 'concurrent-engine-a\n' > "$CONCURRENT_BUNDLE_ENGINE_A"
+printf 'concurrent-engine-b\n' > "$CONCURRENT_BUNDLE_ENGINE_B"
+STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER="$CONCURRENT_BUNDLE_BARRIER" \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$CONCURRENT_BUNDLE_ENGINE_A" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$CONCURRENT_BUNDLE_METADATA" \
+  --debug-dir "$CONCURRENT_BUNDLE_DEBUG" \
+  --out "$CONCURRENT_BUNDLE_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$CONCURRENT_BUNDLE_LOG_A" &
+concurrent_bundle_pid_a=$!
+for _ in $(seq 1 30000); do
+  if [ -e "$CONCURRENT_BUNDLE_BARRIER.ready" ]; then
+    break
+  fi
+  if ! kill -0 "$concurrent_bundle_pid_a" 2>/dev/null; then
+    wait "$concurrent_bundle_pid_a" 2>/dev/null || true
+    echo "FAIL: first concurrent publisher missed its commit barrier" >&2
+    exit 1
+  fi
+  sleep 0.001
+done
+test -e "$CONCURRENT_BUNDLE_BARRIER.ready"
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$CONCURRENT_BUNDLE_ENGINE_B" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$CONCURRENT_BUNDLE_METADATA" \
+  --debug-dir "$CONCURRENT_BUNDLE_DEBUG" \
+  --out "$CONCURRENT_BUNDLE_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$CONCURRENT_BUNDLE_LOG_B" &
+concurrent_bundle_pid_b=$!
+sleep 0.05
+kill -0 "$concurrent_bundle_pid_b" 2>/dev/null
+: > "$CONCURRENT_BUNDLE_BARRIER.release"
+wait "$concurrent_bundle_pid_a"
+wait "$concurrent_bundle_pid_b"
+cmp "$CONCURRENT_BUNDLE_ENGINE_B" "$CONCURRENT_BUNDLE_OUTPUT"
+cmp "$CONCURRENT_BUNDLE_ENGINE_B" \
+  "$CONCURRENT_BUNDLE_DEBUG/component.wasm"
+python3 - "$CONCURRENT_BUNDLE_LOG_A" "$CONCURRENT_BUNDLE_LOG_B" \
+  "$CONCURRENT_BUNDLE_OUTPUT" "$CONCURRENT_BUNDLE_METADATA" <<'PY'
+import hashlib, json, sys
+for path in sys.argv[1:3]:
+    diagnostic = json.load(open(path, encoding="utf-8"))
+    assert diagnostic["code"] == "SMC0000", diagnostic
+    assert diagnostic["phase"] == "publish", diagnostic
+component = open(sys.argv[3], "rb").read()
+metadata = json.load(open(sys.argv[4], encoding="utf-8"))
+assert metadata["component_sha256"] == hashlib.sha256(component).hexdigest()
+PY
+
 RACE_OUTPUT="$WORK/publish-race.wasm"
 RACE_METADATA="$WORK/publish-race.json"
 RACE_DEBUG="$WORK/publish-race.debug"
@@ -1798,5 +2105,92 @@ while IFS='|' read -r local_cache global_cache zig_lib; do
     *) exit 1 ;;
   esac
 done
+
+cache_identity_race() {
+  local race_kind="$1"
+  local race_cache="$SCRATCH/cache identity $race_kind"
+  local race_held="$SCRATCH/cache identity $race_kind held"
+  local race_target="$SCRATCH/cache identity $race_kind user target"
+  local race_output="$WORK/cache identity $race_kind.wasm"
+  local race_error="$SCRATCH/cache-identity-$race_kind.jsonl"
+  local race_barrier="$SCRATCH/cache-identity-$race_kind"
+  rm -rf "$race_cache" "$race_held" "$race_target"
+  FAKE_ZIG_BARRIER="$race_barrier" "$COMPONENTIZER" \
+    --json-diagnostics \
+    --build-root "$ROOT" \
+    --cache-dir "$race_cache" \
+    --zig-bin "$TOOLS/fake zig" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$race_output" \
+    "$BUILD_SOURCE" >/dev/null 2> "$race_error" &
+  local race_pid=$!
+  local race_ready=0
+  for _ in $(seq 1 30000); do
+    if [ -e "$race_barrier.ready" ]; then
+      race_ready=1
+      break
+    fi
+    if ! kill -0 "$race_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.001
+  done
+  if [ "$race_ready" -ne 1 ]; then
+    wait "$race_pid" 2>/dev/null || true
+    echo "FAIL: cache race barrier was not reached for $race_kind" >&2
+    exit 1
+  fi
+
+  if [ "$race_kind" = root ]; then
+    mv "$race_cache" "$race_held"
+    mkdir "$race_cache"
+    printf 'user-root-replacement\n' > "$race_cache/sentinel"
+  else
+    local child="$race_kind"
+    if [ "$race_kind" = runtime-prefix ]; then
+      child="runtimes/$(basename "$(find "$race_cache/runtimes" \
+        -mindepth 1 -maxdepth 1 -type d -print -quit)")"
+    fi
+    mv "$race_cache/$child" "$race_held"
+    mkdir "$race_target"
+    printf 'user-child-replacement\n' > "$race_target/sentinel"
+    ln -s "$race_target" "$race_cache/$child"
+  fi
+  : > "$race_barrier.release"
+  if wait "$race_pid"; then
+    echo "FAIL: cache $race_kind replacement reported success" >&2
+    exit 1
+  fi
+  test ! -e "$race_output"
+  python3 - "$race_error" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC2001", diagnostic
+assert diagnostic["phase"] == "runtime_build", diagnostic
+assert diagnostic["cause"] == "CacheDirectoryChanged", diagnostic
+PY
+  if [ "$race_kind" = root ]; then
+    test "$(cat "$race_cache/sentinel")" = "user-root-replacement"
+    test "$(find "$race_cache" -mindepth 1 ! -name sentinel | wc -l)" -eq 0
+    test -f "$race_held/zig-local-cache/fake-zig-local"
+    test -f "$race_held/zig-global-cache/fake-zig-global"
+  else
+    test "$(cat "$race_target/sentinel")" = "user-child-replacement"
+    test "$(find "$race_target" -mindepth 1 ! -name sentinel | wc -l)" -eq 0
+  fi
+  rm -rf "$race_cache" "$race_held" "$race_target"
+  rm -f "$race_barrier.ready" "$race_barrier.release"
+}
+
+cache_identity_race root
+cache_identity_race runtimes
+cache_identity_race runtime-prefix
+cache_identity_race locks
+cache_identity_race zig-global-cache
+cache_identity_race zig-local-cache
 
 echo "native componentizer fake-tool tests passed"
