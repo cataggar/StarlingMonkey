@@ -2269,6 +2269,7 @@ const Tools = struct {
     wizer: WizerTool,
     wabt: Snapshot,
     wasm_tools: Snapshot,
+    wizer: ?WizerTool,
     weval: ?[]const u8,
     wabt: ?[]const u8,
     wasm_tools: []const u8,
@@ -3217,9 +3218,10 @@ fn execute(
             ) catch @panic("out of memory");
         }
     } else if (needs_initialization) {
-        initialization_args.append(allocator, tools.wizer.executable) catch
+        const wizer = tools.wizer orelse return error.MissingWizer;
+        initialization_args.append(allocator, wizer.executable) catch
             @panic("out of memory");
-        if (tools.wizer.wasmtime_subcommand) {
+        if (wizer.wasmtime_subcommand) {
             initialization_args.append(allocator, "wizer") catch @panic("out of memory");
             initialization_args.appendSlice(allocator, &.{
                 "-S",
@@ -3959,6 +3961,28 @@ fn execute(
     } else {
         std.debug.print("Created runtime-eval component {s}\n", .{output});
     }
+}
+
+fn resolveWizerExecutable(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    return resolveExecutable(
+        allocator,
+        io,
+        environ,
+        cwd,
+        path,
+    ) catch |err| {
+        std.debug.print(
+            "error: failed to resolve required Wizer executable '{s}': {t}\n",
+            .{ path, err },
+        );
+        return err;
+    };
 }
 
 fn externalRuntime(
@@ -5562,23 +5586,50 @@ fn resolveTools(
     else if (environ.get("WASMTIME_BIN")) |path|
         try absolutePath(allocator, cwd, path)
     const wizer = if (config.wizer_bin) |path|
+    const wizer = if (config.aot or !needs_initialization)
+        null
+    else if (config.wizer_bin) |path|
         WizerTool{
-            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .executable = try resolveWizerExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                path,
+            ),
             .wasmtime_subcommand = false,
         }
     else if (config.wasmtime_bin) |path|
         WizerTool{
-            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .executable = try resolveWizerExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                path,
+            ),
             .wasmtime_subcommand = true,
         }
     else if (environ.get("WIZER_BIN")) |path|
         WizerTool{
-            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .executable = try resolveWizerExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                path,
+            ),
             .wasmtime_subcommand = false,
         }
     else if (environ.get("WASMTIME_BIN")) |path|
         WizerTool{
-            .executable = try resolveExecutable(allocator, io, environ, cwd, path),
+            .executable = try resolveWizerExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                path,
+            ),
             .wasmtime_subcommand = true,
         }
     else blk: {

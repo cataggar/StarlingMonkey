@@ -104,6 +104,7 @@ pub fn seal(
 pub const SealHooks = struct {
     directory: ?[]const u8 = null,
     wait_at: ?[]const u8 = null,
+    notify_at: ?[]const u8 = null,
     fail_at: ?[]const u8 = null,
 };
 
@@ -120,12 +121,6 @@ pub fn sealWithHooks(
     hooks: SealHooks,
 ) !void {
     try validateValue(feature_abi);
-    try recover(
-        allocator,
-        io,
-        canonical_cache_path orelse cache_path,
-        manifest_path,
-    );
     var transaction = try SealTransaction.init(
         allocator,
         io,
@@ -144,6 +139,7 @@ pub fn sealWithHooks(
     try runSealHook(allocator, io, hooks, "after-preflight");
 
     const engine_sha = try hashStableFileHex(allocator, io, transaction.engine);
+    try runSealHook(allocator, io, hooks, "after-engine-hash");
     var source_snapshot = try stageStableCopy(
         allocator,
         io,
@@ -152,6 +148,18 @@ pub fn sealWithHooks(
         transaction.source_cache,
     );
     defer source_snapshot.deinit(io);
+    const source_sha = try hashStableFileHex(
+        allocator,
+        io,
+        transaction.source_cache,
+    );
+    const snapshot_sha = try hashFileHandleHex(
+        allocator,
+        io,
+        source_snapshot.file,
+    );
+    if (!std.mem.eql(u8, source_sha, snapshot_sha))
+        return error.SealPathRace;
     try verifyCacheDatabaseFile(io, source_snapshot.file, engine_sha);
 
     var canonical = try stageCanonicalCache(
@@ -210,8 +218,18 @@ pub fn sealWithHooks(
     try manifest.file.writePositionalAll(io, contents, 0);
     try manifest.file.sync(io);
     manifest.identity = try manifest.file.stat(io);
+    manifest.filesystem = try filesystemId(manifest.file);
     manifest.name_identity = manifest.identity;
+    manifest.name_filesystem = manifest.filesystem;
     try runSealHook(allocator, io, hooks, "after-manifest-stage");
+    try transaction.verifyInputsStable(
+        allocator,
+        io,
+        engine_sha,
+        weval_sha,
+        source_sha,
+        primer_sha,
+    );
 
     try publishBundle(
         allocator,
@@ -232,6 +250,7 @@ const StableInput = struct {
     resolved: []const u8,
     file: File,
     identity: File.Stat,
+    filesystem: u128,
 
     fn close(input: StableInput, io: Io) void {
         input.file.close(io);
@@ -243,6 +262,7 @@ const DestinationState = union(enum) {
     existing: struct {
         file: File,
         identity: File.Stat,
+        filesystem: u128,
     },
 
     fn close(state: DestinationState, io: Io) void {
@@ -262,13 +282,47 @@ const SealOutput = struct {
     basename: []const u8,
     parent: Dir,
     parent_identity: File.Stat,
+    parent_filesystem: u128,
     initial: DestinationState,
 
     fn deinit(output: SealOutput, io: Io) void {
         output.initial.close(io);
         output.parent.close(io);
     }
+
+    fn refreshInitial(output: *SealOutput, io: Io) !void {
+        output.initial.close(io);
+        const file = output.parent.openFile(io, output.basename, .{
+            .path_only = true,
+            .follow_symlinks = false,
+            .allow_directory = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                output.initial = .missing;
+                return;
+            },
+            else => return err,
+        };
+        errdefer file.close(io);
+        output.initial = .{ .existing = .{
+            .file = file,
+            .identity = try file.stat(io),
+            .filesystem = try filesystemId(file),
+        } };
+    }
 };
+
+fn sameOutputParent(
+    left: *const SealOutput,
+    right: *const SealOutput,
+) bool {
+    return sameObject(
+        left.parent_identity,
+        left.parent_filesystem,
+        right.parent_identity,
+        right.parent_filesystem,
+    );
+}
 
 const SealTransaction = struct {
     allocator: Allocator,
@@ -279,6 +333,7 @@ const SealTransaction = struct {
     cache_output: SealOutput,
     manifest_output: SealOutput,
     in_place: bool,
+    hooks: SealHooks,
     guard: ?SealGuard = null,
     cache_workspace: ?Dir = null,
     manifest_workspace: ?Dir = null,
@@ -333,6 +388,7 @@ const SealTransaction = struct {
             .cache_output = cache_output,
             .manifest_output = manifest_output,
             .in_place = canonical_cache_path == null,
+            .hooks = hooks,
         };
     }
 
@@ -372,6 +428,12 @@ const SealTransaction = struct {
         allocator: Allocator,
         io: Io,
     ) !void {
+        try runSealHook(
+            allocator,
+            io,
+            transaction.hooks,
+            "before-destination-locks",
+        );
         var guard = try SealGuard.init(
             allocator,
             io,
@@ -386,6 +448,10 @@ const SealTransaction = struct {
             &transaction.manifest_output,
             .{},
         );
+        try transaction.cache_output.refreshInitial(io);
+        try transaction.manifest_output.refreshInitial(io);
+        try transaction.rejectAliases();
+        try transaction.rejectUnsupportedDestinations();
         if (!try destinationMatchesStart(io, &transaction.cache_output) or
             !try destinationMatchesStart(io, &transaction.manifest_output))
             return error.SealPathRace;
@@ -394,6 +460,7 @@ const SealTransaction = struct {
             io,
             &transaction.cache_output,
             &transaction.manifest_output,
+            transaction.hooks,
         );
         transaction.cache_workspace = workspaces.cache;
         transaction.manifest_workspace = workspaces.manifest;
@@ -413,8 +480,10 @@ const SealTransaction = struct {
                 if (sameResolvedOrIdentity(
                     left.resolved,
                     left.identity,
+                    left.filesystem,
                     right.resolved,
                     right.identity,
+                    right.filesystem,
                 )) return reportAlias(left.role, left.supplied, right.role, right.supplied);
             }
         }
@@ -452,6 +521,35 @@ const SealTransaction = struct {
             }
         }
     }
+
+    fn verifyInputsStable(
+        transaction: *const SealTransaction,
+        allocator: Allocator,
+        io: Io,
+        engine_sha: []const u8,
+        weval_sha: []const u8,
+        source_sha: []const u8,
+        primer_sha: []const u8,
+    ) !void {
+        const inputs = [_]struct {
+            input: StableInput,
+            digest: []const u8,
+        }{
+            .{ .input = transaction.engine, .digest = engine_sha },
+            .{ .input = transaction.weval, .digest = weval_sha },
+            .{ .input = transaction.source_cache, .digest = source_sha },
+            .{ .input = transaction.primer, .digest = primer_sha },
+        };
+        for (inputs) |expected| {
+            const current = try rehashStableFileHex(
+                allocator,
+                io,
+                expected.input,
+            );
+            if (!std.mem.eql(u8, current, expected.digest))
+                return error.SealPathRace;
+        }
+    }
 };
 
 fn openStableInput(
@@ -468,6 +566,7 @@ fn openStableInput(
     errdefer file.close(io);
     const identity = try file.stat(io);
     if (identity.kind != .file) return error.MissingCacheArtifact;
+    const filesystem = try filesystemId(file);
     var resolved_buffer: [Dir.max_path_bytes]u8 = undefined;
     const resolved_len = try file.realPath(io, &resolved_buffer);
     return .{
@@ -477,6 +576,7 @@ fn openStableInput(
         .resolved = try allocator.dupe(u8, resolved_buffer[0..resolved_len]),
         .file = file,
         .identity = identity,
+        .filesystem = filesystem,
     };
 }
 
@@ -501,6 +601,10 @@ fn openSealOutput(
     errdefer observed_parent.close(io);
     const observed_identity = try observed_parent.stat(io);
     if (observed_identity.kind != .directory) return error.InvalidManifest;
+    const observed_filesystem = try filesystemId(.{
+        .handle = observed_parent.handle,
+        .flags = .{ .nonblocking = false },
+    });
     var parent_buffer: [Dir.max_path_bytes]u8 = undefined;
     const parent_len = try observed_parent.realPath(io, &parent_buffer);
     const canonical_parent_path = try allocator.dupe(u8, parent_buffer[0..parent_len]);
@@ -532,6 +636,7 @@ fn openSealOutput(
         .existing = .{
             .file = file,
             .identity = try file.stat(io),
+            .filesystem = try filesystemId(file),
         },
     } else .missing;
     return .{
@@ -543,6 +648,7 @@ fn openSealOutput(
         .basename = basename,
         .parent = parent,
         .parent_identity = parent_identity,
+        .parent_filesystem = observed_filesystem,
         .initial = initial,
     };
 }
@@ -569,6 +675,38 @@ fn joinUnresolved(
     );
 }
 
+const c_fstat = struct {
+    extern "c" fn fstat(fd: std.c.fd_t, stat: *std.c.Stat) c_int;
+}.fstat;
+
+fn filesystemId(file: File) !u128 {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx = std.mem.zeroes(linux.Statx);
+        var request = linux.STATX.BASIC_STATS;
+        request.MNT_ID = true;
+        while (true) switch (linux.errno(linux.statx(
+            file.handle,
+            "",
+            linux.AT.EMPTY_PATH,
+            request,
+            &statx,
+        ))) {
+            .SUCCESS => return (@as(u128, statx.dev_major) << 64) |
+                @as(u128, statx.dev_minor),
+            .INTR => continue,
+            else => return error.Unexpected,
+        };
+    }
+    if (comptime builtin.os.tag == .windows) return 0;
+    var native: std.c.Stat = undefined;
+    while (true) switch (std.c.errno(c_fstat(file.handle, &native))) {
+        .SUCCESS => return @intCast(native.dev),
+        .INTR => continue,
+        else => return error.Unexpected,
+    };
+}
+
 fn sameIdentity(left: File.Stat, right: File.Stat) bool {
     return left.kind == right.kind and
         left.inode == right.inode and
@@ -578,13 +716,43 @@ fn sameIdentity(left: File.Stat, right: File.Stat) bool {
         left.ctime.nanoseconds == right.ctime.nanoseconds;
 }
 
-fn sameObject(left: File.Stat, right: File.Stat) bool {
-    return left.kind == right.kind and left.inode == right.inode;
+fn sameObjectFields(
+    left_filesystem: u128,
+    left_inode: u128,
+    left_kind: File.Kind,
+    right_filesystem: u128,
+    right_inode: u128,
+    right_kind: File.Kind,
+) bool {
+    return left_filesystem == right_filesystem and
+        left_inode == right_inode and left_kind == right_kind;
+}
+
+fn sameObject(
+    left: File.Stat,
+    left_filesystem: u128,
+    right: File.Stat,
+    right_filesystem: u128,
+) bool {
+    return sameObjectFields(
+        left_filesystem,
+        @intCast(left.inode),
+        left.kind,
+        right_filesystem,
+        @intCast(right.inode),
+        right.kind,
+    );
 }
 
 fn sameStableContent(left: File.Stat, right: File.Stat) bool {
+    return sameStableObjectMetadata(left, right) and
+        left.ctime.nanoseconds == right.ctime.nanoseconds;
+}
+
+fn sameStableObjectMetadata(left: File.Stat, right: File.Stat) bool {
     return left.kind == right.kind and
         left.inode == right.inode and
+        left.nlink == right.nlink and
         left.size == right.size and
         left.mtime.nanoseconds == right.mtime.nanoseconds;
 }
@@ -592,18 +760,30 @@ fn sameStableContent(left: File.Stat, right: File.Stat) bool {
 fn sameResolvedOrIdentity(
     left_resolved: []const u8,
     left_identity: File.Stat,
+    left_filesystem: u128,
     right_resolved: []const u8,
     right_identity: File.Stat,
+    right_filesystem: u128,
 ) bool {
     if (std.mem.eql(u8, left_resolved, right_resolved)) return true;
-    return sameObject(left_identity, right_identity);
+    return sameObject(
+        left_identity,
+        left_filesystem,
+        right_identity,
+        right_filesystem,
+    );
 }
 
 fn outputAliasesInput(output: *const SealOutput, input: *const StableInput) bool {
     if (std.mem.eql(u8, output.resolved, input.resolved)) return true;
     return switch (output.initial) {
         .missing => false,
-        .existing => |existing| sameObject(existing.identity, input.identity),
+        .existing => |existing| sameObject(
+            existing.identity,
+            existing.filesystem,
+            input.identity,
+            input.filesystem,
+        ),
     };
 }
 
@@ -615,7 +795,9 @@ fn outputsAlias(left: *const SealOutput, right: *const SealOutput) bool {
             .missing => false,
             .existing => |right_existing| sameObject(
                 left_existing.identity,
+                left_existing.filesystem,
                 right_existing.identity,
+                right_existing.filesystem,
             ),
         },
     };
@@ -641,12 +823,18 @@ fn runSealHook(
     phase: []const u8,
 ) !void {
     if (hooks.fail_at) |fail_at| {
-        if (std.mem.eql(u8, fail_at, phase)) return error.AotCacheTestFailure;
+        if (hookListsPhase(fail_at, phase)) return error.AotCacheTestFailure;
     }
     const directory = hooks.directory orelse return;
-    if (hooks.wait_at) |wait_at| {
-        if (!std.mem.eql(u8, wait_at, phase)) return;
-    }
+    const should_wait = if (hooks.wait_at) |wait_at|
+        hookListsPhase(wait_at, phase)
+    else
+        false;
+    const should_notify = if (hooks.notify_at) |notify_at|
+        hookListsPhase(notify_at, phase)
+    else
+        false;
+    if (!should_wait and !should_notify) return;
     const ready = try std.fs.path.join(
         allocator,
         &.{ directory, try std.fmt.allocPrint(allocator, "{s}.ready", .{phase}) },
@@ -656,6 +844,7 @@ fn runSealHook(
         &.{ directory, try std.fmt.allocPrint(allocator, "{s}.continue", .{phase}) },
     );
     try Dir.cwd().writeFile(io, .{ .sub_path = ready, .data = "ready\n" });
+    if (!should_wait) return;
     while (true) {
         _ = Dir.cwd().statFile(io, proceed, .{}) catch |err| switch (err) {
             error.FileNotFound => {
@@ -668,12 +857,22 @@ fn runSealHook(
     }
 }
 
+fn hookListsPhase(list: []const u8, phase: []const u8) bool {
+    var entries = std.mem.splitScalar(u8, list, ',');
+    while (entries.next()) |entry| {
+        if (std.mem.eql(u8, entry, phase)) return true;
+    }
+    return false;
+}
+
 const PrivateFile = struct {
     parent: Dir,
     name: []const u8,
     file: File,
     identity: File.Stat,
+    filesystem: u128,
     name_identity: File.Stat,
+    name_filesystem: u128,
     name_exists: bool = true,
     preserve: bool = false,
 
@@ -709,12 +908,15 @@ fn createPrivateFile(
         };
         errdefer file.close(io);
         const identity = try file.stat(io);
+        const filesystem = try filesystemId(file);
         return .{
             .parent = parent,
             .name = name,
             .file = file,
             .identity = identity,
+            .filesystem = filesystem,
             .name_identity = identity,
+            .name_filesystem = filesystem,
         };
     }
     return error.PathAlreadyExists;
@@ -744,7 +946,9 @@ fn stageStableCopy(
         return error.SealPathRace;
     try snapshot.file.sync(io);
     snapshot.identity = try snapshot.file.stat(io);
+    snapshot.filesystem = try filesystemId(snapshot.file);
     snapshot.name_identity = snapshot.identity;
+    snapshot.name_filesystem = snapshot.filesystem;
     return snapshot;
 }
 
@@ -767,7 +971,9 @@ fn stageCanonicalCache(
     try verifyCacheDatabaseFile(io, canonical.file, engine_sha);
     try canonical.file.sync(io);
     canonical.identity = try canonical.file.stat(io);
+    canonical.filesystem = try filesystemId(canonical.file);
     canonical.name_identity = canonical.identity;
+    canonical.name_filesystem = canonical.filesystem;
     return canonical;
 }
 
@@ -781,6 +987,23 @@ fn hashStableFileHex(
     const digest = try hashFileHandleHex(allocator, io, input.file);
     const after = try input.file.stat(io);
     if (!sameStableContent(before, after)) return error.SealPathRace;
+    return digest;
+}
+
+fn rehashStableFileHex(
+    allocator: Allocator,
+    io: Io,
+    input: StableInput,
+) ![]const u8 {
+    const before = try input.file.stat(io);
+    if (!sameStableObjectMetadata(before, input.identity) or
+        input.filesystem != try filesystemId(input.file))
+        return error.SealPathRace;
+    const digest = try hashFileHandleHex(allocator, io, input.file);
+    const after = try input.file.stat(io);
+    if (!sameIdentity(before, after) or
+        input.filesystem != try filesystemId(input.file))
+        return error.SealPathRace;
     return digest;
 }
 
@@ -813,15 +1036,19 @@ const JournalPhase = enum {
     manifest_before,
     manifest_after,
     rollback_manifest_before,
+    rollback_manifest_quarantine,
     rollback_manifest_after,
     rollback_cache_before,
+    rollback_cache_quarantine,
     rollback_cache_after,
     committed,
     rolled_back,
 };
 
 const OwnedIdentity = struct {
+    filesystem: u128,
     inode: u128,
+    kind: File.Kind,
     nlink: u64,
     size: u64,
     mtime: i128,
@@ -833,9 +1060,12 @@ const OwnedIdentity = struct {
         if (before.kind != .file) return error.InvalidDestinationKind;
         const digest = try hashFileHandle(io, file);
         const after = try file.stat(io);
+        const filesystem = try filesystemId(file);
         if (!sameIdentity(before, after)) return error.SealPathRace;
         return .{
+            .filesystem = filesystem,
             .inode = @intCast(before.inode),
+            .kind = before.kind,
             .nlink = @intCast(before.nlink),
             .size = before.size,
             .mtime = before.mtime.nanoseconds,
@@ -845,16 +1075,23 @@ const OwnedIdentity = struct {
     }
 
     fn matchesObject(identity: OwnedIdentity, io: Io, file: File) !bool {
-        const stat = try file.stat(io);
-        if (stat.kind != .file or
-            identity.inode != @as(u128, @intCast(stat.inode)) or
-            identity.size != stat.size or
-            identity.mtime != stat.mtime.nanoseconds)
+        const before = try file.stat(io);
+        const filesystem = try filesystemId(file);
+        if ((identity.filesystem != 0 and
+            identity.filesystem != filesystem) or
+            identity.inode != @as(u128, @intCast(before.inode)) or
+            identity.kind != before.kind or identity.size != before.size or
+            identity.mtime != before.mtime.nanoseconds)
+            return false;
+        const digest = try hashFileHandle(io, file);
+        const after = try file.stat(io);
+        if (!sameIdentity(before, after) or
+            filesystem != try filesystemId(file))
             return false;
         return std.mem.eql(
             u8,
             &identity.digest,
-            &(try hashFileHandle(io, file)),
+            &digest,
         );
     }
 
@@ -908,9 +1145,25 @@ const Workspaces = struct {
 };
 
 const SealControlNames = struct {
-    lock: []const u8,
     journal: []const u8,
     workspace: []const u8,
+};
+
+const DestinationLocks = struct {
+    files: [2]?File = .{ null, null },
+    count: usize = 0,
+
+    fn deinit(locks: *DestinationLocks, io: Io) void {
+        var index = locks.count;
+        while (index != 0) {
+            index -= 1;
+            const file = locks.files[index].?;
+            file.unlock(io);
+            file.close(io);
+            locks.files[index] = null;
+        }
+        locks.count = 0;
+    }
 };
 
 const journal_magic = "AOTJNL2\x00";
@@ -918,9 +1171,8 @@ const journal_header_size = 8 + 8 + 4 + 4 + Sha256.digest_length;
 const journal_slot_size: u64 = 64 * 1024;
 
 const SealGuard = struct {
-    lock: File,
-    journal: ?File,
-    journal_name: []const u8,
+    locks: DestinationLocks,
+    journal: File,
     workspace_name: []const u8,
     sequence: u64 = 0,
     record: ?JournalRecord = null,
@@ -929,71 +1181,68 @@ const SealGuard = struct {
     fn init(
         allocator: Allocator,
         io: Io,
-        cache_output: *const SealOutput,
-        manifest_output: *const SealOutput,
+        cache_output: *SealOutput,
+        manifest_output: *SealOutput,
     ) !SealGuard {
         const names = try sealControlNames(
             allocator,
             cache_output,
             manifest_output,
         );
-        const lock = try openPrivateControlFile(
+        var locks = try acquireDestinationLocks(
+            allocator,
             io,
-            cache_output.parent,
-            names.lock,
-            true,
+            cache_output,
+            manifest_output,
         );
-        errdefer {
-            lock.unlock(io);
-            lock.close(io);
-        }
-        const journal = openPrivateControlFile(
+        errdefer locks.deinit(io);
+        try cache_output.refreshInitial(io);
+        try manifest_output.refreshInitial(io);
+        const journal = try openPrivateControlFile(
             io,
             cache_output.parent,
             names.journal,
             false,
-        ) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        );
+        errdefer journal.close(io);
         var guard: SealGuard = .{
-            .lock = lock,
+            .locks = locks,
             .journal = journal,
-            .journal_name = names.journal,
             .workspace_name = names.workspace,
         };
-        if (journal) |file| {
-            if (try readLatestJournal(allocator, io, file)) |latest| {
-                guard.sequence = latest.sequence;
-                guard.record = latest.record;
-            } else if ((try file.stat(io)).size != 0) {
+        if (try readLatestJournal(allocator, io, journal)) |latest| {
+            guard.sequence = latest.sequence;
+            guard.record = latest.record;
+        } else {
+            const size = (try journal.stat(io)).size;
+            if (size > journal_slot_size or
+                try workspaceNameExists(
+                    io,
+                    cache_output.parent,
+                    names.workspace,
+                ))
                 return error.InvalidRecoveryJournal;
-            }
+            try journal.setLength(io, 0);
+            guard.record = cleanJournalRecord(
+                cache_output,
+                manifest_output,
+                names.workspace,
+            );
+            try writeJournal(
+                allocator,
+                io,
+                journal,
+                0,
+                guard.record.?,
+            );
+            try syncDir(io, cache_output.parent);
         }
         return guard;
     }
 
     fn deinit(guard: *SealGuard, io: Io) void {
-        if (guard.journal) |journal| journal.close(io);
-        guard.lock.unlock(io);
-        guard.lock.close(io);
-    }
-
-    fn ensureJournal(
-        guard: *SealGuard,
-        io: Io,
-        parent: Dir,
-    ) !File {
-        if (guard.journal) |journal| return journal;
-        const journal = try createPrivateControlFile(
-            io,
-            parent,
-            guard.journal_name,
-        );
-        try journal.sync(io);
-        try syncDir(io, parent);
-        guard.journal = journal;
-        return journal;
+        guard.journal.close(io);
+        guard.locks.deinit(io);
     }
 
     fn setPhase(
@@ -1006,12 +1255,12 @@ const SealGuard = struct {
         var record = guard.record orelse return error.InvalidRecoveryJournal;
         record.phase = phase;
         guard.record = record;
-        const journal = try guard.ensureJournal(io, parent);
+        _ = parent;
         guard.sequence += 1;
         try writeJournal(
             allocator,
             io,
-            journal,
+            guard.journal,
             guard.sequence,
             record,
         );
@@ -1023,15 +1272,23 @@ const SealGuard = struct {
         io: Io,
         cache_output: *const SealOutput,
         manifest_output: *const SealOutput,
+        hooks: SealHooks,
     ) !Workspaces {
         const cache_old = try captureDestination(io, cache_output);
         const manifest_old = try captureDestination(io, manifest_output);
+        const prior = guard.record orelse return error.InvalidRecoveryJournal;
         guard.record = .{
             .phase = .workspace_before,
             .cache_parent_inode = @intCast(cache_output.parent_identity.inode),
             .manifest_parent_inode = @intCast(manifest_output.parent_identity.inode),
-            .cache_workspace_inode = 0,
-            .manifest_workspace_inode = 0,
+            .cache_workspace_inode = if (prior.phase == .clean)
+                prior.cache_workspace_inode
+            else
+                0,
+            .manifest_workspace_inode = if (prior.phase == .clean)
+                prior.manifest_workspace_inode
+            else
+                0,
             .cache_name = cache_output.basename,
             .manifest_name = manifest_output.basename,
             .workspace_name = guard.workspace_name,
@@ -1048,15 +1305,21 @@ const SealGuard = struct {
             cache_output.parent,
             .workspace_before,
         );
+        try runSealHook(
+            allocator,
+            io,
+            hooks,
+            "journal-first-transaction-record",
+        );
         const cache_workspace = try openOwnedWorkspace(
             io,
             cache_output.parent,
             guard.workspace_name,
+            guard.record.?.cache_workspace_inode,
         );
         errdefer cache_workspace.close(io);
         try clearOwnedWorkspace(io, cache_workspace);
-        const shared = cache_output.parent.handle ==
-            manifest_output.parent.handle;
+        const shared = sameOutputParent(cache_output, manifest_output);
         const manifest_workspace = if (shared)
             cache_workspace
         else
@@ -1064,6 +1327,7 @@ const SealGuard = struct {
                 io,
                 manifest_output.parent,
                 guard.workspace_name,
+                guard.record.?.manifest_workspace_inode,
             );
         errdefer if (!shared) manifest_workspace.close(io);
         if (!shared) try clearOwnedWorkspace(io, manifest_workspace);
@@ -1103,8 +1367,7 @@ const SealGuard = struct {
         record.manifest_new = try OwnedIdentity.capture(io, manifest_stage.file);
         guard.record = record;
         try syncDir(io, cache_stage.parent);
-        if (manifest_stage.parent.handle != cache_stage.parent.handle)
-            try syncDir(io, manifest_stage.parent);
+        try syncDir(io, manifest_stage.parent);
         try guard.setPhase(
             allocator,
             io,
@@ -1144,8 +1407,7 @@ const SealGuard = struct {
             else => return err,
         };
         defer if (cache_workspace) |workspace| workspace.close(io);
-        const shared = cache_output.parent.handle ==
-            manifest_output.parent.handle;
+        const shared = sameOutputParent(cache_output, manifest_output);
         const manifest_workspace = if (shared)
             cache_workspace
         else
@@ -1165,12 +1427,18 @@ const SealGuard = struct {
         if (record.cache_new == null or record.manifest_new == null or
             record.cache_stage.len == 0 or record.manifest_stage.len == 0)
         {
-            if (cache_workspace) |workspace|
+            if (cache_workspace) |workspace| {
                 try clearOwnedWorkspace(io, workspace);
-            if (!shared) {
-                if (manifest_workspace) |workspace|
-                    try clearOwnedWorkspace(io, workspace);
+                try syncDir(io, workspace);
             }
+            if (!shared) {
+                if (manifest_workspace) |workspace| {
+                    try clearOwnedWorkspace(io, workspace);
+                    try syncDir(io, workspace);
+                }
+            }
+            try syncDir(io, cache_output.parent);
+            if (!shared) try syncDir(io, manifest_output.parent);
             try guard.setPhase(
                 allocator,
                 io,
@@ -1201,10 +1469,15 @@ const SealGuard = struct {
             record.manifest_old,
             record.manifest_new.?,
         );
-        if (cache_state == .foreign or manifest_state == .foreign)
+        if (cache_state == .foreign or manifest_state == .foreign or
+            cache_state == .external or manifest_state == .external)
             return error.TransactionRecoveryRequired;
 
         if (cache_state == .published and manifest_state == .published) {
+            try syncDir(io, cache_output.parent);
+            if (!shared) try syncDir(io, manifest_output.parent);
+            try syncDir(io, cache_ws);
+            if (!shared) try syncDir(io, manifest_ws);
             try guard.setPhase(
                 allocator,
                 io,
@@ -1228,15 +1501,27 @@ const SealGuard = struct {
                 try restoreRecordedOutput(
                     allocator,
                     io,
+                    guard,
+                    cache_output.parent,
                     manifest_output.parent,
                     record.manifest_name,
                     manifest_ws,
                     record.manifest_stage,
                     record.manifest_old,
                     record.manifest_new.?,
+                    .rollback_manifest_quarantine,
+                    hooks,
+                    "before-manifest-rollback-namespace",
+                    "manifest-rollback-quarantined",
                 );
                 try syncDir(io, manifest_output.parent);
                 try syncDir(io, manifest_ws);
+                try runSealHook(
+                    allocator,
+                    io,
+                    hooks,
+                    "manifest-rollback-durable",
+                );
                 try guard.setPhase(
                     allocator,
                     io,
@@ -1266,15 +1551,27 @@ const SealGuard = struct {
                 try restoreRecordedOutput(
                     allocator,
                     io,
+                    guard,
+                    cache_output.parent,
                     cache_output.parent,
                     record.cache_name,
                     cache_ws,
                     record.cache_stage,
                     record.cache_old,
                     record.cache_new.?,
+                    .rollback_cache_quarantine,
+                    hooks,
+                    "before-cache-rollback-namespace",
+                    "cache-rollback-quarantined",
                 );
                 try syncDir(io, cache_output.parent);
                 try syncDir(io, cache_ws);
+                try runSealHook(
+                    allocator,
+                    io,
+                    hooks,
+                    "cache-rollback-durable",
+                );
                 try guard.setPhase(
                     allocator,
                     io,
@@ -1288,20 +1585,24 @@ const SealGuard = struct {
                     "after-cache-rollback",
                 );
             }
-            if (cache_state != .external and
-                !try destinationMatchesRecorded(
-                    io,
-                    cache_output.parent,
-                    record.cache_name,
-                    record.cache_old,
-                )) return error.TransactionRecoveryRequired;
-            if (manifest_state != .external and
-                !try destinationMatchesRecorded(
-                    io,
-                    manifest_output.parent,
-                    record.manifest_name,
-                    record.manifest_old,
-                )) return error.TransactionRecoveryRequired;
+            if (!try destinationMatchesRecorded(
+                io,
+                cache_output.parent,
+                record.cache_name,
+                record.cache_old,
+            ))
+                return error.TransactionRecoveryRequired;
+            if (!try destinationMatchesRecorded(
+                io,
+                manifest_output.parent,
+                record.manifest_name,
+                record.manifest_old,
+            ))
+                return error.TransactionRecoveryRequired;
+            try syncDir(io, cache_output.parent);
+            if (!shared) try syncDir(io, manifest_output.parent);
+            try syncDir(io, cache_ws);
+            if (!shared) try syncDir(io, manifest_ws);
             try guard.setPhase(
                 allocator,
                 io,
@@ -1313,6 +1614,14 @@ const SealGuard = struct {
         if (!shared) try clearOwnedWorkspace(io, manifest_ws);
         try syncDir(io, cache_ws);
         if (!shared) try syncDir(io, manifest_ws);
+        try syncDir(io, cache_output.parent);
+        if (!shared) try syncDir(io, manifest_output.parent);
+        try runSealHook(
+            allocator,
+            io,
+            hooks,
+            "workspace-cleanup-durable",
+        );
         try guard.setPhase(
             allocator,
             io,
@@ -1420,11 +1729,6 @@ fn sealControlNames(
     const encoded = std.fmt.bytesToHex(digest, .lower);
     const key = try allocator.dupe(u8, encoded[0..24]);
     return .{
-        .lock = try std.fmt.allocPrint(
-            allocator,
-            ".starling-aot-seal-{s}.lock",
-            .{key},
-        ),
         .journal = try std.fmt.allocPrint(
             allocator,
             ".starling-aot-seal-{s}.journal",
@@ -1436,6 +1740,140 @@ fn sealControlNames(
             .{key},
         ),
     };
+}
+
+const DestinationLockRequest = struct {
+    output: *SealOutput,
+    digest: [Sha256.digest_length]u8,
+    name: []const u8,
+};
+
+fn destinationLockRequest(
+    allocator: Allocator,
+    output: *SealOutput,
+) !DestinationLockRequest {
+    var hasher = Sha256.init(.{});
+    hashField(
+        &hasher,
+        "parent-filesystem",
+        try std.fmt.allocPrint(
+            allocator,
+            "{d}",
+            .{output.parent_filesystem},
+        ),
+    );
+    hashField(
+        &hasher,
+        "parent-inode",
+        try std.fmt.allocPrint(
+            allocator,
+            "{d}",
+            .{output.parent_identity.inode},
+        ),
+    );
+    hashField(&hasher, "name", output.basename);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return .{
+        .output = output,
+        .digest = digest,
+        .name = try std.fmt.allocPrint(
+            allocator,
+            ".starling-aot-destination-{s}.lock",
+            .{encoded[0..24]},
+        ),
+    };
+}
+
+fn destinationLockLessThan(
+    _: void,
+    left: DestinationLockRequest,
+    right: DestinationLockRequest,
+) bool {
+    return std.mem.lessThan(u8, &left.digest, &right.digest);
+}
+
+fn acquireDestinationLocks(
+    allocator: Allocator,
+    io: Io,
+    cache_output: *SealOutput,
+    manifest_output: *SealOutput,
+) !DestinationLocks {
+    var requests = [_]DestinationLockRequest{
+        try destinationLockRequest(allocator, cache_output),
+        try destinationLockRequest(allocator, manifest_output),
+    };
+    std.mem.sortUnstable(
+        DestinationLockRequest,
+        &requests,
+        {},
+        destinationLockLessThan,
+    );
+    var locks: DestinationLocks = .{};
+    errdefer locks.deinit(io);
+    for (requests, 0..) |request, index| {
+        if (index != 0 and
+            std.mem.eql(u8, &request.digest, &requests[index - 1].digest))
+            continue;
+        locks.files[locks.count] = try openPrivateControlFile(
+            io,
+            request.output.parent,
+            request.name,
+            true,
+        );
+        locks.count += 1;
+    }
+    return locks;
+}
+
+fn cleanJournalRecord(
+    cache_output: *const SealOutput,
+    manifest_output: *const SealOutput,
+    workspace_name: []const u8,
+) JournalRecord {
+    return .{
+        .phase = .clean,
+        .cache_parent_inode = @intCast(cache_output.parent_identity.inode),
+        .manifest_parent_inode = @intCast(manifest_output.parent_identity.inode),
+        .cache_workspace_inode = 0,
+        .manifest_workspace_inode = 0,
+        .cache_name = cache_output.basename,
+        .manifest_name = manifest_output.basename,
+        .workspace_name = workspace_name,
+        .cache_stage = "",
+        .manifest_stage = "",
+        .cache_old = null,
+        .manifest_old = null,
+        .cache_new = null,
+        .manifest_new = null,
+    };
+}
+
+fn workspaceNameExists(io: Io, parent: Dir, name: []const u8) !bool {
+    const file = parent.openFile(io, name, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io);
+    return true;
+}
+
+fn controlFileExists(io: Io, parent: Dir, name: []const u8) !bool {
+    const file = parent.openFile(io, name, .{
+        .path_only = true,
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close(io);
+    return (try file.stat(io)).kind == .file;
 }
 
 fn openPrivateControlFile(
@@ -1499,13 +1937,19 @@ fn captureDestination(io: Io, output: *const SealOutput) !?OwnedIdentity {
     };
 }
 
-fn openOwnedWorkspace(io: Io, parent: Dir, name: []const u8) !Dir {
+fn openOwnedWorkspace(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    expected_inode: u128,
+) !Dir {
     const permissions: File.Permissions = if (File.Permissions.has_executable_bit)
         File.Permissions.fromMode(0o700)
     else
         .default_dir;
+    var created = true;
     parent.createDir(io, name, permissions) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => created = false,
         else => return err,
     };
     var workspace = try parent.openDir(io, name, .{
@@ -1515,6 +1959,10 @@ fn openOwnedWorkspace(io: Io, parent: Dir, name: []const u8) !Dir {
     errdefer workspace.close(io);
     const stat = try workspace.stat(io);
     if (stat.kind != .directory) return error.InvalidRecoveryJournal;
+    if ((!created and expected_inode == 0) or
+        (expected_inode != 0 and
+            expected_inode != @as(u128, @intCast(stat.inode))))
+        return error.InvalidRecoveryJournal;
     if (File.Permissions.has_executable_bit)
         try workspace.setPermissions(io, File.Permissions.fromMode(0o700));
     return workspace;
@@ -1586,15 +2034,23 @@ fn inspectRecordedOutput(
             try old_identity.matchesObject(io, destination.?) and
             try new.matchesObject(io, staged.?))
             return .original;
+        if (destination != null and staged == null and
+            try old_identity.matchesObject(io, destination.?))
+            return .original;
         if (destination != null and staged != null and
             try new.matchesObject(io, destination.?) and
             try old_identity.matchesObject(io, staged.?))
+            return .published;
+        if (destination != null and staged == null and
+            try new.matchesObject(io, destination.?))
             return .published;
         if (staged != null and try new.matchesObject(io, staged.?))
             return .external;
     } else {
         if (destination == null and staged != null and
             try new.matchesObject(io, staged.?))
+            return .original;
+        if (destination == null and staged == null)
             return .original;
         if (destination != null and staged == null and
             try new.matchesObject(io, destination.?))
@@ -1609,12 +2065,18 @@ fn inspectRecordedOutput(
 fn restoreRecordedOutput(
     allocator: Allocator,
     io: Io,
+    guard: *SealGuard,
+    journal_parent: Dir,
     output_parent: Dir,
     output_name: []const u8,
     workspace: Dir,
     stage_name: []const u8,
     old: ?OwnedIdentity,
     new: OwnedIdentity,
+    quarantine_phase: JournalPhase,
+    hooks: SealHooks,
+    before_namespace_hook: []const u8,
+    quarantined_hook: []const u8,
 ) !void {
     if (try inspectRecordedOutput(
         io,
@@ -1625,6 +2087,7 @@ fn restoreRecordedOutput(
         old,
         new,
     ) != .published) return error.TransactionRecoveryRequired;
+    try runSealHook(allocator, io, hooks, before_namespace_hook);
     if (old != null) {
         try exchangeNames(
             allocator,
@@ -1641,8 +2104,63 @@ fn restoreRecordedOutput(
             io,
         );
     }
-    if (!try destinationMatchesRecorded(io, output_parent, output_name, old))
-        return error.TransactionRecoveryRequired;
+    try syncDir(io, output_parent);
+    try syncDir(io, workspace);
+    if (try destinationMatchesRecorded(io, output_parent, output_name, old) and
+        try destinationMatchesRecorded(
+            io,
+            workspace,
+            stage_name,
+            new,
+        ))
+        return;
+
+    const displaced = qualifiedStatNoFollow(
+        io,
+        workspace,
+        stage_name,
+    ) catch return error.TransactionRecoveryRequired;
+    try guard.setPhase(
+        allocator,
+        io,
+        journal_parent,
+        quarantine_phase,
+    );
+    try runSealHook(allocator, io, hooks, quarantined_hook);
+
+    if (old != null) {
+        try exchangeNames(
+            allocator,
+            workspace,
+            stage_name,
+            output_parent,
+            output_name,
+        );
+    } else {
+        workspace.renamePreserve(
+            stage_name,
+            output_parent,
+            output_name,
+            io,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.TransactionRecoveryRequired,
+            else => return err,
+        };
+    }
+    try syncDir(io, output_parent);
+    try syncDir(io, workspace);
+    const restored = qualifiedStatNoFollow(
+        io,
+        output_parent,
+        output_name,
+    ) catch return error.TransactionRecoveryRequired;
+    if (!sameObject(
+        displaced.stat,
+        displaced.filesystem,
+        restored.stat,
+        restored.filesystem,
+    )) return error.TransactionRecoveryRequired;
+    return error.TransactionRecoveryRequired;
 }
 
 fn destinationMatchesRecorded(
@@ -1905,9 +2423,11 @@ fn formatIdentity(
     const digest = std.fmt.bytesToHex(value.digest, .lower);
     return std.fmt.allocPrint(
         allocator,
-        "{d},{d},{d},{d},{d},{s}",
+        "{d},{d},{s},{d},{d},{d},{d},{s}",
         .{
+            value.filesystem,
             value.inode,
+            @tagName(value.kind),
             value.nlink,
             value.size,
             value.mtime,
@@ -1920,9 +2440,23 @@ fn formatIdentity(
 fn parseIdentity(value: []const u8) !?OwnedIdentity {
     if (std.mem.eql(u8, value, "-")) return null;
     var fields = std.mem.splitScalar(u8, value, ',');
+    const legacy = std.mem.count(u8, value, ",") == 5;
+    const filesystem = if (legacy)
+        0
+    else
+        std.fmt.parseInt(u128, fields.next() orelse
+            return error.InvalidRecoveryJournal, 10) catch
+            return error.InvalidRecoveryJournal;
     const inode = std.fmt.parseInt(u128, fields.next() orelse
         return error.InvalidRecoveryJournal, 10) catch
         return error.InvalidRecoveryJournal;
+    const kind = if (legacy)
+        File.Kind.file
+    else
+        std.meta.stringToEnum(
+            File.Kind,
+            fields.next() orelse return error.InvalidRecoveryJournal,
+        ) orelse return error.InvalidRecoveryJournal;
     const nlink = std.fmt.parseInt(u64, fields.next() orelse
         return error.InvalidRecoveryJournal, 10) catch
         return error.InvalidRecoveryJournal;
@@ -1943,7 +2477,9 @@ fn parseIdentity(value: []const u8) !?OwnedIdentity {
     _ = std.fmt.hexToBytes(&digest, digest_text) catch
         return error.InvalidRecoveryJournal;
     return .{
+        .filesystem = filesystem,
         .inode = inode,
+        .kind = kind,
         .nlink = nlink,
         .size = size,
         .mtime = mtime,
@@ -2023,6 +2559,12 @@ fn publishBundle(
         return preserveRecovery(guard, cache_stage, manifest_stage);
     syncDir(io, cache_stage.parent) catch
         return preserveRecovery(guard, cache_stage, manifest_stage);
+    runSealHook(
+        allocator,
+        io,
+        hooks,
+        "cache-publication-durable",
+    ) catch return preserveRecovery(guard, cache_stage, manifest_stage);
     guard.setPhase(
         allocator,
         io,
@@ -2056,7 +2598,12 @@ fn publishBundle(
         return err;
     };
 
-    if (!try destinationHasIdentity(io, cache_output, cache_stage.identity) or
+    if (!try destinationHasIdentity(
+        io,
+        cache_output,
+        cache_stage.identity,
+        cache_stage.filesystem,
+    ) or
         !try destinationMatchesStart(io, manifest_output))
     {
         if (!recoverPublication(
@@ -2109,6 +2656,12 @@ fn publishBundle(
         return preserveRecovery(guard, cache_stage, manifest_stage);
     syncDir(io, manifest_stage.parent) catch
         return preserveRecovery(guard, cache_stage, manifest_stage);
+    runSealHook(
+        allocator,
+        io,
+        hooks,
+        "manifest-publication-durable",
+    ) catch return preserveRecovery(guard, cache_stage, manifest_stage);
     guard.setPhase(
         allocator,
         io,
@@ -2128,9 +2681,32 @@ fn publishBundle(
         )) return error.TransactionRecoveryRequired;
         return err;
     };
-    if (!try destinationHasIdentity(io, cache_output, cache_stage.identity) or
-        !try destinationHasIdentity(io, manifest_output, manifest_stage.identity))
+    if (!try destinationHasIdentity(
+        io,
+        cache_output,
+        cache_stage.identity,
+        cache_stage.filesystem,
+    ) or !try destinationHasIdentity(
+        io,
+        manifest_output,
+        manifest_stage.identity,
+        manifest_stage.filesystem,
+    ))
         return preserveRecovery(guard, cache_stage, manifest_stage);
+    syncDir(io, cache_output.parent) catch
+        return preserveRecovery(guard, cache_stage, manifest_stage);
+    syncDir(io, manifest_output.parent) catch
+        return preserveRecovery(guard, cache_stage, manifest_stage);
+    syncDir(io, cache_stage.parent) catch
+        return preserveRecovery(guard, cache_stage, manifest_stage);
+    syncDir(io, manifest_stage.parent) catch
+        return preserveRecovery(guard, cache_stage, manifest_stage);
+    runSealHook(
+        allocator,
+        io,
+        hooks,
+        "publication-pair-durable",
+    ) catch return preserveRecovery(guard, cache_stage, manifest_stage);
     guard.setPhase(
         allocator,
         io,
@@ -2210,6 +2786,7 @@ fn destinationHasIdentity(
     io: Io,
     output: *const SealOutput,
     identity: File.Stat,
+    filesystem: u128,
 ) !bool {
     var current = output.parent.openFile(io, output.basename, .{
         .path_only = true,
@@ -2220,7 +2797,12 @@ fn destinationHasIdentity(
         else => return err,
     };
     defer current.close(io);
-    return sameObject(identity, try current.stat(io));
+    return sameObject(
+        identity,
+        filesystem,
+        try current.stat(io),
+        try filesystemId(current),
+    );
 }
 
 fn publishOne(
@@ -2261,12 +2843,18 @@ fn publishOne(
                 output.parent,
                 output.basename,
             );
-            const displaced = statNoFollow(io, staged.parent, staged.name) catch {
+            const displaced = qualifiedStatNoFollow(
+                io,
+                staged.parent,
+                staged.name,
+            ) catch {
                 return error.TransactionRecoveryRequired;
             };
             if (!sameObject(
                 try proven_destination.stat(io),
-                displaced,
+                try filesystemId(proven_destination),
+                displaced.stat,
+                displaced.filesystem,
             )) {
                 exchangeNames(
                     allocator,
@@ -2275,35 +2863,54 @@ fn publishOne(
                     output.parent,
                     output.basename,
                 ) catch return error.TransactionRecoveryRequired;
-                const restored_stage = statNoFollow(
+                const restored_stage = qualifiedStatNoFollow(
                     io,
                     staged.parent,
                     staged.name,
                 ) catch return error.TransactionRecoveryRequired;
-                const restored_destination = statNoFollow(
+                const restored_destination = qualifiedStatNoFollow(
                     io,
                     output.parent,
                     output.basename,
                 ) catch return error.TransactionRecoveryRequired;
-                if (!sameObject(restored_stage, staged.identity) or
-                    !sameObject(restored_destination, displaced))
+                if (!sameObject(
+                    restored_stage.stat,
+                    restored_stage.filesystem,
+                    staged.identity,
+                    staged.filesystem,
+                ) or !sameObject(
+                    restored_destination.stat,
+                    restored_destination.filesystem,
+                    displaced.stat,
+                    displaced.filesystem,
+                ))
                     return error.TransactionRecoveryRequired;
-                staged.name_identity = restored_stage;
+                staged.name_identity = restored_stage.stat;
+                staged.name_filesystem = restored_stage.filesystem;
                 return error.SealPathRace;
             }
-            staged.name_identity = displaced;
+            staged.name_identity = displaced.stat;
+            staged.name_filesystem = displaced.filesystem;
         },
     }
 }
 
-fn statNoFollow(io: Io, parent: Dir, name: []const u8) !File.Stat {
+const QualifiedStat = struct {
+    stat: File.Stat,
+    filesystem: u128,
+};
+
+fn qualifiedStatNoFollow(io: Io, parent: Dir, name: []const u8) !QualifiedStat {
     var file = try parent.openFile(io, name, .{
         .path_only = true,
         .follow_symlinks = false,
         .allow_directory = true,
     });
     defer file.close(io);
-    return file.stat(io);
+    return .{
+        .stat = try file.stat(io),
+        .filesystem = try filesystemId(file),
+    };
 }
 
 fn syncDir(io: Io, dir: Dir) !void {
@@ -2415,6 +3022,242 @@ const BundleControl = struct {
     journal_name: []const u8,
 };
 
+pub fn publishPrefixDirectory(
+    allocator: Allocator,
+    io: Io,
+    target_path: []const u8,
+    generation_path: []const u8,
+    expected_feature_abi: []const u8,
+    hooks: SealHooks,
+) !void {
+    const target_absolute = try absoluteSealPath(allocator, io, target_path);
+    const target_parent_path = std.fs.path.dirname(target_absolute) orelse
+        return error.InvalidManifest;
+    const target_name = std.fs.path.basename(target_absolute);
+    try validateBundleBasename(target_name);
+    try Dir.cwd().createDirPath(io, target_parent_path);
+    const generation_absolute = try absoluteSealPath(
+        allocator,
+        io,
+        generation_path,
+    );
+    var source_generation = try Dir.openDirAbsolute(
+        io,
+        generation_absolute,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source_generation.close(io);
+    const source_generation_stat = try source_generation.stat(io);
+    if (source_generation_stat.kind != .directory)
+        return error.InvalidDestinationKind;
+
+    var parent = try Dir.openDirAbsolute(io, target_parent_path, .{
+        .iterate = true,
+        .follow_symlinks = true,
+    });
+    defer parent.close(io);
+
+    const control = try bundleControlNames(allocator, target_name);
+    var lock = try openPrivateControlFile(
+        io,
+        parent,
+        control.lock_name,
+        false,
+    );
+    try runSealHook(allocator, io, hooks, "prefix-lock-attempt");
+    try lock.lock(io, .exclusive);
+    defer {
+        lock.unlock(io);
+        lock.close(io);
+    }
+    var journal = try openPrivateControlFile(
+        io,
+        parent,
+        control.journal_name,
+        false,
+    );
+    defer journal.close(io);
+    var sequence: u64 = 0;
+    if (try readLatestBundleJournal(allocator, io, journal)) |latest| {
+        if (!std.mem.eql(u8, latest.record.target_name, target_name))
+            return error.InvalidRecoveryJournal;
+        sequence = latest.sequence;
+        try recoverBundleLocked(
+            allocator,
+            io,
+            parent,
+            journal,
+            &sequence,
+            latest.record,
+            hooks,
+        );
+    } else {
+        if ((try journal.stat(io)).size > journal_slot_size)
+            return error.InvalidRecoveryJournal;
+        try initializeBundleJournal(
+            allocator,
+            io,
+            parent,
+            journal,
+            target_name,
+        );
+    }
+
+    const old_inode = try targetDirectoryInode(io, parent, target_name);
+    const stage_name = try randomBundleStageName(allocator, io, target_name);
+    var record: BundleRecord = .{
+        .phase = .stage_before,
+        .target_name = target_name,
+        .stage_name = stage_name,
+        .old_inode = old_inode,
+        .new_inode = 0,
+    };
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .stage_before,
+    );
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    try parent.createDir(io, stage_name, private_permissions);
+    try syncDir(io, parent);
+    var generation = try parent.openDir(io, stage_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    var generation_closed = false;
+    defer if (!generation_closed) generation.close(io);
+    record.new_inode = @intCast((try generation.stat(io)).inode);
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .staging,
+    );
+    try copyDirectoryContents(io, source_generation, generation);
+    try generation.setPermissions(io, source_generation_stat.permissions);
+    try syncDirectoryTree(io, generation);
+    try runSealHook(allocator, io, hooks, "prefix-files-durable");
+    try validateInstalledPrefix(
+        allocator,
+        io,
+        target_parent_path,
+        stage_name,
+        expected_feature_abi,
+    );
+    try syncDirectoryTree(io, generation);
+    try runSealHook(allocator, io, hooks, "prefix-validated");
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .prepared,
+    );
+    runSealHook(allocator, io, hooks, "prefix-prepared") catch |err| {
+        generation.close(io);
+        generation_closed = true;
+        try recoverBundleLocked(
+            allocator,
+            io,
+            parent,
+            journal,
+            &sequence,
+            record,
+            .{},
+        );
+        return err;
+    };
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .switch_before,
+    );
+    runSealHook(allocator, io, hooks, "before-prefix-switch") catch |err| {
+        generation.close(io);
+        generation_closed = true;
+        try recoverBundleLocked(
+            allocator,
+            io,
+            parent,
+            journal,
+            &sequence,
+            record,
+            .{},
+        );
+        return err;
+    };
+    generation.close(io);
+    generation_closed = true;
+    if (old_inode != null)
+        try exchangeNames(allocator, parent, stage_name, parent, target_name)
+    else
+        try parent.renamePreserve(stage_name, parent, target_name, io);
+    try syncDir(io, parent);
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .switch_after,
+    );
+    runSealHook(allocator, io, hooks, "after-prefix-switch") catch |err| {
+        try recoverBundleLocked(
+            allocator,
+            io,
+            parent,
+            journal,
+            &sequence,
+            record,
+            .{},
+        );
+        return err;
+    };
+    if (try targetDirectoryInode(io, parent, target_name) != record.new_inode)
+        return error.TransactionRecoveryRequired;
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .committed,
+    );
+    try runSealHook(allocator, io, hooks, "prefix-committed");
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .cleanup_before,
+    );
+    try runSealHook(allocator, io, hooks, "before-prefix-cleanup");
+    try removeBundleStage(io, parent, record);
+    try syncDir(io, parent);
+    try writeBundlePhase(
+        allocator,
+        io,
+        journal,
+        &sequence,
+        &record,
+        .clean,
+    );
+    try runSealHook(allocator, io, hooks, "after-prefix-cleanup");
+}
+
 pub fn publishBundleDirectory(
     allocator: Allocator,
     io: Io,
@@ -2452,8 +3295,10 @@ pub fn publishBundleDirectory(
         io,
         parent,
         control.lock_name,
-        true,
+        false,
     );
+    try runSealHook(allocator, io, hooks, "bundle-lock-attempt");
+    try lock.lock(io, .exclusive);
     defer {
         lock.unlock(io);
         lock.close(io);
@@ -2479,8 +3324,16 @@ pub fn publishBundleDirectory(
             latest.record,
             hooks,
         );
-    } else if ((try journal.stat(io)).size != 0) {
-        return error.InvalidRecoveryJournal;
+    } else {
+        if ((try journal.stat(io)).size > journal_slot_size)
+            return error.InvalidRecoveryJournal;
+        try initializeBundleJournal(
+            allocator,
+            io,
+            parent,
+            journal,
+            target_name,
+        );
     }
 
     const old_inode = try targetDirectoryInode(io, parent, target_name);
@@ -2753,8 +3606,10 @@ pub fn recoverBundleDirectory(
         io,
         parent,
         control.lock_name,
-        true,
+        false,
     );
+    try runSealHook(allocator, io, hooks, "bundle-lock-attempt");
+    try lock.lock(io, .exclusive);
     defer {
         lock.unlock(io);
         lock.close(io);
@@ -2770,7 +3625,18 @@ pub fn recoverBundleDirectory(
         allocator,
         io,
         journal,
-    )) orelse return error.InvalidRecoveryJournal;
+    )) orelse {
+        if ((try journal.stat(io)).size > journal_slot_size)
+            return error.InvalidRecoveryJournal;
+        try initializeBundleJournal(
+            allocator,
+            io,
+            parent,
+            journal,
+            target_name,
+        );
+        return;
+    };
     if (!std.mem.eql(u8, latest.record.target_name, target_name))
         return error.InvalidRecoveryJournal;
     var sequence = latest.sequence;
@@ -2822,7 +3688,8 @@ fn recoverBundleLocked(
     const committed = record.phase == .committed or
         record.phase == .cleanup_before;
     if (record.phase == .stage_before and target_is_old) {
-        if (stage_inode != null) try parent.deleteTree(io, record.stage_name);
+        if (stage_inode != null)
+            return error.TransactionRecoveryRequired;
     } else if (target_is_new and stage_is_old) {
         if (!committed) {
             try writeBundlePhase(
@@ -2875,6 +3742,10 @@ fn recoverBundleLocked(
         try removeBundleStage(io, parent, record);
     } else if (target_is_new and stage_inode == null and committed) {
         // Cleanup completed before the final clean journal record.
+    } else if (target_is_old and stage_inode == null and
+        record.phase == .rollback_after)
+    {
+        // Rolled-back cleanup completed before the final clean record.
     } else {
         return error.TransactionRecoveryRequired;
     }
@@ -2913,6 +3784,98 @@ fn targetDirectoryInode(
     const stat = try directory.stat(io);
     if (stat.kind != .directory) return error.InvalidDestinationKind;
     return @intCast(stat.inode);
+}
+
+fn syncDirectoryTree(io: Io, directory: Dir) !void {
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                var file = try directory.openFile(io, entry.name, .{
+                    .follow_symlinks = false,
+                    .allow_directory = false,
+                });
+                defer file.close(io);
+                try file.sync(io);
+            },
+            .directory => {
+                var child = try directory.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(io);
+                try syncDirectoryTree(io, child);
+            },
+            .sym_link => {},
+            else => return error.InvalidDestinationKind,
+        }
+    }
+    try syncDir(io, directory);
+}
+
+fn validateInstalledPrefix(
+    allocator: Allocator,
+    io: Io,
+    parent_path: []const u8,
+    generation_name: []const u8,
+    expected_feature_abi: []const u8,
+) !void {
+    const generation_path = try std.fs.path.join(
+        allocator,
+        &.{ parent_path, generation_name },
+    );
+    const bin_path = try std.fs.path.join(
+        allocator,
+        &.{ generation_path, "bin" },
+    );
+    const required = [_][]const u8{
+        "starling-raw.wasm",
+        cache_basename,
+        manifest_basename,
+        "starling-aot-cache",
+        "starling-componentize",
+        "componentize.sh",
+        "preview1-adapter.wasm",
+        "features.json",
+        "smoke.js",
+        "wabt",
+        "wasm-tools",
+        "wasmtime",
+        "weval",
+    };
+    for (required) |name| {
+        const path = try std.fs.path.join(allocator, &.{ bin_path, name });
+        const input = try openStableInput(
+            allocator,
+            io,
+            "installed prefix artifact",
+            path,
+        );
+        defer input.close(io);
+        if (input.identity.size == 0) return error.MissingCacheArtifact;
+    }
+    const engine = try std.fs.path.join(
+        allocator,
+        &.{ bin_path, "starling-raw.wasm" },
+    );
+    const weval = try std.fs.path.join(allocator, &.{ bin_path, "weval" });
+    const cache = try std.fs.path.join(
+        allocator,
+        &.{ bin_path, cache_basename },
+    );
+    const manifest = try std.fs.path.join(
+        allocator,
+        &.{ bin_path, manifest_basename },
+    );
+    _ = try validate(
+        allocator,
+        io,
+        engine,
+        weval,
+        cache,
+        manifest,
+        expected_feature_abi,
+    );
 }
 
 fn randomBundleStageName(
@@ -3078,6 +4041,26 @@ fn copyDirectoryContents(io: Io, source: Dir, destination: Dir) !void {
 
 const bundle_journal_magic = "AOTBND2\x00";
 
+fn initializeBundleJournal(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    journal: File,
+    target_name: []const u8,
+) !void {
+    const baseline: BundleRecord = .{
+        .phase = .clean,
+        .target_name = target_name,
+        .stage_name = "",
+        .old_inode = null,
+        .new_inode = 0,
+    };
+    try journal.setLength(io, 0);
+    const payload = try encodeBundleJournal(allocator, baseline);
+    try writeBundleJournalPayload(io, journal, 0, payload);
+    try syncDir(io, parent);
+}
+
 fn writeBundlePhase(
     allocator: Allocator,
     io: Io,
@@ -3088,11 +4071,24 @@ fn writeBundlePhase(
 ) !void {
     record.phase = phase;
     sequence.* += 1;
+    const payload = try encodeBundleJournal(allocator, record.*);
+    try writeBundleJournalPayload(
+        io,
+        journal,
+        sequence.*,
+        payload,
+    );
+}
+
+fn encodeBundleJournal(
+    allocator: Allocator,
+    record: BundleRecord,
+) ![]const u8 {
     const old = if (record.old_inode) |inode|
         try std.fmt.allocPrint(allocator, "{d}", .{inode})
     else
         try allocator.dupe(u8, "-");
-    const payload = try std.fmt.allocPrint(
+    return std.fmt.allocPrint(
         allocator,
         "version=2\nphase={s}\ntarget={s}\nstage={s}\nold={s}\nnew={d}\n",
         .{
@@ -3102,12 +4098,6 @@ fn writeBundlePhase(
             old,
             record.new_inode,
         },
-    );
-    try writeBundleJournalPayload(
-        io,
-        journal,
-        sequence.*,
-        payload,
     );
 }
 
@@ -3272,23 +4262,9 @@ pub fn recoverWithHooks(
         hooks,
     );
     defer manifest_output.deinit(io);
-    const names = try sealControlNames(
-        allocator,
-        &cache_output,
-        &manifest_output,
-    );
+    if (outputsAlias(&cache_output, &manifest_output))
+        return error.SealPathAlias;
     if (try hasLegacySealJournal(io, cache_output.parent))
-        return error.InvalidRecoveryJournal;
-    var probe = cache_output.parent.openFile(io, names.journal, .{
-        .path_only = true,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer probe.close(io);
-    if ((try probe.stat(io)).kind != .file)
         return error.InvalidRecoveryJournal;
     var guard = try SealGuard.init(
         allocator,
@@ -3297,6 +4273,7 @@ pub fn recoverWithHooks(
         &manifest_output,
     );
     defer guard.deinit(io);
+    try runSealHook(allocator, io, hooks, "recovery-locked");
     try guard.recover(
         allocator,
         io,
@@ -3346,7 +4323,48 @@ pub fn validateWithHooks(
     expected_feature_abi: ?[]const u8,
     hooks: SealHooks,
 ) !Validated {
-    try recover(allocator, io, cache_path, manifest_path);
+    var cache_output = try openSealOutput(
+        allocator,
+        io,
+        "cache",
+        cache_path,
+        hooks,
+    );
+    defer cache_output.deinit(io);
+    var manifest_output = try openSealOutput(
+        allocator,
+        io,
+        "manifest",
+        manifest_path,
+        hooks,
+    );
+    defer manifest_output.deinit(io);
+    if (outputsAlias(&cache_output, &manifest_output))
+        return error.SealPathAlias;
+    if (try hasLegacySealJournal(io, cache_output.parent))
+        return error.InvalidRecoveryJournal;
+    const names = try sealControlNames(
+        allocator,
+        &cache_output,
+        &manifest_output,
+    );
+    var guard: ?SealGuard = null;
+    defer if (guard) |*active| active.deinit(io);
+    if (try controlFileExists(io, cache_output.parent, names.journal)) {
+        guard = try SealGuard.init(
+            allocator,
+            io,
+            &cache_output,
+            &manifest_output,
+        );
+        try guard.?.recover(
+            allocator,
+            io,
+            &cache_output,
+            &manifest_output,
+            .{},
+        );
+    }
     const engine = openStableInput(
         allocator,
         io,
@@ -3397,9 +4415,9 @@ pub fn validateWithHooks(
         16 * 1024,
     );
     const parsed = try parseManifest(data);
-    const engine_sha = try hashStableFileHex(allocator, io, engine);
+    const engine_sha = try rehashStableFileHex(allocator, io, engine);
     if (!std.mem.eql(u8, parsed.engine_sha256, engine_sha)) return error.StaleEngine;
-    const weval_sha = try hashStableFileHex(allocator, io, weval);
+    const weval_sha = try rehashStableFileHex(allocator, io, weval);
     if (!std.mem.eql(u8, parsed.weval_sha256, weval_sha)) return error.StaleTool;
     if (expected_feature_abi) |expected| {
         if (!std.mem.eql(u8, parsed.feature_abi, expected)) return error.StaleFeatureAbi;
@@ -3412,13 +4430,33 @@ pub fn validateWithHooks(
         parsed.primer_sha256,
     );
     if (!std.mem.eql(u8, parsed.key, expected_key)) return error.InvalidManifest;
-    const cache_sha = try hashStableFileHex(allocator, io, cache);
+    const cache_sha = try rehashStableFileHex(allocator, io, cache);
     if (!std.mem.eql(u8, parsed.cache_sha256, cache_sha)) return error.CorruptCache;
     try verifyCacheDatabaseFile(io, cache.file, engine_sha);
-    for ([_]StableInput{ engine, weval, cache, manifest }) |input| {
-        if (!sameStableContent(input.identity, try input.file.stat(io)))
+    for ([_]struct {
+        input: StableInput,
+        digest: []const u8,
+    }{
+        .{ .input = engine, .digest = engine_sha },
+        .{ .input = weval, .digest = weval_sha },
+        .{ .input = cache, .digest = cache_sha },
+    }) |expected| {
+        const current = try rehashStableFileHex(
+            allocator,
+            io,
+            expected.input,
+        );
+        if (!std.mem.eql(u8, current, expected.digest))
             return error.SealPathRace;
     }
+    const final_manifest = try rereadStableFileAlloc(
+        allocator,
+        io,
+        manifest,
+        16 * 1024,
+    );
+    if (!std.mem.eql(u8, data, final_manifest))
+        return error.SealPathRace;
     return .{ .key = parsed.key, .feature_abi = parsed.feature_abi };
 }
 
@@ -3429,12 +4467,35 @@ fn readStableFileAlloc(
     limit: usize,
 ) ![]u8 {
     const before = try input.file.stat(io);
-    if (!sameStableContent(before, input.identity) or before.size > limit)
+    if (!sameStableObjectMetadata(before, input.identity) or
+        input.filesystem != try filesystemId(input.file) or
+        before.size > limit)
         return error.InvalidManifest;
     const data = try allocator.alloc(u8, @intCast(before.size));
     if (try input.file.readPositionalAll(io, data, 0) != data.len)
         return error.SealPathRace;
     if (!sameStableContent(before, try input.file.stat(io)))
+        return error.SealPathRace;
+    return data;
+}
+
+fn rereadStableFileAlloc(
+    allocator: Allocator,
+    io: Io,
+    input: StableInput,
+    limit: usize,
+) ![]u8 {
+    const before = try input.file.stat(io);
+    if (!sameStableObjectMetadata(before, input.identity) or
+        input.filesystem != try filesystemId(input.file) or
+        before.size > limit)
+        return error.SealPathRace;
+    const data = try allocator.alloc(u8, @intCast(before.size));
+    if (try input.file.readPositionalAll(io, data, 0) != data.len)
+        return error.SealPathRace;
+    const after = try input.file.stat(io);
+    if (!sameIdentity(before, after) or
+        input.filesystem != try filesystemId(input.file))
         return error.SealPathRace;
     return data;
 }
@@ -4015,7 +5076,35 @@ fn isDigest(value: []const u8) bool {
     for (value) |byte| {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     }
+
     return true;
+}
+
+test "filesystem-qualified object identity" {
+    try std.testing.expect(sameObjectFields(
+        7,
+        42,
+        .file,
+        7,
+        42,
+        .file,
+    ));
+    try std.testing.expect(!sameObjectFields(
+        7,
+        42,
+        .file,
+        8,
+        42,
+        .file,
+    ));
+    try std.testing.expect(!sameObjectFields(
+        7,
+        42,
+        .file,
+        7,
+        42,
+        .directory,
+    ));
 }
 
 test "cache key covers every declared semantic input" {

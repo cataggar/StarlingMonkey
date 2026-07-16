@@ -128,14 +128,16 @@ routed to Zig rather than CMake):
 
 ```console
 just builddir=build-aot aot-test
+just builddir=build-aot aot-build-prefix-test
 just builddir=build-aot aot-package release-artifacts
 ```
 
 The package recipe validates the AOT engine and its sealed cache before
 publishing `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
 `starling-ics.wevalcache.manifest`. Publication is serialized per release
-directory. Build installs and packages use the same crash-recoverable
-whole-directory generation switch, preserving the three public filenames.
+directory. AOT installs stage the complete prefix privately before the same
+crash-recoverable whole-directory generation switch used by packaging,
+preserving the three public package filenames.
 Non-AOT `just build` modes continue to use CMake.
 
 See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT

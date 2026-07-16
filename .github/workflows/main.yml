@@ -136,9 +136,13 @@ jobs:
   test-aot:
     name: Test sealed Zig AOT
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-aot
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-aot
+      STARLING_REQUIRE_NOEXEC: 1
+      STARLING_NOEXEC_SUDO: 1
     steps:
     - uses: actions/checkout@v4
 
@@ -179,7 +183,17 @@ jobs:
       run: ./deps/build-deps.sh --all
 
     - name: Build and test sealed AOT runtime
-      run: just builddir=zig-out-aot aot-test
+      run: |
+        just builddir=zig-out-aot aot-test
+        just builddir=zig-out-aot aot-build-prefix-test
+
+    - name: Clean up noexec test mount
+      if: always()
+      run: |
+        mountpoint="${{ github.workspace }}/tests/componentizer/.scratch/noexec output"
+        if mountpoint -q "$mountpoint"; then
+          sudo -n umount "$mountpoint"
+        fi
 
     - name: Validate AOT package assembly
       run: just builddir=zig-out-aot aot-package release-artifacts

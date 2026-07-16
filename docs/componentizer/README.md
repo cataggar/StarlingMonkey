@@ -129,16 +129,22 @@ deleted or unrelated rows cannot bind a cache to an engine.
 
 Sealing retains no-follow handles for every input and the initially resolved
 output parents. SQLite parsing, hashing, integrity checks, schema checks, and
-live-row checks all consume those same handles. Publication uses a
-target-scoped kernel lock, private `0700` transaction directories, and a
-checksummed two-slot journal. The journal records both old and new
-inode/content identities and durably advances before and after each cache,
-manifest, and rollback namespace operation. `seal`, `validate`, and the
+live-row checks all consume those same handles. Object identity includes the
+filesystem/device, inode, and kind; stable reads check ctime and repeat content
+digests, so restored mtimes cannot hide in-place mutation. Publication acquires
+the sorted set of cache and manifest destination locks, uses private `0700`
+transaction directories, and maintains a checksummed two-slot journal with a
+durable clean baseline before its first transaction record. The journal records
+both old and new inode/content identities and durably advances around each
+cache, manifest, rollback, quarantine, and cleanup namespace operation.
+`seal`, `validate`, and the
 explicit `starling-aot-cache recover` command recover an interrupted
 transaction before doing new work. Recovery either restores both exact old
-objects or accepts both exact new objects; an unrelated raced replacement is
-never deleted and keeps the journal/backups recoverable until its owner
-resolves the conflict.
+objects or accepts both exact new objects. Rollback exchanges an object into
+quarantine before validating it; an unrelated raced replacement is restored
+when safe, never deleted, and keeps the journal/backups recoverable until its
+owner resolves the conflict. Every affected output and workspace directory is
+synced before committed, rolled-back, cleanup, and clean records.
 
 The lock, journal, and empty private transaction directories use hidden
 `.starling-aot-seal-*` names beside the cache. They are persistent control
@@ -163,6 +169,9 @@ roots are probed with an actual private executable before use. If explicit
 runtime/temp variables are absent, supported Unix hosts also try the platform
 default temporary directory (`/tmp`) before the current directory, so
 read-only installations and no-execute output mounts still work.
+The required CI gate provisions a real `noexec` tmpfs and fails if it cannot;
+local runs explicitly report `SKIP` rather than treating an ordinary
+filesystem probe as coverage.
 
 `--aot-min-stack-size` sets Weval's `RUST_MIN_STACK`. The deterministic
 default is 8 MiB, and ambient `RUST_MIN_STACK` and `STARLINGMONKEY_CONFIG`
@@ -194,13 +203,16 @@ Its fixtures and cache/output paths include spaces.
 
 Release packaging must keep the cache and manifest together. The repository's
 packaging gate builds through Zig and validates both the engine module and the
-sealed SQLite bundle before publication. Build-prefix installation and release
-packaging share `starling-aot-cache publish-bundle`: it overlays the three
-validated files into a private complete generation directory, syncs it, and
-atomically exchanges the whole target directory. A sibling checksummed journal
-recovers abandoned staging, switching, rollback, and cleanup phases before a
-new publisher starts. A target-scoped kernel lock serializes publishers and is
-automatically released on process termination; no child process inherits it.
+sealed SQLite bundle before publication. AOT installation writes every prefix
+artifact, including Weval and the sealed bundle, to a build-cache generation;
+`starling-aot-cache publish-prefix` copies and validates that complete
+generation under the publication lock before atomically exchanging the prefix.
+Release packaging uses `publish-bundle` to overlay its three public artifacts
+into an equally private complete generation. Both commands use the same
+checksummed dual-slot journal and recover abandoned staging, switching,
+rollback, and cleanup phases before a new publisher starts. A target-scoped
+kernel lock serializes publishers and is automatically released on process
+termination; no child process inherits it.
 The public package layout remains three ordinary files with the existing
 names. Hidden `.starling-aot-publish-*` lock/journal files live beside, rather
 than inside, the switched directory:
@@ -496,7 +508,11 @@ differs. The broader `build.zig.zon` minimum remains only a package parser
 floor.
 `--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options. Executable
 overrides may be absolute paths, relative paths containing a separator, or
-bare names resolved through `PATH`.
+bare names resolved through `PATH`. Wizer is resolved only for a non-AOT run
+that actually initializes JavaScript; AOT and non-AOT output-only runs ignore
+ambient Wizer settings. The AOT runtime-only initializer snapshots no engine,
+but resets libc environment state and finalizes the monotonic-clock offset so
+runtime `STARLINGMONKEY_CONFIG` and `-e` arguments are observed after resume.
 
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized

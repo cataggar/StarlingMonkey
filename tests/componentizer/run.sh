@@ -91,9 +91,16 @@ rm -rf "$SCRATCH"
 mkdir -p "$TOOLS" "$WORK/wit package"
 NOEXEC_MOUNTED=0
 NOEXEC_OUTPUT_DIR=""
+unmount_noexec() {
+  if [ "${STARLING_NOEXEC_SUDO:-0}" = 1 ]; then
+    sudo -n umount "$1"
+  else
+    umount "$1"
+  fi
+}
 cleanup() {
   if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
-    umount "$NOEXEC_OUTPUT_DIR" || true
+    unmount_noexec "$NOEXEC_OUTPUT_DIR" || true
   fi
   rm -rf "$SCRATCH"
 }
@@ -1574,6 +1581,33 @@ POSITIONAL_OUTPUT="$WORK/positional native output.wasm"
   "$POSITIONAL_OUTPUT"
 cmp "$ENGINE" "$POSITIONAL_OUTPUT"
 
+INVALID_WIZER="$WORK/ambient wizer must not resolve"
+OUTPUT_ONLY="$WORK/non-aot output only.wasm"
+WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$OUTPUT_ONLY"
+cmp "$ENGINE" "$OUTPUT_ONLY"
+if WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WORK/invalid required wizer.wasm" \
+  "$SOURCE" >"$SCRATCH/invalid-required-wizer.log" 2>&1
+then
+  echo "FAIL: a Wizer-required run ignored invalid WIZER_BIN" >&2
+  exit 1
+fi
+grep -Eq 'FileNotFound|MissingBuildArtifact|failed to resolve executable' \
+  "$SCRATCH/invalid-required-wizer.log"
+
 AOT_BUNDLE="$WORK/aot cache bundle"
 AOT_OUTPUT="$WORK/aot output component.wasm"
 mkdir -p "$AOT_BUNDLE"
@@ -1624,68 +1658,86 @@ PY
 
 NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
 mkdir "$NOEXEC_OUTPUT_DIR"
-noexec_result="explicit executable-probe fallback"
+mount_noexec=(mount)
+if [ "${STARLING_NOEXEC_SUDO:-0}" = 1 ]; then
+  mount_noexec=(sudo -n mount)
+fi
+noexec_options="noexec,mode=700,size=8m,uid=$(id -u),gid=$(id -g)"
 if command -v mount >/dev/null &&
-  mount -t tmpfs -o noexec,mode=700,size=8m \
+  "${mount_noexec[@]}" -t tmpfs -o "$noexec_options" \
     starling-componentizer-noexec "$NOEXEC_OUTPUT_DIR" \
-    2>"$SCRATCH/noexec-mount.log"
-then
+    2>"$SCRATCH/noexec-mount.log"; then
   NOEXEC_MOUNTED=1
-  noexec_result="mounted noexec filesystem"
+  if ! findmnt -n -o OPTIONS --target "$NOEXEC_OUTPUT_DIR" |
+    tr ',' '\n' | grep -Fxq noexec
+  then
+    unmount_noexec "$NOEXEC_OUTPUT_DIR"
+    NOEXEC_MOUNTED=0
+  fi
 fi
-NOEXEC_OUTPUT="$NOEXEC_OUTPUT_DIR/aot component.wasm"
-EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
-"$COMPONENTIZER" \
-  --aot \
-  --engine "$ENGINE" \
-  --aot-cache-dir "$AOT_BUNDLE" \
-  --weval-bin "$TOOLS/fake weval" \
-  --preview2-adapter "$ADAPTER" \
-  --wit "$WIT" \
-  --world-name exports \
-  --wabt-bin "$TOOLS/fake wabt" \
-  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
-  --out "$NOEXEC_OUTPUT" \
-  "$SOURCE"
-cmp "$ENGINE" "$NOEXEC_OUTPUT"
-test -z "$(find "$TOOLS" -maxdepth 1 -name '.starling-aot-exec-*' -print -quit)"
+if [ "$NOEXEC_MOUNTED" -ne 1 ]; then
+  if [ "${STARLING_REQUIRE_NOEXEC:-0}" = 1 ]; then
+    echo "FAIL: required genuine noexec mount is unavailable" >&2
+    cat "$SCRATCH/noexec-mount.log" >&2 || true
+    exit 1
+  fi
+  echo "SKIP: genuine noexec mount is unavailable"
+else
+  NOEXEC_OUTPUT="$NOEXEC_OUTPUT_DIR/aot component.wasm"
+  EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
+  "$COMPONENTIZER" \
+    --aot \
+    --engine "$ENGINE" \
+    --aot-cache-dir "$AOT_BUNDLE" \
+    --weval-bin "$TOOLS/fake weval" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$NOEXEC_OUTPUT" \
+    "$SOURCE"
+  cmp "$ENGINE" "$NOEXEC_OUTPUT"
+  test -z "$(find "$TOOLS" -maxdepth 1 \
+    -name '.starling-aot-exec-*' -print -quit)"
 
-DEFAULT_TEMP="$SCRATCH/platform default temp"
-READONLY_INSTALL="$SCRATCH/read-only install"
-mkdir "$DEFAULT_TEMP" "$READONLY_INSTALL"
-cp "$COMPONENTIZER" "$READONLY_INSTALL/starling-componentize"
-cp "$TOOLS/fake weval" "$READONLY_INSTALL/weval"
-chmod 500 "$READONLY_INSTALL/starling-componentize" "$READONLY_INSTALL/weval"
-chmod 500 "$READONLY_INSTALL"
-DEFAULT_TEMP_OUTPUT="$NOEXEC_OUTPUT_DIR/default temp aot component.wasm"
-(
-  cd "$NOEXEC_OUTPUT_DIR"
-  env -u ZIG_GLOBAL_CACHE_DIR -u XDG_RUNTIME_DIR -u TMPDIR -u TMP -u TEMP \
-    STARLING_AOT_CACHE_TEST_DEFAULT_TMPDIR="$DEFAULT_TEMP" \
-    EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
-    EXPECT_AOT_EXEC_STAGE_ROOT="$DEFAULT_TEMP" \
-    "$READONLY_INSTALL/starling-componentize" \
-      --aot \
-      --engine "$ENGINE" \
-      --aot-cache-dir "$AOT_BUNDLE" \
-      --weval-bin "$READONLY_INSTALL/weval" \
-      --preview2-adapter "$ADAPTER" \
-      --wit "$WIT" \
-      --world-name exports \
-      --wabt-bin "$TOOLS/fake wabt" \
-      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
-      --out "$DEFAULT_TEMP_OUTPUT" \
-      "$SOURCE"
-)
-cmp "$ENGINE" "$DEFAULT_TEMP_OUTPUT"
-test -z "$(find "$DEFAULT_TEMP" -maxdepth 1 \
-  -name '.starling-aot-exec-*' -print -quit)"
-chmod 700 "$READONLY_INSTALL"
-if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
-  umount "$NOEXEC_OUTPUT_DIR"
+  DEFAULT_TEMP="$SCRATCH/platform default temp"
+  READONLY_INSTALL="$SCRATCH/read-only install"
+  mkdir "$DEFAULT_TEMP" "$READONLY_INSTALL"
+  cp "$COMPONENTIZER" "$READONLY_INSTALL/starling-componentize"
+  cp "$TOOLS/fake weval" "$READONLY_INSTALL/weval"
+  chmod 500 "$READONLY_INSTALL/starling-componentize" \
+    "$READONLY_INSTALL/weval"
+  chmod 500 "$READONLY_INSTALL"
+  DEFAULT_TEMP_OUTPUT="$NOEXEC_OUTPUT_DIR/default temp aot component.wasm"
+  (
+    cd "$NOEXEC_OUTPUT_DIR"
+    env -u ZIG_GLOBAL_CACHE_DIR -u XDG_RUNTIME_DIR -u TMPDIR -u TMP \
+      -u TEMP \
+      STARLING_AOT_CACHE_TEST_DEFAULT_TMPDIR="$DEFAULT_TEMP" \
+      EXPECT_AOT_EXEC_STAGE_OUTSIDE="$NOEXEC_OUTPUT_DIR" \
+      EXPECT_AOT_EXEC_STAGE_ROOT="$DEFAULT_TEMP" \
+      "$READONLY_INSTALL/starling-componentize" \
+        --aot \
+        --engine "$ENGINE" \
+        --aot-cache-dir "$AOT_BUNDLE" \
+        --weval-bin "$READONLY_INSTALL/weval" \
+        --preview2-adapter "$ADAPTER" \
+        --wit "$WIT" \
+        --world-name exports \
+        --wabt-bin "$TOOLS/fake wabt" \
+        --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+        --out "$DEFAULT_TEMP_OUTPUT" \
+        "$SOURCE"
+  )
+  cmp "$ENGINE" "$DEFAULT_TEMP_OUTPUT"
+  test -z "$(find "$DEFAULT_TEMP" -maxdepth 1 \
+    -name '.starling-aot-exec-*' -print -quit)"
+  chmod 700 "$READONLY_INSTALL"
+  unmount_noexec "$NOEXEC_OUTPUT_DIR"
   NOEXEC_MOUNTED=0
+  echo "AOT noexec output staging passed (mounted noexec filesystem)"
 fi
-echo "AOT noexec output staging passed ($noexec_result)"
 
 expect_seal_failure() {
   local cache="$1" label="$2"
@@ -1770,7 +1822,7 @@ expect_seal_failure "$INTEGRITY_CACHE" integrity-corrupt
 
 RUNTIME_ONLY_OUTPUT="$WORK/runtime only output.wasm"
 rm -f "$FAKE_AOT_RUNTIME_ARGS_LOG"
-"$COMPONENTIZER" \
+WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
@@ -1792,7 +1844,8 @@ assert args[args.index("--init-func") + 1] == "starling-aot-runtime-initialize"
 PY
 
 export EXPECTED_RUST_MIN_STACK=123456
-PATH="$TOOLS:$PATH" RUST_MIN_STACK=999 "$COMPONENTIZER" \
+PATH="$TOOLS:$PATH" RUST_MIN_STACK=999 WIZER_BIN="$INVALID_WIZER" \
+"$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \

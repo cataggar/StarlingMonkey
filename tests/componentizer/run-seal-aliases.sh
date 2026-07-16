@@ -19,7 +19,14 @@ PRIMER="$WORK/primer.js"
 
 rm -rf "$SCRATCH"
 mkdir -p "$WORK"
-trap 'rm -rf "$SCRATCH"' EXIT
+CROSS_FS_INPUT=""
+cleanup() {
+  if [ -n "$CROSS_FS_INPUT" ]; then
+    rm -f "$CROSS_FS_INPUT"
+  fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
 
 printf 'seal-alias-engine\n' > "$ENGINE"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$WEVAL"
@@ -258,5 +265,33 @@ cp "$SOURCE_CACHE" "$IN_PLACE_CACHE"
   --manifest "$IN_PLACE_MANIFEST" \
   --feature-abi seal-alias-test
 cmp "$SAFE_CACHE" "$IN_PLACE_CACHE"
+
+if [ -d /dev/shm ] && [ -w /dev/shm ] &&
+  [ "$(stat -c %d /dev/shm)" != "$(stat -c %d "$WORK")" ]
+then
+  CROSS_FS_INPUT="/dev/shm/starling-seal-alias-primer-$$.js"
+  cp "$PRIMER" "$CROSS_FS_INPUT"
+  CROSS_FS_CACHE="$WORK/cross-filesystem cache"
+  CROSS_FS_MANIFEST="$WORK/cross-filesystem manifest"
+  "$CACHE_TOOL" seal \
+    --engine "$ENGINE" \
+    --weval "$WEVAL" \
+    --cache "$SOURCE_CACHE" \
+    --cache-out "$CROSS_FS_CACHE" \
+    --primer "$CROSS_FS_INPUT" \
+    --feature-abi seal-alias-test \
+    --out "$CROSS_FS_MANIFEST"
+  "$CACHE_TOOL" validate \
+    --engine "$ENGINE" \
+    --weval "$WEVAL" \
+    --cache "$CROSS_FS_CACHE" \
+    --manifest "$CROSS_FS_MANIFEST" \
+    --feature-abi seal-alias-test
+  rm "$CROSS_FS_INPUT"
+  CROSS_FS_INPUT=""
+  echo "AOT seal cross-filesystem identity test passed"
+else
+  echo "SKIP: no writable second filesystem for AOT alias test"
+fi
 
 echo "AOT seal alias rejection matrix passed"

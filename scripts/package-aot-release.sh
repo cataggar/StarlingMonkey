@@ -37,12 +37,7 @@ done
   --cache "$bin/starling-ics.wevalcache" \
   --manifest "$bin/starling-ics.wevalcache.manifest"
 
-"$bin/wasm-tools" validate --features all \
-  "$release_dir/starling-raw-weval.wasm"
-"$bin/starling-aot-cache" validate \
-  --engine "$release_dir/starling-raw-weval.wasm" \
-  --weval "$bin/weval" \
-  --cache "$release_dir/starling-ics.wevalcache" \
-  --manifest "$release_dir/starling-ics.wevalcache.manifest"
-
-echo "Validated AOT release artifacts in $release_dir"
+generation="$(sed -n 's/^key=//p' \
+  "$bin/starling-ics.wevalcache.manifest")"
+test -n "$generation"
+echo "Published validated AOT release generation $generation in $release_dir"

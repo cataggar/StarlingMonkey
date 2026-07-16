@@ -9,9 +9,10 @@ pub fn main(init: std.process.Init) !void {
     const validating = std.mem.eql(u8, args[1], "validate");
     const recovering = std.mem.eql(u8, args[1], "recover");
     const publishing = std.mem.eql(u8, args[1], "publish-bundle");
+    const publishing_prefix = std.mem.eql(u8, args[1], "publish-prefix");
     const recovering_bundle = std.mem.eql(u8, args[1], "recover-bundle");
     if (!sealing and !validating and !recovering and !publishing and
-        !recovering_bundle) usage();
+        !publishing_prefix and !recovering_bundle) usage();
 
     var engine: ?[]const u8 = null;
     var weval: ?[]const u8 = null;
@@ -23,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var manifest: ?[]const u8 = null;
     var target: ?[]const u8 = null;
     var engine_name: ?[]const u8 = null;
+    var generation: ?[]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) usage();
@@ -46,12 +48,15 @@ pub fn main(init: std.process.Init) !void {
             target = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--engine-name")) {
             engine_name = args[i + 1];
+        } else if (std.mem.eql(u8, args[i], "--generation")) {
+            generation = args[i + 1];
         } else {
             usage();
         }
     }
     if (sealing) {
-        if (manifest != null or target != null or engine_name != null) usage();
+        if (manifest != null or target != null or engine_name != null or
+            generation != null) usage();
         aot_cache.sealWithHooks(
             allocator,
             init.io,
@@ -69,6 +74,9 @@ pub fn main(init: std.process.Init) !void {
                 .wait_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_WAIT_AT",
                 ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
+                ),
                 .fail_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_FAIL",
                 ),
@@ -76,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         ) catch |err| std.process.fatal("failed to seal AOT cache: {t}", .{err});
     } else if (validating) {
         if (primer != null or canonical_cache != null or output != null or
-            target != null or engine_name != null)
+            target != null or engine_name != null or generation != null)
             usage();
         const validated = aot_cache.validateWithHooks(
             allocator,
@@ -93,6 +101,9 @@ pub fn main(init: std.process.Init) !void {
                 .wait_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_WAIT_AT",
                 ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
+                ),
                 .fail_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_FAIL",
                 ),
@@ -102,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (recovering) {
         if (engine != null or weval != null or primer != null or
             canonical_cache != null or output != null or feature_abi != null or
-            target != null or engine_name != null)
+            target != null or engine_name != null or generation != null)
             usage();
         aot_cache.recoverWithHooks(
             allocator,
@@ -116,6 +127,9 @@ pub fn main(init: std.process.Init) !void {
                 .wait_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_WAIT_AT",
                 ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
+                ),
                 .fail_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_FAIL",
                 ),
@@ -127,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Recovered AOT cache transaction\n", .{});
     } else if (publishing) {
         if (primer != null or canonical_cache != null or output != null or
-            target == null)
+            target == null or generation != null)
             usage();
         aot_cache.publishBundleDirectory(
             allocator,
@@ -146,6 +160,9 @@ pub fn main(init: std.process.Init) !void {
                 .wait_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_WAIT_AT",
                 ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
+                ),
                 .fail_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_FAIL",
                 ),
@@ -155,11 +172,45 @@ pub fn main(init: std.process.Init) !void {
             .{err},
         );
         std.debug.print("Published AOT bundle to {s}\n", .{target.?});
+    } else if (publishing_prefix) {
+        if (engine != null or weval != null or cache != null or
+            canonical_cache != null or primer != null or output != null or
+            manifest != null or engine_name != null or target == null or
+            generation == null or feature_abi == null)
+            usage();
+        aot_cache.publishPrefixDirectory(
+            allocator,
+            init.io,
+            target.?,
+            generation.?,
+            feature_abi.?,
+            .{
+                .directory = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_HOOK_DIR",
+                ),
+                .wait_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_WAIT_AT",
+                ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
+                ),
+                .fail_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_FAIL",
+                ),
+            },
+        ) catch |err| std.process.fatal(
+            "failed to publish AOT prefix: {t}",
+            .{err},
+        );
+        std.debug.print(
+            "Published AOT prefix generation to {s}\n",
+            .{target.?},
+        );
     } else {
         if (engine != null or weval != null or cache != null or
             canonical_cache != null or primer != null or feature_abi != null or
             output != null or manifest != null or engine_name != null or
-            target == null)
+            generation != null or target == null)
             usage();
         aot_cache.recoverBundleDirectory(
             allocator,
@@ -171,6 +222,9 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 .wait_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_WAIT_AT",
+                ),
+                .notify_at = init.environ_map.get(
+                    "STARLING_AOT_CACHE_TEST_NOTIFY_AT",
                 ),
                 .fail_at = init.environ_map.get(
                     "STARLING_AOT_CACHE_TEST_FAIL",
@@ -196,6 +250,8 @@ fn usage() noreturn {
             "       starling-aot-cache publish-bundle --target <directory> " ++
             "--engine <wasm> [--engine-name <name>] --weval <bin> " ++
             "--cache <sqlite> --manifest <manifest> [--feature-abi <abi>]\n" ++
+            "       starling-aot-cache publish-prefix --target <directory> " ++
+            "--generation <private-directory> --feature-abi <abi>\n" ++
             "       starling-aot-cache recover-bundle --target <directory>",
         .{},
     );

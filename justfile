@@ -105,6 +105,11 @@ aot-test: aot-build
         -Doptimize=ReleaseSmall -Daot-engine=true
 
 [group('aot')]
+aot-build-prefix-test: aot-build
+    {{ justdir }}/tests/componentizer/run-build-prefix-publication.sh \
+        {{ quote(zig) }} '{{ builddir }}'
+
+[group('aot')]
 aot-package outdir="release-artifacts": aot-build
     {{ justdir }}/scripts/package-aot-release.sh '{{ builddir }}' '{{ outdir }}'
 

@@ -22,6 +22,7 @@ AOT_OUTPUT="$WORK/aot component.wasm"
 AOT_CACHED_OUTPUT="$WORK/aot cached component.wasm"
 AOT_REPRIMED_OUTPUT="$WORK/aot reprimed component.wasm"
 AOT_RUNTIME_OUTPUT="$WORK/aot runtime component.wasm"
+AOT_RUNTIME_INVOKE_OUTPUT="$WORK/aot runtime invocation component.wasm"
 SOURCE="$ROOT/tests/fixtures/js-dispatch.js"
 PRIMER="$ROOT/tools/componentizer/aot-cache-primer.js"
 PRIMER_BACKUP="$CACHE/aot-cache-primer.js.original"
@@ -242,6 +243,27 @@ echo "Clean AOT cache reproducibility passed"
 
 "$AOT_BUNDLE/componentize.sh" --output "$AOT_RUNTIME_OUTPUT"
 "$WASM_TOOLS" validate --features all "$AOT_RUNTIME_OUTPUT"
+"$COMPONENTIZER" \
+  --aot \
+  --build-root "$ROOT" \
+  --cache-dir "$CACHE/runtime-only cache" \
+  --zig-bin "$ZIG" \
+  --weval-bin "$WEVAL" \
+  --preview2-adapter "$ADAPTER" \
+  --wasm-tools-bin "$WASM_TOOLS" \
+  --out "$AOT_RUNTIME_INVOKE_OUTPUT"
+"$WASM_TOOLS" validate --features all "$AOT_RUNTIME_INVOKE_OUTPUT"
+runtime_env_output="$(
+  "$WASMTIME" run -S cli -S http \
+    --env "STARLINGMONKEY_CONFIG=-e console.log('runtime-env-config')" \
+    "$AOT_RUNTIME_INVOKE_OUTPUT"
+)"
+test "$runtime_env_output" = "Log: runtime-env-config"
+runtime_arg_output="$(
+  "$WASMTIME" run -S cli -S http "$AOT_RUNTIME_INVOKE_OUTPUT" \
+    -e "console.log('runtime-argument-config')"
+)"
+test "$runtime_arg_output" = "Log: runtime-argument-config"
 
 OLD_CACHE_SHA="$(sha256sum "$AOT_BUNDLE/starling-ics.wevalcache" | cut -d ' ' -f 1)"
 OLD_PRIMER_SHA="$(sed -n 's/^primer_sha256=//p' "${manifests[0]}")"

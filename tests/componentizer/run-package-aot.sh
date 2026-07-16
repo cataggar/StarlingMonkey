@@ -162,6 +162,67 @@ assert_bundle() {
     --manifest "$target/starling-ics.wevalcache.manifest"
 }
 
+FIRST_BUNDLE_TARGET="$SCRATCH/first bundle target"
+FIRST_BUNDLE_HOOK="$SCRATCH/first-bundle-hook"
+mkdir "$FIRST_BUNDLE_HOOK"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$FIRST_BUNDLE_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-stage \
+  "$PREFIX_A/bin/starling-aot-cache" publish-bundle \
+    --target "$FIRST_BUNDLE_TARGET" \
+    --engine "$PREFIX_A/bin/starling-raw.wasm" \
+    --engine-name starling-raw-weval.wasm \
+    --weval "$PREFIX_A/bin/weval" \
+    --cache "$PREFIX_A/bin/starling-ics.wevalcache" \
+    --manifest "$PREFIX_A/bin/starling-ics.wevalcache.manifest" \
+    >"$SCRATCH/first-bundle.log" 2>&1 &
+first_bundle_pid=$!
+wait_for_hook "$FIRST_BUNDLE_HOOK/before-bundle-stage.ready"
+FIRST_BUNDLE_JOURNAL="$(
+  find "$SCRATCH" -maxdepth 1 \
+    -name '.starling-aot-publish-*.journal' -print -quit
+)"
+test -n "$FIRST_BUNDLE_JOURNAL"
+FIRST_BUNDLE_RECORD="$SCRATCH/first-bundle-record"
+cp "$FIRST_BUNDLE_JOURNAL" "$FIRST_BUNDLE_RECORD"
+kill -KILL "$first_bundle_pid"
+wait "$first_bundle_pid" 2>/dev/null || true
+python3 - "$PREFIX_A/bin/starling-aot-cache" "$FIRST_BUNDLE_TARGET" \
+  "$FIRST_BUNDLE_JOURNAL" "$FIRST_BUNDLE_RECORD" <<'PY'
+import subprocess
+import sys
+
+tool, target, journal, record_path = sys.argv[1:]
+record = open(record_path, "rb").read()
+header_size = 56
+payload_size = int.from_bytes(record[16:20], "little")
+baseline = record[:header_size + payload_size]
+
+def recover(data, label):
+    with open(journal, "wb") as output:
+        output.write(data)
+        output.flush()
+    result = subprocess.run(
+        [tool, "recover-bundle", "--target", target],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        raise AssertionError(
+            f"{label}: {result.stderr.decode(errors='replace')}"
+        )
+
+for length in range(len(baseline) + 1):
+    recover(baseline[:length], f"bundle baseline byte {length}")
+
+slot = 64 * 1024
+assert len(record) > slot
+for length in range(slot, len(record) + 1):
+    recover(record[:length], f"bundle first record byte {length - slot}")
+PY
+"$PREFIX_A/bin/starling-aot-cache" recover-bundle \
+  --target "$FIRST_BUNDLE_TARGET"
+echo "AOT bundle first-journal-write interruption matrix passed"
+
 HOOK_A="$SCRATCH/publisher-A-hook"
 HOOK_B="$SCRATCH/publisher-B-hook"
 mkdir "$HOOK_A" "$HOOK_B"
@@ -174,16 +235,23 @@ pid_a=$!
 wait_for_hook "$HOOK_A/before-bundle-switch.ready"
 STARLING_AOT_CACHE_TEST_HOOK_DIR="$HOOK_B" \
 STARLING_AOT_CACHE_TEST_WAIT_AT=bundle-prepared \
+STARLING_AOT_CACHE_TEST_NOTIFY_AT=bundle-lock-attempt \
   "$PACKAGE_SCRIPT" "$PREFIX_B" "$RELEASE" \
     > "$SCRATCH/package-B.log" 2>&1 &
 pid_b=$!
-sleep 0.2
+wait_for_hook "$HOOK_B/bundle-lock-attempt.ready"
 test ! -e "$HOOK_B/bundle-prepared.ready"
 touch "$HOOK_A/before-bundle-switch.continue"
 wait "$pid_a"
 wait_for_hook "$HOOK_B/bundle-prepared.ready"
 touch "$HOOK_B/bundle-prepared.continue"
 wait "$pid_b"
+grep -Fq "generation $(sed -n 's/^key=//p' \
+  "$PREFIX_A/bin/starling-ics.wevalcache.manifest")" \
+  "$SCRATCH/package-A.log"
+grep -Fq "generation $(sed -n 's/^key=//p' \
+  "$PREFIX_B/bin/starling-ics.wevalcache.manifest")" \
+  "$SCRATCH/package-B.log"
 assert_bundle "$RELEASE"
 cmp "$RELEASE/starling-raw-weval.wasm" "$PREFIX_B/bin/starling-raw.wasm"
 
@@ -267,49 +335,123 @@ cmp "$ROLLBACK_RELEASE/starling-raw-weval.wasm" \
   "$PREFIX_A/bin/starling-raw.wasm"
 
 BUILD_PREFIX="$SCRATCH/existing build prefix"
-BUILD_BIN="$BUILD_PREFIX/bin"
-mkdir -p "$BUILD_BIN"
-"$PREFIX_A/bin/starling-aot-cache" publish-bundle \
-  --target "$BUILD_BIN" \
-  --engine "$PREFIX_A/bin/starling-raw.wasm" \
-  --engine-name starling-raw.wasm \
-  --weval "$PREFIX_A/bin/weval" \
-  --cache "$PREFIX_A/bin/starling-ics.wevalcache" \
-  --manifest "$PREFIX_A/bin/starling-ics.wevalcache.manifest"
-printf 'preserved installed tool\n' > "$BUILD_BIN/starling-componentize"
+make_prefix_generation() {
+  local label="$1" serial="$2"
+  local source generation bin
+  source="$SCRATCH/source $label"
+  generation="$SCRATCH/.existing build prefix.generation-$label-$serial"
+  bin="$generation/bin"
+  rm -rf "$generation"
+  mkdir -p "$bin"
+  cp "$source/bin/starling-raw.wasm" "$bin/"
+  cp "$source/bin/starling-ics.wevalcache" "$bin/"
+  cp "$source/bin/starling-ics.wevalcache.manifest" "$bin/"
+  cp "$source/bin/starling-aot-cache" "$bin/"
+  cp "$source/bin/weval" "$bin/"
+  cp "$source/bin/wasm-tools" "$bin/"
+  cp "$source/bin/wasm-tools" "$bin/wasmtime"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/starling-componentize"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/componentize.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/wabt"
+  printf 'preview adapter %s\n' "$label" > "$bin/preview1-adapter.wasm"
+  printf '{"generation":"%s"}\n' "$label" > "$bin/features.json"
+  printf 'console.log("smoke %s");\n' "$label" > "$bin/smoke.js"
+  chmod +x "$bin/starling-aot-cache" "$bin/weval" "$bin/wasm-tools" \
+    "$bin/wasmtime" "$bin/starling-componentize" "$bin/componentize.sh" \
+    "$bin/wabt"
+  printf '%s\n' "$generation"
+}
+
+assert_prefix() {
+  local target="$1" owner="$2"
+  local source="$SCRATCH/source $owner"
+  cmp "$target/bin/starling-raw.wasm" "$source/bin/starling-raw.wasm"
+  cmp "$target/bin/starling-ics.wevalcache" \
+    "$source/bin/starling-ics.wevalcache"
+  cmp "$target/bin/starling-ics.wevalcache.manifest" \
+    "$source/bin/starling-ics.wevalcache.manifest"
+  test -s "$target/bin/starling-componentize"
+  test -s "$target/bin/componentize.sh"
+  test -s "$target/bin/preview1-adapter.wasm"
+  test -s "$target/bin/features.json"
+  test -s "$target/bin/smoke.js"
+  test -s "$target/bin/wabt"
+  test -x "$target/bin/wasmtime"
+}
+
+generation_a="$(make_prefix_generation A initial)"
+"$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+  --target "$BUILD_PREFIX" \
+  --generation "$generation_a" \
+  --feature-abi package-race-A
+assert_prefix "$BUILD_PREFIX" A
+BUILD_BASELINE="$(
+  find "$BUILD_PREFIX" -type f -print0 |
+    sort -z |
+    xargs -0 sha256sum
+)"
+BUILD_INODE="$(stat -c '%d:%i' "$BUILD_PREFIX")"
 for phase in \
-  before-bundle-stage \
-  after-bundle-stage \
-  bundle-engine-staged \
-  bundle-cache-staged \
-  bundle-manifest-staged \
-  bundle-prepared \
-  before-bundle-switch \
-  after-bundle-switch
+  prefix-files-durable \
+  prefix-validated \
+  prefix-prepared \
+  before-prefix-switch \
+  after-prefix-switch
 do
+  generation_b="$(make_prefix_generation B "$phase")"
   if STARLING_AOT_CACHE_TEST_FAIL="$phase" \
-    "$PREFIX_B/bin/starling-aot-cache" publish-bundle \
-      --target "$BUILD_BIN" \
-      --engine "$PREFIX_B/bin/starling-raw.wasm" \
-      --engine-name starling-raw.wasm \
-      --weval "$PREFIX_B/bin/weval" \
-      --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
-      --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
+    "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+      --target "$BUILD_PREFIX" \
+      --generation "$generation_b" \
+      --feature-abi package-race-B \
       > "$SCRATCH/build-prefix-$phase.log" 2>&1
   then
     echo "FAIL: build-prefix $phase injection unexpectedly succeeded" >&2
     exit 1
   fi
   "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
-    --target "$BUILD_BIN"
-  cmp "$BUILD_BIN/starling-raw.wasm" "$PREFIX_A/bin/starling-raw.wasm"
-  cmp "$BUILD_BIN/starling-ics.wevalcache" \
-    "$PREFIX_A/bin/starling-ics.wevalcache"
-  cmp "$BUILD_BIN/starling-ics.wevalcache.manifest" \
-    "$PREFIX_A/bin/starling-ics.wevalcache.manifest"
-  grep -Fq 'preserved installed tool' "$BUILD_BIN/starling-componentize"
+    --target "$BUILD_PREFIX"
+  assert_prefix "$BUILD_PREFIX" A
+  test "$(stat -c '%d:%i' "$BUILD_PREFIX")" = "$BUILD_INODE"
+  test "$(
+    find "$BUILD_PREFIX" -type f -print0 |
+      sort -z |
+      xargs -0 sha256sum
+  )" = "$BUILD_BASELINE"
 done
+
+PREFIX_HOOK_A="$SCRATCH/prefix-publisher-A-hook"
+PREFIX_HOOK_B="$SCRATCH/prefix-publisher-B-hook"
+mkdir "$PREFIX_HOOK_A" "$PREFIX_HOOK_B"
+generation_a="$(make_prefix_generation A concurrent)"
+generation_b="$(make_prefix_generation B concurrent)"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$PREFIX_HOOK_A" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-prefix-switch \
+  "$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$generation_a" \
+    --feature-abi package-race-A \
+    > "$SCRATCH/prefix-A.log" 2>&1 &
+prefix_pid_a=$!
+wait_for_hook "$PREFIX_HOOK_A/before-prefix-switch.ready"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$PREFIX_HOOK_B" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=prefix-prepared \
+STARLING_AOT_CACHE_TEST_NOTIFY_AT=prefix-lock-attempt \
+  "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$generation_b" \
+    --feature-abi package-race-B \
+    > "$SCRATCH/prefix-B.log" 2>&1 &
+prefix_pid_b=$!
+wait_for_hook "$PREFIX_HOOK_B/prefix-lock-attempt.ready"
+test ! -e "$PREFIX_HOOK_B/prefix-prepared.ready"
+touch "$PREFIX_HOOK_A/before-prefix-switch.continue"
+wait "$prefix_pid_a"
+wait_for_hook "$PREFIX_HOOK_B/prefix-prepared.ready"
+touch "$PREFIX_HOOK_B/prefix-prepared.continue"
+wait "$prefix_pid_b"
+assert_prefix "$BUILD_PREFIX" B
 
 echo "Serialized atomic-directory AOT package publication passed"
 echo "AOT package SIGKILL recovery matrix passed"
-echo "Transactional AOT build-prefix failure matrix passed"
+echo "Transactional AOT build-prefix failure/concurrency matrix passed"
