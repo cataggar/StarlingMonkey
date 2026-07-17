@@ -7,7 +7,7 @@ const File = std.Io.File;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const schema = "starling-weval-cache-v1";
+pub const schema = "starling-weval-cache-v2";
 pub const engine_abi = "spidermonkey-pbl-weval-aot-ics-v1";
 pub const cache_abi = "weval-sqlite-v1";
 pub const primer_abi = "starling-aot-cache-initialize-v1";
@@ -19,6 +19,7 @@ pub const Error = error{
     AotCacheTestFailure,
     CorruptCache,
     IncompleteCache,
+    InstallOwnershipConflict,
     InvalidCacheFormat,
     InvalidCacheSchema,
     InvalidDestinationKind,
@@ -32,11 +33,18 @@ pub const Error = error{
     StaleFeatureAbi,
     StaleTool,
     TransactionRecoveryRequired,
+    UnsafeWevalPackage,
+    WevalPackageRace,
+    WevalPackageTooDeep,
+    WevalPackageTooLarge,
 };
 
 pub const Validated = struct {
     key: []const u8,
     feature_abi: []const u8,
+    weval_package_sha256: []const u8,
+    weval_selected_relative: []const u8,
+    weval_selected_basename: []const u8,
 };
 
 const Manifest = struct {
@@ -46,6 +54,18 @@ const Manifest = struct {
     cache_sha256: []const u8 = "",
     feature_abi: []const u8 = "",
     primer_sha256: []const u8 = "",
+    weval_package_sha256: []const u8 = "",
+    weval_selected_relative: []const u8 = "",
+    weval_selected_basename: []const u8 = "",
+};
+
+const WevalPackageSeal = struct {
+    root: []const u8,
+    selected: []const u8,
+    provenance: []const u8,
+    digest: []const u8,
+    selected_relative: []const u8,
+    selected_basename: []const u8,
 };
 
 pub fn featureAbi(
@@ -170,6 +190,13 @@ pub fn sealWithHooks(
         engine_sha,
     );
     defer canonical.deinit(io);
+    const weval_package = try inspectWevalPackage(
+        allocator,
+        io,
+        weval_path,
+    );
+    if (!std.mem.eql(u8, weval_package.provenance, transaction.weval.resolved))
+        return error.WevalPackageRace;
     const weval_sha = try hashStableFileHex(allocator, io, transaction.weval);
     try runSealHook(allocator, io, hooks, "after-weval-hash");
     const primer_sha = try hashStableFileHex(allocator, io, transaction.primer);
@@ -180,6 +207,9 @@ pub fn sealWithHooks(
         allocator,
         engine_sha,
         weval_sha,
+        weval_package.digest,
+        weval_package.selected_relative,
+        weval_package.selected_basename,
         feature_abi,
         primer_sha,
     );
@@ -194,7 +224,10 @@ pub fn sealWithHooks(
             "weval_sha256={s}\n" ++
             "cache_sha256={s}\n" ++
             "feature_abi={s}\n" ++
-            "primer_sha256={s}\n",
+            "primer_sha256={s}\n" ++
+            "weval_package_sha256={s}\n" ++
+            "weval_selected_relative={s}\n" ++
+            "weval_selected_basename={s}\n",
         .{
             schema,
             key,
@@ -206,6 +239,9 @@ pub fn sealWithHooks(
             cache_sha,
             feature_abi,
             primer_sha,
+            weval_package.digest,
+            weval_package.selected_relative,
+            weval_package.selected_basename,
         },
     );
     var manifest = try createPrivateFile(
@@ -229,6 +265,7 @@ pub fn sealWithHooks(
         weval_sha,
         source_sha,
         primer_sha,
+        weval_package,
     );
 
     try publishBundle(
@@ -368,7 +405,7 @@ const SealTransaction = struct {
         errdefer manifest_output.deinit(io);
         const engine = try openStableInput(allocator, io, "engine", engine_path);
         errdefer engine.close(io);
-        const weval = try openStableInput(allocator, io, "Weval binary", weval_path);
+        const weval = try openWevalInput(allocator, io, weval_path);
         errdefer weval.close(io);
         const source_cache = try openStableInput(
             allocator,
@@ -530,6 +567,7 @@ const SealTransaction = struct {
         weval_sha: []const u8,
         source_sha: []const u8,
         primer_sha: []const u8,
+        weval_package: WevalPackageSeal,
     ) !void {
         const inputs = [_]struct {
             input: StableInput,
@@ -549,8 +587,459 @@ const SealTransaction = struct {
             if (!std.mem.eql(u8, current, expected.digest))
                 return error.SealPathRace;
         }
+        const current_package = try inspectWevalPackage(
+            allocator,
+            io,
+            weval_package.selected,
+        );
+        if (!std.mem.eql(u8, current_package.provenance, transaction.weval.resolved) or
+            !std.mem.eql(u8, current_package.digest, weval_package.digest) or
+            !std.mem.eql(
+                u8,
+                current_package.selected_relative,
+                weval_package.selected_relative,
+            ) or
+            !std.mem.eql(
+                u8,
+                current_package.selected_basename,
+                weval_package.selected_basename,
+            ))
+            return error.WevalPackageRace;
     }
 };
+
+fn openWevalInput(
+    allocator: Allocator,
+    io: Io,
+    supplied: []const u8,
+) !StableInput {
+    const absolute = try absoluteSealPath(allocator, io, supplied);
+    const resolved = Dir.realPathFileAbsoluteAlloc(
+        io,
+        absolute,
+        allocator,
+    ) catch return error.MissingCacheArtifact;
+    var file = try Dir.openFileAbsolute(io, resolved, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const identity = try file.stat(io);
+    if (identity.kind != .file) return error.MissingCacheArtifact;
+    return .{
+        .role = "Weval binary",
+        .supplied = supplied,
+        .absolute = absolute,
+        .resolved = resolved,
+        .file = file,
+        .identity = identity,
+        .filesystem = try filesystemId(file),
+    };
+}
+
+const weval_package_max_entries = 4096;
+const weval_package_max_depth = 32;
+const weval_package_max_bytes: u64 = 1024 * 1024 * 1024;
+
+const WevalPackageHashState = struct {
+    allocator: Allocator,
+    io: Io,
+    hasher: Sha256 = Sha256.init(.{}),
+    entries: usize = 0,
+    bytes: u64 = 0,
+    symlinks: std.ArrayList([]const u8) = .empty,
+};
+
+const WevalPackageIdentity = struct {
+    stat: File.Stat,
+    filesystem: u128,
+};
+
+fn inspectWevalPackage(
+    allocator: Allocator,
+    io: Io,
+    selected_path: []const u8,
+) !WevalPackageSeal {
+    const absolute = try absoluteSealPath(allocator, io, selected_path);
+    const parent_path = std.fs.path.dirname(absolute) orelse
+        return error.UnsafeWevalPackage;
+    const selected_basename = std.fs.path.basename(absolute);
+    try validateBundleBasename(selected_basename);
+    const root = Dir.realPathFileAbsoluteAlloc(
+        io,
+        parent_path,
+        allocator,
+    ) catch return error.UnsafeWevalPackage;
+    const selected = try std.fs.path.join(
+        allocator,
+        &.{ root, selected_basename },
+    );
+    var selected_name = Dir.openFileAbsolute(io, selected, .{
+        .path_only = true,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return error.UnsafeWevalPackage;
+    defer selected_name.close(io);
+    const selected_stat = try selected_name.stat(io);
+    if (selected_stat.kind != .file and selected_stat.kind != .sym_link)
+        return error.UnsafeWevalPackage;
+    const provenance = Dir.realPathFileAbsoluteAlloc(
+        io,
+        selected,
+        allocator,
+    ) catch return error.UnsafeWevalPackage;
+    if (!wevalPathContains(root, provenance))
+        return error.UnsafeWevalPackage;
+    var executable = try Dir.openFileAbsolute(io, provenance, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer executable.close(io);
+    const executable_stat = try executable.stat(io);
+    if (executable_stat.kind != .file)
+        return error.UnsafeWevalPackage;
+    if (File.Permissions.has_executable_bit and
+        executable_stat.permissions.toMode() & 0o111 == 0)
+        return error.UnsafeWevalPackage;
+    const selected_relative = try allocator.dupe(u8, selected_basename);
+    try validateWevalSelection(selected_relative, selected_basename);
+    return .{
+        .root = root,
+        .selected = selected,
+        .provenance = provenance,
+        .digest = try hashWevalPackageHex(allocator, io, root),
+        .selected_relative = selected_relative,
+        .selected_basename = try allocator.dupe(u8, selected_basename),
+    };
+}
+
+pub fn validateWevalPackage(
+    allocator: Allocator,
+    io: Io,
+    selected_path: []const u8,
+    expected: Validated,
+) !void {
+    const package = try inspectWevalPackage(allocator, io, selected_path);
+    if (!std.mem.eql(
+        u8,
+        package.digest,
+        expected.weval_package_sha256,
+    ) or !std.mem.eql(
+        u8,
+        package.selected_relative,
+        expected.weval_selected_relative,
+    ) or !std.mem.eql(
+        u8,
+        package.selected_basename,
+        expected.weval_selected_basename,
+    ))
+        return error.StaleTool;
+}
+
+fn hashWevalPackageHex(
+    allocator: Allocator,
+    io: Io,
+    root_path: []const u8,
+) ![]const u8 {
+    var root = try Dir.openDirAbsolute(io, root_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer root.close(io);
+    const root_identity = try wevalDirectoryIdentity(io, root);
+    if (root_identity.stat.kind != .directory)
+        return error.UnsafeWevalPackage;
+    var state: WevalPackageHashState = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer state.symlinks.deinit(allocator);
+    state.hasher.update("starling-weval-package-v1\x00");
+    hashWevalPackageEntry(&state.hasher, 'd', "", root_identity.stat);
+    try hashWevalPackageDirectory(
+        &state,
+        root,
+        "",
+        0,
+        root_identity,
+    );
+    for (state.symlinks.items) |relative| {
+        const link_path = try std.fs.path.join(
+            allocator,
+            &.{ root_path, relative },
+        );
+        const resolved = Dir.realPathFileAbsoluteAlloc(
+            io,
+            link_path,
+            allocator,
+        ) catch return error.UnsafeWevalPackage;
+        if (!wevalPathContains(root_path, resolved))
+            return error.UnsafeWevalPackage;
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    state.hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &encoded);
+}
+
+fn hashWevalPackageDirectory(
+    state: *WevalPackageHashState,
+    directory: Dir,
+    relative_dir: []const u8,
+    depth: usize,
+    initial_identity: WevalPackageIdentity,
+) anyerror!void {
+    if (depth > weval_package_max_depth)
+        return error.WevalPackageTooDeep;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(state.allocator);
+    var iterator = directory.iterate();
+    while (try iterator.next(state.io)) |entry| {
+        if (state.entries >= weval_package_max_entries)
+            return error.WevalPackageTooLarge;
+        state.entries += 1;
+        names.append(
+            state.allocator,
+            try state.allocator.dupe(u8, entry.name),
+        ) catch @panic("out of memory");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+
+    for (names.items) |name| {
+        try validateBundleBasename(name);
+        const relative = if (relative_dir.len == 0)
+            try state.allocator.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(
+                state.allocator,
+                "{s}/{s}",
+                .{ relative_dir, name },
+            );
+        const identity = try wevalPathIdentity(state.io, directory, name);
+        switch (identity.stat.kind) {
+            .file => {
+                if (identity.stat.size > weval_package_max_bytes - state.bytes)
+                    return error.WevalPackageTooLarge;
+                state.bytes += identity.stat.size;
+                hashWevalPackageEntry(
+                    &state.hasher,
+                    'f',
+                    relative,
+                    identity.stat,
+                );
+                var file = try directory.openFile(state.io, name, .{
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                });
+                defer file.close(state.io);
+                const opened = try wevalFileIdentity(state.io, file);
+                if (!sameStableWevalIdentity(identity, opened))
+                    return error.WevalPackageRace;
+                const digest = try hashWevalPackageFile(state.io, file);
+                const final = try wevalFileIdentity(state.io, file);
+                if (!sameStableWevalIdentity(identity, final))
+                    return error.WevalPackageRace;
+                state.hasher.update(&digest);
+            },
+            .directory => {
+                hashWevalPackageEntry(
+                    &state.hasher,
+                    'd',
+                    relative,
+                    identity.stat,
+                );
+                var child = try directory.openDir(state.io, name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(state.io);
+                const opened = try wevalDirectoryIdentity(state.io, child);
+                if (!sameStableWevalIdentity(identity, opened))
+                    return error.WevalPackageRace;
+                try hashWevalPackageDirectory(
+                    state,
+                    child,
+                    relative,
+                    depth + 1,
+                    opened,
+                );
+            },
+            .sym_link => {
+                hashWevalPackageEntry(
+                    &state.hasher,
+                    'l',
+                    relative,
+                    identity.stat,
+                );
+                var target_buffer: [Dir.max_path_bytes]u8 = undefined;
+                const target_len = try directory.readLink(
+                    state.io,
+                    name,
+                    &target_buffer,
+                );
+                const target = target_buffer[0..target_len];
+                if (target.len == 0 or std.fs.path.isAbsolute(target))
+                    return error.UnsafeWevalPackage;
+                var verify_buffer: [Dir.max_path_bytes]u8 = undefined;
+                const verify_len = try directory.readLink(
+                    state.io,
+                    name,
+                    &verify_buffer,
+                );
+                if (!std.mem.eql(u8, target, verify_buffer[0..verify_len]))
+                    return error.WevalPackageRace;
+                hashWevalPackageBytes(&state.hasher, target);
+                state.symlinks.append(
+                    state.allocator,
+                    try state.allocator.dupe(u8, relative),
+                ) catch @panic("out of memory");
+            },
+            else => return error.UnsafeWevalPackage,
+        }
+        try verifyWevalNameIdentity(
+            state.io,
+            directory,
+            name,
+            identity,
+        );
+    }
+    const final_identity = try wevalDirectoryIdentity(state.io, directory);
+    if (!sameStableWevalIdentity(initial_identity, final_identity))
+        return error.WevalPackageRace;
+}
+
+fn hashWevalPackageEntry(
+    hasher: *Sha256,
+    kind: u8,
+    relative: []const u8,
+    stat: File.Stat,
+) void {
+    hasher.update(&.{kind});
+    hashWevalPackageBytes(hasher, relative);
+    const executable_mode: u16 = if (File.Permissions.has_executable_bit)
+        @intCast(stat.permissions.toMode() & 0o111)
+    else
+        0;
+    var encoded_mode: [2]u8 = undefined;
+    std.mem.writeInt(u16, &encoded_mode, executable_mode, .little);
+    hasher.update(&encoded_mode);
+}
+
+fn hashWevalPackageBytes(hasher: *Sha256, value: []const u8) void {
+    var encoded_length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_length, value.len, .little);
+    hasher.update(&encoded_length);
+    hasher.update(value);
+}
+
+fn hashWevalPackageFile(
+    io: Io,
+    file: File,
+) ![Sha256.digest_length]u8 {
+    const before = try file.stat(io);
+    if (before.kind != .file) return error.UnsafeWevalPackage;
+    var hasher = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try file.readPositional(io, &.{&buffer}, offset);
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    if (offset != before.size or
+        !sameStableContent(before, try file.stat(io)))
+        return error.WevalPackageRace;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn wevalPathIdentity(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+) !WevalPackageIdentity {
+    var file = try parent.openFile(io, name, .{
+        .path_only = true,
+        .allow_directory = true,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    return wevalFileIdentity(io, file);
+}
+
+fn wevalFileIdentity(io: Io, file: File) !WevalPackageIdentity {
+    return .{
+        .stat = try file.stat(io),
+        .filesystem = try filesystemId(file),
+    };
+}
+
+fn wevalDirectoryIdentity(io: Io, dir: Dir) !WevalPackageIdentity {
+    return wevalFileIdentity(io, .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    });
+}
+
+fn verifyWevalNameIdentity(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    expected: WevalPackageIdentity,
+) !void {
+    const current = try wevalPathIdentity(io, parent, name);
+    if (!sameStableWevalIdentity(expected, current))
+        return error.WevalPackageRace;
+}
+
+fn sameStableWevalIdentity(
+    left: WevalPackageIdentity,
+    right: WevalPackageIdentity,
+) bool {
+    return left.filesystem == right.filesystem and
+        left.stat.kind == right.stat.kind and
+        left.stat.inode == right.stat.inode and
+        left.stat.nlink == right.stat.nlink and
+        left.stat.size == right.stat.size and
+        left.stat.permissions == right.stat.permissions and
+        left.stat.mtime.nanoseconds == right.stat.mtime.nanoseconds and
+        left.stat.ctime.nanoseconds == right.stat.ctime.nanoseconds;
+}
+
+fn wevalPathContains(root: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (!std.mem.startsWith(u8, candidate, root) or candidate.len <= root.len)
+        return false;
+    return candidate[root.len] == std.fs.path.sep;
+}
+
+fn validateWevalSelection(
+    relative: []const u8,
+    basename: []const u8,
+) Error!void {
+    validateValue(relative) catch return error.InvalidManifest;
+    validateValue(basename) catch return error.InvalidManifest;
+    if (std.fs.path.isAbsolute(relative) or
+        std.mem.indexOfScalar(u8, relative, '\\') != null or
+        std.mem.indexOf(u8, relative, "//") != null or
+        std.mem.eql(u8, relative, ".") or
+        std.mem.eql(u8, relative, "..") or
+        !std.mem.eql(u8, std.fs.path.basename(relative), basename))
+        return error.InvalidManifest;
+    var components = std.mem.splitScalar(u8, relative, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return error.InvalidManifest;
+    }
+    validateBundleBasename(basename) catch return error.InvalidManifest;
+}
 
 fn openStableInput(
     allocator: Allocator,
@@ -561,7 +1050,7 @@ fn openStableInput(
     const absolute = try absoluteSealPath(allocator, io, supplied);
     var file = try Dir.openFileAbsolute(io, absolute, .{
         .allow_directory = false,
-        .follow_symlinks = false,
+        .follow_symlinks = true,
     });
     errdefer file.close(io);
     const identity = try file.stat(io);
@@ -3022,7 +3511,380 @@ const BundleControl = struct {
     journal_name: []const u8,
 };
 
+const managed_prefix_name = ".starling-aot-engine";
+const managed_prefix_owner_name = "owner";
+const managed_prefix_owner = "starling-aot-prefix-owner-v1\n";
+const managed_prefix_manifest_name = "ownership.manifest";
+const managed_prefix_manifest_schema = "starling-aot-prefix-ownership-v1";
+const managed_prefix_generation_name = "current";
+
 pub fn publishPrefixDirectory(
+    allocator: Allocator,
+    io: Io,
+    target_path: []const u8,
+    generation_path: []const u8,
+    expected_feature_abi: []const u8,
+    hooks: SealHooks,
+) !void {
+    const target_absolute = try absoluteSealPath(allocator, io, target_path);
+    try Dir.cwd().createDirPath(io, target_absolute);
+    var prefix = Dir.openDirAbsolute(io, target_absolute, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.InstallOwnershipConflict;
+    defer prefix.close(io);
+    if ((try prefix.stat(io)).kind != .directory)
+        return error.InstallOwnershipConflict;
+    var managed = try openManagedPrefix(allocator, io, prefix);
+    defer managed.close(io);
+    const expected = try managedPrefixEntries(
+        allocator,
+        io,
+        generation_path,
+    );
+    try verifyManagedPrefixOwnership(
+        allocator,
+        io,
+        prefix,
+        managed,
+        expected,
+        false,
+    );
+    const managed_absolute = try std.fs.path.join(
+        allocator,
+        &.{ target_absolute, managed_prefix_name },
+    );
+    const current_path = try std.fs.path.join(
+        allocator,
+        &.{ managed_absolute, managed_prefix_generation_name },
+    );
+    try publishGenerationDirectory(
+        allocator,
+        io,
+        current_path,
+        generation_path,
+        expected_feature_abi,
+        hooks,
+    );
+    try ensureManagedPrefixOwnership(
+        allocator,
+        io,
+        prefix,
+        managed,
+        expected,
+    );
+}
+
+const ManagedPrefixEntries = struct {
+    names: []const []const u8,
+    manifest: []const u8,
+};
+
+fn openManagedPrefix(
+    allocator: Allocator,
+    io: Io,
+    prefix: Dir,
+) !Dir {
+    _ = allocator;
+    const permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    var created = true;
+    prefix.createDir(io, managed_prefix_name, permissions) catch |err| switch (err) {
+        error.PathAlreadyExists => created = false,
+        else => return err,
+    };
+    var managed = prefix.openDir(io, managed_prefix_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.InstallOwnershipConflict;
+    errdefer managed.close(io);
+    if ((try managed.stat(io)).kind != .directory)
+        return error.InstallOwnershipConflict;
+    if (created) {
+        var owner = try managed.createFile(io, managed_prefix_owner_name, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = if (File.Permissions.has_executable_bit)
+                File.Permissions.fromMode(0o600)
+            else
+                .default_file,
+        });
+        defer owner.close(io);
+        try owner.writePositionalAll(io, managed_prefix_owner, 0);
+        try owner.sync(io);
+        try syncDir(io, managed);
+    } else {
+        try verifyManagedOwner(io, managed);
+    }
+    return managed;
+}
+
+fn verifyManagedOwner(io: Io, managed: Dir) !void {
+    var owner = managed.openFile(io, managed_prefix_owner_name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return error.InstallOwnershipConflict;
+    defer owner.close(io);
+    const stat = try owner.stat(io);
+    if (stat.kind != .file or stat.size != managed_prefix_owner.len)
+        return error.InstallOwnershipConflict;
+    var contents: [managed_prefix_owner.len]u8 = undefined;
+    if (try owner.readPositionalAll(io, &contents, 0) != contents.len or
+        !std.mem.eql(u8, &contents, managed_prefix_owner))
+        return error.InstallOwnershipConflict;
+}
+
+fn managedPrefixEntries(
+    allocator: Allocator,
+    io: Io,
+    generation_path: []const u8,
+) !ManagedPrefixEntries {
+    const generation_absolute = try absoluteSealPath(
+        allocator,
+        io,
+        generation_path,
+    );
+    var generation = try Dir.openDirAbsolute(io, generation_absolute, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer generation.close(io);
+    var bin = generation.openDir(io, "bin", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.MissingCacheArtifact;
+    defer bin.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var iterator = bin.iterate();
+    while (try iterator.next(io)) |entry| {
+        try validateBundleBasename(entry.name);
+        switch (entry.kind) {
+            .file, .directory, .sym_link => {},
+            else => return error.InvalidDestinationKind,
+        }
+        names.append(
+            allocator,
+            try allocator.dupe(u8, entry.name),
+        ) catch @panic("out of memory");
+    }
+    if (names.items.len == 0) return error.MissingCacheArtifact;
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+    var manifest: std.ArrayList(u8) = .empty;
+    manifest.appendSlice(
+        allocator,
+        "schema=" ++ managed_prefix_manifest_schema ++ "\n",
+    ) catch @panic("out of memory");
+    for (names.items) |name| {
+        manifest.appendSlice(allocator, "entry=bin/") catch
+            @panic("out of memory");
+        manifest.appendSlice(allocator, name) catch @panic("out of memory");
+        manifest.append(allocator, '\n') catch @panic("out of memory");
+    }
+    return .{
+        .names = try names.toOwnedSlice(allocator),
+        .manifest = try manifest.toOwnedSlice(allocator),
+    };
+}
+
+fn managedCurrentExists(io: Io, managed: Dir) !bool {
+    var current = managed.openDir(io, managed_prefix_generation_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return error.InstallOwnershipConflict,
+    };
+    defer current.close(io);
+    return (try current.stat(io)).kind == .directory;
+}
+
+fn openManagedBin(io: Io, prefix: Dir, create: bool) !?Dir {
+    if (create) {
+        const permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+            File.Permissions.fromMode(0o755)
+        else
+            .default_dir;
+        prefix.createDir(io, "bin", permissions) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    return prefix.openDir(io, "bin", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => if (create)
+            return error.InstallOwnershipConflict
+        else
+            return null,
+        else => return error.InstallOwnershipConflict,
+    };
+}
+
+fn managedLinkTarget(
+    allocator: Allocator,
+    name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "../{s}/{s}/bin/{s}",
+        .{
+            managed_prefix_name,
+            managed_prefix_generation_name,
+            name,
+        },
+    );
+}
+
+fn managedLinkState(
+    allocator: Allocator,
+    io: Io,
+    bin: Dir,
+    name: []const u8,
+) !bool {
+    var link = bin.openFile(io, name, .{
+        .path_only = true,
+        .allow_directory = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return error.InstallOwnershipConflict,
+    };
+    defer link.close(io);
+    if ((try link.stat(io)).kind != .sym_link)
+        return error.InstallOwnershipConflict;
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const length = bin.readLink(io, name, &buffer) catch
+        return error.InstallOwnershipConflict;
+    const expected = try managedLinkTarget(allocator, name);
+    if (!std.mem.eql(u8, buffer[0..length], expected))
+        return error.InstallOwnershipConflict;
+    return true;
+}
+
+fn readManagedManifest(
+    allocator: Allocator,
+    io: Io,
+    managed: Dir,
+) !?[]const u8 {
+    var file = managed.openFile(io, managed_prefix_manifest_name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.InstallOwnershipConflict,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size > 64 * 1024)
+        return error.InstallOwnershipConflict;
+    const contents = try allocator.alloc(u8, @intCast(stat.size));
+    if (try file.readPositionalAll(io, contents, 0) != contents.len)
+        return error.InstallOwnershipConflict;
+    return contents;
+}
+
+fn verifyManagedPrefixOwnership(
+    allocator: Allocator,
+    io: Io,
+    prefix: Dir,
+    managed: Dir,
+    expected: ManagedPrefixEntries,
+    require_manifest: bool,
+) !void {
+    const manifest = try readManagedManifest(allocator, io, managed);
+    if (manifest) |contents| {
+        if (!std.mem.eql(u8, contents, expected.manifest))
+            return error.InstallOwnershipConflict;
+    } else if (require_manifest) {
+        return error.InstallOwnershipConflict;
+    }
+    var bin = (try openManagedBin(io, prefix, false)) orelse {
+        if (manifest != null) return error.InstallOwnershipConflict;
+        return;
+    };
+    defer bin.close(io);
+    const recovering = manifest == null and try managedCurrentExists(io, managed);
+    for (expected.names) |name| {
+        const exists = try managedLinkState(allocator, io, bin, name);
+        if (manifest != null and !exists)
+            return error.InstallOwnershipConflict;
+        if (manifest == null and exists and !recovering)
+            return error.InstallOwnershipConflict;
+    }
+}
+
+fn ensureManagedPrefixOwnership(
+    allocator: Allocator,
+    io: Io,
+    prefix: Dir,
+    managed: Dir,
+    expected: ManagedPrefixEntries,
+) !void {
+    var bin = (try openManagedBin(io, prefix, true)).?;
+    defer bin.close(io);
+    for (expected.names) |name| {
+        if (!try managedLinkState(allocator, io, bin, name)) {
+            const target = try managedLinkTarget(allocator, name);
+            bin.symLink(io, target, name, .{}) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    if (!try managedLinkState(allocator, io, bin, name))
+                        return error.InstallOwnershipConflict;
+                },
+                else => return err,
+            };
+        }
+    }
+    try syncDir(io, bin);
+    if (try readManagedManifest(allocator, io, managed) == null) {
+        var staged = try createPrivateFile(
+            allocator,
+            io,
+            managed,
+            ".ownership-manifest",
+        );
+        defer staged.deinit(io);
+        try staged.file.writePositionalAll(io, expected.manifest, 0);
+        try staged.file.sync(io);
+        var renamed = true;
+        managed.renamePreserve(
+            staged.name,
+            managed,
+            managed_prefix_manifest_name,
+            io,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                renamed = false;
+                const existing = (try readManagedManifest(
+                    allocator,
+                    io,
+                    managed,
+                )) orelse return error.InstallOwnershipConflict;
+                if (!std.mem.eql(u8, existing, expected.manifest))
+                    return error.InstallOwnershipConflict;
+            },
+            else => return err,
+        };
+        if (renamed) staged.name_exists = false;
+        try syncDir(io, managed);
+    }
+    try verifyManagedPrefixOwnership(
+        allocator,
+        io,
+        prefix,
+        managed,
+        expected,
+        true,
+    );
+}
+
+fn publishGenerationDirectory(
     allocator: Allocator,
     io: Io,
     target_path: []const u8,
@@ -3415,6 +4277,7 @@ pub fn publishBundleDirectory(
         weval_path,
     );
     defer weval.close(io);
+    const initial_weval_sha = try hashStableFileHex(allocator, io, weval);
     const cache = try openStableInput(
         allocator,
         io,
@@ -3436,8 +4299,6 @@ pub fn publishBundleDirectory(
     try runSealHook(allocator, io, hooks, "bundle-cache-staged");
     try replacePrivateFile(io, stage, manifest_basename, manifest);
     try runSealHook(allocator, io, hooks, "bundle-manifest-staged");
-    const validation_weval = ".starling-aot-validation-weval";
-    try replacePrivateFile(io, stage, validation_weval, weval);
     try syncDir(io, stage);
 
     const stage_absolute = try std.fs.path.join(
@@ -3447,10 +4308,6 @@ pub fn publishBundleDirectory(
     const staged_engine = try std.fs.path.join(
         allocator,
         &.{ stage_absolute, engine_name },
-    );
-    const staged_weval = try std.fs.path.join(
-        allocator,
-        &.{ stage_absolute, validation_weval },
     );
     const staged_cache = try std.fs.path.join(
         allocator,
@@ -3464,12 +4321,14 @@ pub fn publishBundleDirectory(
         allocator,
         io,
         staged_engine,
-        staged_weval,
+        weval_path,
         staged_cache,
         staged_manifest,
         expected_feature_abi,
     );
-    try stage.deleteFile(io, validation_weval);
+    const final_weval_sha = try rehashStableFileHex(allocator, io, weval);
+    if (!std.mem.eql(u8, initial_weval_sha, final_weval_sha))
+        return error.SealPathRace;
     try stage.setPermissions(io, target_permissions);
     try syncDir(io, stage);
     try writeBundlePhase(
@@ -3577,6 +4436,73 @@ pub fn publishBundleDirectory(
 }
 
 pub fn recoverBundleDirectory(
+    allocator: Allocator,
+    io: Io,
+    target_path: []const u8,
+    hooks: SealHooks,
+) !void {
+    const target_absolute = try absoluteSealPath(allocator, io, target_path);
+    var prefix = Dir.openDirAbsolute(io, target_absolute, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return recoverGenerationDirectory(
+            allocator,
+            io,
+            target_path,
+            hooks,
+        ),
+        else => return recoverGenerationDirectory(
+            allocator,
+            io,
+            target_path,
+            hooks,
+        ),
+    };
+    defer prefix.close(io);
+    var managed = prefix.openDir(io, managed_prefix_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return recoverGenerationDirectory(
+            allocator,
+            io,
+            target_path,
+            hooks,
+        ),
+        else => return error.InstallOwnershipConflict,
+    };
+    defer managed.close(io);
+    try verifyManagedOwner(io, managed);
+    const managed_absolute = try std.fs.path.join(
+        allocator,
+        &.{ target_absolute, managed_prefix_name },
+    );
+    const current_path = try std.fs.path.join(
+        allocator,
+        &.{ managed_absolute, managed_prefix_generation_name },
+    );
+    try recoverGenerationDirectory(allocator, io, current_path, hooks);
+    if (!try managedCurrentExists(io, managed)) return;
+    const expected = try managedPrefixEntries(allocator, io, current_path);
+    try verifyManagedPrefixOwnership(
+        allocator,
+        io,
+        prefix,
+        managed,
+        expected,
+        false,
+    );
+    try ensureManagedPrefixOwnership(
+        allocator,
+        io,
+        prefix,
+        managed,
+        expected,
+    );
+}
+
+fn recoverGenerationDirectory(
     allocator: Allocator,
     io: Io,
     target_path: []const u8,
@@ -3858,7 +4784,10 @@ fn validateInstalledPrefix(
         allocator,
         &.{ bin_path, "starling-raw.wasm" },
     );
-    const weval = try std.fs.path.join(allocator, &.{ bin_path, "weval" });
+    const weval = try std.fs.path.join(
+        allocator,
+        &.{ generation_path, "weval-package", "weval" },
+    );
     const cache = try std.fs.path.join(
         allocator,
         &.{ bin_path, cache_basename },
@@ -4375,10 +5304,9 @@ pub fn validateWithHooks(
         else => return err,
     };
     defer engine.close(io);
-    const weval = openStableInput(
+    const weval = openWevalInput(
         allocator,
         io,
-        "Weval binary",
         weval_path,
     ) catch |err| switch (err) {
         error.FileNotFound => return error.MissingCacheArtifact,
@@ -4417,6 +5345,28 @@ pub fn validateWithHooks(
     const parsed = try parseManifest(data);
     const engine_sha = try rehashStableFileHex(allocator, io, engine);
     if (!std.mem.eql(u8, parsed.engine_sha256, engine_sha)) return error.StaleEngine;
+    const weval_package = try inspectWevalPackage(
+        allocator,
+        io,
+        weval_path,
+    );
+    if (!std.mem.eql(u8, weval_package.provenance, weval.resolved) or
+        !std.mem.eql(
+            u8,
+            parsed.weval_package_sha256,
+            weval_package.digest,
+        ) or
+        !std.mem.eql(
+            u8,
+            parsed.weval_selected_relative,
+            weval_package.selected_relative,
+        ) or
+        !std.mem.eql(
+            u8,
+            parsed.weval_selected_basename,
+            weval_package.selected_basename,
+        ))
+        return error.StaleTool;
     const weval_sha = try rehashStableFileHex(allocator, io, weval);
     if (!std.mem.eql(u8, parsed.weval_sha256, weval_sha)) return error.StaleTool;
     if (expected_feature_abi) |expected| {
@@ -4426,6 +5376,9 @@ pub fn validateWithHooks(
         allocator,
         parsed.engine_sha256,
         parsed.weval_sha256,
+        parsed.weval_package_sha256,
+        parsed.weval_selected_relative,
+        parsed.weval_selected_basename,
         parsed.feature_abi,
         parsed.primer_sha256,
     );
@@ -4457,7 +5410,30 @@ pub fn validateWithHooks(
     );
     if (!std.mem.eql(u8, data, final_manifest))
         return error.SealPathRace;
-    return .{ .key = parsed.key, .feature_abi = parsed.feature_abi };
+    const final_package = try inspectWevalPackage(
+        allocator,
+        io,
+        weval_path,
+    );
+    if (!std.mem.eql(u8, final_package.digest, parsed.weval_package_sha256) or
+        !std.mem.eql(
+            u8,
+            final_package.selected_relative,
+            parsed.weval_selected_relative,
+        ) or
+        !std.mem.eql(
+            u8,
+            final_package.selected_basename,
+            parsed.weval_selected_basename,
+        ))
+        return error.WevalPackageRace;
+    return .{
+        .key = parsed.key,
+        .feature_abi = parsed.feature_abi,
+        .weval_package_sha256 = parsed.weval_package_sha256,
+        .weval_selected_relative = parsed.weval_selected_relative,
+        .weval_selected_basename = parsed.weval_selected_basename,
+    };
 }
 
 fn readStableFileAlloc(
@@ -4548,11 +5524,27 @@ fn parseManifest(data: []const u8) Error!Manifest {
             if (seen & 512 != 0 or !isDigest(value)) return error.InvalidManifest;
             seen |= 512;
             manifest.primer_sha256 = value;
+        } else if (std.mem.eql(u8, name, "weval_package_sha256")) {
+            if (seen & 1024 != 0 or !isDigest(value)) return error.InvalidManifest;
+            seen |= 1024;
+            manifest.weval_package_sha256 = value;
+        } else if (std.mem.eql(u8, name, "weval_selected_relative")) {
+            if (seen & 2048 != 0) return error.InvalidManifest;
+            seen |= 2048;
+            manifest.weval_selected_relative = value;
+        } else if (std.mem.eql(u8, name, "weval_selected_basename")) {
+            if (seen & 4096 != 0) return error.InvalidManifest;
+            seen |= 4096;
+            manifest.weval_selected_basename = value;
         } else {
             return error.InvalidManifest;
         }
     }
-    if (seen != 0x3ff) return error.InvalidManifest;
+    if (seen != 0x1fff) return error.InvalidManifest;
+    try validateWevalSelection(
+        manifest.weval_selected_relative,
+        manifest.weval_selected_basename,
+    );
     return manifest;
 }
 
@@ -4560,6 +5552,9 @@ fn cacheKey(
     allocator: Allocator,
     engine_sha: []const u8,
     weval_sha: []const u8,
+    weval_package_sha: []const u8,
+    weval_selected_relative: []const u8,
+    weval_selected_basename: []const u8,
     feature_abi: []const u8,
     primer_sha: []const u8,
 ) ![]const u8 {
@@ -4570,6 +5565,9 @@ fn cacheKey(
     hashField(&hasher, "primer-abi", primer_abi);
     hashField(&hasher, "engine-sha256", engine_sha);
     hashField(&hasher, "weval-sha256", weval_sha);
+    hashField(&hasher, "weval-package-sha256", weval_package_sha);
+    hashField(&hasher, "weval-selected-relative", weval_selected_relative);
+    hashField(&hasher, "weval-selected-basename", weval_selected_basename);
     hashField(&hasher, "feature-abi", feature_abi);
     hashField(&hasher, "primer-sha256", primer_sha);
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -5112,6 +6110,9 @@ test "cache key covers every declared semantic input" {
         std.testing.allocator,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "bin/weval",
+        "weval",
         "features-a",
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     );
@@ -5120,6 +6121,9 @@ test "cache key covers every declared semantic input" {
         std.testing.allocator,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "bin/weval",
+        "weval",
         "features-b",
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     );

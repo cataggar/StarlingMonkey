@@ -108,7 +108,9 @@ zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 ```
 
 Weval AOT uses a distinct SpiderMonkey build and a sealed, engine-specific IC
-cache. Build that variant and select it explicitly:
+cache. All v0.4 AOT builds use exactly Zig
+`0.17.0-dev.902+7255f3e72`; another 0.17 development build is not supported.
+Build that variant and select it explicitly:
 
 ```console
 ./deps/build-deps.sh --all
@@ -138,6 +140,11 @@ publishing `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
 directory. AOT installs stage the complete prefix privately before the same
 crash-recoverable whole-directory generation switch used by packaging,
 preserving the three public package filenames.
+The main v0.4 release inventory is exactly those three inseparable AOT files
+plus `starling-raw.wasm`, `starling-raw-debug.wasm`, `starling.wasm`,
+`starling-debug.wasm`, and `preview1-adapter.wasm`. The release gate rejects
+extra files, including `starling-raw-weval-external.wasm`, and incomplete or
+unsealed AOT bundles.
 Non-AOT `just build` modes continue to use CMake.
 
 See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT

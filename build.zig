@@ -370,6 +370,18 @@ pub fn build(b: *std.Build) void {
     );
     aot_shell_test_step.dependOn(&aot_shell_test.step);
     componentizer_test_step.dependOn(aot_shell_test_step);
+    const archive_test = b.addSystemCommand(
+        &.{ "bash", "deps/test-spidermonkey-archive.sh" },
+    );
+    archive_test.addArg(b.graph.zig_exe);
+    componentizer_test_step.dependOn(&archive_test.step);
+    const release_inventory_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-release-inventory.sh" },
+    );
+    release_inventory_test.addFileArg(
+        b.path("scripts/check-release-artifacts.sh"),
+    );
+    componentizer_test_step.dependOn(&release_inventory_test.step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
@@ -948,8 +960,18 @@ pub fn build(b: *std.Build) void {
         _ = addPrefixBinFile(b, aot_generation, d.path("wasm-tools"), "wasm-tools");
     if (b.lazyDependency("wasmtime", .{})) |d|
         _ = addPrefixBinFile(b, aot_generation, d.path("wasmtime"), "wasmtime");
-    if (b.lazyDependency("weval", .{})) |d|
-        _ = addPrefixBinFile(b, aot_generation, d.path("weval"), "weval");
+    if (b.lazyDependency("weval", .{})) |d| {
+        if (aot_generation) |generation| {
+            _ = generation.addCopyDirectory(
+                d.path("."),
+                "weval-package",
+                .{},
+            );
+            _ = addPrefixBinFile(b, aot_generation, d.path("weval"), "weval");
+        } else {
+            _ = addPrefixBinFile(b, aot_generation, d.path("weval"), "weval");
+        }
+    }
 
     const componentize_sh = renderComponentizeScript(
         b,

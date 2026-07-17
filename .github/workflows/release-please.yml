@@ -108,6 +108,7 @@ jobs:
             exit 1
           fi
           just builddir=build-aot aot-package release-artifacts
+          ./scripts/check-release-artifacts.sh release-artifacts
 
           echo "Release artifacts:"
           ls -la release-artifacts/

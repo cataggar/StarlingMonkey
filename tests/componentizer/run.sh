@@ -15,6 +15,8 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 BARRIERS="$SCRATCH/test barriers"
 TOOLS="$SCRATCH/fake tools"
+WEVAL_PACKAGE="$SCRATCH/fake weval package"
+FAKE_WEVAL="$WEVAL_PACKAGE/fake weval"
 WORK="$SCRATCH/work with spaces"
 FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
 FAKE_HOST_API_DIR="$FAKE_BUILD_ROOT/host-apis/$EXPECTED_HOST_API"
@@ -88,7 +90,7 @@ printf 'adapter-bytes\n' > \
   "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
 rm -rf "$SCRATCH"
-mkdir -p "$TOOLS" "$WORK/wit package"
+mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package"
 NOEXEC_MOUNTED=0
 NOEXEC_OUTPUT_DIR=""
 unmount_noexec() {
@@ -276,7 +278,7 @@ input="${!#}"
 cp "$input" "$out"
 EOF
 
-cat > "$TOOLS/fake weval" <<'EOF'
+cat > "$FAKE_WEVAL" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 test -z "${STARLINGMONKEY_CONFIG+x}"
@@ -735,6 +737,7 @@ done
 cp "${!#}" "$out"
 EOF
 chmod +x "$TOOLS"/*
+chmod +x "$FAKE_WEVAL"
 for tool in zig wizer wasmtime wabt wasm-tools weval; do
   ln -s "fake $tool" "$TOOLS/path-$tool"
 done
@@ -1644,14 +1647,14 @@ db.close()
 PY
 "$CACHE_TOOL" seal \
   --engine "$ENGINE" \
-  --weval "$TOOLS/fake weval" \
+  --weval "$FAKE_WEVAL" \
   --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
   --primer "$SOURCE" \
   --feature-abi 'starling-features-v1;fake=1' \
   --out "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
 "$CACHE_TOOL" validate \
   --engine "$ENGINE" \
-  --weval "$TOOLS/fake weval" \
+  --weval "$FAKE_WEVAL" \
   --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
   --manifest "$AOT_BUNDLE/starling-ics.wevalcache.manifest" \
   --feature-abi 'starling-features-v1;fake=1'
@@ -1696,6 +1699,19 @@ run_fixture_aot() {
   cmp "$ENGINE" "$output"
 }
 
+expect_fixture_aot_rejection() {
+  local weval="$1" bundle="$2" label="$3"
+  local output="$WORK/$label rejected output.wasm"
+  printf 'preserved package rejection\n' > "$output"
+  if run_fixture_aot "$weval" "$bundle" "$output" \
+    >"$SCRATCH/$label-package-rejection.log" 2>&1
+  then
+    echo "FAIL: $label Weval package mutation was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "$output")" = "preserved package rejection"
+}
+
 WRAPPER_PACKAGE="$SCRATCH/wrapper weval package"
 WRAPPER_BUNDLE="$WORK/wrapper weval bundle"
 WRAPPER_OUTPUT="$WORK/wrapper weval output.wasm"
@@ -1731,6 +1747,63 @@ run_fixture_aot \
   "$WRAPPER_PACKAGE/wrapper weval" \
   "$WRAPPER_BUNDLE" \
   "$WRAPPER_OUTPUT"
+
+cp -p "$WRAPPER_PACKAGE/weval sibling" \
+  "$SCRATCH/wrapper-sibling.baseline"
+printf '# sibling mutation\n' >> "$WRAPPER_PACKAGE/weval sibling"
+expect_fixture_aot_rejection \
+  "$WRAPPER_PACKAGE/wrapper weval" \
+  "$WRAPPER_BUNDLE" \
+  wrapper-sibling
+cp -p "$SCRATCH/wrapper-sibling.baseline" \
+  "$WRAPPER_PACKAGE/weval sibling"
+chmod -x "$WRAPPER_PACKAGE/weval sibling"
+expect_fixture_aot_rejection \
+  "$WRAPPER_PACKAGE/wrapper weval" \
+  "$WRAPPER_BUNDLE" \
+  wrapper-permission
+chmod +x "$WRAPPER_PACKAGE/weval sibling"
+
+RELOCATED_PACKAGE_ONE="$SCRATCH/relocated package one"
+RELOCATED_PACKAGE_TWO="$SCRATCH/relocated package two"
+RELOCATED_BUNDLE_ONE="$WORK/relocated bundle one"
+RELOCATED_BUNDLE_TWO="$WORK/relocated bundle two"
+cp -a "$WRAPPER_PACKAGE" "$RELOCATED_PACKAGE_ONE"
+cp -a "$WRAPPER_PACKAGE" "$RELOCATED_PACKAGE_TWO"
+seal_fixture_bundle \
+  "$RELOCATED_PACKAGE_ONE/wrapper weval" \
+  "$RELOCATED_BUNDLE_ONE"
+seal_fixture_bundle \
+  "$RELOCATED_PACKAGE_TWO/wrapper weval" \
+  "$RELOCATED_BUNDLE_TWO"
+cmp "$RELOCATED_BUNDLE_ONE/starling-ics.wevalcache" \
+  "$RELOCATED_BUNDLE_TWO/starling-ics.wevalcache"
+cmp "$RELOCATED_BUNDLE_ONE/starling-ics.wevalcache.manifest" \
+  "$RELOCATED_BUNDLE_TWO/starling-ics.wevalcache.manifest"
+run_fixture_aot \
+  "$RELOCATED_PACKAGE_TWO/wrapper weval" \
+  "$RELOCATED_BUNDLE_ONE" \
+  "$WORK/relocated package output.wasm"
+
+ln -s "wrapper weval" "$WRAPPER_PACKAGE/selected path A"
+ln -s "wrapper weval" "$WRAPPER_PACKAGE/selected path B"
+SELECTED_PATH_BUNDLE="$WORK/selected path bundle"
+seal_fixture_bundle \
+  "$WRAPPER_PACKAGE/selected path A" \
+  "$SELECTED_PATH_BUNDLE"
+expect_fixture_aot_rejection \
+  "$WRAPPER_PACKAGE/selected path B" \
+  "$SELECTED_PATH_BUNDLE" \
+  selected-path
+
+LEGACY_PACKAGE_BUNDLE="$WORK/legacy package manifest bundle"
+cp -R "$WRAPPER_BUNDLE" "$LEGACY_PACKAGE_BUNDLE"
+sed -i 's/^schema=starling-weval-cache-v2$/schema=starling-weval-cache-v1/' \
+  "$LEGACY_PACKAGE_BUNDLE/starling-ics.wevalcache.manifest"
+expect_fixture_aot_rejection \
+  "$WRAPPER_PACKAGE/wrapper weval" \
+  "$LEGACY_PACKAGE_BUNDLE" \
+  legacy-package-schema
 
 ELF_PACKAGE="$SCRATCH/ELF weval package with spaces"
 ELF_BUNDLE="$WORK/ELF weval bundle"
@@ -1790,31 +1863,52 @@ cc -o "$ELF_PACKAGE/bin/weval-real" \
   -Wl,-rpath,'$ORIGIN' \
   -lweval_fixture
 ln -s "bin/weval-real" "$ELF_PACKAGE/weval argv0 alias"
-seal_fixture_bundle "$ELF_PACKAGE/bin/weval-real" "$ELF_BUNDLE"
+seal_fixture_bundle "$ELF_PACKAGE/weval argv0 alias" "$ELF_BUNDLE"
 run_fixture_aot \
   "$ELF_PACKAGE/weval argv0 alias" \
   "$ELF_BUNDLE" \
   "$ELF_OUTPUT"
 
+cp -p "$ELF_PACKAGE/bin/libweval_fixture.so" \
+  "$SCRATCH/libweval-fixture.baseline"
+printf 'library mutation\n' >> "$ELF_PACKAGE/bin/libweval_fixture.so"
+expect_fixture_aot_rejection \
+  "$ELF_PACKAGE/weval argv0 alias" \
+  "$ELF_BUNDLE" \
+  origin-library
+cp -p "$SCRATCH/libweval-fixture.baseline" \
+  "$ELF_PACKAGE/bin/libweval_fixture.so"
+
+SYMLINK_PACKAGE="$SCRATCH/symlink target package"
+SYMLINK_BUNDLE="$WORK/symlink target bundle"
+mkdir "$SYMLINK_PACKAGE"
+cp "$FAKE_WEVAL" "$SYMLINK_PACKAGE/target A"
+cp "$FAKE_WEVAL" "$SYMLINK_PACKAGE/target B"
+ln -s "target A" "$SYMLINK_PACKAGE/selected weval"
+seal_fixture_bundle \
+  "$SYMLINK_PACKAGE/selected weval" \
+  "$SYMLINK_BUNDLE"
+ln -sfn "target B" "$SYMLINK_PACKAGE/selected weval"
+expect_fixture_aot_rejection \
+  "$SYMLINK_PACKAGE/selected weval" \
+  "$SYMLINK_BUNDLE" \
+  symlink-target
+
 UNSAFE_PACKAGE="$SCRATCH/unsafe weval package"
 UNSAFE_BUNDLE="$WORK/unsafe weval bundle"
 UNSAFE_OUTPUT="$WORK/unsafe weval output.wasm"
 mkdir "$UNSAFE_PACKAGE"
-cp "$TOOLS/fake weval" "$UNSAFE_PACKAGE/weval"
+cp "$FAKE_WEVAL" "$UNSAFE_PACKAGE/weval"
 printf 'outside package\n' > "$SCRATCH/outside package sibling"
 ln -s "../outside package sibling" "$UNSAFE_PACKAGE/escaping sibling"
-seal_fixture_bundle "$UNSAFE_PACKAGE/weval" "$UNSAFE_BUNDLE"
-printf 'preserved unsafe output\n' > "$UNSAFE_OUTPUT"
-if run_fixture_aot \
+if seal_fixture_bundle \
   "$UNSAFE_PACKAGE/weval" \
-  "$UNSAFE_BUNDLE" \
-  "$UNSAFE_OUTPUT" >"$SCRATCH/unsafe-weval.log" 2>&1
+  "$UNSAFE_BUNDLE" >"$SCRATCH/unsafe-weval.log" 2>&1
 then
-  echo "FAIL: escaping Weval package symlink was accepted" >&2
+  echo "FAIL: escaping Weval package symlink was sealed" >&2
   exit 1
 fi
 grep -Fq UnsafeWevalPackage "$SCRATCH/unsafe-weval.log"
-test "$(cat "$UNSAFE_OUTPUT")" = "preserved unsafe output"
 
 NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
 mkdir "$NOEXEC_OUTPUT_DIR"
@@ -1849,7 +1943,7 @@ else
     --aot \
     --engine "$ENGINE" \
     --aot-cache-dir "$AOT_BUNDLE" \
-    --weval-bin "$TOOLS/fake weval" \
+    --weval-bin "$FAKE_WEVAL" \
     --preview2-adapter "$ADAPTER" \
     --wit "$WIT" \
     --world-name exports \
@@ -1865,9 +1959,10 @@ else
   READONLY_INSTALL="$SCRATCH/read-only install"
   mkdir "$DEFAULT_TEMP" "$READONLY_INSTALL"
   cp "$COMPONENTIZER" "$READONLY_INSTALL/starling-componentize"
-  cp "$TOOLS/fake weval" "$READONLY_INSTALL/weval"
+  mkdir "$READONLY_INSTALL/weval-package"
+  cp "$FAKE_WEVAL" "$READONLY_INSTALL/weval-package/weval"
   chmod 500 "$READONLY_INSTALL/starling-componentize" \
-    "$READONLY_INSTALL/weval"
+    "$READONLY_INSTALL/weval-package/weval"
   chmod 500 "$READONLY_INSTALL"
   DEFAULT_TEMP_OUTPUT="$NOEXEC_OUTPUT_DIR/default temp aot component.wasm"
   (
@@ -1881,7 +1976,7 @@ else
         --aot \
         --engine "$ENGINE" \
         --aot-cache-dir "$AOT_BUNDLE" \
-        --weval-bin "$READONLY_INSTALL/weval" \
+        --weval-bin "$READONLY_INSTALL/weval-package/weval" \
         --preview2-adapter "$ADAPTER" \
         --wit "$WIT" \
         --world-name exports \
@@ -1903,7 +1998,7 @@ expect_seal_failure() {
   local cache="$1" label="$2"
   if "$CACHE_TOOL" seal \
     --engine "$ENGINE" \
-    --weval "$TOOLS/fake weval" \
+    --weval "$FAKE_WEVAL" \
     --cache "$cache" \
     --primer "$SOURCE" \
     --feature-abi 'starling-features-v1;fake=1' \
@@ -1986,7 +2081,7 @@ WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
-  --weval-bin "$TOOLS/fake weval" \
+  --weval-bin "$FAKE_WEVAL" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
@@ -2004,13 +2099,13 @@ assert args[args.index("--init-func") + 1] == "starling-aot-runtime-initialize"
 PY
 
 export EXPECTED_RUST_MIN_STACK=123456
-PATH="$TOOLS:$PATH" RUST_MIN_STACK=999 WIZER_BIN="$INVALID_WIZER" \
+PATH="$WEVAL_PACKAGE:$TOOLS:$PATH" RUST_MIN_STACK=999 WIZER_BIN="$INVALID_WIZER" \
 "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
   --aot-min-stack-size "$EXPECTED_RUST_MIN_STACK" \
-  --weval-bin path-weval \
+  --weval-bin "fake weval" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
@@ -2025,8 +2120,8 @@ LEGACY_PREOPEN="$SCRATCH/legacy preopen"
 LEGACY_PREOPEN_OUTPUT="$WORK/legacy preopen output.wasm"
 mkdir -p "$LEGACY_PREOPEN"
 export EXPECTED_RUST_MIN_STACK=8388608
-env PATH="$TOOLS:$PATH" \
-  WEVAL_BIN=path-weval WABT=path-wabt WASM_TOOLS_BIN=path-wasm-tools \
+env PATH="$WEVAL_PACKAGE:$TOOLS:$PATH" \
+  WEVAL_BIN="fake weval" WABT=path-wabt WASM_TOOLS_BIN=path-wasm-tools \
   "$COMPONENTIZER" \
   --aot \
   --legacy-wrapper-preopen \
@@ -2050,7 +2145,7 @@ DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE/starling-ics.wevalcache" \
-  --weval-bin "$TOOLS/fake weval" \
+  --weval-bin "$FAKE_WEVAL" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
@@ -2061,16 +2156,27 @@ DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
 cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
 
 RACE_ENGINE="$WORK/race engine.wasm"
-RACE_WEVAL="$TOOLS/race weval"
-RACE_SIBLING="$TOOLS/race sibling"
+RACE_PACKAGE="$SCRATCH/race weval package"
+RACE_WEVAL="$RACE_PACKAGE/race weval"
+RACE_SIBLING="$RACE_PACKAGE/race sibling"
 RACE_BUNDLE="$WORK/race cache bundle"
 RACE_ENGINE_BASELINE="$WORK/race engine baseline.wasm"
 RACE_CACHE_BASELINE="$WORK/race cache baseline.sqlite"
 RACE_OUTPUT="$WORK/race output component.wasm"
 cp "$ENGINE" "$RACE_ENGINE"
-cp "$TOOLS/fake weval" "$RACE_WEVAL"
+mkdir "$RACE_PACKAGE"
+cp "$FAKE_WEVAL" "$RACE_WEVAL"
 printf 'snapshot sibling\n' > "$RACE_SIBLING"
-cp -R "$AOT_BUNDLE" "$RACE_BUNDLE"
+mkdir "$RACE_BUNDLE"
+cp "$AOT_BUNDLE/starling-ics.wevalcache" \
+  "$RACE_BUNDLE/starling-ics.wevalcache"
+"$CACHE_TOOL" seal \
+  --engine "$RACE_ENGINE" \
+  --weval "$RACE_WEVAL" \
+  --cache "$RACE_BUNDLE/starling-ics.wevalcache" \
+  --primer "$SOURCE" \
+  --feature-abi 'starling-features-v1;fake=1' \
+  --out "$RACE_BUNDLE/starling-ics.wevalcache.manifest"
 cp "$RACE_ENGINE" "$RACE_ENGINE_BASELINE"
 cp "$RACE_BUNDLE/starling-ics.wevalcache" "$RACE_CACHE_BASELINE"
 EXPECT_AOT_SNAPSHOT=1 \
@@ -2103,7 +2209,7 @@ if FAKE_AOT_FAIL=1 "$COMPONENTIZER" \
   --aot \
   --engine "$ENGINE" \
   --aot-cache-dir "$AOT_BUNDLE" \
-  --weval-bin "$TOOLS/fake weval" \
+  --weval-bin "$FAKE_WEVAL" \
   --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
@@ -2147,27 +2253,27 @@ expect_aot_cache_failure() {
   test "$(cat "$failure_output")" = "preserved"
 }
 
-expect_aot_cache_failure "$WORK/missing bundle" "$ENGINE" "$TOOLS/fake weval" missing
+expect_aot_cache_failure "$WORK/missing bundle" "$ENGINE" "$FAKE_WEVAL" missing
 
 STALE_ENGINE="$WORK/stale engine.wasm"
 cp "$ENGINE" "$STALE_ENGINE"
 printf 'stale\n' >> "$STALE_ENGINE"
-expect_aot_cache_failure "$AOT_BUNDLE" "$STALE_ENGINE" "$TOOLS/fake weval" stale
+expect_aot_cache_failure "$AOT_BUNDLE" "$STALE_ENGINE" "$FAKE_WEVAL" stale
 
 CORRUPT_BUNDLE="$WORK/corrupt cache bundle"
 cp -R "$AOT_BUNDLE" "$CORRUPT_BUNDLE"
 printf 'corrupt\n' >> "$CORRUPT_BUNDLE/starling-ics.wevalcache"
-expect_aot_cache_failure "$CORRUPT_BUNDLE" "$ENGINE" "$TOOLS/fake weval" corrupt
+expect_aot_cache_failure "$CORRUPT_BUNDLE" "$ENGINE" "$FAKE_WEVAL" corrupt
 
 STALE_WEVAL="$TOOLS/stale weval"
-cp "$TOOLS/fake weval" "$STALE_WEVAL"
+cp "$FAKE_WEVAL" "$STALE_WEVAL"
 printf '# stale tool\n' >> "$STALE_WEVAL"
 expect_aot_cache_failure "$AOT_BUNDLE" "$ENGINE" "$STALE_WEVAL" stale-tool
 
 INVALID_BUNDLE="$WORK/invalid manifest bundle"
 cp -R "$AOT_BUNDLE" "$INVALID_BUNDLE"
 printf 'not-a-manifest\n' > "$INVALID_BUNDLE/starling-ics.wevalcache.manifest"
-expect_aot_cache_failure "$INVALID_BUNDLE" "$ENGINE" "$TOOLS/fake weval" invalid-manifest
+expect_aot_cache_failure "$INVALID_BUNDLE" "$ENGINE" "$FAKE_WEVAL" invalid-manifest
 unset EXPECTED_RUST_MIN_STACK
 
 SOURCE_ALIAS_DIR="$SCRATCH/real sources"

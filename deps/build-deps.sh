@@ -47,6 +47,7 @@ OPENSSL_VERSION="3.0.17"
 
 command -v zig >/dev/null || { echo "zig not found on PATH"; exit 1; }
 command -v cargo >/dev/null || { echo "cargo not found on PATH"; exit 1; }
+command -v flock >/dev/null || { echo "flock not found on PATH"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 1. SpiderMonkey (from source, with the Zig toolchain).
@@ -56,12 +57,50 @@ build_spidermonkey() {
   local variant="$1"
   local sm_obj="$2"
   local sm_lib="$sm_obj/dist/libspidermonkey.a"
-  if [[ "$FORCE" -ne 1 && -f "$sm_lib" ]]; then
+  local sm_marker="$sm_lib.complete"
+  local archive_builder="$DEPS/assemble-spidermonkey-archive.sh"
+  local sm_base="$sm_obj/js/src/build/libjs_static.a"
+  local -a sm_objs=(
+    memory/build/Unified_cpp_memory_build0.o
+    memory/mozalloc/Unified_cpp_memory_mozalloc0.o
+    mfbt/Unified_cpp_mfbt0.o mfbt/Unified_cpp_mfbt1.o
+    mozglue/misc/AutoProfilerLabel.o mozglue/misc/ConditionVariable_noop.o
+    mozglue/misc/Debug.o mozglue/misc/Decimal.o mozglue/misc/MmapFaultHandler.o
+    mozglue/misc/Mutex_noop.o mozglue/misc/Now.o mozglue/misc/Printf.o
+    mozglue/misc/SIMD.o mozglue/misc/StackWalk.o mozglue/misc/TimeStamp.o
+    mozglue/misc/TimeStamp_posix.o mozglue/misc/Uptime.o
+    mozglue/static/lz4.o mozglue/static/lz4frame.o mozglue/static/lz4hc.o
+    mozglue/static/xxhash.o third_party/fmt/Unified_cpp_third_party_fmt0.o
+  )
+  local -a sm_object_paths=()
+  local object
+  for object in "${sm_objs[@]}"; do
+    sm_object_paths+=("$sm_obj/$object")
+  done
+
+  mkdir -p "$sm_obj"
+  local sm_lock_fd
+  exec {sm_lock_fd}>>"$sm_obj/.starling-spidermonkey-build.lock"
+  flock -x "$sm_lock_fd"
+  if [[ "$FORCE" -ne 1 ]] &&
+    bash "$archive_builder" --validate \
+      "$(command -v zig)" "$sm_lib" "$sm_marker" "$variant" "$SM_TAG" \
+      "$sm_base" "$sm_obj" "${sm_object_paths[@]}" 2>/dev/null
+  then
     echo ">>> SpiderMonkey $variant up to date"
+    exec {sm_lock_fd}>&-
     return
   fi
 
-  echo ">>> Building SpiderMonkey $variant ($SM_TAG)"
+  local rebuild_objects="$FORCE"
+  for object in "$sm_base" "${sm_object_paths[@]}" \
+    "$sm_obj/js/src/js-confdefs.h"
+  do
+    [[ -f "$object" ]] || rebuild_objects=1
+  done
+
+  if [[ "$rebuild_objects" -eq 1 ]]; then
+    echo ">>> Building SpiderMonkey $variant ($SM_TAG)"
   if [[ ! -d "$SM_SRC/.git" ]]; then
     git clone --depth 1 --branch "$SM_TAG" "$SM_REPO" "$SM_SRC"
   fi
@@ -142,25 +181,19 @@ EOF
     }
   done
   echo ">>> Confirmed -fPIC is enabled for the SpiderMonkey $variant build (see $build_log)"
+  else
+    echo ">>> Reassembling SpiderMonkey $variant archive"
+  fi
 
   # Combine libjs_static.a with the extra objects StarlingMonkey needs (matches
   # SM_OBJ_FILES in cmake/spidermonkey.cmake).
-  SM_OBJS=(
-    memory/build/Unified_cpp_memory_build0.o
-    memory/mozalloc/Unified_cpp_memory_mozalloc0.o
-    mfbt/Unified_cpp_mfbt0.o mfbt/Unified_cpp_mfbt1.o
-    mozglue/misc/AutoProfilerLabel.o mozglue/misc/ConditionVariable_noop.o
-    mozglue/misc/Debug.o mozglue/misc/Decimal.o mozglue/misc/MmapFaultHandler.o
-    mozglue/misc/Mutex_noop.o mozglue/misc/Now.o mozglue/misc/Printf.o
-    mozglue/misc/SIMD.o mozglue/misc/StackWalk.o mozglue/misc/TimeStamp.o
-    mozglue/misc/TimeStamp_posix.o mozglue/misc/Uptime.o
-    mozglue/static/lz4.o mozglue/static/lz4frame.o mozglue/static/lz4hc.o
-    mozglue/static/xxhash.o third_party/fmt/Unified_cpp_third_party_fmt0.o
-  )
   mkdir -p "$sm_obj/dist/include"
-  cp "$sm_obj/js/src/build/libjs_static.a" "$sm_lib"
-  ( cd "$sm_obj" && zig ar -q "$sm_lib" "${SM_OBJS[@]}" )
+  STARLING_SM_ARCHIVE_FORCE="$FORCE" \
+    bash "$archive_builder" \
+      "$(command -v zig)" "$sm_lib" "$sm_marker" "$variant" "$SM_TAG" \
+      "$sm_base" "$sm_obj" "${sm_object_paths[@]}"
   cp -f "$sm_obj/js/src/js-confdefs.h" "$sm_obj/dist/include/js-confdefs.h"
+  exec {sm_lock_fd}>&-
   echo ">>> SpiderMonkey $variant done: $sm_lib"
 }
 

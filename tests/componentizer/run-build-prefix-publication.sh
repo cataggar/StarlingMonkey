@@ -22,11 +22,17 @@ build_prefix() {
     -Daot-engine=true
 }
 
-prefix_hash() {
-  find "$PREFIX" -type f -print0 |
-    sort -z |
-    xargs -0 sha256sum |
-    sha256sum
+mkdir -p "$PREFIX/unrelated/nested"
+printf 'shared prefix bytes\n' > "$PREFIX/unrelated/nested/preserved.txt"
+unrelated_inode="$(stat -c '%d:%i' \
+  "$PREFIX/unrelated/nested/preserved.txt")"
+unrelated_hash="$(sha256sum "$PREFIX/unrelated/nested/preserved.txt")"
+
+assert_unrelated() {
+  test "$(stat -c '%d:%i' \
+    "$PREFIX/unrelated/nested/preserved.txt")" = "$unrelated_inode"
+  test "$(sha256sum "$PREFIX/unrelated/nested/preserved.txt")" = \
+    "$unrelated_hash"
 }
 
 wait_for_hook() {
@@ -39,9 +45,38 @@ wait_for_hook() {
   exit 1
 }
 
+kill_process_tree() {
+  local root_pid="$1"
+  mapfile -t process_tree < <(python3 - "$root_pid" <<'PY'
+import subprocess
+import sys
+
+root = int(sys.argv[1])
+children = {}
+for line in subprocess.check_output(
+    ["ps", "-eo", "pid=,ppid="], text=True
+).splitlines():
+    pid, parent = map(int, line.split())
+    children.setdefault(parent, []).append(pid)
+
+def descendants(pid):
+    for child in children.get(pid, []):
+        yield from descendants(child)
+        yield child
+
+print(*descendants(root), root, sep="\n")
+PY
+)
+  for pid in "${process_tree[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
 test -x "$PREFIX/bin/starling-aot-cache"
 baseline_inode="$(stat -c '%d:%i' "$PREFIX")"
-baseline_hash="$(prefix_hash)"
+test -f "$PREFIX/.starling-aot-engine/owner"
+test -f "$PREFIX/.starling-aot-engine/ownership.manifest"
+test -L "$PREFIX/bin/starling-raw.wasm"
 
 for phase in \
   prefix-files-durable \
@@ -58,11 +93,24 @@ do
   fi
   grep -Fq AotCacheTestFailure "$SCRATCH/failure-$phase.log"
   test "$(stat -c '%d:%i' "$PREFIX")" = "$baseline_inode"
-  test "$(prefix_hash)" = "$baseline_hash"
+  assert_unrelated
   "$PREFIX/bin/starling-aot-cache" recover-bundle --target "$PREFIX"
   test "$(stat -c '%d:%i' "$PREFIX")" = "$baseline_inode"
-  test "$(prefix_hash)" = "$baseline_hash"
+  assert_unrelated
 done
+
+kill_hook="$SCRATCH/sigkill"
+mkdir "$kill_hook"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$kill_hook" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=after-prefix-switch \
+  build_prefix >"$SCRATCH/sigkill.log" 2>&1 &
+kill_pid=$!
+wait_for_hook "$kill_hook/after-prefix-switch.ready"
+kill_process_tree "$kill_pid"
+wait "$kill_pid" 2>/dev/null || true
+"$PREFIX/bin/starling-aot-cache" recover-bundle --target "$PREFIX"
+assert_unrelated
+test "$(stat -c '%d:%i' "$PREFIX")" = "$baseline_inode"
 
 hook_a="$SCRATCH/concurrent-A"
 hook_b="$SCRATCH/concurrent-B"
@@ -87,7 +135,7 @@ wait "$pid_b"
 
 "$PREFIX/bin/starling-aot-cache" validate \
   --engine "$PREFIX/bin/starling-raw.wasm" \
-  --weval "$PREFIX/bin/weval" \
+  --weval "$PREFIX/.starling-aot-engine/current/weval-package/weval" \
   --cache "$PREFIX/bin/starling-ics.wevalcache" \
   --manifest "$PREFIX/bin/starling-ics.wevalcache.manifest"
 test -x "$PREFIX/bin/starling-componentize"
@@ -95,5 +143,7 @@ test -x "$PREFIX/bin/componentize.sh"
 test -x "$PREFIX/bin/weval"
 test -s "$PREFIX/bin/preview1-adapter.wasm"
 test -s "$PREFIX/bin/features.json"
+assert_unrelated
+test "$(stat -c '%d:%i' "$PREFIX")" = "$baseline_inode"
 
-echo "Actual Zig build-prefix failure/concurrency matrix passed"
+echo "Actual shared-prefix upgrade/failure/SIGKILL/concurrency matrix passed"

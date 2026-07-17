@@ -13,12 +13,12 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/tests/componentizer/.seal-aliases"
 WORK="$SCRATCH/work with spaces"
 ENGINE="$WORK/engine.wasm"
-WEVAL="$WORK/weval tool"
+WEVAL="$WORK/weval-package/weval tool"
 SOURCE_CACHE="$WORK/source.wevalcache"
 PRIMER="$WORK/primer.js"
 
 rm -rf "$SCRATCH"
-mkdir -p "$WORK"
+mkdir -p "$WORK/weval-package"
 CROSS_FS_INPUT=""
 cleanup() {
   if [ -n "$CROSS_FS_INPUT" ]; then
@@ -212,7 +212,7 @@ expect_collision normalized-relative \
     cd "$1"
     exec "$2" seal \
       --engine engine.wasm \
-      --weval "weval tool" \
+      --weval "weval-package/weval tool" \
       --cache source.wevalcache \
       --cache-out normalized/cache \
       --primer primer.js \
@@ -241,7 +241,7 @@ SAFE_MANIFEST="$WORK/safe manifest"
   cd "$WORK"
   "$CACHE_TOOL" validate \
     --engine engine.wasm \
-    --weval "weval tool" \
+    --weval "weval-package/weval tool" \
     --cache "safe canonical cache" \
     --manifest "safe manifest" \
     --feature-abi seal-alias-test

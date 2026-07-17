@@ -25,13 +25,15 @@ make_bundle() {
   local label="$1"
   local prefix="$SCRATCH/source $label"
   local bin="$prefix/bin"
-  mkdir -p "$bin"
+  local weval_package="$prefix/weval-package"
+  mkdir -p "$bin" "$weval_package"
   printf 'engine-%s\n' "$label" > "$bin/starling-raw.wasm"
   cp "$CACHE_TOOL" "$bin/starling-aot-cache"
-  cat > "$bin/weval" <<'EOF'
+  cat > "$weval_package/weval" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
+  cp "$weval_package/weval" "$bin/weval"
   cat > "$bin/wasm-tools" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -41,7 +43,7 @@ while [ ! -d "$BARRIER/A.ready" ] || [ ! -d "$BARRIER/B.ready" ]; do
   sleep 0.01
 done
 EOF
-  chmod +x "$bin/weval" "$bin/wasm-tools"
+  chmod +x "$weval_package/weval" "$bin/weval" "$bin/wasm-tools"
   python3 - "$bin/starling-ics.wevalcache.raw" \
     "$bin/starling-raw.wasm" "$label" <<'PY'
 import hashlib
@@ -77,7 +79,7 @@ db.close()
 PY
   "$bin/starling-aot-cache" seal \
     --engine "$bin/starling-raw.wasm" \
-    --weval "$bin/weval" \
+    --weval "$weval_package/weval" \
     --cache "$bin/starling-ics.wevalcache.raw" \
     --cache-out "$bin/starling-ics.wevalcache" \
     --primer "$PRIMER" \
@@ -85,7 +87,7 @@ PY
     --out "$bin/starling-ics.wevalcache.manifest"
   "$bin/starling-aot-cache" seal \
     --engine "$bin/starling-raw.wasm" \
-    --weval "$bin/weval" \
+    --weval "$weval_package/weval" \
     --cache "$bin/starling-ics.wevalcache.raw" \
     --cache-out "$bin/starling-ics.wevalcache.repeat" \
     --primer "$PRIMER" \
@@ -136,6 +138,12 @@ wait_for_hook() {
     sleep 0.001
   done
   echo "FAIL: timed out waiting for $ready" >&2
+  for log in "$SCRATCH"/*.log; do
+    [ -f "$log" ] && {
+      echo "--- $log" >&2
+      cat "$log" >&2
+    }
+  done
   exit 1
 }
 
@@ -157,7 +165,7 @@ assert_bundle() {
     "$owner/bin/starling-ics.wevalcache.manifest"
   "$owner/bin/starling-aot-cache" validate \
     --engine "$target/starling-raw-weval.wasm" \
-    --weval "$owner/bin/weval" \
+    --weval "$owner/weval-package/weval" \
     --cache "$target/starling-ics.wevalcache" \
     --manifest "$target/starling-ics.wevalcache.manifest"
 }
@@ -171,7 +179,7 @@ STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-stage \
     --target "$FIRST_BUNDLE_TARGET" \
     --engine "$PREFIX_A/bin/starling-raw.wasm" \
     --engine-name starling-raw-weval.wasm \
-    --weval "$PREFIX_A/bin/weval" \
+    --weval "$PREFIX_A/weval-package/weval" \
     --cache "$PREFIX_A/bin/starling-ics.wevalcache" \
     --manifest "$PREFIX_A/bin/starling-ics.wevalcache.manifest" \
     >"$SCRATCH/first-bundle.log" 2>&1 &
@@ -282,7 +290,7 @@ do
       --target "$CRASH_RELEASE" \
       --engine "$PREFIX_B/bin/starling-raw.wasm" \
       --engine-name starling-raw-weval.wasm \
-      --weval "$PREFIX_B/bin/weval" \
+      --weval "$PREFIX_B/weval-package/weval" \
       --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
       --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
       > "$SCRATCH/crash-$phase.log" 2>&1 &
@@ -309,7 +317,7 @@ STARLING_AOT_CACHE_TEST_WAIT_AT=after-bundle-switch \
     --target "$ROLLBACK_RELEASE" \
     --engine "$PREFIX_B/bin/starling-raw.wasm" \
     --engine-name starling-raw-weval.wasm \
-    --weval "$PREFIX_B/bin/weval" \
+    --weval "$PREFIX_B/weval-package/weval" \
     --cache "$PREFIX_B/bin/starling-ics.wevalcache" \
     --manifest "$PREFIX_B/bin/starling-ics.wevalcache.manifest" \
     > "$SCRATCH/rollback-switch.log" 2>&1 &
@@ -335,6 +343,31 @@ cmp "$ROLLBACK_RELEASE/starling-raw-weval.wasm" \
   "$PREFIX_A/bin/starling-raw.wasm"
 
 BUILD_PREFIX="$SCRATCH/existing build prefix"
+mkdir -p "$BUILD_PREFIX/bin" "$BUILD_PREFIX/unrelated/nested"
+printf 'unrelated user tool\n' > "$BUILD_PREFIX/bin/user-tool"
+printf 'unrelated nested bytes\n' > \
+  "$BUILD_PREFIX/unrelated/nested/preserved.txt"
+UNRELATED_TOOL_INODE="$(stat -c '%d:%i' "$BUILD_PREFIX/bin/user-tool")"
+UNRELATED_NESTED_INODE="$(
+  stat -c '%d:%i' "$BUILD_PREFIX/unrelated/nested/preserved.txt"
+)"
+UNRELATED_HASH="$(
+  sha256sum "$BUILD_PREFIX/bin/user-tool" \
+    "$BUILD_PREFIX/unrelated/nested/preserved.txt"
+)"
+
+assert_unrelated_prefix() {
+  test "$(stat -c '%d:%i' "$BUILD_PREFIX/bin/user-tool")" = \
+    "$UNRELATED_TOOL_INODE"
+  test "$(
+    stat -c '%d:%i' "$BUILD_PREFIX/unrelated/nested/preserved.txt"
+  )" = "$UNRELATED_NESTED_INODE"
+  test "$(
+    sha256sum "$BUILD_PREFIX/bin/user-tool" \
+      "$BUILD_PREFIX/unrelated/nested/preserved.txt"
+  )" = "$UNRELATED_HASH"
+}
+
 make_prefix_generation() {
   local label="$1" serial="$2"
   local source generation bin
@@ -348,6 +381,7 @@ make_prefix_generation() {
   cp "$source/bin/starling-ics.wevalcache.manifest" "$bin/"
   cp "$source/bin/starling-aot-cache" "$bin/"
   cp "$source/bin/weval" "$bin/"
+  cp -R "$source/weval-package" "$generation/"
   cp "$source/bin/wasm-tools" "$bin/"
   cp "$source/bin/wasm-tools" "$bin/wasmtime"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/starling-componentize"
@@ -385,11 +419,10 @@ generation_a="$(make_prefix_generation A initial)"
   --generation "$generation_a" \
   --feature-abi package-race-A
 assert_prefix "$BUILD_PREFIX" A
-BUILD_BASELINE="$(
-  find "$BUILD_PREFIX" -type f -print0 |
-    sort -z |
-    xargs -0 sha256sum
-)"
+assert_unrelated_prefix
+test -f "$BUILD_PREFIX/.starling-aot-engine/owner"
+test -f "$BUILD_PREFIX/.starling-aot-engine/ownership.manifest"
+test -L "$BUILD_PREFIX/bin/starling-raw.wasm"
 BUILD_INODE="$(stat -c '%d:%i' "$BUILD_PREFIX")"
 for phase in \
   prefix-files-durable \
@@ -412,13 +445,27 @@ do
   "$PREFIX_A/bin/starling-aot-cache" recover-bundle \
     --target "$BUILD_PREFIX"
   assert_prefix "$BUILD_PREFIX" A
+  assert_unrelated_prefix
   test "$(stat -c '%d:%i' "$BUILD_PREFIX")" = "$BUILD_INODE"
-  test "$(
-    find "$BUILD_PREFIX" -type f -print0 |
-      sort -z |
-      xargs -0 sha256sum
-  )" = "$BUILD_BASELINE"
 done
+
+PREFIX_KILL_HOOK="$SCRATCH/prefix-kill-hook"
+mkdir "$PREFIX_KILL_HOOK"
+generation_b="$(make_prefix_generation B sigkill)"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$PREFIX_KILL_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=after-prefix-switch \
+  "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$generation_b" \
+    --feature-abi package-race-B \
+    > "$SCRATCH/prefix-sigkill.log" 2>&1 &
+prefix_kill_pid=$!
+wait_for_hook "$PREFIX_KILL_HOOK/after-prefix-switch.ready"
+kill -KILL "$prefix_kill_pid"
+wait "$prefix_kill_pid" 2>/dev/null || true
+"$PREFIX_A/bin/starling-aot-cache" recover-bundle --target "$BUILD_PREFIX"
+assert_prefix "$BUILD_PREFIX" A
+assert_unrelated_prefix
 
 PREFIX_HOOK_A="$SCRATCH/prefix-publisher-A-hook"
 PREFIX_HOOK_B="$SCRATCH/prefix-publisher-B-hook"
@@ -451,6 +498,29 @@ wait_for_hook "$PREFIX_HOOK_B/prefix-prepared.ready"
 touch "$PREFIX_HOOK_B/prefix-prepared.continue"
 wait "$prefix_pid_b"
 assert_prefix "$BUILD_PREFIX" B
+assert_unrelated_prefix
+test "$(stat -c '%d:%i' "$BUILD_PREFIX")" = "$BUILD_INODE"
+
+CONFLICT_PREFIX="$SCRATCH/conflicting shared prefix"
+mkdir -p "$CONFLICT_PREFIX/bin"
+printf 'foreign artifact\n' > "$CONFLICT_PREFIX/bin/starling-raw.wasm"
+CONFLICT_INODE="$(
+  stat -c '%d:%i' "$CONFLICT_PREFIX/bin/starling-raw.wasm"
+)"
+if "$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+  --target "$CONFLICT_PREFIX" \
+  --generation "$generation_a" \
+  --feature-abi package-race-A \
+  >"$SCRATCH/prefix-conflict.log" 2>&1
+then
+  echo "FAIL: unowned prefix artifact conflict was accepted" >&2
+  exit 1
+fi
+grep -Fq InstallOwnershipConflict "$SCRATCH/prefix-conflict.log"
+test "$(cat "$CONFLICT_PREFIX/bin/starling-raw.wasm")" = \
+  "foreign artifact"
+test "$(stat -c '%d:%i' "$CONFLICT_PREFIX/bin/starling-raw.wasm")" = \
+  "$CONFLICT_INODE"
 
 echo "Serialized atomic-directory AOT package publication passed"
 echo "AOT package SIGKILL recovery matrix passed"

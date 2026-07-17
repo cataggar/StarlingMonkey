@@ -111,11 +111,15 @@ zig-out/bin/starling-componentize \
 ```
 
 The componentizer uses a distinct runtime-cache key for Wizer and AOT and
-passes `-Daot-engine=true` to the nested Zig build. The generated cache seal
-keys the cache schema, explicit AOT engine ABI, exact engine and Weval binary
-SHA-256 digests, resolved feature/build/host ABI, dedicated cache-initializer
-ABI, and cache-primer digest. A separate cache SHA-256 protects the SQLite
-bytes. Before sealing, the cache is rebuilt in deterministic row order with
+passes `-Daot-engine=true` to the nested Zig build. Every v0.4 build uses
+exactly Zig `0.17.0-dev.902+7255f3e72`. The
+`starling-weval-cache-v2` seal keys the explicit AOT engine ABI, exact engine
+and selected Weval binary SHA-256 digests, a deterministic digest of the full
+Weval package tree, the selected relative path and basename, resolved
+feature/build/host ABI, dedicated cache-initializer ABI, and cache-primer
+digest. Schema v1 does not bind the complete package and is intentionally
+rejected rather than migrated or accepted as a fallback. A separate cache
+SHA-256 protects the SQLite bytes. Before sealing, the cache is rebuilt in deterministic row order with
 `created_time` normalized to zero and fixed SQLite storage settings, so clean
 primes of the same inputs produce byte-identical packaged databases. WIT
 closures, generated
@@ -156,7 +160,10 @@ unchanged and relocatable.
 with the manifest at `<path>.manifest`, for compatibility with callers that
 treat ComponentizeJS's `--aot-cache-dir` as a file option. `--engine --aot`
 defaults to a bundle beside the engine. `--weval-bin` must identify the exact
-binary in the seal. Missing artifacts, malformed manifests, non-SQLite or
+selected package path in the seal. A Zig AOT installation owns the complete
+closure under `weval-package/`, with `weval-package/weval` as the managed
+selection. `bin/weval` is only a convenience entry point and resolves to that
+managed selection; it is not a second compatibility identity. Missing artifacts, malformed manifests, non-SQLite or
 checksum-corrupt caches, and engine/tool/feature mismatches all fail before
 initialization or output publication; there is no Wizer fallback.
 The validated engine, cache, and manifest are copied into a private per-run
@@ -235,6 +242,14 @@ than inside, the switched directory:
 ```console
 just builddir=build-aot aot-package release-artifacts
 ```
+
+The GitHub v0.4 release contains exactly eight assets: the five non-AOT files
+`starling-raw.wasm`, `starling-raw-debug.wasm`, `starling.wasm`,
+`starling-debug.wasm`, and `preview1-adapter.wasm`, plus the inseparable AOT
+trio `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
+`starling-ics.wevalcache.manifest`. The inventory gate rejects external
+engines such as `starling-raw-weval-external.wasm`, unsealed caches, extra
+files, or a partial trio.
 
 For an already assembled bundle, run the same seal validation directly:
 
