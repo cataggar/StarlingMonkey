@@ -230,14 +230,17 @@ without overlaying any caller directory.
 
 Static native tools execute an immutable file descriptor with `execveat`.
 For dynamic ELF64 tools, the componentizer parses `PT_INTERP`, `DT_NEEDED`,
-and supported `$ORIGIN` runpaths, retains and verifies the exact loader and
-transitive shared libraries, and copies them into the sealed snapshot.
-Empty, absolute, ambiguous, or otherwise tokenized RUNPATH/RPATH entries are
-rejected before any system-library fallback. The retained
+and supported `$ORIGIN` RUNPATH entries, retains and verifies the exact loader
+and transitive shared libraries, and copies them into the sealed snapshot.
+DT_RPATH is rejected because its inherited transitive precedence is not
+modeled. Empty, absolute, ambiguous, or otherwise tokenized RUNPATH entries
+are rejected before any system-library fallback. The retained
 loader executes by descriptor with cache/hwcaps lookup disabled and a private
 library path; loader injection environment variables are removed. Live host
 mounts are no-execute, so PATH tools and uncaptured executable mappings cannot
-join the closure. Before `execveat`, every descriptor except stdio, the
+join the closure. At process startup, missing stdin/stdout/stderr descriptors
+are reserved with `/dev/null` before any capture can reuse descriptor 0, 1,
+or 2. Before `execveat`, every descriptor except stdio, the
 selected sealed executable or loader, and explicitly retained read-only
 engine/cache input handles is marked close-on-exec. Captured package directory
 handles therefore never reach tool code through `/proc/self/fd`. The pinned

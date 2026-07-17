@@ -920,8 +920,23 @@ static void probe_inherited_directories(void) {
   closedir(fds);
 }
 
+static int probe_standard_descriptors(void) {
+  if (!getenv("FAKE_EXPECT_NULL_STDIO")) return 0;
+  char path[64], target[256];
+  for (int fd = 1; fd <= 2; ++fd) {
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    ssize_t count = readlink(path, target, sizeof(target) - 1);
+    if (count < 0) return 1;
+    target[count] = '\0';
+    if (strcmp(target, "/dev/null") != 0) return 1;
+  }
+  write_marker("FAKE_STDIO_PROBE_MARKER", "normalized stdio\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) return 70;
+  if (probe_standard_descriptors()) return 75;
   char executable[4096], sibling[4096], value[64] = {0};
   snprintf(executable, sizeof(executable), "%s", argv[0]);
   snprintf(sibling, sizeof(sibling), "%s/tool sibling", dirname(executable));
@@ -1370,6 +1385,30 @@ if grep -Fq '/proc/self/fd/' "$WABT_EXECUTABLE_LOG"; then
   echo "FAIL: retained tools exposed descriptor paths as argv[0]" >&2
   exit 1
 fi
+
+CLOSED_STDIO_OUTPUT="$WORK/closed stdio output.wasm"
+CLOSED_STDIO_MARKER="$SCRATCH/closed stdio probe completed"
+if ! (
+  exec 1>&- 2>&-
+  FAKE_EXPECT_NULL_STDIO=1 \
+  FAKE_STDIO_PROBE_MARKER="$CLOSED_STDIO_MARKER" \
+  PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin path-wizer \
+    --wabt-bin path-wabt \
+    --wasm-tools-bin path-wasm-tools \
+    --out "$CLOSED_STDIO_OUTPUT" \
+    "$SOURCE"
+); then
+  echo "FAIL: componentizer failed with initially closed stdout/stderr" >&2
+  exit 1
+fi
+cmp "$ENGINE" "$CLOSED_STDIO_OUTPUT"
+test "$(cat "$CLOSED_STDIO_MARKER")" = "normalized stdio"
+echo "Closed stdout/stderr descriptor normalization passed"
 
 if [ -w /mnt ]; then
   MNT_PIPELINE_DIR="/mnt/starling-componentizer-$$"
@@ -2717,6 +2756,7 @@ cc -o "$ELF_PACKAGE/bin/weval-real" \
   "$ELF_PACKAGE/weval_fixture.c" \
   -L"$ELF_PACKAGE/bin" \
   -Wl,--dynamic-linker,"$ELF_LOADER" \
+  -Wl,--enable-new-dtags \
   -Wl,-rpath,'$ORIGIN' \
   -lweval_fixture
 ln -s "bin/weval-real" "$ELF_PACKAGE/weval argv0 alias"
@@ -2748,6 +2788,8 @@ build_rejected_runpath_package() {
   local dtags_args=()
   if [ "$dtags" = rpath ]; then
     dtags_args=(-Wl,--disable-new-dtags)
+  else
+    dtags_args=(-Wl,--enable-new-dtags)
   fi
   cc -o "$package/bin/weval-real" \
     "$package/weval_fixture.c" \
@@ -2781,7 +2823,53 @@ build_rejected_runpath_package \
   "\$ORIGIN:$ELF_PACKAGE/bin" \
   libweval_ambiguous.so \
   runpath
-echo "Unsupported and ambiguous RUNPATH/RPATH closure matrix passed"
+
+TRANSITIVE_RPATH_PACKAGE="$SCRATCH/transitive RPATH package"
+TRANSITIVE_RPATH_BUNDLE="$WORK/transitive RPATH bundle"
+mkdir -p "$TRANSITIVE_RPATH_PACKAGE/bin"
+cp "$ELF_LOADER" "$TRANSITIVE_RPATH_PACKAGE/retained loader"
+cp "$ELF_PACKAGE/weval_fixture.c" "$TRANSITIVE_RPATH_PACKAGE/"
+cat > "$TRANSITIVE_RPATH_PACKAGE/transitive-z.c" <<'EOF'
+const char *transitive_z_marker(void) {
+  return "origin-relative-library";
+}
+EOF
+cat > "$TRANSITIVE_RPATH_PACKAGE/parent.c" <<'EOF'
+extern const char *transitive_z_marker(void);
+const char *weval_fixture_marker(void) {
+  return transitive_z_marker();
+}
+EOF
+cc -fPIC -shared \
+  -Wl,-soname,libz.so.1 \
+  -o "$TRANSITIVE_RPATH_PACKAGE/bin/libz.so.1" \
+  "$TRANSITIVE_RPATH_PACKAGE/transitive-z.c"
+cc -fPIC -shared \
+  -Wl,-soname,libweval_parent.so \
+  -L"$TRANSITIVE_RPATH_PACKAGE/bin" \
+  -Wl,-l:libz.so.1 \
+  -o "$TRANSITIVE_RPATH_PACKAGE/bin/libweval_parent.so" \
+  "$TRANSITIVE_RPATH_PACKAGE/parent.c"
+cc -o "$TRANSITIVE_RPATH_PACKAGE/bin/weval-real" \
+  "$TRANSITIVE_RPATH_PACKAGE/weval_fixture.c" \
+  -L"$TRANSITIVE_RPATH_PACKAGE/bin" \
+  -Wl,--dynamic-linker,"$TRANSITIVE_RPATH_PACKAGE/retained loader" \
+  -Wl,--disable-new-dtags \
+  -Wl,-rpath,'$ORIGIN' \
+  -Wl,-rpath-link,"$TRANSITIVE_RPATH_PACKAGE/bin" \
+  -Wl,-l:libweval_parent.so
+ln -s "bin/weval-real" \
+  "$TRANSITIVE_RPATH_PACKAGE/weval argv0 alias"
+seal_fixture_bundle \
+  "$TRANSITIVE_RPATH_PACKAGE/weval argv0 alias" \
+  "$TRANSITIVE_RPATH_BUNDLE"
+expect_fixture_aot_rejection \
+  "$TRANSITIVE_RPATH_PACKAGE/weval argv0 alias" \
+  "$TRANSITIVE_RPATH_BUNDLE" \
+  transitive-rpath
+grep -Fq UnsupportedRetainedExecution \
+  "$SCRATCH/transitive-rpath-package-rejection.log"
+echo "Unsupported, ambiguous, and transitive RPATH closure matrix passed"
 
 ELF_ENV_HOOK="$SCRATCH/ELF environment closure hook"
 ELF_ENV_OUTPUT="$WORK/ELF environment substitution output.wasm"

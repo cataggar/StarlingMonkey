@@ -2691,6 +2691,7 @@ fn recordFeatureSurfaceWork(
 }
 
 pub fn main(init: std.process.Init) !void {
+    try reserveStandardDescriptors();
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     var diagnostic = diagnostics.Context{
@@ -2724,6 +2725,33 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+    }
+}
+
+fn reserveStandardDescriptors() !void {
+    if (builtin.os.tag != .linux)
+        return;
+    for (0..3) |index| {
+        const handle: std.posix.fd_t = @intCast(index);
+        switch (std.posix.errno(std.posix.system.fcntl(
+            handle,
+            std.posix.F.GETFD,
+            @as(usize, 0),
+        ))) {
+            .SUCCESS => continue,
+            .BADF => {},
+            else => return error.UnsupportedRetainedExecution,
+        }
+        const replacement = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            "/dev/null",
+            .{ .ACCMODE = .RDWR, .CLOEXEC = false },
+            0,
+        );
+        if (replacement != handle) {
+            _ = std.os.linux.close(replacement);
+            return error.UnsupportedRetainedExecution;
+        }
     }
 }
 
@@ -8605,10 +8633,12 @@ fn readElfClosureInfo(
             ) catch @panic("out of memory"),
             std.elf.DT_STRTAB => string_vaddr = value,
             std.elf.DT_STRSZ => string_size = value,
-            std.elf.DT_RUNPATH => runpath_offset = value,
-            std.elf.DT_RPATH => {
-                if (runpath_offset == null) runpath_offset = value;
+            std.elf.DT_RUNPATH => {
+                if (runpath_offset != null)
+                    return error.UnsupportedRetainedExecution;
+                runpath_offset = value;
             },
+            std.elf.DT_RPATH => return error.UnsupportedRetainedExecution,
             else => {},
         }
     }
