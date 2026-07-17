@@ -2246,6 +2246,7 @@ const Runtime = struct {
     adapter: Snapshot,
     engine: []const u8,
     engine_capture: ?CapturedFile,
+    external_capture: ?*CapturedExternalRuntime,
     adapter: []const u8,
     component_wit: ?[]const u8,
     component_world: ?[]const u8,
@@ -2253,6 +2254,7 @@ const Runtime = struct {
     surface_target_world: ?[]const u8,
     platform_wit: []const u8,
     features: feature_surface.Features,
+    surface_world: ?[]const u8,
     bindings: ?[]const u8,
     dispatch_wit_digest: ?[]const u8,
     component_wit_digest: ?[]const u8,
@@ -2293,23 +2295,44 @@ const WevalTool = struct {
     provenance: []const u8,
 };
 
+const CapturedAncestor = struct {
+    name: []const u8,
+    dir: Dir,
+    identity: PackageIdentity,
+};
+
+const CapturedPath = struct {
+    root: Dir,
+    root_identity: PackageIdentity,
+    ancestors: []CapturedAncestor,
+
+    fn parent(captured: CapturedPath) Dir {
+        if (captured.ancestors.len == 0) return captured.root;
+        return captured.ancestors[captured.ancestors.len - 1].dir;
+    }
+
+    fn close(captured: CapturedPath, io: Io) void {
+        var index = captured.ancestors.len;
+        while (index != 0) {
+            index -= 1;
+            captured.ancestors[index].dir.close(io);
+        }
+        captured.root.close(io);
+    }
+};
+
 const CapturedFile = struct {
     path: []const u8,
-    resolved_path: []const u8,
     basename: []const u8,
-    parent: Dir,
-    resolved_basename: []const u8,
-    resolved_parent: Dir,
+    parent_path: CapturedPath,
     file: File,
     name_identity: PackageIdentity,
-    resolved_name_identity: PackageIdentity,
     identity: PackageIdentity,
     digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
     fn close(captured: CapturedFile, io: Io) void {
         captured.file.close(io);
-        captured.resolved_parent.close(io);
-        captured.parent.close(io);
+        captured.parent_path.close(io);
     }
 };
 
@@ -2337,16 +2360,44 @@ const CapturedPackageDirectory = struct {
 };
 
 const CapturedWevalPackage = struct {
-    root_path: []const u8,
-    root_basename: []const u8,
-    root_parent: Dir,
-    root_name_identity: PackageIdentity,
-    root: *CapturedPackageDirectory,
+    tree: CapturedDirectory,
     selected_relative: []const u8,
 
     fn close(captured: CapturedWevalPackage, io: Io) void {
+        captured.tree.close(io);
+    }
+};
+
+const CapturedDirectory = struct {
+    path: []const u8,
+    basename: []const u8,
+    parent_path: CapturedPath,
+    name_identity: PackageIdentity,
+    root: *CapturedPackageDirectory,
+
+    fn close(captured: CapturedDirectory, io: Io) void {
         closeCapturedPackageDirectory(io, captured.root);
-        captured.root_parent.close(io);
+        captured.parent_path.close(io);
+    }
+};
+
+const CapturedExternalRuntime = struct {
+    adapter: CapturedFile,
+    features: CapturedFile,
+    component_wit: CapturedDirectory,
+    surface_wit: CapturedDirectory,
+    feature_wit: CapturedDirectory,
+    supplied_surface_wit: ?CapturedDirectory,
+    supplied_component_wit: ?CapturedDirectory,
+
+    fn close(captured: CapturedExternalRuntime, io: Io) void {
+        captured.adapter.close(io);
+        captured.features.close(io);
+        captured.component_wit.close(io);
+        captured.surface_wit.close(io);
+        captured.feature_wit.close(io);
+        if (captured.supplied_surface_wit) |tree| tree.close(io);
+        if (captured.supplied_component_wit) |tree| tree.close(io);
     }
 };
 
@@ -2837,6 +2888,9 @@ fn execute(
         null;
     var effective_cache: ?EffectiveCache = if (config.cache_dir) |configured|
         try resolveEffectiveCache(
+
+    var runtime = if (config.engine) |engine_override|
+        try externalRuntime(
             allocator,
             io,
             cwd,
@@ -2893,6 +2947,7 @@ fn execute(
         try root.refreshRetainedDirectoryBaseline(io);
         try root.verify(io);
     defer if (runtime.engine_capture) |capture| capture.close(io);
+    defer if (runtime.external_capture) |capture| capture.close(io);
     defer if (runtime.cache_lock) |lock| {
         lock.unlock(io);
         lock.close(io);
@@ -3203,6 +3258,19 @@ fn execute(
         .default_dir;
     try Dir.createDirAbsolute(io, transaction_dir, private_permissions);
     defer removePrivateTree(io, transaction_dir);
+
+    if (runtime.external_capture != null) {
+        try snapshotExternalRuntime(
+            allocator,
+            io,
+            environ,
+            cwd,
+            config,
+            tools.wasm_tools,
+            transaction_dir,
+            &runtime,
+        );
+    }
 
     const aot_snapshot = if (config.aot) blk: {
         const bundle = runtime.aot_cache orelse return error.MissingAotCache;
@@ -4026,6 +4094,13 @@ fn execute(
     } else null;
 
     var candidate_file = try Dir.openFileAbsolute(io, processed.path, .{});
+    if (runtime.external_capture) |capture| {
+        try verifyCapturedExternalRuntime(io, capture);
+    }
+    if (runtime.engine_capture) |capture| {
+        try verifyCapturedFile(io, capture);
+    }
+    var candidate_file = try Dir.openFileAbsolute(io, candidate, .{});
     defer candidate_file.close(io);
     try candidate_file.sync(io);
     if (metadata_staged) |path| {
@@ -4284,7 +4359,7 @@ fn externalRuntime(
     const requested_engine = try absolutePath(allocator, cwd, engine_override);
     const engine_capture = try captureFile(allocator, io, requested_engine);
     errdefer engine_capture.close(io);
-    const engine = engine_capture.resolved_path;
+    const engine = engine_capture.path;
     const provenance = try readEngineProvenance(
         allocator,
         io,
@@ -4296,27 +4371,24 @@ fn externalRuntime(
         allocator,
         &.{ package_root, "preview1-adapter.wasm" },
     );
-    try requireFile(io, adapter);
+    const adapter_capture = try captureFile(allocator, io, adapter);
+    errdefer adapter_capture.close(io);
     if (config.preview2_adapter) |path| {
-        const supplied = try resolveExistingFile(allocator, io, cwd, path);
-        const packaged = try Dir.realPathFileAbsoluteAlloc(
-            io,
-            adapter,
-            allocator,
-        );
-        if (!std.mem.eql(u8, supplied, packaged))
+        const supplied = try absolutePath(allocator, cwd, path);
+        if (!std.mem.eql(u8, supplied, adapter))
             return error.InvalidEngineProvenance;
     }
     const features_path = try std.fs.path.join(
         allocator,
         &.{ package_root, "features.json" },
     );
-    try validateExternalFeatures(
+    const features_capture = try validateExternalFeatures(
         allocator,
         io,
         features_path,
         provenance.features,
     );
+    errdefer features_capture.close(io);
     const component_wit = try std.fs.path.join(
         allocator,
         &.{ package_root, "component-wit" },
@@ -4329,43 +4401,92 @@ fn externalRuntime(
         allocator,
         &.{ package_root, "feature-wit" },
     );
-    try requireWitWorld(
+    const component_wit_capture = captureDirectory(
         allocator,
         io,
         component_wit,
-        provenance.component_world,
-    );
-    try requireWitWorld(
+        false,
+    ) catch return error.InvalidEngineProvenance;
+    errdefer component_wit_capture.close(io);
+    const surface_wit_capture = captureDirectory(
         allocator,
         io,
         surface_wit,
-        provenance.surface_world,
-    );
-    try requireWitTree(allocator, io, feature_wit);
-    if (config.component_wit) |path| {
-        const supplied = try Dir.realPathFileAbsoluteAlloc(
+        false,
+    ) catch return error.InvalidEngineProvenance;
+    errdefer surface_wit_capture.close(io);
+    const feature_wit_capture = captureDirectory(
+        allocator,
+        io,
+        feature_wit,
+        false,
+    ) catch return error.InvalidEngineProvenance;
+    errdefer feature_wit_capture.close(io);
+    const supplied_surface_wit = if (config.wit) |path| blk: {
+        if (!std.mem.eql(u8, config.world_name.?, provenance.surface_world))
+            return error.InvalidEngineProvenance;
+        const captured = captureDirectory(
+            allocator,
             io,
             try absolutePath(allocator, cwd, path),
-            allocator,
+            false,
+        ) catch return error.InvalidEngineProvenance;
+        const supplied_digest = capturedDirectoryDigest(captured);
+        const packaged_digest = capturedDirectoryDigest(
+            surface_wit_capture,
         );
-        const packaged = try Dir.realPathFileAbsoluteAlloc(
-            io,
-            component_wit,
-            allocator,
-        );
-        if (!std.mem.eql(u8, supplied, packaged))
+        if (!std.mem.eql(
+            u8,
+            &supplied_digest,
+            &packaged_digest,
+        )) {
+            captured.close(io);
             return error.InvalidEngineProvenance;
-    }
+        }
+        break :blk captured;
+    } else null;
+    errdefer if (supplied_surface_wit) |tree| tree.close(io);
+    const supplied_component_wit = if (config.component_wit) |path| blk: {
+        const captured = captureDirectory(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            false,
+        ) catch return error.InvalidEngineProvenance;
+        const supplied_digest = capturedDirectoryDigest(captured);
+        const packaged_digest = capturedDirectoryDigest(
+            component_wit_capture,
+        );
+        if (!std.mem.eql(
+            u8,
+            &supplied_digest,
+            &packaged_digest,
+        )) {
+            captured.close(io);
+            return error.InvalidEngineProvenance;
+        }
+        break :blk captured;
+    } else null;
+    errdefer if (supplied_component_wit) |tree| tree.close(io);
     if (config.component_world_name) |world| {
         if (!std.mem.eql(u8, world, provenance.component_world))
             return error.InvalidEngineProvenance;
     }
     try validateExternalEngineInventory(
-        allocator,
         io,
-        package_root,
+        engine_capture.parent_path.parent(),
         std.fs.path.basename(engine),
     );
+    const external_capture = try allocator.create(CapturedExternalRuntime);
+    external_capture.* = .{
+        .adapter = adapter_capture,
+        .features = features_capture,
+        .component_wit = component_wit_capture,
+        .surface_wit = surface_wit_capture,
+        .feature_wit = feature_wit_capture,
+        .supplied_surface_wit = supplied_surface_wit,
+        .supplied_component_wit = supplied_component_wit,
+    };
     const expected_feature_abi = try aot_cache.featureAbi(
         allocator,
         provenance.features.stdio,
@@ -4380,6 +4501,7 @@ fn externalRuntime(
     return .{
         .engine = engine,
         .engine_capture = engine_capture,
+        .external_capture = external_capture,
         .adapter = adapter,
         .component_wit = selected_component_wit.absolute,
         .component_world = provenance.component_world,
@@ -4389,6 +4511,7 @@ fn externalRuntime(
         .features = provenance.features,
         .component_wit = component_wit,
         .component_world = provenance.component_world,
+        .surface_world = provenance.surface_world,
         .bindings = null,
         .dispatch_wit_digest = selected_surface_target_wit.digest,
         .component_wit_digest = selected_component_wit.digest,
@@ -4569,6 +4692,185 @@ fn findEngineProvenanceSection(
                     .section_start = section_start,
                     .metadata = module[name_end..section_end],
                 };
+fn snapshotExternalRuntime(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    config: *const cli.Config,
+    wasm_tools: []const u8,
+    transaction_dir: []const u8,
+    runtime: *Runtime,
+) !void {
+    const captured = runtime.external_capture.?;
+    const snapshot_engine = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "external-engine.wasm" },
+    );
+    const snapshot_adapter = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "external-adapter.wasm" },
+    );
+    const snapshot_component_wit = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "external-component-wit" },
+    );
+    const snapshot_surface_wit = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "external-surface-wit" },
+    );
+    const snapshot_feature_wit = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "external-feature-wit" },
+    );
+    try copyCapturedFile(io, runtime.engine_capture.?, snapshot_engine);
+    try copyCapturedFile(io, captured.adapter, snapshot_adapter);
+    try copyCapturedDirectory(
+        io,
+        captured.component_wit,
+        snapshot_component_wit,
+    );
+    try copyCapturedDirectory(
+        io,
+        captured.surface_wit,
+        snapshot_surface_wit,
+    );
+    try copyCapturedDirectory(
+        io,
+        captured.feature_wit,
+        snapshot_feature_wit,
+    );
+    const readonly_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o400)
+    else
+        .default_file;
+    try setRegularFilePermissions(io, snapshot_engine, readonly_permissions);
+    try setRegularFilePermissions(io, snapshot_adapter, readonly_permissions);
+    try verifyCapturedFile(io, runtime.engine_capture.?);
+    try verifyCapturedExternalRuntime(io, captured);
+
+    var command_log: std.ArrayList(u8) = .empty;
+    try validateWitWorld(
+        allocator,
+        io,
+        cwd,
+        config.verbose,
+        wasm_tools,
+        snapshot_component_wit,
+        runtime.component_world.?,
+        transaction_dir,
+        "component",
+        &command_log,
+    );
+    try validateWitWorld(
+        allocator,
+        io,
+        cwd,
+        config.verbose,
+        wasm_tools,
+        snapshot_surface_wit,
+        runtime.surface_world.?,
+        transaction_dir,
+        "surface",
+        &command_log,
+    );
+    const feature_output = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "validated-feature-wit.wasm" },
+    );
+    runCommand(
+        allocator,
+        io,
+        "validate external feature WIT",
+        &.{
+            wasm_tools,
+            "component",
+            "wit",
+            "--wasm",
+            "--output",
+            feature_output,
+            snapshot_feature_wit,
+        },
+        cwd,
+        null,
+        null,
+        config.verbose,
+        &command_log,
+    ) catch return error.InvalidEngineProvenance;
+    try verifyCapturedExternalRuntime(io, captured);
+    try runComponentizerTestHook(
+        allocator,
+        io,
+        environ,
+        "external-inputs-snapshotted",
+    );
+    runtime.engine = snapshot_engine;
+    runtime.adapter = snapshot_adapter;
+    runtime.component_wit = snapshot_component_wit;
+}
+
+fn validateWitWorld(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    verbose: bool,
+    wasm_tools: []const u8,
+    wit: []const u8,
+    world: []const u8,
+    transaction_dir: []const u8,
+    label: []const u8,
+    command_log: *std.ArrayList(u8),
+) !void {
+    const output = try std.fs.path.join(
+        allocator,
+        &.{
+            transaction_dir,
+            try std.fmt.allocPrint(
+                allocator,
+                "validated-{s}-wit.wasm",
+                .{label},
+            ),
+        },
+    );
+    runCommand(
+        allocator,
+        io,
+        "validate external WIT world",
+        &.{
+            wasm_tools,
+            "component",
+            "embed",
+            "--all-features",
+            "--world",
+            world,
+            "--dummy",
+            "--output",
+            output,
+            wit,
+        },
+        cwd,
+        null,
+        null,
+        verbose,
+        command_log,
+    ) catch return error.InvalidEngineProvenance;
+}
+
+fn verifyCapturedExternalRuntime(
+    io: Io,
+    captured: *CapturedExternalRuntime,
+) !void {
+    try verifyCapturedFile(io, captured.adapter);
+    try verifyCapturedFile(io, captured.features);
+    try verifyCapturedDirectory(io, captured.component_wit);
+    try verifyCapturedDirectory(io, captured.surface_wit);
+    try verifyCapturedDirectory(io, captured.feature_wit);
+    if (captured.supplied_surface_wit) |tree|
+        try verifyCapturedDirectory(io, tree);
+    if (captured.supplied_component_wit) |tree|
+        try verifyCapturedDirectory(io, tree);
+}
+
 fn readEngineProvenance(
     allocator: Allocator,
     io: Io,
@@ -4787,10 +5089,10 @@ fn validateExternalFeatures(
     io: Io,
     path: []const u8,
     expected: EngineFeatures,
-) !void {
+) !CapturedFile {
     const captured = captureFile(allocator, io, path) catch
         return error.InvalidEngineProvenance;
-    defer captured.close(io);
+    errdefer captured.close(io);
     if (captured.identity.stat.size == 0 or
         captured.identity.stat.size > 16 * 1024)
         return error.InvalidEngineProvenance;
@@ -4808,77 +5110,14 @@ fn validateExternalFeatures(
     if (!std.meta.eql(actual, expected))
         return error.InvalidEngineProvenance;
     try verifyCapturedFile(io, captured);
-}
-
-fn requireWitTree(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
-) !void {
-    var dir = Dir.openDirAbsolute(io, path, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch return error.InvalidEngineProvenance;
-    defer dir.close(io);
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| switch (entry.kind) {
-        .directory => {},
-        .file => {
-            if (std.mem.endsWith(u8, entry.path, ".wit")) count += 1;
-        },
-        else => return error.InvalidEngineProvenance,
-    };
-    if (count == 0) return error.InvalidEngineProvenance;
-}
-
-fn requireWitWorld(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
-    world: []const u8,
-) !void {
-    try requireWitTree(allocator, io, path);
-    var dir = try Dir.openDirAbsolute(io, path, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer dir.close(io);
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-    const needle = try std.fmt.allocPrint(
-        allocator,
-        "world {s}",
-        .{world},
-    );
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or
-            !std.mem.endsWith(u8, entry.path, ".wit"))
-            continue;
-        const data = try dir.readFileAlloc(
-            io,
-            entry.path,
-            allocator,
-            .limited(4 * 1024 * 1024),
-        );
-        if (std.mem.indexOf(u8, data, needle) != null) return;
-    }
-    return error.InvalidEngineProvenance;
+    return captured;
 }
 
 fn validateExternalEngineInventory(
-    allocator: Allocator,
     io: Io,
-    package_root: []const u8,
+    dir: Dir,
     engine_basename: []const u8,
 ) !void {
-    _ = allocator;
-    var dir = try Dir.openDirAbsolute(io, package_root, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer dir.close(io);
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (entry.kind == .sym_link)
@@ -5302,6 +5541,25 @@ fn buildRuntime(
         try setDirectoryInherited(
             child_directories[inherited_count],
             false,
+
+    const installed_bin = if (config.aot)
+        try std.fs.path.join(
+            allocator,
+            &.{ prefix, ".starling-aot-engine", "current", "bin" },
+        )
+    else
+        try std.fs.path.join(allocator, &.{ prefix, "bin" });
+    const engine = try std.fs.path.join(
+        allocator,
+        &.{ installed_bin, "starling-raw.wasm" },
+    );
+    try requireFile(io, engine);
+    const adapter = if (config.preview2_adapter) |path|
+        try absolutePath(allocator, cwd, path)
+    else blk: {
+        const installed = try std.fs.path.join(
+            allocator,
+            &.{ installed_bin, "preview1-adapter.wasm" },
         );
     }
     try runtime_prefix.setPermissions(io, .fromMode(0o700));
@@ -5417,6 +5675,7 @@ fn buildRuntime(
             "surface-wit",
             try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-surface-wit" }),
             transaction,
+            &.{ installed_bin, "component-bindings.zig" },
         );
     };
     const surface_target_world = config.world_name orelse "caller";
@@ -5433,7 +5692,7 @@ fn buildRuntime(
             io,
             cwd,
             config.aot_cache_dir,
-            try std.fs.path.join(allocator, &.{ prefix, "bin" }),
+            installed_bin,
             expected_feature_abi,
         )
     else
@@ -5442,6 +5701,7 @@ fn buildRuntime(
     return .{
         .engine = engine,
         .engine_capture = null,
+        .external_capture = null,
         .adapter = adapter,
         .component_wit = runtime_component_wit.absolute,
         .component_world = runtime_component_world,
@@ -5449,6 +5709,9 @@ fn buildRuntime(
         .surface_target_world = surface_target_world,
         .platform_wit = platform_wit.absolute,
         .features = features,
+        .component_wit = if (component_wit) |wit| wit.absolute else null,
+        .component_world = config.component_world_name orelse config.world_name,
+        .surface_world = config.world_name,
         .bindings = bindings,
         .dispatch_wit_digest = surface_target_wit.digest,
         .component_wit_digest = runtime_component_wit.digest,
@@ -6204,7 +6467,16 @@ fn snapshotAotInputs(
     else
         try captureFile(allocator, io, engine);
     defer if (retained_engine == null) captured_engine.close(io);
-    const captured_cache = try captureFile(allocator, io, bundle.cache);
+    const captured_cache = try captureFileWithHook(
+        allocator,
+        io,
+        bundle.cache,
+        .{
+            .environ = environ,
+            .parent_phase = "aot-cache-parent-captured",
+            .captured_phase = "aot-cache-file-captured",
+        },
+    );
     defer captured_cache.close(io);
     const captured_manifest = try captureFile(
         allocator,
@@ -6311,6 +6583,7 @@ const PackageIdentity = struct {
 const CapturePackageState = struct {
     allocator: Allocator,
     io: Io,
+    allow_symlinks: bool,
     entries: usize = 0,
     bytes: u64 = 0,
 };
@@ -6320,63 +6593,177 @@ fn captureFile(
     io: Io,
     path: []const u8,
 ) !CapturedFile {
+    return captureFileWithHook(allocator, io, path, null);
+}
+
+const CaptureFileHook = struct {
+    environ: *std.process.Environ.Map,
+    parent_phase: []const u8,
+    captured_phase: []const u8,
+};
+
+fn captureFileWithHook(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    hook: ?CaptureFileHook,
+) !CapturedFile {
     const parent_path = std.fs.path.dirname(path) orelse
         return error.InvalidPath;
     const basename = std.fs.path.basename(path);
-    var parent = try Dir.openDirAbsolute(io, parent_path, .{
-        .iterate = true,
-        .follow_symlinks = true,
-    });
-    errdefer parent.close(io);
-    const name_identity = try packagePathIdentity(io, parent, basename);
-    const resolved_path = try Dir.realPathFileAbsoluteAlloc(
-        io,
-        path,
-        allocator,
-    );
-    const resolved_parent_path = std.fs.path.dirname(resolved_path) orelse
+    if (basename.len == 0 or
+        std.mem.eql(u8, basename, ".") or
+        std.mem.eql(u8, basename, ".."))
         return error.InvalidPath;
-    const resolved_basename = std.fs.path.basename(resolved_path);
-    var resolved_parent = try Dir.openDirAbsolute(io, resolved_parent_path, .{
-        .iterate = true,
-        .follow_symlinks = true,
-    });
-    errdefer resolved_parent.close(io);
-    const resolved_name_identity = try packagePathIdentity(
+    const captured_parent = try captureAbsoluteDirectoryPath(
+        allocator,
         io,
-        resolved_parent,
-        resolved_basename,
+        parent_path,
     );
-    var file = try resolved_parent.openFile(io, resolved_basename, .{
+    errdefer captured_parent.close(io);
+    if (hook) |test_hook| {
+        try runComponentizerTestHook(
+            allocator,
+            io,
+            test_hook.environ,
+            test_hook.parent_phase,
+        );
+    }
+    const parent = captured_parent.parent();
+    const name_identity = try packagePathIdentity(io, parent, basename);
+    var file = try parent.openFile(io, basename, .{
         .allow_directory = false,
         .follow_symlinks = false,
     });
     errdefer file.close(io);
     const identity = try packageFileIdentity(io, file);
     if (identity.stat.kind != .file or
-        !sameStablePackageIdentity(resolved_name_identity, identity))
+        !sameStablePackageIdentity(name_identity, identity))
         return error.InvalidPath;
+    const digest = try hashPackageFile(io, file);
+    if (hook) |test_hook| {
+        try runComponentizerTestHook(
+            allocator,
+            io,
+            test_hook.environ,
+            test_hook.captured_phase,
+        );
+    }
     try verifyPackageNameIdentity(io, parent, basename, name_identity);
-    const resolved_again = try Dir.realPathFileAbsoluteAlloc(
-        io,
-        path,
-        allocator,
-    );
-    if (!std.mem.eql(u8, resolved_path, resolved_again))
-        return error.WevalPackageRace;
+    try verifyCapturedPath(io, captured_parent);
     return .{
         .path = try allocator.dupe(u8, path),
-        .resolved_path = resolved_path,
         .basename = try allocator.dupe(u8, basename),
-        .parent = parent,
-        .resolved_basename = try allocator.dupe(u8, resolved_basename),
-        .resolved_parent = resolved_parent,
+        .parent_path = captured_parent,
         .file = file,
         .name_identity = name_identity,
-        .resolved_name_identity = resolved_name_identity,
         .identity = identity,
-        .digest = try hashPackageFile(io, file),
+        .digest = digest,
     };
+}
+
+fn captureAbsoluteDirectoryPath(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) !CapturedPath {
+    if (!std.fs.path.isAbsolute(path) or
+        std.mem.indexOfScalar(u8, path, '\\') != null)
+        return error.InvalidPath;
+    var root = try Dir.openDirAbsolute(io, "/", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer root.close(io);
+    const root_identity = try packageDirectoryIdentity(io, root);
+    var ancestors: std.ArrayList(CapturedAncestor) = .empty;
+    errdefer {
+        var index = ancestors.items.len;
+        while (index != 0) {
+            index -= 1;
+            ancestors.items[index].dir.close(io);
+        }
+    }
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    while (components.next()) |name| {
+        if (std.mem.eql(u8, name, ".") or
+            std.mem.eql(u8, name, ".."))
+            return error.InvalidPath;
+        const parent = if (ancestors.items.len == 0)
+            root
+        else
+            ancestors.items[ancestors.items.len - 1].dir;
+        const name_identity = try packagePathIdentity(io, parent, name);
+        var child = try parent.openDir(io, name, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        errdefer child.close(io);
+        const identity = try packageDirectoryIdentity(io, child);
+        if (identity.stat.kind != .directory or
+            !sameStablePackageIdentity(name_identity, identity))
+            return error.WevalPackageRace;
+        try ancestors.append(allocator, .{
+            .name = try allocator.dupe(u8, name),
+            .dir = child,
+            .identity = identity,
+        });
+    }
+    const owned = try ancestors.toOwnedSlice(allocator);
+    return .{
+        .root = root,
+        .root_identity = root_identity,
+        .ancestors = owned,
+    };
+}
+
+fn verifyCapturedPath(io: Io, captured: CapturedPath) !void {
+    if (!samePathIdentity(
+        captured.root_identity,
+        try packageDirectoryIdentity(io, captured.root),
+    )) return error.WevalPackageRace;
+    for (captured.ancestors, 0..) |ancestor, index| {
+        const parent = if (index == 0)
+            captured.root
+        else
+            captured.ancestors[index - 1].dir;
+        if (!samePathIdentity(
+            ancestor.identity,
+            try packageDirectoryIdentity(io, ancestor.dir),
+        )) return error.WevalPackageRace;
+        try verifyRetainedPathNameIdentity(
+            io,
+            parent,
+            ancestor.name,
+            ancestor.identity,
+        );
+    }
+}
+
+fn verifyRetainedPathNameIdentity(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    expected: PackageIdentity,
+) !void {
+    var current = parent.openFile(io, name, .{
+        .path_only = true,
+        .allow_directory = true,
+        .follow_symlinks = false,
+    }) catch return error.WevalPackageRace;
+    defer current.close(io);
+    const identity = PackageIdentity{
+        .stat = try current.stat(io),
+        .filesystem = try packageFilesystemId(current),
+    };
+    if (!samePathIdentity(expected, identity))
+        return error.WevalPackageRace;
+}
+
+fn samePathIdentity(left: PackageIdentity, right: PackageIdentity) bool {
+    return left.filesystem == right.filesystem and
+        left.stat.kind == right.stat.kind and
+        left.stat.inode == right.stat.inode;
 }
 
 fn copyCapturedFile(
@@ -6419,24 +6806,11 @@ fn verifyCapturedFile(io: Io, captured: CapturedFile) !void {
         return error.WevalPackageRace;
     try verifyRetainedNameIdentity(
         io,
-        captured.resolved_parent,
-        captured.resolved_basename,
-        captured.resolved_name_identity,
-    );
-    try verifyRetainedNameIdentity(
-        io,
-        captured.parent,
+        captured.parent_path.parent(),
         captured.basename,
         captured.name_identity,
     );
-    const resolved = Dir.realPathFileAbsoluteAlloc(
-        io,
-        captured.path,
-        std.heap.page_allocator,
-    ) catch return error.WevalPackageRace;
-    defer std.heap.page_allocator.free(resolved);
-    if (!std.mem.eql(u8, resolved, captured.resolved_path))
-        return error.WevalPackageRace;
+    try verifyCapturedPath(io, captured.parent_path);
 }
 
 fn captureWevalPackage(
@@ -6444,36 +6818,11 @@ fn captureWevalPackage(
     io: Io,
     weval: WevalTool,
 ) !CapturedWevalPackage {
-    const root_parent_path = std.fs.path.dirname(weval.package_root) orelse
-        return error.UnsafeWevalPackage;
-    const root_basename = std.fs.path.basename(weval.package_root);
-    var root_parent = try Dir.openDirAbsolute(io, root_parent_path, .{
-        .iterate = true,
-        .follow_symlinks = true,
-    });
-    errdefer root_parent.close(io);
-    const root_name_identity = try packagePathIdentity(
+    const tree = try captureDirectory(
+        allocator,
         io,
-        root_parent,
-        root_basename,
-    );
-    var root_dir = try root_parent.openDir(io, root_basename, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    errdefer root_dir.close(io);
-    const root_identity = try packageDirectoryIdentity(io, root_dir);
-    if (root_identity.stat.kind != .directory)
-        return error.UnsafeWevalPackage;
-    var state: CapturePackageState = .{
-        .allocator = allocator,
-        .io = io,
-    };
-    const root = try capturePackageDirectory(
-        &state,
-        root_dir,
-        root_identity,
-        0,
+        weval.package_root,
+        true,
     );
     const selected_relative = try std.fs.path.relative(
         allocator,
@@ -6486,12 +6835,60 @@ fn captureWevalPackage(
         !safePackageRelativePath(selected_relative))
         return error.UnsafeWevalPackage;
     return .{
-        .root_path = try allocator.dupe(u8, weval.package_root),
-        .root_basename = try allocator.dupe(u8, root_basename),
-        .root_parent = root_parent,
-        .root_name_identity = root_name_identity,
-        .root = root,
+        .tree = tree,
         .selected_relative = selected_relative,
+    };
+}
+
+fn captureDirectory(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    allow_symlinks: bool,
+) !CapturedDirectory {
+    const parent_path = std.fs.path.dirname(path) orelse
+        return error.InvalidPath;
+    const basename = std.fs.path.basename(path);
+    if (basename.len == 0 or
+        std.mem.eql(u8, basename, ".") or
+        std.mem.eql(u8, basename, ".."))
+        return error.InvalidPath;
+    const captured_parent = try captureAbsoluteDirectoryPath(
+        allocator,
+        io,
+        parent_path,
+    );
+    errdefer captured_parent.close(io);
+    const parent = captured_parent.parent();
+    const name_identity = try packagePathIdentity(io, parent, basename);
+    var root_dir = try parent.openDir(io, basename, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer root_dir.close(io);
+    const root_identity = try packageDirectoryIdentity(io, root_dir);
+    if (root_identity.stat.kind != .directory or
+        !sameStablePackageIdentity(name_identity, root_identity))
+        return error.WevalPackageRace;
+    var state: CapturePackageState = .{
+        .allocator = allocator,
+        .io = io,
+        .allow_symlinks = allow_symlinks,
+    };
+    const root = try capturePackageDirectory(
+        &state,
+        root_dir,
+        root_identity,
+        0,
+    );
+    try verifyPackageNameIdentity(io, parent, basename, name_identity);
+    try verifyCapturedPath(io, captured_parent);
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .basename = try allocator.dupe(u8, basename),
+        .parent_path = captured_parent,
+        .name_identity = name_identity,
+        .root = root,
     };
 }
 
@@ -6508,6 +6905,41 @@ fn safePackageRelativePath(relative: []const u8) bool {
             return false;
     }
     return true;
+}
+
+fn capturedDirectoryDigest(
+    captured: CapturedDirectory,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashCapturedPackageDirectory(&hasher, captured.root);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashCapturedPackageDirectory(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    captured: *CapturedPackageDirectory,
+) void {
+    for (captured.entries) |entry| {
+        hasher.update(entry.name);
+        hasher.update(&.{0});
+        switch (entry.value) {
+            .file => |file| {
+                hasher.update("file\x00");
+                hasher.update(&file.digest);
+            },
+            .directory => |directory| {
+                hasher.update("directory\x00");
+                hashCapturedPackageDirectory(hasher, directory);
+            },
+            .sym_link => |link| {
+                hasher.update("symlink\x00");
+                hasher.update(link.target);
+            },
+        }
+        hasher.update(&.{0xff});
+    }
 }
 
 fn capturePackageDirectory(
@@ -6589,6 +7021,8 @@ fn capturePackageDirectory(
                     ) };
                 },
                 .sym_link => blk: {
+                    if (!state.allow_symlinks)
+                        return error.UnsafeWevalPackage;
                     const file = try dir.openFile(state.io, name, .{
                         .path_only = true,
                         .allow_directory = true,
@@ -6668,7 +7102,7 @@ fn copyCapturedWevalPackage(
         .follow_symlinks = false,
     });
     defer destination.close(io);
-    try copyCapturedPackageDirectory(io, captured.root, destination);
+    try copyCapturedPackageDirectory(io, captured.tree.root, destination);
     const selected = try std.fs.path.join(
         allocator,
         &.{ destination_path, captured.selected_relative },
@@ -6682,6 +7116,24 @@ fn copyCapturedWevalPackage(
         return error.UnsafeWevalPackage;
     try requireExecutableFile(allocator, io, selected);
     return .{ .selected = selected, .provenance = provenance };
+}
+
+fn copyCapturedDirectory(
+    io: Io,
+    captured: CapturedDirectory,
+    destination_path: []const u8,
+) !void {
+    const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
+        File.Permissions.fromMode(0o700)
+    else
+        .default_dir;
+    try Dir.createDirAbsolute(io, destination_path, private_permissions);
+    var destination = try Dir.openDirAbsolute(io, destination_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer destination.close(io);
+    try copyCapturedPackageDirectory(io, captured.root, destination);
 }
 
 fn copyCapturedPackageDirectory(
@@ -6757,13 +7209,21 @@ fn verifyCapturedWevalPackage(
     io: Io,
     captured: CapturedWevalPackage,
 ) !void {
+    try verifyCapturedDirectory(io, captured.tree);
+}
+
+fn verifyCapturedDirectory(
+    io: Io,
+    captured: CapturedDirectory,
+) !void {
     try verifyCapturedPackageDirectory(io, captured.root);
     try verifyRetainedNameIdentity(
         io,
-        captured.root_parent,
-        captured.root_basename,
-        captured.root_name_identity,
+        captured.parent_path.parent(),
+        captured.basename,
+        captured.name_identity,
     );
+    try verifyCapturedPath(io, captured.parent_path);
 }
 
 fn verifyCapturedPackageDirectory(
@@ -7425,9 +7885,9 @@ fn runComponentizerTestHook(
     const wait_at = environ.get("STARLING_COMPONENTIZER_TEST_WAIT_AT");
     const notify_at = environ.get("STARLING_COMPONENTIZER_TEST_NOTIFY_AT");
     const should_wait = wait_at != null and
-        std.mem.eql(u8, wait_at.?, phase);
+        hookPhaseEnabled(wait_at.?, phase);
     const should_notify = notify_at != null and
-        std.mem.eql(u8, notify_at.?, phase);
+        hookPhaseEnabled(notify_at.?, phase);
     if (!should_wait and !should_notify) return;
     const ready = try std.fs.path.join(
         allocator,
@@ -7455,6 +7915,14 @@ fn runComponentizerTestHook(
         };
         break;
     }
+}
+
+fn hookPhaseEnabled(value: []const u8, phase: []const u8) bool {
+    var phases = std.mem.splitScalar(u8, value, ',');
+    while (phases.next()) |candidate| {
+        if (std.mem.eql(u8, candidate, phase)) return true;
+    }
+    return false;
 }
 
 fn removePrivateTree(io: Io, path: []const u8) void {

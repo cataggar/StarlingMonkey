@@ -171,15 +171,23 @@ An external engine package must carry schema-1
 `feature-wit/` trees containing the declared component and surface worlds.
 Missing or incompatible provenance, features, or worlds is rejected before
 the engine is used. AOT derives the required feature ABI from that validated
-provenance and requires the seal to match it.
+provenance and requires the seal to match it. World validation uses
+`wasm-tools` to parse and embed the complete closures; comments, filename
+matches, and raw text do not satisfy it. Explicit `--wit`, `--world-name`,
+`--component-wit`, and `--component-world-name` selections must match the
+packaged closure digests and provenance exactly.
 
 Missing artifacts, malformed manifests, non-SQLite or
 checksum-corrupt caches, and engine/tool/feature mismatches all fail before
 initialization or output publication; there is no Wizer fallback.
-The engine, cache, manifest, and every Weval package entry are retained by
-no-follow handles before a private per-run snapshot is assembled. Snapshot
-bytes are read only from those handles; before/after object, namespace, and
-digest checks reject unrestored substitution or retained-object mutation.
+The engine, cache, manifest, adapter, complete component/surface/feature WIT
+closures, and every Weval package entry are retained by no-follow handles
+before a private per-run snapshot is assembled. Absolute paths are walked
+from a retained root handle; every ancestor is retained and identity-checked,
+so swapping and restoring an ancestor cannot redirect a capture. Snapshot
+bytes are read only from those handles, and children receive only private
+snapshot paths. Before/after object, namespace, and digest checks reject
+unrestored substitution or retained-object mutation.
 A transient rename/substitution that is restored may complete, but substituted
 bytes are never copied or executed. The Weval snapshot scope is the selected executable's canonical
 containing directory and all descendants (at most 4,096 entries, 32 levels,

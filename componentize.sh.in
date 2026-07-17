@@ -23,22 +23,21 @@ aot_driver="@AOT_DRIVER@"
 preopen_dir="${PREOPEN_DIR:-}"
 
 if [[ $aot -ne 0 && "$aot_driver" == native ]]; then
+  package_dir="$(dirname "$0")"
+  managed_dir="$package_dir/../.starling-aot-engine/current/bin"
+  if [[ -d "$managed_dir" ]]; then
+    package_dir="$managed_dir"
+  fi
   aot_args=(
     --aot
     --legacy-wrapper-preopen
-    --engine "$(dirname "$0")/starling-raw.wasm"
-    --aot-cache-dir "${WEVAL_CACHE_DIR:-$(dirname "$0")}"
+    --engine "$package_dir/starling-raw.wasm"
+    --aot-cache-dir "${WEVAL_CACHE_DIR:-$package_dir}"
     --weval-bin "$weval"
-    --preview2-adapter "$(dirname "$0")/preview1-adapter.wasm"
+    --preview2-adapter "$package_dir/preview1-adapter.wasm"
     --wabt-bin "$wabt"
     --wasm-tools-bin "$wasm_tools"
   )
-  if [[ -n "$component_world" ]]; then
-    aot_args+=(
-      --wit "$component_wit"
-      --world-name "$component_world"
-    )
-  fi
   if [[ -n "${AOT_MIN_STACK_SIZE:-}" ]]; then
     aot_args+=(--aot-min-stack-size "$AOT_MIN_STACK_SIZE")
   fi

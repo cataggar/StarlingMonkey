@@ -396,6 +396,8 @@ pub fn build(b: *std.Build) void {
     componentizer_orchestration.addArtifactArg(componentizer);
     componentizer_orchestration.addArg(host_api_selection);
     componentizer_orchestration.addArtifactArg(aot_cache_tool);
+    if (b.lazyDependency("wasm-tools", .{})) |dep|
+        componentizer_orchestration.addFileArg(dep.path("wasm-tools"));
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
