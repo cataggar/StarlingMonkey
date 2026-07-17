@@ -133,7 +133,10 @@ tool, or traversed tree paths fail during input diagnostics with
 `InvalidUtf8Path`, ensuring every public diagnostic path remains a JSON string.
 Component, metadata, and debug destination validation is also input preflight
 and therefore reports `SMC1001`/`inputs`; the later metadata and debug phase
-codes describe generation, not destination parsing.
+codes describe generation, not destination parsing. Engine, adapter, WIT,
+tool, Zig executable/library, build-root, and preopen capture also remain in
+the input phase. Only execution of the retained native build enters
+`runtime_build`.
 
 ## Imports and provenance metadata
 
@@ -157,6 +160,11 @@ content hashes of both complete WIT layouts, the resolved feature booleans,
 SHA-256 hashes of every invoked tool (including nested runtime-build tools
 such as `wasip3-bindgen` and `wasm-opt`), source/initializer/runtime-argument
 hashes, engine/adapter hashes, and the exact published component hash. The
+optional `build_root_sha256` and ordered `preopen_trees` fields record
+domain-separated digests of the exact directory snapshots visible to native
+Zig and Wizer. Their order follows the CLI preopen order; they do not expose
+host paths.
+The
 `zig` tool record carries both the executable `sha256` and a domain-separated
 `lib_tree_sha256` over the complete snapshotted Zig library tree; both fields
 participate unambiguously in `tools_sha256`. Other tool records set
@@ -175,7 +183,17 @@ timestamps, random transaction names, or host paths, so its provenance fields
 are deterministic even if an underlying snapshot tool emits byte-distinct
 components. Files, complete JavaScript source-directory trees, WIT trees, and
 executables are copied to immutable per-run snapshots in controlled transaction
-storage before use; hashes are computed while creating those snapshots. On
+storage before use; hashes are computed while creating those snapshots.
+Symlinked WIT roots are resolved to a no-follow canonical directory anchor and
+copied descriptor-relative while both identities and the complete target
+manifest are checked. Internal escaping, absolute, dangling, or non-regular
+WIT entries are rejected. Native builds run with a retained build-root snapshot
+as their working directory. The versioned
+`tools/componentizer/runtime-build-inputs.txt` inventory limits that snapshot
+to the exact runtime-build closure; roots without the inventory are captured
+in full, excluding only identity-checked transaction/cache entries. Wizer
+preopens are complete retained snapshots mapped to their original guest paths.
+On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
 pre-created output files. Supported BSD-family hosts use inherited `/dev/fd`
@@ -201,6 +219,10 @@ not yet created). Their parent directories and unrelated debug contents remain
 hashed and staged, so modules beside or inside destination directories keep
 working. Unrelated names that resemble transaction, output, or cache names
 remain ordinary hashed and staged source entries.
+Root ctime relaxation is permitted only after Linux inotify positively
+observes a root rename. Hosts without that observation compare strict identity
+and manifests and fail closed; transaction-owned publication moves remain
+explicitly identity-checked before and after rename.
 Source and initializer snapshots are mapped to their original logical paths for
 Wizer, and the runtime-argument hash covers the exact stable byte stream
 supplied to Wizer.
@@ -242,6 +264,11 @@ transaction storage, and the build runs only that executable with
 supports archive layouts, installed `bin/zig` plus `lib/zig` layouts, symlinked
 executables, and paths containing spaces without consulting the original
 installation after snapshot validation.
+Every top-level and nested build requires exactly Zig
+`0.17.0-dev.902+7255f3e72`; `--zig-bin` and `ZIG` overrides are queried from
+their retained executable and rejected during input preflight when the version
+differs. The broader `build.zig.zon` minimum remains only a package parser
+floor.
 
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized

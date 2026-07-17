@@ -47,6 +47,10 @@ pub const InitializerTree = struct {
     shares_source_tree: bool,
 };
 
+pub const DirectoryTree = struct {
+    sha256: []const u8,
+};
+
 pub const Inputs = struct {
     source_sha256: []const u8,
     initializer_sha256: ?[]const u8,
@@ -55,6 +59,8 @@ pub const Inputs = struct {
     runtime_arguments_sha256: []const u8,
     engine_sha256: []const u8,
     preview2_adapter_sha256: []const u8,
+    build_root_sha256: ?[]const u8 = null,
+    preopen_trees: ?[]const DirectoryTree = null,
 };
 
 pub const Provenance = struct {
@@ -226,6 +232,12 @@ fn validateDocumentUtf8(document: Document) !void {
     try validateString(inputs.runtime_arguments_sha256);
     try validateString(inputs.engine_sha256);
     try validateString(inputs.preview2_adapter_sha256);
+    if (inputs.build_root_sha256) |digest| try validateString(digest);
+    if (inputs.preopen_trees) |trees| {
+        for (trees) |tree| {
+            try validateString(tree.sha256);
+        }
+    }
 }
 
 fn validateImportsUtf8(imports: Imports) !void {

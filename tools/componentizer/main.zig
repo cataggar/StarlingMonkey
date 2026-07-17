@@ -9,6 +9,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Dir = Io.Dir;
 const File = Io.File;
+const required_zig_version = "0.17.0-dev.902+7255f3e72";
+const runtime_build_manifest = "tools/componentizer/runtime-build-inputs.txt";
 
 const PipelineError = error{
     CacheDirectoryChanged,
@@ -29,11 +31,28 @@ const PipelineError = error{
     RollbackIncomplete,
     UnrepresentableRuntimeArgument,
     UnsupportedWitEntry,
+    UnsupportedZigVersion,
 };
 
 const StagedWit = struct {
     absolute: []const u8,
     digest: []const u8,
+};
+
+const RetainedDirectory = struct {
+    absolute: []const u8,
+    guest: []const u8,
+    digest: []const u8,
+};
+
+const BuildSelections = struct {
+    paths: []const []const u8,
+    manifest_digest: ?[]const u8,
+};
+
+const SnapshotSymlinkPolicy = enum {
+    preserve_internal,
+    dereference_files,
 };
 
 const Snapshot = struct {
@@ -171,6 +190,14 @@ const TreeManifest = struct {
             }
         }
         return true;
+    }
+
+    fn matchesAfterObservedRootRename(
+        self: TreeManifest,
+        other: TreeManifest,
+        rename_observed: bool,
+    ) bool {
+        return rename_observed and self.matchesAfterRootRename(other);
     }
 
     fn matchesWithAdditions(
@@ -501,7 +528,11 @@ const SourceManifestGuard = struct {
         };
         errdefer guard.monitor.deinit(allocator);
         for (manifest.entries) |entry| {
-            if (entry.kind == .sym_link) continue;
+            if (entry.kind == .sym_link and
+                !std.mem.eql(u8, entry.path, "."))
+            {
+                continue;
+            }
             const absolute = if (std.mem.eql(u8, entry.path, "."))
                 root
             else
@@ -1435,9 +1466,11 @@ const Transaction = struct {
                 protected.path,
             ) catch return error.TransactionChanged;
             if (!protected.manifest.matches(current)) {
-                if ((builtin.os.tag == .linux and
-                    !protected.namespace_changed) or
-                    !protected.manifest.matchesAfterRootRename(current))
+                if (builtin.os.tag != .linux or
+                    !protected.manifest.matchesAfterObservedRootRename(
+                        current,
+                        protected.namespace_changed,
+                    ))
                 {
                     return error.TransactionChanged;
                 }
@@ -1827,6 +1860,7 @@ const Runtime = struct {
     features_known: bool,
     zig: ?ZigSnapshot,
     build_tools: []const metadata.Tool,
+    build_root_digest: ?[]const u8,
     cache_lock: ?File,
 };
 
@@ -2134,7 +2168,41 @@ fn execute(
     const source_snapshot = input_snapshots.source;
     const initializer_snapshot = input_snapshots.initializer;
 
-    diagnostic.begin(.runtime_build);
+    const tools = try resolveTools(
+        allocator,
+        io,
+        environ,
+        cwd,
+        executable_dir,
+        config,
+        config.wit != null,
+        &transaction,
+    );
+
+    var preopen_snapshots: std.ArrayList(RetainedDirectory) = .empty;
+    for (config.preopen_dirs, 0..) |preopen, index| {
+        const preopen_abs = try absolutePath(allocator, cwd, preopen);
+        preopen_snapshots.append(
+            allocator,
+            try snapshotRetainedDirectory(
+                allocator,
+                io,
+                preopen_abs,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "preopens/{d}",
+                    .{index},
+                ),
+                preopen_abs,
+                "starling-componentizer-preopen-tree-v1",
+                &.{},
+                input_exclusions.items,
+                .preserve_internal,
+                &transaction,
+            ),
+        ) catch @panic("out of memory");
+    }
+
     const runtime = if (config.engine) |engine_override|
         try externalRuntime(
             allocator,
@@ -2162,18 +2230,6 @@ fn execute(
         lock.unlock(io);
         lock.close(io);
     };
-
-    diagnostic.begin(.inputs);
-    const tools = try resolveTools(
-        allocator,
-        io,
-        environ,
-        cwd,
-        executable_dir,
-        config,
-        runtime.component_wit != null,
-        &transaction,
-    );
 
     const runtime_args_path = try std.fs.path.join(
         allocator,
@@ -2252,9 +2308,13 @@ fn execute(
             );
         }
     }
-    for (config.preopen_dirs) |preopen| {
-        const preopen_abs = try absolutePath(allocator, cwd, preopen);
-        try addPreopen(allocator, &wizer_args, preopen_abs);
+    for (preopen_snapshots.items) |preopen| {
+        try addMappedPreopen(
+            allocator,
+            &wizer_args,
+            preopen.absolute,
+            preopen.guest,
+        );
     }
     wizer_args.appendSlice(allocator, &.{ "-o", initialized.path, runtime.engine.path }) catch
         @panic("out of memory");
@@ -2563,6 +2623,7 @@ fn execute(
             runtime_args,
             runtime,
             tools,
+            preopen_snapshots.items,
             processed.path,
             imports,
         );
@@ -2784,6 +2845,7 @@ fn externalRuntime(
         .features_known = false,
         .zig = null,
         .build_tools = &.{},
+        .build_root_digest = null,
         .cache_lock = null,
     };
 }
@@ -2802,6 +2864,47 @@ fn buildRuntime(
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     try cache.verifyCanonical(io);
+
+    const canonical_build_root = try canonicalDirectoryPath(
+        allocator,
+        io,
+        build_root,
+    );
+    const build_selections = try runtimeBuildSelections(
+        allocator,
+        io,
+        canonical_build_root,
+    );
+    const build_exclusions = [_]InputExclusion{.{
+        .path = cache.path,
+        .identity = cache.identity,
+    }};
+    const build_snapshot = try snapshotRetainedDirectory(
+        allocator,
+        io,
+        canonical_build_root,
+        "build-root",
+        build_root,
+        "starling-componentizer-runtime-build-root-v1",
+        build_selections.paths,
+        &build_exclusions,
+        .dereference_files,
+        transaction,
+    );
+    if (build_selections.manifest_digest) |expected_digest| {
+        const retained_manifest = try std.fs.path.join(
+            allocator,
+            &.{ build_snapshot.absolute, runtime_build_manifest },
+        );
+        const actual_digest = try metadata.sha256File(
+            allocator,
+            io,
+            retained_manifest,
+        );
+        if (!std.mem.eql(u8, expected_digest, actual_digest)) {
+            return error.InputChanged;
+        }
+    }
 
     var dispatch_wit: ?StagedWit = null;
     var component_wit: ?StagedWit = null;
@@ -2833,11 +2936,44 @@ fn buildRuntime(
             dispatch_wit;
     }
 
+    const zig_source = if (config.zig_bin) |path|
+        try absolutePath(allocator, cwd, path)
+    else if (environ.get("ZIG")) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        build_options.zig_exe;
+    const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
+    const zig_install = try snapshotZigInstallation(
+        allocator,
+        io,
+        zig_resolved,
+        environ,
+        build_root,
+        build_snapshot.absolute,
+        transaction,
+    );
+    const zig = zig_install.executable;
+    const configured_adapter = if (config.preview2_adapter) |path|
+        try snapshotFile(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(
+                allocator,
+                &.{ transaction_dir, "preview2-adapter.wasm" },
+            ),
+            transaction,
+        )
+    else
+        null;
+
     const key = try runtimeKey(
         allocator,
         config,
         if (dispatch_wit) |wit| wit.digest else null,
         if (component_wit) |wit| wit.digest else null,
+        build_snapshot.digest,
+        zig_install,
     );
     var runtimes = try ensureCacheDirectory(
         allocator,
@@ -2895,22 +3031,6 @@ fn buildRuntime(
     );
     defer zig_local.close(io);
 
-    const zig_source = if (config.zig_bin) |path|
-        try absolutePath(allocator, cwd, path)
-    else if (environ.get("ZIG")) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        build_options.zig_exe;
-    const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
-    const zig_install = try snapshotZigInstallation(
-        allocator,
-        io,
-        zig_resolved,
-        environ,
-        build_root,
-        transaction,
-    );
-    const zig = zig_install.executable;
     try verifyCacheLayout(
         cache,
         &runtimes,
@@ -3036,12 +3156,13 @@ fn buildRuntime(
         inherited_count += 1;
     }
     try runtime_prefix.setPermissions(io, .fromMode(0o500));
+    diagnostic.begin(.runtime_build);
     try runCommandRedacted(
         allocator,
         io,
         "zig build runtime",
         argv.items,
-        build_root,
+        build_snapshot.absolute,
         &build_env,
         null,
         config.verbose,
@@ -3097,17 +3218,8 @@ fn buildRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
     );
-    const adapter = if (config.preview2_adapter) |path|
-        try snapshotFile(
-            allocator,
-            io,
-            try absolutePath(allocator, cwd, path),
-            try std.fs.path.join(
-                allocator,
-                &.{ transaction_dir, "preview2-adapter.wasm" },
-            ),
-            transaction,
-        )
+    const adapter = if (configured_adapter) |snapshot|
+        snapshot
     else if (try statEntry(runtime_bin, io, "preview1-adapter.wasm") != null)
         try snapshotFileAt(
             allocator,
@@ -3178,6 +3290,7 @@ fn buildRuntime(
         .features_known = true,
         .zig = zig_install,
         .build_tools = build_tools,
+        .build_root_digest = build_snapshot.digest,
         .cache_lock = lock_file,
     };
 }
@@ -3187,10 +3300,11 @@ fn snapshotZigInstallation(
     io: Io,
     zig_path: []const u8,
     environ: *std.process.Environ.Map,
-    cwd: []const u8,
+    resolution_cwd: []const u8,
+    child_cwd: []const u8,
     transaction: *Transaction,
 ) !ZigSnapshot {
-    const zig_absolute = try absolutePath(allocator, cwd, zig_path);
+    const zig_absolute = try absolutePath(allocator, resolution_cwd, zig_path);
     const zig_source = try Dir.realPathFileAbsoluteAlloc(
         io,
         zig_absolute,
@@ -3212,13 +3326,22 @@ fn snapshotZigInstallation(
         transaction,
         zig_identity,
     );
+    try requirePinnedZigVersion(
+        allocator,
+        io,
+        executable.path,
+        environ,
+        child_cwd,
+        transaction,
+    );
     const lib_source = try discoverZigLibDir(
         allocator,
         io,
         zig_source,
         executable.path,
         environ,
-        cwd,
+        resolution_cwd,
+        child_cwd,
         transaction,
     );
     const lib_destination = try std.fs.path.join(
@@ -3230,6 +3353,10 @@ fn snapshotZigInstallation(
         io,
         lib_source,
         lib_destination,
+        "starling-componentizer-zig-lib-tree-v1",
+        &.{},
+        &.{},
+        .preserve_internal,
         transaction,
     );
     const lib_child_path = try transaction.retainStorageDirectory(
@@ -3244,17 +3371,55 @@ fn snapshotZigInstallation(
     };
 }
 
+fn requirePinnedZigVersion(
+    allocator: Allocator,
+    io: Io,
+    zig: []const u8,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    transaction: *Transaction,
+) !void {
+    try transaction.prepareChild(io);
+    var child_prepared = true;
+    defer if (child_prepared) transaction.finishChild(io) catch {};
+    try transaction.verifyRetainedIntegrity();
+    try transaction.verifyChildHandleIdentities(io);
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ zig, "version" },
+        .cwd = .{ .path = cwd },
+        .environ_map = environ,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try transaction.verifyChildHandleIdentities(io);
+    try transaction.verifyRetainedIntegrity();
+    try transaction.finishChild(io);
+    child_prepared = false;
+    if (!termSucceeded(result.term) or
+        !std.mem.eql(
+            u8,
+            std.mem.trim(u8, result.stdout, " \t\r\n"),
+            required_zig_version,
+        ))
+    {
+        return error.UnsupportedZigVersion;
+    }
+}
+
 fn discoverZigLibDir(
     allocator: Allocator,
     io: Io,
     zig_source: []const u8,
     zig: []const u8,
     environ: *std.process.Environ.Map,
-    cwd: []const u8,
+    resolution_cwd: []const u8,
+    child_cwd: []const u8,
     transaction: *Transaction,
 ) ![]const u8 {
     const discovered = if (environ.get("ZIG_LIB_DIR")) |configured|
-        try absolutePath(allocator, cwd, configured)
+        try absolutePath(allocator, resolution_cwd, configured)
     else if (try inferZigLibDir(allocator, io, zig_source)) |inferred|
         inferred
     else blk: {
@@ -3272,7 +3437,7 @@ fn discoverZigLibDir(
         try transaction.verifyChildHandleIdentities(io);
         const result = try std.process.run(allocator, io, .{
             .argv = &.{ zig, "env" },
-            .cwd = .{ .path = cwd },
+            .cwd = .{ .path = child_cwd },
             .environ_map = environ,
             .stdout_limit = .limited(1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
@@ -3312,7 +3477,7 @@ fn discoverZigLibDir(
             allocator,
             literal,
         ) catch return error.MissingBuildArtifact;
-        break :blk try absolutePath(allocator, cwd, parsed);
+        break :blk try absolutePath(allocator, resolution_cwd, parsed);
     };
     const canonical = try Dir.realPathFileAbsoluteAlloc(io, discovered, allocator);
     const stat = try Dir.cwd().statFile(
@@ -3368,14 +3533,17 @@ fn snapshotDirectoryTree(
     io: Io,
     source_path: []const u8,
     destination_path: []const u8,
+    digest_domain: []const u8,
+    included_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
+    symlink_policy: SnapshotSymlinkPolicy,
     transaction: *Transaction,
 ) ![]const u8 {
-    var source_guard = try SourceManifestGuard.init(
-        allocator,
-        io,
-        source_path,
-    );
-    defer source_guard.deinit(allocator);
+    var source_guard: ?SourceManifestGuard = if (included_paths.len == 0)
+        try SourceManifestGuard.init(allocator, io, source_path)
+    else
+        null;
+    defer if (source_guard) |*guard| guard.deinit(allocator);
     var source = try Dir.openDirAbsolute(
         io,
         source_path,
@@ -3397,7 +3565,8 @@ fn snapshotDirectoryTree(
         destination_path,
     );
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("starling-componentizer-zig-lib-tree-v1\x00");
+    hasher.update(digest_domain);
+    hasher.update(&.{0});
     _ = try copyInputDirectory(
         allocator,
         io,
@@ -3407,7 +3576,9 @@ fn snapshotDirectoryTree(
         "",
         destination_relative,
         "",
-        &.{},
+        included_paths,
+        excluded_paths,
+        symlink_policy,
         transaction,
         &hasher,
     );
@@ -3420,7 +3591,7 @@ fn snapshotDirectoryTree(
     {
         return error.InputChanged;
     }
-    try source_guard.verify(allocator, io);
+    if (source_guard) |*guard| try guard.verify(allocator, io);
     try sealSnapshotDirectory(io, destination);
     _ = try transaction.protectStoragePath(
         allocator,
@@ -3431,6 +3602,129 @@ fn snapshotDirectoryTree(
     hasher.final(&digest);
     const encoded = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &encoded);
+}
+
+fn canonicalDirectoryPath(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+) ![]const u8 {
+    const canonical = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        source_path,
+        allocator,
+    );
+    const stat = try Dir.cwd().statFile(
+        io,
+        canonical,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .directory) return error.InvalidPath;
+    return canonical;
+}
+
+fn snapshotRetainedDirectory(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    storage_relative: []const u8,
+    guest: []const u8,
+    digest_domain: []const u8,
+    included_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
+    symlink_policy: SnapshotSymlinkPolicy,
+    transaction: *Transaction,
+) !RetainedDirectory {
+    const canonical = try canonicalDirectoryPath(allocator, io, source_path);
+    try transaction.ensureStorageDirPath(allocator, io, storage_relative);
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, storage_relative },
+    );
+    const digest = try snapshotDirectoryTree(
+        allocator,
+        io,
+        canonical,
+        destination,
+        digest_domain,
+        included_paths,
+        excluded_paths,
+        symlink_policy,
+        transaction,
+    );
+    for (included_paths) |included| {
+        const retained_path = try std.fs.path.join(
+            allocator,
+            &.{ storage_relative, included },
+        );
+        _ = transaction.storage.statFile(
+            io,
+            retained_path,
+            .{ .follow_symlinks = false },
+        ) catch return error.InvalidBuildRoot;
+    }
+    return .{
+        .absolute = try transaction.retainStorageDirectory(
+            allocator,
+            io,
+            storage_relative,
+        ),
+        .guest = try allocator.dupe(u8, guest),
+        .digest = digest,
+    };
+}
+
+fn runtimeBuildSelections(
+    allocator: Allocator,
+    io: Io,
+    build_root: []const u8,
+) !BuildSelections {
+    const manifest_path = try std.fs.path.join(
+        allocator,
+        &.{ build_root, runtime_build_manifest },
+    );
+    const source = Dir.cwd().readFileAlloc(
+        io,
+        manifest_path,
+        allocator,
+        .limited(1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .paths = &.{},
+            .manifest_digest = null,
+        },
+        else => return err,
+    };
+    var selections: std.ArrayList([]const u8) = .empty;
+    selections.append(allocator, runtime_build_manifest) catch
+        @panic("out of memory");
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        try validatePathUtf8(line);
+        if (std.fs.path.isAbsolute(line) or
+            std.mem.indexOfScalar(u8, line, '\\') != null)
+        {
+            return error.InvalidBuildRoot;
+        }
+        var components = std.mem.splitScalar(u8, line, '/');
+        while (components.next()) |component| {
+            if (component.len == 0 or
+                std.mem.eql(u8, component, ".") or
+                std.mem.eql(u8, component, ".."))
+            {
+                return error.InvalidBuildRoot;
+            }
+        }
+        selections.append(allocator, try allocator.dupe(u8, line)) catch
+            @panic("out of memory");
+    }
+    return .{
+        .paths = selections.toOwnedSlice(allocator) catch
+            @panic("out of memory"),
+        .manifest_digest = try metadata.sha256Bytes(allocator, source),
+    };
 }
 
 fn copyEnvironment(
@@ -3597,13 +3891,34 @@ fn stageWit(
     stage_path: []const u8,
     transaction: *Transaction,
 ) !StagedWit {
-    var source_guard = try SourceManifestGuard.init(
+    var root_guard = try SourceManifestGuard.init(
         allocator,
         io,
         source_path,
     );
+    defer root_guard.deinit(allocator);
+    const canonical_source = try canonicalDirectoryPath(
+        allocator,
+        io,
+        source_path,
+    );
+    var source_guard = try SourceManifestGuard.init(
+        allocator,
+        io,
+        canonical_source,
+    );
     defer source_guard.deinit(allocator);
-    var source_dir = try Dir.openDirAbsolute(io, source_path, .{ .iterate = true });
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        "wit",
+    );
+    var source_dir = try Dir.openDirAbsolute(
+        io,
+        canonical_source,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
     defer source_dir.close(io);
     var walker = try source_dir.walk(allocator);
     defer walker.deinit();
@@ -3678,6 +3993,15 @@ fn stageWit(
         stage_relative,
     );
     try source_guard.verify(allocator, io);
+    try root_guard.verify(allocator, io);
+    const confirmed_canonical = try canonicalDirectoryPath(
+        allocator,
+        io,
+        source_path,
+    );
+    if (!std.mem.eql(u8, canonical_source, confirmed_canonical)) {
+        return error.InputChanged;
+    }
     return .{
         .absolute = try transaction.retainStorageDirectory(
             allocator,
@@ -3693,6 +4017,8 @@ fn runtimeKey(
     config: *const cli.Config,
     dispatch_digest: ?[]const u8,
     component_digest: ?[]const u8,
+    build_root_digest: []const u8,
+    zig: ZigSnapshot,
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashField(&hasher, "schema", "1");
@@ -3700,6 +4026,9 @@ fn runtimeKey(
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
+    hashField(&hasher, "build-root", build_root_digest);
+    hashField(&hasher, "zig", zig.executable.digest);
+    hashField(&hasher, "zig-lib", zig.lib_digest);
     hashField(&hasher, "dispatch-world", config.world_name orelse "");
     hashField(&hasher, "component-world", config.component_world_name orelse config.world_name orelse "");
     for (config.disable_features) |feature| hashField(&hasher, "disable", feature);
@@ -3730,6 +4059,7 @@ fn buildMetadataDocument(
     runtime_args: []const u8,
     runtime: Runtime,
     tools: Tools,
+    preopens: []const RetainedDirectory,
     component: []const u8,
     imports: metadata.Imports,
 ) !metadata.Document {
@@ -3822,6 +4152,13 @@ fn buildMetadataDocument(
         tools.wasm_tools,
     );
 
+    var preopen_values: std.ArrayList(metadata.DirectoryTree) = .empty;
+    for (preopens) |preopen| {
+        preopen_values.append(allocator, .{
+            .sha256 = preopen.digest,
+        }) catch @panic("out of memory");
+    }
+
     return .{
         .processed_by = .{ .version = build_options.version },
         .component_sha256 = try metadata.sha256File(allocator, io, component),
@@ -3860,6 +4197,12 @@ fn buildMetadataDocument(
                 ),
                 .engine_sha256 = runtime.engine.digest,
                 .preview2_adapter_sha256 = runtime.adapter.digest,
+                .build_root_sha256 = runtime.build_root_digest,
+                .preopen_trees = if (preopen_values.items.len == 0)
+                    null
+                else
+                    preopen_values.toOwnedSlice(allocator) catch
+                        @panic("out of memory"),
             },
         },
     };
@@ -4625,7 +4968,9 @@ fn snapshotInputTree(
         "",
         destination_relative,
         normalized_entry,
+        &.{},
         excluded_paths,
+        .preserve_internal,
         transaction,
         &tree_hasher,
     );
@@ -4772,7 +5117,9 @@ fn copyInputDirectory(
     relative: []const u8,
     destination_relative: []const u8,
     digest_entry: []const u8,
+    included_paths: []const []const u8,
     excluded_paths: []const InputExclusion,
+    symlink_policy: SnapshotSymlinkPolicy,
     transaction: *Transaction,
     tree_hasher: *std.crypto.hash.sha2.Sha256,
 ) !?[]const u8 {
@@ -4797,6 +5144,15 @@ fn copyInputDirectory(
         if (transaction.isRootEntry(child_source_path, stat)) {
             continue;
         }
+        const selected_path = if (relative.len == 0)
+            entry.name
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ relative, entry.name },
+            );
+        if (!treePathSelected(selected_path, included_paths)) continue;
         for (excluded_paths) |excluded| {
             if (excluded.matches(child_source_path, stat)) break;
         } else {
@@ -4926,7 +5282,9 @@ fn copyInputDirectory(
                     child_relative,
                     owned_path,
                     digest_entry,
+                    included_paths,
                     excluded_paths,
+                    symlink_policy,
                     transaction,
                     tree_hasher,
                 );
@@ -4945,6 +5303,73 @@ fn copyInputDirectory(
                 );
             },
             .sym_link => {
+                if (symlink_policy == .dereference_files) {
+                    var source_file = try source.openFile(io, entry.name, .{
+                        .mode = .read_only,
+                        .allow_directory = false,
+                        .follow_symlinks = true,
+                    });
+                    defer source_file.close(io);
+                    const target_stat = try source_file.stat(io);
+                    if (target_stat.kind != .file) {
+                        return error.UnsupportedInputEntry;
+                    }
+                    const target_identity = SourceIdentity.fromStat(target_stat);
+                    if (!entry.identity.matches(try source.statFile(
+                        io,
+                        entry.name,
+                        .{ .follow_symlinks = false },
+                    ))) return error.InputChanged;
+                    hashTreeEntryHeader(
+                        tree_hasher,
+                        'f',
+                        child_relative,
+                        target_identity.size,
+                    );
+                    var destination_file = try destination.createFile(
+                        io,
+                        entry.name,
+                        .{ .exclusive = true },
+                    );
+                    defer destination_file.close(io);
+                    try transaction.recordStoragePath(
+                        allocator,
+                        io,
+                        owned_path,
+                    );
+                    var buffer: [64 * 1024]u8 = undefined;
+                    while (true) {
+                        const count = source_file.readStreaming(
+                            io,
+                            &.{&buffer},
+                        ) catch |err| switch (err) {
+                            error.EndOfStream => break,
+                            else => return err,
+                        };
+                        if (count == 0) continue;
+                        tree_hasher.update(buffer[0..count]);
+                        try destination_file.writeStreamingAll(
+                            io,
+                            buffer[0..count],
+                        );
+                    }
+                    tree_hasher.update(&.{0xff});
+                    if (!target_identity.matches(try source_file.stat(io)) or
+                        !entry.identity.matches(try source.statFile(
+                            io,
+                            entry.name,
+                            .{ .follow_symlinks = false },
+                        )))
+                    {
+                        return error.InputChanged;
+                    }
+                    try destination_file.setPermissions(
+                        io,
+                        target_stat.permissions,
+                    );
+                    try destination_file.sync(io);
+                    continue;
+                }
                 var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const link_len = try source.readLink(io, entry.name, &link_buffer);
                 if (!entry.identity.matches(try source.statFile(
@@ -4996,6 +5421,15 @@ fn copyInputDirectory(
         if (transaction.isRootEntry(child_source_path, stat)) {
             continue;
         }
+        const selected_path = if (relative.len == 0)
+            entry.name
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ relative, entry.name },
+            );
+        if (!treePathSelected(selected_path, included_paths)) continue;
         for (excluded_paths) |excluded| {
             if (excluded.matches(child_source_path, stat)) break;
         } else {
@@ -5012,6 +5446,28 @@ fn copyInputDirectory(
     }
     if (seen != entries.items.len) return error.InputChanged;
     return selected_digest;
+}
+
+fn treePathSelected(
+    path: []const u8,
+    included_paths: []const []const u8,
+) bool {
+    if (included_paths.len == 0) return true;
+    for (included_paths) |selected| {
+        if (std.mem.eql(u8, path, selected) or
+            isRelativeDescendant(path, selected) or
+            isRelativeDescendant(selected, path))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isRelativeDescendant(path: []const u8, parent: []const u8) bool {
+    return path.len > parent.len and
+        std.mem.startsWith(u8, path, parent) and
+        path[parent.len] == '/';
 }
 
 fn snapshotFile(
@@ -6166,6 +6622,41 @@ fn waitForCommitTestBarrier(
 }
 
 const SpawnBarrierPoint = enum { before, after };
+
+fn waitForCaptureTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+) !void {
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER",
+    ) orelse return;
+    if (environ.get("STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE")) |selected| {
+        if (!std.mem.eql(u8, selected, stage)) return;
+    }
+    try validateArgument(base);
+    const ready = try std.fmt.allocPrint(
+        allocator,
+        "{s}.ready",
+        .{base},
+    );
+    const release = try std.fmt.allocPrint(
+        allocator,
+        "{s}.release",
+        .{base},
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
 
 fn waitForSpawnTestBarrier(
     allocator: Allocator,
@@ -7440,15 +7931,6 @@ fn termSucceeded(term: std.process.Child.Term) bool {
     };
 }
 
-fn addPreopen(
-    allocator: Allocator,
-    args: *std.ArrayList([]const u8),
-    path: []const u8,
-) !void {
-    try validateArgument(path);
-    args.appendSlice(allocator, &.{ "--dir", path }) catch @panic("out of memory");
-}
-
 fn addMappedPreopen(
     allocator: Allocator,
     args: *std.ArrayList([]const u8),
@@ -7973,10 +8455,35 @@ test "runtime cache key excludes JavaScript source" {
         .component_world_name = "component-world",
         .disable_features = &.{"http"},
     };
-    const first = try runtimeKey(std.testing.allocator, &config, "a", "b");
+    const snapshot = Snapshot{
+        .path = "zig",
+        .storage_path = "zig",
+        .digest = "zig-digest",
+        .protection = 0,
+    };
+    const zig = ZigSnapshot{
+        .executable = snapshot,
+        .lib_dir = "lib",
+        .lib_digest = "lib-digest",
+    };
+    const first = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        "a",
+        "b",
+        "root",
+        zig,
+    );
     defer std.testing.allocator.free(first);
     config.source = "second.js";
-    const second = try runtimeKey(std.testing.allocator, &config, "a", "b");
+    const second = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        "a",
+        "b",
+        "root",
+        zig,
+    );
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
 }
@@ -8018,4 +8525,49 @@ test "monitor distinguishes namespace changes from integrity failures" {
     try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.ATTRIB));
     try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.MODIFY));
     try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.Q_OVERFLOW));
+}
+
+test "root ctime relaxation requires an observed rename" {
+    var expected_entry = std.mem.zeroes(ManifestEntry);
+    expected_entry.path = ".";
+    expected_entry.kind = .directory;
+    var changed_entry = expected_entry;
+    changed_entry.ctime.nanoseconds = 1;
+    const expected = TreeManifest{
+        .entries = &.{expected_entry},
+        .digest = @splat(0),
+    };
+    const changed = TreeManifest{
+        .entries = &.{changed_entry},
+        .digest = @splat(0),
+    };
+
+    try std.testing.expect(!expected.matches(changed));
+    try std.testing.expect(expected.matchesAfterRootRename(changed));
+    try std.testing.expect(!expected.matchesAfterObservedRootRename(
+        changed,
+        false,
+    ));
+    try std.testing.expect(expected.matchesAfterObservedRootRename(
+        changed,
+        true,
+    ));
+}
+
+test "runtime build selections include only selected closures" {
+    const selected = [_][]const u8{
+        "build.zig",
+        "runtime",
+        "deps/lib/archive.a",
+    };
+    try std.testing.expect(treePathSelected("build.zig", &selected));
+    try std.testing.expect(treePathSelected("runtime/js.cpp", &selected));
+    try std.testing.expect(treePathSelected("deps", &selected));
+    try std.testing.expect(treePathSelected("deps/lib", &selected));
+    try std.testing.expect(treePathSelected(
+        "deps/lib/archive.a",
+        &selected,
+    ));
+    try std.testing.expect(!treePathSelected("deps/source", &selected));
+    try std.testing.expect(!treePathSelected(".zig-cache", &selected));
 }

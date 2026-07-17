@@ -11,6 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="$ROOT/tests/componentizer/.scratch"
 TOOLS="$SCRATCH/fake tools"
 WORK="$SCRATCH/work with spaces"
+FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
 SOURCE_RACER_PID=""
 SOURCE_COMPONENTIZER_PID=""
 SNAPSHOT_TEST_PID=""
@@ -69,7 +70,11 @@ remove_tree() {
   command rm -rf -- "$@"
 }
 cleanup_scratch
-mkdir -p "$TOOLS" "$WORK/wit package"
+mkdir -p "$TOOLS" "$WORK/wit package" "$FAKE_BUILD_ROOT/runtime" \
+  "$FAKE_BUILD_ROOT/tools/componentizer"
+printf 'captured-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
+touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
+  "$FAKE_BUILD_ROOT/tools/componentizer/main.zig"
 trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
@@ -160,6 +165,29 @@ if [ -n "${FAKE_ASSERT_GENERATED_SIBLINGS:-}" ]; then
   test ! -e "$snapshot/dist/app.json"
   test ! -e "$snapshot/dist/app.debug/commands.txt"
 fi
+if [ -n "${FAKE_ASSERT_PREOPEN_SNAPSHOT:-}" ]; then
+  matched=0
+  for arg in "$@"; do
+    case "$arg" in
+      *::"$FAKE_PREOPEN_GUEST")
+        snapshot="${arg%%::*}"
+        test "$snapshot" != "$FAKE_PREOPEN_GUEST"
+        if [ ! -f "$snapshot/marker.txt" ]; then
+          echo "retained preopen marker missing at $snapshot" >&2
+          ls -la "$snapshot" >&2 || true
+          exit 27
+        fi
+        if [ "$(cat "$snapshot/marker.txt")" != \
+             "${FAKE_EXPECT_PREOPEN:-captured-preopen}" ]; then
+          echo "retained preopen marker has substituted bytes" >&2
+          exit 28
+        fi
+        matched=1
+        ;;
+    esac
+  done
+  test "$matched" -eq 1
+fi
 cat > "$FAKE_RUNTIME_ARGS_LOG"
 if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-source\n' > "$FAKE_REPLACE_SOURCE"
@@ -204,6 +232,13 @@ PY
     echo "injected $stage failure" >&2
   fi
   exit 23
+fi
+if [ "$stage" = "component embed" ] &&
+   [ -n "${FAKE_ASSERT_WIT_SNAPSHOT:-}" ]; then
+  wit_index=$(($# - 1))
+  wit="${!wit_index}"
+  grep -Fq "world captured" "$wit/world.wit"
+  ! grep -Fq "substituted" "$wit/world.wit"
 fi
 out=""
 for ((i = 1; i <= $#; i++)); do
@@ -321,6 +356,10 @@ for fd in /proc/self/fd/*; do
       ;;
   esac
 done
+if [ "${1:-}" = "version" ]; then
+  printf '%s\n' "${FAKE_ZIG_VERSION:-0.17.0-dev.902+7255f3e72}"
+  exit 0
+fi
 if [ "${1:-}" = "env" ]; then
   test -d "$FAKE_ZIG_LIB_DIR"
   printf '.{\n    .lib_dir = "%s",\n}\n' "$FAKE_ZIG_LIB_DIR"
@@ -353,6 +392,10 @@ if [ -n "${FAKE_MUTATE_ZIG_LIB_DIR:-}" ]; then
   printf 'mutated-original\n' > "$FAKE_MUTATE_ZIG_LIB_DIR/marker"
 fi
 test "$(cat "$ZIG_LIB_DIR/marker")" = "immutable-zig-lib"
+if [ -n "${FAKE_ASSERT_BUILD_SNAPSHOT:-}" ]; then
+  test "$(cat build.zig)" = "captured-build-root"
+  test "$(pwd -P)" != "$FAKE_BUILD_ROOT_GUEST"
+fi
 if [ -n "${FAKE_ZIG_BARRIER:-}" ]; then
   printf 'ready\n' > "$FAKE_ZIG_BARRIER.ready"
   while [ ! -e "$FAKE_ZIG_BARRIER.release" ]; do
@@ -1320,7 +1363,7 @@ for runtime_root in "$RUNTIME_FAILURE_ROOT_A" "$RUNTIME_FAILURE_ROOT_B"; do
   fi
   if FAKE_FAIL_STAGE="zig build" FAKE_ECHO_RUNTIME_PATHS=1 "$COMPONENTIZER" \
     --json-diagnostics \
-    --build-root "$ROOT" \
+    --build-root "$FAKE_BUILD_ROOT" \
     --cache-dir "$RUNTIME_CACHE" \
     --zig-bin "$TOOLS/fake zig" \
     --wit "$WIT" \
@@ -1356,7 +1399,7 @@ RUNTIME_HUMAN_STDERR="$SCRATCH/runtime-human.stderr"
 mkdir "$RUNTIME_HUMAN_ROOT"
 if FAKE_FAIL_STAGE="zig build" FAKE_ECHO_RUNTIME_PATHS=1 "$COMPONENTIZER" \
   --verbose \
-  --build-root "$ROOT" \
+  --build-root "$FAKE_BUILD_ROOT" \
   --cache-dir "$RUNTIME_CACHE" \
   --zig-bin "$TOOLS/fake zig" \
   --wit "$WIT" \
@@ -2240,6 +2283,80 @@ test "$(cat "$DIRECTORY_DEBUG_DIR/commands.txt/sentinel")" = \
   "preserve-generated-tree"
 test ! -e "$DIRECTORY_DEBUG_OUTPUT"
 
+PREOPEN_ROOT="$SCRATCH/preopen caller tree"
+PREOPEN_SAVED="$SCRATCH/preopen caller tree saved"
+PREOPEN_OUTPUT="$WORK/preopen snapshot.wasm"
+PREOPEN_METADATA="$WORK/preopen snapshot.json"
+PREOPEN_BARRIER="$SCRATCH/preopen-snapshot"
+PREOPEN_LOG="$SCRATCH/preopen-snapshot.log"
+mkdir "$PREOPEN_ROOT"
+printf 'captured-preopen\n' > "$PREOPEN_ROOT/marker.txt"
+FAKE_ASSERT_PREOPEN_SNAPSHOT=1 \
+FAKE_PREOPEN_GUEST="$PREOPEN_ROOT" \
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$PREOPEN_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preopen-dir "$PREOPEN_ROOT" \
+  --metadata-out "$PREOPEN_METADATA" \
+  --out "$PREOPEN_OUTPUT" \
+  "$SOURCE" >/dev/null 2> "$PREOPEN_LOG" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$PREOPEN_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "preopen snapshot substitution"
+mv "$PREOPEN_ROOT" "$PREOPEN_SAVED"
+mkdir "$PREOPEN_ROOT"
+printf 'substituted-preopen\n' > "$PREOPEN_ROOT/marker.txt"
+: > "$PREOPEN_BARRIER.release"
+wait_for_marker "$PREOPEN_BARRIER.complete" "$SNAPSHOT_TEST_PID" \
+  "preopen snapshot completion"
+: > "$PREOPEN_BARRIER.verify"
+if ! wait "$SNAPSHOT_TEST_PID"; then
+  cat "$PREOPEN_LOG" >&2
+  cat "$FAKE_WIZER_ARGS_LOG" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$PREOPEN_OUTPUT"
+python3 - "$PREOPEN_METADATA" <<'PY'
+import json, re, sys
+metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+trees = metadata["provenance"]["inputs"]["preopen_trees"]
+assert len(trees) == 1, trees
+assert re.fullmatch(r"[0-9a-f]{64}", trees[0]["sha256"]), trees
+PY
+remove_tree "$PREOPEN_ROOT"
+mv "$PREOPEN_SAVED" "$PREOPEN_ROOT"
+PREOPEN_FIRST_DIGEST="$(python3 - "$PREOPEN_METADATA" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))
+      ["provenance"]["inputs"]["preopen_trees"][0]["sha256"])
+PY
+)"
+printf 'changed-preopen\n' > "$PREOPEN_ROOT/marker.txt"
+FAKE_ASSERT_PREOPEN_SNAPSHOT=1 \
+FAKE_EXPECT_PREOPEN=changed-preopen \
+FAKE_PREOPEN_GUEST="$PREOPEN_ROOT" \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preopen-dir "$PREOPEN_ROOT" \
+  --metadata-out "$PREOPEN_METADATA" \
+  --out "$PREOPEN_OUTPUT" \
+  "$SOURCE" >/dev/null
+PREOPEN_SECOND_DIGEST="$(python3 - "$PREOPEN_METADATA" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))
+      ["provenance"]["inputs"]["preopen_trees"][0]["sha256"])
+PY
+)"
+test "$PREOPEN_FIRST_DIGEST" != "$PREOPEN_SECOND_DIGEST"
+
 CACHE="$WORK/runtime cache"
 BUILD_OUTPUT_1="$WORK/built output 1.wasm"
 BUILD_OUTPUT_2="$WORK/built output 2.wasm"
@@ -2252,7 +2369,7 @@ build_with_selected_zig() {
   local zig="$1" output="$2"
   shift 2
   "$COMPONENTIZER" \
-    --build-root "$ROOT" \
+    --build-root "$FAKE_BUILD_ROOT" \
     --cache-dir "$CACHE" \
     --zig-bin "$zig" \
     --wit "$WIT" \
@@ -2269,6 +2386,102 @@ build_with_fake_zig() {
   shift
   build_with_selected_zig "$TOOLS/fake zig" "$output" "$@"
 }
+
+BUILD_ROOT_SNAPSHOT_OUTPUT="$WORK/build root snapshot.wasm"
+BUILD_ROOT_SNAPSHOT_METADATA="$WORK/build root snapshot.json"
+BUILD_ROOT_SNAPSHOT_METADATA_CHANGED="$WORK/build root snapshot changed.json"
+BUILD_ROOT_SNAPSHOT_BARRIER="$SCRATCH/build-root-snapshot"
+BUILD_ROOT_SAVED="$SCRATCH/fake native build root saved"
+FAKE_ASSERT_BUILD_SNAPSHOT=1 \
+FAKE_BUILD_ROOT_GUEST="$FAKE_BUILD_ROOT" \
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$BUILD_ROOT_SNAPSHOT_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE="zig build runtime" \
+build_with_fake_zig "$BUILD_ROOT_SNAPSHOT_OUTPUT" \
+  --metadata-out "$BUILD_ROOT_SNAPSHOT_METADATA" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$BUILD_ROOT_SNAPSHOT_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "build root snapshot substitution"
+mv "$FAKE_BUILD_ROOT" "$BUILD_ROOT_SAVED"
+mkdir -p "$FAKE_BUILD_ROOT/runtime" \
+  "$FAKE_BUILD_ROOT/tools/componentizer"
+printf 'substituted-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
+touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
+  "$FAKE_BUILD_ROOT/tools/componentizer/main.zig"
+: > "$BUILD_ROOT_SNAPSHOT_BARRIER.release"
+wait_for_marker "$BUILD_ROOT_SNAPSHOT_BARRIER.complete" "$SNAPSHOT_TEST_PID" \
+  "build root snapshot completion"
+: > "$BUILD_ROOT_SNAPSHOT_BARRIER.verify"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+remove_tree "$FAKE_BUILD_ROOT"
+mv "$BUILD_ROOT_SAVED" "$FAKE_BUILD_ROOT"
+python3 - "$BUILD_ROOT_SNAPSHOT_METADATA" <<'PY'
+import json, re, sys
+digest = json.load(open(sys.argv[1], encoding="utf-8")) \
+    ["provenance"]["inputs"]["build_root_sha256"]
+assert re.fullmatch(r"[0-9a-f]{64}", digest), digest
+PY
+printf 'changed-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
+build_with_fake_zig "$BUILD_ROOT_SNAPSHOT_OUTPUT" \
+  --metadata-out "$BUILD_ROOT_SNAPSHOT_METADATA_CHANGED"
+printf 'captured-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
+python3 - "$BUILD_ROOT_SNAPSHOT_METADATA" \
+  "$BUILD_ROOT_SNAPSHOT_METADATA_CHANGED" <<'PY'
+import json, sys
+digests = [
+    json.load(open(path, encoding="utf-8"))
+    ["provenance"]["inputs"]["build_root_sha256"]
+    for path in sys.argv[1:]
+]
+assert digests[0] != digests[1], digests
+PY
+
+INVALID_ZIG_OUTPUT="$WORK/invalid Zig version.wasm"
+INVALID_ZIG_ERROR="$SCRATCH/invalid-zig-version.jsonl"
+if FAKE_ZIG_VERSION=0.17.0-dev.901+invalid \
+  build_with_fake_zig "$INVALID_ZIG_OUTPUT" \
+    --json-diagnostics 2> "$INVALID_ZIG_ERROR"
+then
+  echo "FAIL: --zig-bin accepted an unpinned Zig version" >&2
+  exit 1
+fi
+python3 - "$INVALID_ZIG_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "UnsupportedZigVersion", diagnostic
+PY
+test ! -e "$INVALID_ZIG_OUTPUT"
+
+INVALID_ENV_ZIG_ERROR="$SCRATCH/invalid-env-zig-version.jsonl"
+if FAKE_ZIG_VERSION=0.18.0-dev.1+invalid ZIG="$TOOLS/fake zig" \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --build-root "$FAKE_BUILD_ROOT" \
+    --cache-dir "$CACHE" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$INVALID_ZIG_OUTPUT" \
+    "$BUILD_SOURCE" 2> "$INVALID_ENV_ZIG_ERROR"
+then
+  echo "FAIL: ZIG accepted an unpinned Zig version" >&2
+  exit 1
+fi
+python3 - "$INVALID_ENV_ZIG_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "UnsupportedZigVersion", diagnostic
+PY
+test ! -e "$INVALID_ZIG_OUTPUT"
+
 build_with_fake_zig "$BUILD_OUTPUT_1"
 build_with_fake_zig "$BUILD_OUTPUT_2"
 printf '\n// cache invalidation\n' >> "$WIT/world.wit"
@@ -2315,8 +2528,9 @@ assert all(sha256.match(provenance[k]) for k in (
 inputs = provenance["inputs"]
 assert all(sha256.match(inputs[k]) for k in (
     "source_sha256", "runtime_arguments_sha256", "engine_sha256",
-    "preview2_adapter_sha256",
+    "preview2_adapter_sha256", "build_root_sha256",
 ))
+assert inputs["preopen_trees"] is None
 assert inputs["initializer_sha256"] is None
 assert inputs["source_tree"]["entry"] == "source module.js"
 assert sha256.match(inputs["source_tree"]["sha256"])
@@ -2427,7 +2641,7 @@ wait "$pid2"
 unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
-test "${#prefixes[@]}" -eq 14
+test "${#prefixes[@]}" -eq 16
 for prefix in "${prefixes[@]}"; do
   case "$prefix" in
     *".starling-componentize-"*/data/runtime-prefix) ;;
@@ -2437,7 +2651,7 @@ for prefix in "${prefixes[@]}"; do
       ;;
   esac
 done
-test "$(printf '%s\n' "${prefixes[@]}" | sort -u | wc -l)" -eq 14
+test "$(printf '%s\n' "${prefixes[@]}" | sort -u | wc -l)" -eq 16
 test "$(find "$CACHE/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
   -ge 1
 cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
@@ -2527,7 +2741,7 @@ cache_identity_race() {
   remove_tree "$race_cache" "$race_held" "$race_target"
   FAKE_ZIG_BARRIER="$race_barrier" "$COMPONENTIZER" \
     --json-diagnostics \
-    --build-root "$ROOT" \
+    --build-root "$FAKE_BUILD_ROOT" \
     --cache-dir "$race_cache" \
     --zig-bin "$TOOLS/fake zig" \
     --wit "$WIT" \
@@ -2624,6 +2838,127 @@ SNAPSHOT_SOURCE_ROOT="$SCRATCH/stable snapshot source"
 SNAPSHOT_SOURCE="$SNAPSHOT_SOURCE_ROOT/main.js"
 mkdir "$SNAPSHOT_SOURCE_ROOT"
 printf 'export const stableSnapshot = true;\n' > "$SNAPSHOT_SOURCE"
+
+WIT_TARGET="$SCRATCH/symlinked WIT target"
+WIT_TARGET_SAVED="$SCRATCH/symlinked WIT target saved"
+WIT_LINK="$SCRATCH/symlinked WIT root"
+WIT_SUBSTITUTION_OUTPUT="$WORK/WIT target substitution.wasm"
+WIT_SUBSTITUTION_BARRIER="$SCRATCH/WIT-target-substitution"
+mkdir "$WIT_TARGET"
+cat > "$WIT_TARGET/world.wit" <<'EOF'
+package test:componentizer;
+world captured {}
+EOF
+ln -s "$WIT_TARGET" "$WIT_LINK"
+FAKE_ASSERT_WIT_SNAPSHOT=1 \
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$WIT_SUBSTITUTION_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
+"$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT_LINK" \
+  --world-name captured \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WIT_SUBSTITUTION_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2>&1 &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$WIT_SUBSTITUTION_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "symlinked WIT target substitution"
+mv "$WIT_TARGET" "$WIT_TARGET_SAVED"
+mkdir "$WIT_TARGET"
+cat > "$WIT_TARGET/world.wit" <<'EOF'
+package test:componentizer;
+world substituted {}
+EOF
+: > "$WIT_SUBSTITUTION_BARRIER.release"
+wait_for_marker "$WIT_SUBSTITUTION_BARRIER.complete" "$SNAPSHOT_TEST_PID" \
+  "symlinked WIT target completion"
+: > "$WIT_SUBSTITUTION_BARRIER.verify"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$WIT_SUBSTITUTION_OUTPUT"
+remove_tree "$WIT_TARGET"
+mv "$WIT_TARGET_SAVED" "$WIT_TARGET"
+
+WIT_RACE_OUTPUT="$WORK/WIT capture race.wasm"
+WIT_RACE_ERROR="$SCRATCH/WIT-capture-race.jsonl"
+WIT_RACE_BARRIER="$SCRATCH/WIT-capture-race"
+printf 'old-WIT-race-output\n' > "$WIT_RACE_OUTPUT"
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$WIT_RACE_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=wit \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT_LINK" \
+  --world-name captured \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WIT_RACE_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2> "$WIT_RACE_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$WIT_RACE_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "symlinked WIT target capture race"
+cat > "$WIT_TARGET/world.wit" <<'EOF'
+package test:componentizer;
+world capture_race_mutation {}
+EOF
+: > "$WIT_RACE_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: WIT target capture race reported success" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$WIT_RACE_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test "$(cat "$WIT_RACE_OUTPUT")" = "old-WIT-race-output"
+
+for wit_link_kind in escaping dangling; do
+  WIT_UNSAFE_ROOT="$SCRATCH/unsafe WIT $wit_link_kind"
+  WIT_UNSAFE_ERROR="$SCRATCH/unsafe-WIT-$wit_link_kind.jsonl"
+  mkdir "$WIT_UNSAFE_ROOT"
+  cat > "$WIT_UNSAFE_ROOT/world.wit" <<'EOF'
+package test:componentizer;
+world unsafe {}
+EOF
+  if [ "$wit_link_kind" = escaping ]; then
+    ln -s "$ENGINE" "$WIT_UNSAFE_ROOT/escaped.wit"
+  else
+    ln -s missing.wit "$WIT_UNSAFE_ROOT/dangling.wit"
+  fi
+  if "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT_UNSAFE_ROOT" \
+    --world-name unsafe \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$WORK/unsafe WIT $wit_link_kind.wasm" \
+    "$SNAPSHOT_SOURCE" >/dev/null 2> "$WIT_UNSAFE_ERROR"
+  then
+    echo "FAIL: $wit_link_kind WIT symlink was accepted" >&2
+    exit 1
+  fi
+  python3 - "$WIT_UNSAFE_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "UnsupportedWitEntry", diagnostic
+PY
+done
 
 SNAPSHOT_MUTATION_OUTPUT="$WORK/snapshot-mutation.wasm"
 SNAPSHOT_MUTATION_ERROR="$SCRATCH/snapshot-mutation.jsonl"
@@ -2918,7 +3253,7 @@ FAKE_ZIG_BARRIER="$SNAPSHOT_ZIG_BARRIER-child" \
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_ZIG_BARRIER" \
 STARLING_COMPONENTIZER_TEST_SPAWN_STAGE="zig build runtime" \
 "$COMPONENTIZER" \
-  --build-root "$ROOT" \
+  --build-root "$FAKE_BUILD_ROOT" \
   --cache-dir "$SNAPSHOT_ZIG_CACHE" \
   --zig-bin "$TOOLS/fake zig" \
   --wit "$WIT" \

@@ -1,4 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const required_zig_version = "0.17.0-dev.902+7255f3e72";
 
 const RuntimeBuildTool = struct {
     name: []const u8,
@@ -151,6 +154,9 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 }
 
 pub fn build(b: *std.Build) void {
+    if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
+        @panic("StarlingMonkey v0.4 requires Zig " ++ required_zig_version);
+    }
     const optimize = b.standardOptimizeOption(.{});
 
     // Native, Node-free driver for the monolithic Zig/WABT componentization
@@ -418,8 +424,10 @@ pub fn build(b: *std.Build) void {
     if (dispatch_wit) |wit_dir| {
         const dep = b.dependency("wasip3", .{});
         wasip3_dep = dep;
+        const bindgen_artifact = dep.artifact("wasip3-bindgen");
+        bindgen_artifact.root_module.optimize = .ReleaseSmall;
         const bindgen_snapshot = b.addWriteFiles().addCopyFile(
-            dep.artifact("wasip3-bindgen").getEmittedBin(),
+            bindgen_artifact.getEmittedBin(),
             "wasip3-bindgen",
         );
         runtime_build_tools.append(gpa, .{
