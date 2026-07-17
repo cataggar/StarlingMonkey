@@ -45,7 +45,6 @@ const PipelineError = error{
     TransactionChanged,
     UnsupportedRetainedExecution,
 };
-const retained_exec_marker = "__starling-retained-exec-v1";
 
 const EngineFeatures = struct {
     stdio: bool,
@@ -2426,8 +2425,10 @@ const CapturedTool = struct {
     executable: []const u8,
     package: CapturedWevalPackage,
     snapshot_package: ?CapturedWevalPackage = null,
+    retained_plan: ?RetainedExecPlan = null,
 
     fn close(tool: CapturedTool, io: Io) void {
+        if (tool.retained_plan) |plan| plan.close(io);
         if (tool.snapshot_package) |package| package.close(io);
         tool.package.close(io);
     }
@@ -2748,23 +2749,31 @@ fn retainedExecHelper(
     allocator: Allocator,
     io: Io,
     args: []const []const u8,
+    child_env: ?[*:null]const ?[*:0]const u8,
 ) !void {
-    if (builtin.os.tag != .linux or args.len < 6)
+    if (builtin.os.tag != .linux or args.len < 8)
         return error.UnsupportedRetainedExecution;
-    _ = args[0];
-    const execution_mount = "/mnt";
-    const root_path = "/mnt/starling-retained-package";
-    const selected_relative = args[1];
-    const selected_fd = try std.fmt.parseInt(std.posix.fd_t, args[2], 10);
-    const entry_args = try std.fmt.parseInt(usize, args[3], 10);
-    if (args.len < 4 + entry_args + 2 or
-        !std.mem.eql(u8, args[4 + entry_args], "--"))
+    const namespace_root_path = args[0];
+    const host_component = args[1];
+    const package_component = args[2];
+    const selected_relative = args[3];
+    const dynamic = if (std.mem.eql(u8, args[4], "dynamic"))
+        true
+    else if (std.mem.eql(u8, args[4], "static"))
+        false
+    else
+        return error.UnsupportedRetainedExecution;
+    const entry_args = try std.fmt.parseInt(usize, args[5], 10);
+    if (args.len < 6 + entry_args + 2 or
+        !std.mem.eql(u8, args[6 + entry_args], "--"))
         return error.UnsupportedRetainedExecution;
     const linux = std.os.linux;
-    const mount_z = try allocator.dupeSentinel(u8, execution_mount, 0);
+    const original_cwd = try std.process.currentPathAlloc(io, allocator);
+    try enterPrivateUserMountNamespace(io);
+    const mount_path = try allocator.dupeSentinel(u8, namespace_root_path, 0);
     switch (linux.errno(linux.mount(
         "starling-retained-package",
-        mount_z,
+        mount_path,
         "tmpfs",
         linux.MS.NOSUID | linux.MS.NODEV,
         0,
@@ -2772,17 +2781,102 @@ fn retainedExecHelper(
         .SUCCESS => {},
         else => return error.UnsupportedRetainedExecution,
     }
-    try Dir.createDirAbsolute(
+    var namespace_root = try Dir.openDirAbsolute(io, mount_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer namespace_root.close(io);
+    try namespace_root.createDir(
         io,
-        root_path,
+        host_component,
         File.Permissions.fromMode(0o700),
     );
-    var root = try Dir.openDirAbsolute(io, root_path, .{
+    try namespace_root.createDir(
+        io,
+        package_component,
+        File.Permissions.fromMode(0o700),
+    );
+    const namespace_path = try std.fmt.allocPrint(
+        allocator,
+        "/proc/self/fd/{d}",
+        .{namespace_root.handle},
+    );
+    const host_path = try std.fs.path.join(
+        allocator,
+        &.{ namespace_path, host_component },
+    );
+    const host_path_z = try allocator.dupeSentinel(u8, host_path, 0);
+    switch (linux.errno(linux.mount(
+        "/",
+        host_path_z,
+        null,
+        linux.MS.BIND | linux.MS.REC,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    const MountAttr = extern struct {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    };
+    var mount_attr: MountAttr = .{
+        .attr_set = 0x2 | 0x4 | 0x8,
+        .attr_clr = 0,
+        .propagation = 0,
+        .userns_fd = 0,
+    };
+    switch (linux.errno(linux.syscall5(
+        .mount_setattr,
+        @as(u32, @bitCast(@as(i32, linux.AT.FDCWD))),
+        @intFromPtr(host_path_z.ptr),
+        linux.AT.RECURSIVE,
+        @intFromPtr(&mount_attr),
+        @sizeOf(MountAttr),
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    switch (linux.errno(linux.mount(
+        null,
+        host_path_z,
+        null,
+        linux.MS.BIND | linux.MS.REMOUNT | linux.MS.NOEXEC |
+            linux.MS.NOSUID | linux.MS.NODEV,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    var host_root = try Dir.openDirAbsolute(io, "/", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer host_root.close(io);
+    var root_entries = host_root.iterate();
+    while (try root_entries.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, host_component) or
+            std.mem.eql(u8, entry.name, package_component))
+            return error.UnsupportedRetainedExecution;
+        const target = try namespaceMirrorLinkTarget(
+            allocator,
+            host_component,
+            entry.name,
+        );
+        try namespace_root.symLink(io, target, entry.name, .{});
+    }
+    var root = try namespace_root.openDir(io, package_component, .{
         .iterate = true,
         .follow_symlinks = false,
     });
     defer root.close(io);
-    var index: usize = 4;
+    switch (linux.errno(linux.fchdir(namespace_root.handle))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    var index: usize = 6;
     const entries_end = index + entry_args;
     while (index < entries_end) {
         const kind = args[index];
@@ -2818,7 +2912,11 @@ fn retainedExecHelper(
             var buffer: [64 * 1024]u8 = undefined;
             var offset: u64 = 0;
             while (offset < stat.size) {
-                const count = try source.readPositional(io, &.{&buffer}, offset);
+                const count = try source.readPositional(
+                    io,
+                    &.{&buffer},
+                    offset,
+                );
                 if (count == 0) return error.TransactionChanged;
                 try output.writePositionalAll(io, buffer[0..count], offset);
                 offset += count;
@@ -2835,9 +2933,13 @@ fn retainedExecHelper(
         }
     }
     try root.setPermissions(io, File.Permissions.fromMode(0o500));
+    switch (linux.errno(linux.fchdir(namespace_root.handle))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
     switch (linux.errno(linux.mount(
         null,
-        mount_z,
+        ".",
         null,
         linux.MS.REMOUNT | linux.MS.RDONLY |
             linux.MS.NOSUID | linux.MS.NODEV,
@@ -2847,11 +2949,24 @@ fn retainedExecHelper(
         else => return error.UnsupportedRetainedExecution,
     }
     _ = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    switch (linux.errno(linux.fchdir(namespace_root.handle))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    switch (linux.errno(linux.chroot("."))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    const cwd_z = try allocator.dupeSentinel(u8, original_cwd, 0);
+    switch (linux.errno(linux.chdir(cwd_z))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
     const selected_path = try std.fs.path.join(
         allocator,
-        &.{ root_path, selected_relative },
+        &.{ "/", package_component, selected_relative },
     );
-    const child_args = args[5 + entry_args ..];
+    const child_args = args[7 + entry_args ..];
     if (child_args.len == 0)
         return error.UnsupportedRetainedExecution;
     var argv_z = try allocator.allocSentinel(
@@ -2862,34 +2977,138 @@ fn retainedExecHelper(
     argv_z[0] = (try allocator.dupeSentinel(u8, selected_path, 0)).ptr;
     for (child_args[1..], 1..) |arg, arg_index|
         argv_z[arg_index] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
-    var magic: [2]u8 = undefined;
-    const selected_file: File = .{
-        .handle = selected_fd,
-        .flags = .{ .nonblocking = false },
-    };
-    const magic_len = try selected_file.readPositional(io, &.{&magic}, 0);
-    const rc = if (magic_len == 2 and std.mem.eql(u8, &magic, "#!"))
-        linux.execve(
-            (try allocator.dupeSentinel(u8, selected_path, 0)).ptr,
-            argv_z.ptr,
-            @ptrCast(std.c.environ),
-        )
-    else binary: {
+    const envp: [*:null]const ?[*:0]const u8 = child_env orelse
+        @ptrCast(std.c.environ);
+    const rc = if (dynamic) dynamic_exec: {
+        const loader = try root.openFile(
+            io,
+            ".starling-runtime-v1/loader",
+            .{ .follow_symlinks = false },
+        );
+        const library_path = try std.fs.path.join(
+            allocator,
+            &.{ "/", package_component, ".starling-runtime-v1/lib" },
+        );
+        var loader_argv = try allocator.allocSentinel(
+            ?[*:0]const u8,
+            child_args.len + 8,
+            null,
+        );
+        const fixed = [_][]const u8{
+            "starling-retained-loader",
+            "--inhibit-cache",
+            "--glibc-hwcaps-mask",
+            "",
+            "--library-path",
+            library_path,
+            "--argv0",
+            selected_path,
+            selected_path,
+        };
+        for (fixed, 0..) |arg, arg_index|
+            loader_argv[arg_index] =
+                (try allocator.dupeSentinel(u8, arg, 0)).ptr;
+        for (child_args[1..], fixed.len..) |arg, arg_index|
+            loader_argv[arg_index] =
+                (try allocator.dupeSentinel(u8, arg, 0)).ptr;
+        break :dynamic_exec linux.execveat(
+            loader.handle,
+            "",
+            loader_argv.ptr,
+            envp,
+            .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = false },
+        );
+    } else static_exec: {
         const immutable_executable = try root.openFile(
             io,
             selected_relative,
             .{ .follow_symlinks = true },
         );
-        break :binary linux.execveat(
+        break :static_exec linux.execveat(
             immutable_executable.handle,
             "",
             argv_z.ptr,
-            @ptrCast(std.c.environ),
+            envp,
             .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = false },
         );
     };
     _ = rc;
     return error.UnsupportedRetainedExecution;
+}
+
+fn namespaceMirrorLinkTarget(
+    allocator: Allocator,
+    host_component: []const u8,
+    root_entry: []const u8,
+) ![]const u8 {
+    if (host_component.len == 0 or root_entry.len == 0 or
+        std.mem.indexOfScalar(u8, host_component, '/') != null or
+        std.mem.indexOfScalar(u8, root_entry, '/') != null)
+        return error.UnsupportedRetainedExecution;
+    return std.fmt.allocPrint(
+        allocator,
+        "/{s}/{s}",
+        .{ host_component, root_entry },
+    );
+}
+
+fn enterPrivateUserMountNamespace(io: Io) !void {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    const uid = linux.getuid();
+    const gid = linux.getgid();
+    switch (linux.errno(linux.unshare(
+        linux.CLONE.NEWUSER | linux.CLONE.NEWNS,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    Dir.cwd().writeFile(io, .{
+        .sub_path = "/proc/self/setgroups",
+        .data = "deny\n",
+    }) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.UnsupportedRetainedExecution,
+    };
+    const uid_map = try std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "0 {d} 1\n",
+        .{uid},
+    );
+    defer std.heap.page_allocator.free(uid_map);
+    const gid_map = try std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "0 {d} 1\n",
+        .{gid},
+    );
+    defer std.heap.page_allocator.free(gid_map);
+    Dir.cwd().writeFile(io, .{
+        .sub_path = "/proc/self/uid_map",
+        .data = uid_map,
+    }) catch return error.UnsupportedRetainedExecution;
+    Dir.cwd().writeFile(io, .{
+        .sub_path = "/proc/self/gid_map",
+        .data = gid_map,
+    }) catch return error.UnsupportedRetainedExecution;
+    switch (linux.errno(linux.setresgid(0, 0, 0))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    switch (linux.errno(linux.setresuid(0, 0, 0))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    switch (linux.errno(linux.mount(
+        null,
+        "/",
+        null,
+        linux.MS.REC | linux.MS.PRIVATE,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
 }
 
 fn execute(
@@ -3761,6 +3980,7 @@ fn execute(
                 io,
                 "weval AOT",
                 snapshot.weval_capture,
+                null,
                 initialization_args.items,
                 snapshot.weval,
                 cwd,
@@ -8112,11 +8332,18 @@ fn snapshotTool(
         },
     );
     errdefer snapshot_package.close(io);
+    const retained_plan = try createRetainedExecPlan(
+        allocator,
+        io,
+        snapshot_package,
+    );
+    errdefer retained_plan.close(io);
     tool.executable = try retainedPackageExecutablePath(
         allocator,
         snapshot_package,
     );
     tool.snapshot_package = snapshot_package;
+    tool.retained_plan = retained_plan;
 }
 
 fn verifyCapturedTools(io: Io, tools: Tools) !void {
@@ -8133,6 +8360,7 @@ fn verifySnapshotTool(io: Io, tool: CapturedTool) !void {
         io,
         tool.snapshot_package orelse return error.TransactionChanged,
     );
+    try (tool.retained_plan orelse return error.TransactionChanged).verify(io);
 }
 
 fn verifyToolTransaction(io: Io, tool: CapturedTool) !void {
@@ -8183,11 +8411,452 @@ fn retainedPackageExecutablePath(
 const RetainedExecPlan = struct {
     helper_argv: []const []const u8,
     files: []const File,
+    captures: []const CapturedFile,
 
     fn close(plan: RetainedExecPlan, io: Io) void {
         for (plan.files) |file| file.close(io);
+        for (plan.captures) |capture| capture.close(io);
+    }
+
+    fn verify(plan: RetainedExecPlan, io: Io) !void {
+        for (plan.captures) |capture| try verifyCapturedFile(io, capture);
     }
 };
+
+const ElfClosureInfo = struct {
+    interpreter: ?[]const u8,
+    needed: []const []const u8,
+    runpath: ?[]const u8,
+};
+
+const RuntimeLibrary = struct {
+    name: []const u8,
+    source: CapturedPackageFile,
+};
+
+const RuntimeObject = struct {
+    source: CapturedPackageFile,
+    package_relative: ?[]const u8,
+};
+
+fn readPositionalExact(
+    io: Io,
+    file: File,
+    buffer: []u8,
+    offset: u64,
+) !void {
+    var completed: usize = 0;
+    while (completed < buffer.len) {
+        const count = try file.readPositional(
+            io,
+            &.{buffer[completed..]},
+            offset + completed,
+        );
+        if (count == 0) return error.UnsupportedRetainedExecution;
+        completed += count;
+    }
+}
+
+fn readLeInt(comptime T: type, bytes: []const u8) T {
+    return std.mem.readInt(T, bytes[0..@sizeOf(T)], .little);
+}
+
+fn readElfClosureInfo(
+    allocator: Allocator,
+    io: Io,
+    source: CapturedPackageFile,
+) !ElfClosureInfo {
+    var header: [64]u8 = undefined;
+    if (source.identity.stat.size < header.len)
+        return error.UnsupportedRetainedExecution;
+    try readPositionalExact(io, source.file, &header, 0);
+    if (!std.mem.eql(u8, header[0..4], "\x7fELF") or
+        header[4] != std.elf.ELFCLASS64 or
+        header[5] != std.elf.ELFDATA2LSB)
+        return error.UnsupportedRetainedExecution;
+    const phoff = readLeInt(u64, header[32..40]);
+    const phentsize = readLeInt(u16, header[54..56]);
+    const phnum = readLeInt(u16, header[56..58]);
+    if (phentsize < 56 or phnum > 256)
+        return error.UnsupportedRetainedExecution;
+    const Load = struct { offset: u64, vaddr: u64, filesz: u64 };
+    var loads: std.ArrayList(Load) = .empty;
+    var interpreter_offset: ?u64 = null;
+    var interpreter_size: u64 = 0;
+    var dynamic_offset: ?u64 = null;
+    var dynamic_size: u64 = 0;
+    var ph: [56]u8 = undefined;
+    for (0..phnum) |index| {
+        const delta = std.math.mul(
+            u64,
+            @intCast(index),
+            phentsize,
+        ) catch return error.UnsupportedRetainedExecution;
+        const offset = std.math.add(
+            u64,
+            phoff,
+            delta,
+        ) catch return error.UnsupportedRetainedExecution;
+        if (offset > source.identity.stat.size or
+            source.identity.stat.size - offset < ph.len)
+            return error.UnsupportedRetainedExecution;
+        try readPositionalExact(io, source.file, &ph, offset);
+        const kind = readLeInt(u32, ph[0..4]);
+        const file_offset = readLeInt(u64, ph[8..16]);
+        const vaddr = readLeInt(u64, ph[16..24]);
+        const filesz = readLeInt(u64, ph[32..40]);
+        switch (kind) {
+            std.elf.PT_LOAD => loads.append(
+                allocator,
+                .{ .offset = file_offset, .vaddr = vaddr, .filesz = filesz },
+            ) catch @panic("out of memory"),
+            std.elf.PT_INTERP => {
+                interpreter_offset = file_offset;
+                interpreter_size = filesz;
+            },
+            std.elf.PT_DYNAMIC => {
+                dynamic_offset = file_offset;
+                dynamic_size = filesz;
+            },
+            else => {},
+        }
+    }
+    const interpreter = if (interpreter_offset) |offset| blk: {
+        if (interpreter_size < 2 or interpreter_size > 4096 or
+            offset > source.identity.stat.size or
+            source.identity.stat.size - offset < interpreter_size)
+            return error.UnsupportedRetainedExecution;
+        const bytes = try allocator.alloc(u8, @intCast(interpreter_size));
+        try readPositionalExact(io, source.file, bytes, offset);
+        if (bytes[bytes.len - 1] != 0)
+            return error.UnsupportedRetainedExecution;
+        break :blk bytes[0 .. bytes.len - 1];
+    } else null;
+    const dyn_offset = dynamic_offset orelse return .{
+        .interpreter = interpreter,
+        .needed = &.{},
+        .runpath = null,
+    };
+    if (dynamic_size > 1024 * 1024 or
+        dyn_offset > source.identity.stat.size or
+        source.identity.stat.size - dyn_offset < dynamic_size)
+        return error.UnsupportedRetainedExecution;
+    var needed_offsets: std.ArrayList(u64) = .empty;
+    var string_vaddr: ?u64 = null;
+    var string_size: ?u64 = null;
+    var runpath_offset: ?u64 = null;
+    var dynamic_entry: [16]u8 = undefined;
+    var cursor: u64 = 0;
+    while (cursor + dynamic_entry.len <= dynamic_size) : (cursor += dynamic_entry.len) {
+        try readPositionalExact(
+            io,
+            source.file,
+            &dynamic_entry,
+            dyn_offset + cursor,
+        );
+        const tag = readLeInt(i64, dynamic_entry[0..8]);
+        const value = readLeInt(u64, dynamic_entry[8..16]);
+        switch (tag) {
+            std.elf.DT_NULL => break,
+            std.elf.DT_NEEDED => needed_offsets.append(
+                allocator,
+                value,
+            ) catch @panic("out of memory"),
+            std.elf.DT_STRTAB => string_vaddr = value,
+            std.elf.DT_STRSZ => string_size = value,
+            std.elf.DT_RUNPATH => runpath_offset = value,
+            std.elf.DT_RPATH => {
+                if (runpath_offset == null) runpath_offset = value;
+            },
+            else => {},
+        }
+    }
+    if (needed_offsets.items.len == 0 and runpath_offset == null)
+        return .{ .interpreter = interpreter, .needed = &.{}, .runpath = null };
+    const str_vaddr = string_vaddr orelse
+        return error.UnsupportedRetainedExecution;
+    const str_size = string_size orelse return error.UnsupportedRetainedExecution;
+    if (str_size == 0 or str_size > 4 * 1024 * 1024)
+        return error.UnsupportedRetainedExecution;
+    var str_file_offset: ?u64 = null;
+    for (loads.items) |load| {
+        if (str_vaddr >= load.vaddr and
+            str_vaddr - load.vaddr < load.filesz)
+        {
+            str_file_offset = std.math.add(
+                u64,
+                load.offset,
+                str_vaddr - load.vaddr,
+            ) catch return error.UnsupportedRetainedExecution;
+            break;
+        }
+    }
+    const strings_offset = str_file_offset orelse
+        return error.UnsupportedRetainedExecution;
+    if (strings_offset > source.identity.stat.size or
+        source.identity.stat.size - strings_offset < str_size)
+        return error.UnsupportedRetainedExecution;
+    const strings = try allocator.alloc(u8, @intCast(str_size));
+    try readPositionalExact(io, source.file, strings, strings_offset);
+    var needed: std.ArrayList([]const u8) = .empty;
+    for (needed_offsets.items) |offset| {
+        needed.append(
+            allocator,
+            try elfStringAt(strings, offset),
+        ) catch @panic("out of memory");
+    }
+    return .{
+        .interpreter = interpreter,
+        .needed = try needed.toOwnedSlice(allocator),
+        .runpath = if (runpath_offset) |offset|
+            try elfStringAt(strings, offset)
+        else
+            null,
+    };
+}
+
+fn elfStringAt(strings: []const u8, offset: u64) ![]const u8 {
+    if (offset >= strings.len) return error.UnsupportedRetainedExecution;
+    const start: usize = @intCast(offset);
+    const end = std.mem.indexOfScalarPos(
+        u8,
+        strings,
+        start,
+        0,
+    ) orelse return error.UnsupportedRetainedExecution;
+    if (end == start) return error.UnsupportedRetainedExecution;
+    return strings[start..end];
+}
+
+fn capturedPackageSource(captured: CapturedFile) CapturedPackageFile {
+    return .{
+        .file = captured.file,
+        .identity = captured.identity,
+        .digest = captured.digest,
+    };
+}
+
+fn normalizePackageLibraryPath(
+    allocator: Allocator,
+    origin_relative: []const u8,
+    runpath: []const u8,
+    library: []const u8,
+) ![]const u8 {
+    const origin = std.fs.path.dirname(origin_relative) orelse "";
+    const suffix = if (std.mem.startsWith(u8, runpath, "$ORIGIN"))
+        runpath["$ORIGIN".len..]
+    else if (std.mem.startsWith(u8, runpath, "${ORIGIN}"))
+        runpath["${ORIGIN}".len..]
+    else
+        return error.UnsupportedRetainedExecution;
+    if (suffix.len != 0 and suffix[0] != '/')
+        return error.UnsupportedRetainedExecution;
+    const candidate = try std.mem.join(
+        allocator,
+        "/",
+        &.{ origin, std.mem.trimStart(u8, suffix, "/"), library },
+    );
+    var normalized: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.splitScalar(u8, candidate, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            if (normalized.items.len == 0)
+                return error.UnsupportedRetainedExecution;
+            _ = normalized.pop();
+        } else {
+            normalized.append(allocator, part) catch @panic("out of memory");
+        }
+    }
+    if (normalized.items.len == 0)
+        return error.UnsupportedRetainedExecution;
+    return std.mem.join(allocator, "/", normalized.items);
+}
+
+fn resolvePackageRuntimeLibrary(
+    allocator: Allocator,
+    root: *CapturedPackageDirectory,
+    object_relative: []const u8,
+    runpath: ?[]const u8,
+    library: []const u8,
+) !?struct { relative: []const u8, source: CapturedPackageFile } {
+    const value = runpath orelse return null;
+    var paths = std.mem.splitScalar(u8, value, ':');
+    while (paths.next()) |path| {
+        const relative = normalizePackageLibraryPath(
+            allocator,
+            object_relative,
+            path,
+            library,
+        ) catch continue;
+        const resolved = resolveCapturedPackageEntry(
+            allocator,
+            root,
+            relative,
+        ) catch continue;
+        const source = switch (resolved.entry.value) {
+            .file => |file| file,
+            else => continue,
+        };
+        return .{ .relative = resolved.relative, .source = source };
+    }
+    return null;
+}
+
+const system_library_directories = [_][]const u8{
+    "/usr/lib",
+    "/lib",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+};
+
+fn captureSystemRuntimeFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) !CapturedFile {
+    const resolved = try resolveExistingFile(allocator, io, "/", path);
+    return captureFile(allocator, io, resolved) catch
+        return error.UnsupportedRetainedExecution;
+}
+
+fn captureSystemRuntimeLibrary(
+    allocator: Allocator,
+    io: Io,
+    name: []const u8,
+) !CapturedFile {
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null)
+        return error.UnsupportedRetainedExecution;
+    for (system_library_directories) |directory| {
+        const candidate = try std.fs.path.join(
+            allocator,
+            &.{ directory, name },
+        );
+        if (!pathExists(io, candidate)) continue;
+        return captureSystemRuntimeFile(allocator, io, candidate);
+    }
+    return error.UnsupportedRetainedExecution;
+}
+
+fn captureExecutableRuntimeClosure(
+    allocator: Allocator,
+    io: Io,
+    package: CapturedWevalPackage,
+    selected_relative: []const u8,
+    selected_entry: *const CapturedPackageEntry,
+    libraries: *std.ArrayList(RuntimeLibrary),
+    captures: *std.ArrayList(CapturedFile),
+) !?CapturedFile {
+    const selected_source = switch (selected_entry.value) {
+        .file => |file| file,
+        else => return error.UnsupportedRetainedExecution,
+    };
+    const selected_info = try readElfClosureInfo(
+        allocator,
+        io,
+        selected_source,
+    );
+    if (selected_info.interpreter == null and selected_info.needed.len == 0)
+        return null;
+    const interpreter = selected_info.interpreter orelse
+        return error.UnsupportedRetainedExecution;
+    if (!std.fs.path.isAbsolute(interpreter))
+        return error.UnsupportedRetainedExecution;
+    const loader = try captureSystemRuntimeFile(
+        allocator,
+        io,
+        interpreter,
+    );
+    captures.append(allocator, loader) catch @panic("out of memory");
+    const loader_info = try readElfClosureInfo(
+        allocator,
+        io,
+        capturedPackageSource(loader),
+    );
+    if (loader_info.interpreter != null or loader_info.needed.len != 0)
+        return error.UnsupportedRetainedExecution;
+    var objects: std.ArrayList(struct {
+        object: RuntimeObject,
+        info: ElfClosureInfo,
+    }) = .empty;
+    objects.append(allocator, .{
+        .object = .{
+            .source = selected_source,
+            .package_relative = selected_relative,
+        },
+        .info = selected_info,
+    }) catch @panic("out of memory");
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    seen.put(
+        allocator,
+        std.fs.path.basename(loader.path),
+        {},
+    ) catch @panic("out of memory");
+    var object_index: usize = 0;
+    while (object_index < objects.items.len) : (object_index += 1) {
+        if (objects.items.len > 128)
+            return error.UnsupportedRetainedExecution;
+        const current = objects.items[object_index];
+        for (current.info.needed) |name| {
+            if (seen.contains(name)) continue;
+            seen.put(allocator, name, {}) catch @panic("out of memory");
+            if (current.object.package_relative) |relative| {
+                if (try resolvePackageRuntimeLibrary(
+                    allocator,
+                    package.tree.root,
+                    relative,
+                    current.info.runpath,
+                    name,
+                )) |package_library| {
+                    libraries.append(allocator, .{
+                        .name = try allocator.dupe(u8, name),
+                        .source = package_library.source,
+                    }) catch @panic("out of memory");
+                    const info = try readElfClosureInfo(
+                        allocator,
+                        io,
+                        package_library.source,
+                    );
+                    objects.append(allocator, .{
+                        .object = .{
+                            .source = package_library.source,
+                            .package_relative = package_library.relative,
+                        },
+                        .info = info,
+                    }) catch @panic("out of memory");
+                    continue;
+                }
+            }
+            const system = try captureSystemRuntimeLibrary(
+                allocator,
+                io,
+                name,
+            );
+            captures.append(allocator, system) catch @panic("out of memory");
+            libraries.append(allocator, .{
+                .name = try allocator.dupe(u8, name),
+                .source = capturedPackageSource(system),
+            }) catch @panic("out of memory");
+            const info = try readElfClosureInfo(
+                allocator,
+                io,
+                capturedPackageSource(system),
+            );
+            objects.append(allocator, .{
+                .object = .{
+                    .source = capturedPackageSource(system),
+                    .package_relative = null,
+                },
+                .info = info,
+            }) catch @panic("out of memory");
+        }
+    }
+    return loader;
+}
 
 fn createSealedPackageFile(
     io: Io,
@@ -8223,6 +8892,12 @@ fn createSealedPackageFile(
     hasher.final(&digest);
     if (!std.mem.eql(u8, &digest, &source.digest))
         return error.TransactionChanged;
+    try sealed.setPermissions(
+        io,
+        File.Permissions.fromMode(
+            source.identity.stat.permissions.toMode() & 0o777,
+        ),
+    );
     switch (std.posix.errno(std.posix.system.fcntl(
         sealed.handle,
         linux.F.ADD_SEALS,
@@ -8240,10 +8915,8 @@ fn appendRetainedPackageEntries(
     io: Io,
     directory: *CapturedPackageDirectory,
     prefix: []const u8,
-    selected_entry: *const CapturedPackageEntry,
     args: *std.ArrayList([]const u8),
     files: *std.ArrayList(File),
-    selected_fd: *?std.posix.fd_t,
 ) !void {
     if (prefix.len != 0) {
         args.appendSlice(allocator, &.{
@@ -8265,7 +8938,6 @@ fn appendRetainedPackageEntries(
             .file => |source| {
                 const sealed = try createSealedPackageFile(io, source);
                 files.append(allocator, sealed) catch @panic("out of memory");
-                if (entry == selected_entry) selected_fd.* = sealed.handle;
                 args.appendSlice(allocator, &.{
                     "f",
                     relative,
@@ -8282,10 +8954,8 @@ fn appendRetainedPackageEntries(
                 io,
                 child,
                 relative,
-                selected_entry,
                 args,
                 files,
-                selected_fd,
             ),
             .sym_link => |link| {
                 args.appendSlice(
@@ -8301,7 +8971,6 @@ fn createRetainedExecPlan(
     allocator: Allocator,
     io: Io,
     package: CapturedWevalPackage,
-    argv: []const []const u8,
 ) !RetainedExecPlan {
     if (builtin.os.tag != .linux)
         return error.UnsupportedRetainedExecution;
@@ -8315,44 +8984,108 @@ fn createRetainedExecPlan(
     var entries: std.ArrayList([]const u8) = .empty;
     var files: std.ArrayList(File) = .empty;
     errdefer for (files.items) |file| file.close(io);
-    var selected_fd: ?std.posix.fd_t = null;
+    var captures: std.ArrayList(CapturedFile) = .empty;
+    errdefer for (captures.items) |capture| capture.close(io);
+    var libraries: std.ArrayList(RuntimeLibrary) = .empty;
+    if (capturedPackageEntry(
+        package.tree.root,
+        ".starling-runtime-v1",
+    ) != null) return error.UnsupportedRetainedExecution;
+    const loader = try captureExecutableRuntimeClosure(
+        allocator,
+        io,
+        package,
+        selected.relative,
+        selected.entry,
+        &libraries,
+        &captures,
+    );
     try appendRetainedPackageEntries(
         allocator,
         io,
         package.tree.root,
         "",
-        selected.entry,
         &entries,
         &files,
-        &selected_fd,
     );
-    const self = try Dir.openFileAbsolute(io, "/proc/self/exe", .{
-        .allow_directory = false,
-        .follow_symlinks = true,
-    });
-    errdefer self.close(io);
-    try clearCloseOnExec(self.handle);
-    files.append(allocator, self) catch @panic("out of memory");
+    if (loader) |captured_loader| {
+        entries.appendSlice(allocator, &.{
+            "d",
+            ".starling-runtime-v1",
+            "500",
+            "d",
+            ".starling-runtime-v1/lib",
+            "500",
+        }) catch @panic("out of memory");
+        const sealed_loader = try createSealedPackageFile(
+            io,
+            capturedPackageSource(captured_loader),
+        );
+        files.append(allocator, sealed_loader) catch @panic("out of memory");
+        entries.appendSlice(allocator, &.{
+            "f",
+            ".starling-runtime-v1/loader",
+            try std.fmt.allocPrint(
+                allocator,
+                "{d}",
+                .{sealed_loader.handle},
+            ),
+            "500",
+        }) catch @panic("out of memory");
+        for (libraries.items) |library| {
+            const sealed_library = try createSealedPackageFile(
+                io,
+                library.source,
+            );
+            files.append(
+                allocator,
+                sealed_library,
+            ) catch @panic("out of memory");
+            entries.appendSlice(allocator, &.{
+                "f",
+                try std.fmt.allocPrint(
+                    allocator,
+                    ".starling-runtime-v1/lib/{s}",
+                    .{library.name},
+                ),
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{d}",
+                    .{sealed_library.handle},
+                ),
+                "400",
+            }) catch @panic("out of memory");
+        }
+    }
+    try clearCloseOnExec(package.tree.root.dir.handle);
+    var namespace_random: [16]u8 = undefined;
+    io.random(&namespace_random);
+    const namespace_hex = std.fmt.bytesToHex(namespace_random, .lower);
+    const host_component = try std.fmt.allocPrint(
+        allocator,
+        ".__starling-host-{s}",
+        .{&namespace_hex},
+    );
+    const package_component = try std.fmt.allocPrint(
+        allocator,
+        ".__starling-package-{s}",
+        .{&namespace_hex},
+    );
     var helper: std.ArrayList([]const u8) = .empty;
     helper.appendSlice(allocator, &.{
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--",
-        try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{self.handle}),
-        retained_exec_marker,
         package.tree.path,
+        host_component,
+        package_component,
         package.selected_relative,
-        try std.fmt.allocPrint(allocator, "{d}", .{selected_fd.?}),
+        if (loader != null) "dynamic" else "static",
         try std.fmt.allocPrint(allocator, "{d}", .{entries.items.len}),
     }) catch @panic("out of memory");
     helper.appendSlice(allocator, entries.items) catch @panic("out of memory");
     helper.append(allocator, "--") catch @panic("out of memory");
-    helper.appendSlice(allocator, argv) catch @panic("out of memory");
     return .{
         .helper_argv = try helper.toOwnedSlice(allocator),
         .files = try files.toOwnedSlice(allocator),
+        .captures = try captures.toOwnedSlice(allocator),
     };
 }
 
@@ -14715,6 +15448,7 @@ fn runCapturedToolCommand(
         io,
         stage,
         tool.snapshot_package orelse return error.TransactionChanged,
+        tool.retained_plan,
         argv,
         tool.provenance,
         cwd,
@@ -14932,6 +15666,7 @@ fn runRetainedPackageCommand(
     io: Io,
     stage: []const u8,
     package: CapturedWevalPackage,
+    prepared_plan: ?RetainedExecPlan,
     argv: []const []const u8,
     display_argv0: ?[]const u8,
     cwd: []const u8,
@@ -14948,16 +15683,141 @@ fn runRetainedPackageCommand(
         verbose,
         command_log,
     );
-    const plan = try createRetainedExecPlan(allocator, io, package, argv);
-    defer plan.close(io);
-    try spawnCommand(
+    const owned_plan = if (prepared_plan == null)
+        try createRetainedExecPlan(allocator, io, package)
+    else
+        null;
+    defer if (owned_plan) |plan| plan.close(io);
+    const plan = prepared_plan orelse owned_plan.?;
+    plan.verify(io) catch return error.TransactionChanged;
+    var helper_args: std.ArrayList([]const u8) = .empty;
+    helper_args.appendSlice(
+        allocator,
+        plan.helper_argv,
+    ) catch @panic("out of memory");
+    helper_args.appendSlice(allocator, argv) catch @panic("out of memory");
+    if (environ) |map| {
+        const phase = if (std.mem.eql(u8, stage, "weval AOT"))
+            "retained-environment-captured-weval"
+        else
+            "retained-environment-captured-tool";
+        try runComponentizerTestHook(
+            allocator,
+            io,
+            @constCast(map),
+            phase,
+        );
+    }
+    const result = runRetainedHelperProcess(
+        allocator,
         io,
         stage,
-        plan.helper_argv,
+        helper_args.items,
         cwd,
         environ,
         stdin_path,
     );
+    plan.verify(io) catch return error.TransactionChanged;
+    try result;
+}
+
+fn runRetainedHelperProcess(
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    helper_args: []const []const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+) !void {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    const stdin_file = try Dir.openFileAbsolute(
+        io,
+        stdin_path orelse "/dev/null",
+        .{},
+    );
+    defer stdin_file.close(io);
+    var sanitized_environment = if (environ) |map|
+        try map.clone(allocator)
+    else
+        try currentEnvironmentMap(allocator);
+    defer sanitized_environment.deinit();
+    const loader_environment = [_][]const u8{
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_DEBUG_OUTPUT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "GLIBC_TUNABLES",
+    };
+    for (loader_environment) |name|
+        _ = sanitized_environment.swapRemove(name);
+    const env_block = try sanitized_environment.createPosixBlock(
+        allocator,
+        .{},
+    );
+    defer env_block.deinit(allocator);
+    const fork_result = linux.fork();
+    switch (linux.errno(fork_result)) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    if (fork_result == 0) {
+        const cwd_z = allocator.dupeSentinel(u8, cwd, 0) catch
+            linux.exit_group(126);
+        if (linux.errno(linux.chdir(cwd_z)) != .SUCCESS)
+            linux.exit_group(126);
+        if (linux.errno(linux.dup2(stdin_file.handle, 0)) != .SUCCESS)
+            linux.exit_group(126);
+        retainedExecHelper(
+            allocator,
+            io,
+            helper_args,
+            @ptrCast(env_block.view().slice.ptr),
+        ) catch |err| {
+            std.debug.print(
+                "error: retained execution helper failed: {t}\n",
+                .{err},
+            );
+            linux.exit_group(127);
+        };
+        unreachable;
+    }
+    var status: i32 = 0;
+    const wait_result = linux.waitpid(
+        @intCast(fork_result),
+        &status,
+        0,
+    );
+    switch (linux.errno(wait_result)) {
+        .SUCCESS => {},
+        else => return error.CommandFailed,
+    }
+    const wait_status: u32 = @bitCast(status);
+    if (!linux.W.IFEXITED(wait_status) or
+        linux.W.EXITSTATUS(wait_status) != 0)
+    {
+        std.debug.print("error: {s} failed\n", .{stage});
+        return error.CommandFailed;
+    }
+}
+
+fn currentEnvironmentMap(
+    allocator: Allocator,
+) !std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(allocator);
+    errdefer map.deinit();
+    var index: usize = 0;
+    while (std.c.environ[index]) |entry| : (index += 1) {
+        const value = std.mem.span(entry);
+        const separator = std.mem.indexOfScalar(u8, value, '=') orelse
+            continue;
+        if (separator == 0) continue;
+        try map.put(value[0..separator], value[separator + 1 ..]);
+    }
+    return map;
 }
 
 fn addPreopen(
@@ -15472,6 +16332,24 @@ test "Unix AOT staging has a platform default temp root" {
         ),
         else => try std.testing.expect(platformDefaultTempRoot() == null),
     }
+}
+
+test "private namespace mirrors caller-visible mnt paths" {
+    const target = try namespaceMirrorLinkTarget(
+        std.testing.allocator,
+        ".__starling-host-test",
+        "mnt",
+    );
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings(
+        "/.__starling-host-test/mnt",
+        target,
+    );
+    try std.testing.expect(!std.mem.startsWith(
+        u8,
+        "/mnt/caller/source.js",
+        "/.__starling-package-test",
+    ));
 }
 
 test "runtime arguments preserve paths with spaces" {

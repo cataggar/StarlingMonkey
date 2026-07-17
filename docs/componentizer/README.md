@@ -212,20 +212,34 @@ copies stable regular files, directories, and relative symlinks. Every
 relative symlink target, including each intermediate symlink, is recursively
 resolved against the captured package model and retained. Dangling, cyclic,
 absolute, package-escaping, and special-file layouts are rejected. The
-selected basename and internal symlink target are retained, so scripts using
-`dirname "$0"`, argv[0]-dispatched tools, and `$ORIGIN` sibling libraries see
-their original relative layout.
+selected basename and internal symlink target are retained, so native
+argv[0]-dispatched tools and `$ORIGIN` sibling libraries see their original
+relative layout. Selected scripts are rejected: their interpreter and
+arbitrary PATH subprocess closure cannot be proven complete.
 
 Resolved WABT and `wasm-tools` executables are treated the same way. Their
 containing closures are retained and reverified through publication. On
 Linux, every captured regular file is copied from its retained descriptor into
-a write/grow/shrink-sealed memfd. A retained copy of the componentizer enters
-a private user and mount namespace, reconstructs the complete closure on
-private tmpfs, and remounts it read-only. Native tools execute an immutable
-file descriptor with `execveat`; shebang scripts execute the private immutable
-pathname so package-relative argv[0], sibling lookup, script `dirname "$0"`,
-argv0 dispatch, and ELF `$ORIGIN` all retain their package semantics. Engine
-and cache reads likewise use retained file descriptors. Platforms without
+a write/grow/shrink-sealed memfd. The componentizer forks without reopening
+itself and enters a private user and mount namespace with direct Linux
+syscalls; no external `unshare` program is involved. A per-transaction tmpfs
+root contains the immutable package and a recursive, no-execute bind mirror
+of the original root filesystem. A chroot with top-level mirror links keeps
+all caller-visible absolute paths—including paths under `/mnt`—visible
+without overlaying any caller directory.
+
+Static native tools execute an immutable file descriptor with `execveat`.
+For dynamic ELF64 tools, the componentizer parses `PT_INTERP`, `DT_NEEDED`,
+and `$ORIGIN` runpaths, retains and verifies the exact loader and transitive
+shared libraries, and copies them into the sealed snapshot. The retained
+loader executes by descriptor with cache/hwcaps lookup disabled and a private
+library path; loader injection environment variables are removed. Live host
+mounts are no-execute, so PATH tools and uncaptured executable mappings cannot
+join the closure. The pinned WABT, wasm-tools, and Weval binaries are covered;
+unsupported executable formats fail closed. Reusable tool snapshots avoid
+recapturing, rehashing, or resealing the package and runtime closure for each
+invocation; only the required private namespace materialization is repeated.
+Engine and cache reads likewise use retained file descriptors. Platforms without
 equivalent retained-handle execution fail closed. Diagnostics and debug
 command logs continue to identify the originally selected tool.
 Replacing a tool pathname after resolution therefore cannot select different

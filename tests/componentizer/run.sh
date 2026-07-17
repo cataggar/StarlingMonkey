@@ -98,6 +98,7 @@ mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package" \
   "$ENGINE_PACKAGE/feature-wit"
 NOEXEC_MOUNTED=0
 NOEXEC_OUTPUT_DIR=""
+MNT_PIPELINE_DIR=""
 unmount_noexec() {
   if [ "${STARLING_NOEXEC_SUDO:-0}" = 1 ]; then
     sudo -n umount "$1"
@@ -108,6 +109,9 @@ unmount_noexec() {
 cleanup() {
   if [ "$NOEXEC_MOUNTED" -eq 1 ]; then
     unmount_noexec "$NOEXEC_OUTPUT_DIR" || true
+  fi
+  if [ -n "$MNT_PIPELINE_DIR" ]; then
+    rm -rf "$MNT_PIPELINE_DIR"
   fi
   rm -rf "$SCRATCH"
 }
@@ -397,7 +401,7 @@ if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
 fi
 if [ -n "${EXPECT_AOT_EXEC_STAGE_ROOT:-}" ]; then
   case "$0" in
-    /mnt/starling-retained-package/*) ;;
+    /.__starling-package-*/*) ;;
     *)
       echo "AOT executable did not use the private immutable namespace" >&2
       exit 29
@@ -704,9 +708,7 @@ fi
 EOF
 
 cat > "$TOOLS/tool sibling" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s-sibling-ok\n' "$1"
+wabt-sibling-ok
 EOF
 
 cat > "$TOOLS/fake zig" <<'EOF'
@@ -843,6 +845,202 @@ for ((i = 1; i <= $#; i++)); do
 done
 cp "${!#}" "$out"
 EOF
+cat > "$SCRATCH/fake-wabt.c" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int copy_file(const char *input, const char *output) {
+  int in = open(input, O_RDONLY);
+  int out = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (in < 0 || out < 0) return 80;
+  char buffer[65536];
+  ssize_t count;
+  while ((count = read(in, buffer, sizeof(buffer))) > 0)
+    if (write(out, buffer, (size_t)count) != count) return 81;
+  close(in);
+  return close(out) || count < 0 ? 82 : 0;
+}
+
+static void wait_for(const char *path) {
+  while (access(path, F_OK) != 0) usleep(1000);
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3) return 70;
+  char executable[4096], sibling[4096], value[64] = {0};
+  snprintf(executable, sizeof(executable), "%s", argv[0]);
+  snprintf(sibling, sizeof(sibling), "%s/tool sibling", dirname(executable));
+  const char *hook = getenv("FAKE_WABT_CHILD_HOOK");
+  char path[4096];
+  if (hook) {
+    snprintf(path, sizeof(path), "%s/claimed", hook);
+    if (mkdir(path, 0700) == 0) {
+      snprintf(path, sizeof(path), "%s/ready", hook);
+      close(open(path, O_WRONLY | O_CREAT, 0600));
+      snprintf(path, sizeof(path), "%s/continue", hook);
+      wait_for(path);
+      FILE *marker = fopen(sibling, "r");
+      if (!marker || !fgets(value, sizeof(value), marker) ||
+          strcmp(value, "wabt-sibling-ok\n") != 0) return 71;
+      fclose(marker);
+      snprintf(path, sizeof(path), "%s/consumed", hook);
+      close(open(path, O_WRONLY | O_CREAT, 0600));
+      snprintf(path, sizeof(path), "%s/finish", hook);
+      wait_for(path);
+    }
+  } else {
+    FILE *marker = fopen(sibling, "r");
+    if (!marker || !fgets(value, sizeof(value), marker) ||
+        strcmp(value, "wabt-sibling-ok\n") != 0) return 71;
+    fclose(marker);
+  }
+  if (getenv("FAKE_TRY_LIVE_PATH")) {
+    pid_t child = fork();
+    if (child == 0) {
+      execlp("retained-live-path", "retained-live-path", NULL);
+      _exit(0);
+    }
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 74;
+  }
+  const char *log = getenv("FAKE_WABT_EXECUTABLE_LOG");
+  if (log) {
+    FILE *file = fopen(log, "a");
+    if (!file) return 72;
+    fprintf(file, "%s\n", argv[0]);
+    fclose(file);
+  }
+  const char *fail = getenv("FAKE_FAIL_STAGE");
+  char stage[256];
+  snprintf(stage, sizeof(stage), "%s %s", argv[1], argv[2]);
+  if (fail && strcmp(fail, stage) == 0) return 23;
+  const char *output = NULL;
+  for (int i = 1; i + 1 < argc; ++i)
+    if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
+      output = argv[++i];
+  if (!output) return 73;
+  return copy_file(argv[argc - 1], output);
+}
+EOF
+cc -static -O2 -o "$TOOLS/fake wabt" "$SCRATCH/fake-wabt.c"
+cp "$REAL_WASM_TOOLS" "$TOOLS/fake wasm-tools"
+cat > "$TOOLS/retained-live-path" <<EOF
+#!/bin/sh
+touch "$SCRATCH/live PATH executable consumed"
+exit 97
+EOF
+cat > "$SCRATCH/fake-weval.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int copy_file(const char *input, const char *output) {
+  int in = open(input, O_RDONLY);
+  int out = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (in < 0 || out < 0) return 80;
+  char buffer[65536];
+  ssize_t count;
+  while ((count = read(in, buffer, sizeof(buffer))) > 0)
+    if (write(out, buffer, (size_t)count) != count) return 81;
+  close(in);
+  return close(out) || count < 0 ? 82 : 0;
+}
+
+static int same_file(const char *a, const char *b) {
+  int left = open(a, O_RDONLY), right = open(b, O_RDONLY);
+  if (left < 0 || right < 0) return 0;
+  char x[8192], y[8192];
+  ssize_t xn, yn;
+  do {
+    xn = read(left, x, sizeof(x));
+    yn = read(right, y, sizeof(y));
+    if (xn != yn || (xn > 0 && memcmp(x, y, (size_t)xn))) return 0;
+  } while (xn > 0);
+  close(left);
+  close(right);
+  return xn == 0;
+}
+
+static void write_text(const char *path, const char *text) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd >= 0) {
+    write(fd, text, strlen(text));
+    close(fd);
+  }
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2 || strcmp(argv[1], "weval") != 0) return 70;
+  if (getenv("STARLINGMONKEY_CONFIG")) return 71;
+  const char *stack = getenv("RUST_MIN_STACK");
+  const char *expected_stack = getenv("EXPECTED_RUST_MIN_STACK");
+  if (!stack || strcmp(stack, expected_stack ? expected_stack : "8388608"))
+    return 72;
+  const char *output = NULL, *input = NULL, *cache = NULL;
+  int cache_ro = 0;
+  for (int i = 2; i < argc; ++i) {
+    if (!strcmp(argv[i], "-o") && i + 1 < argc) output = argv[++i];
+    else if (!strcmp(argv[i], "-i") && i + 1 < argc) input = argv[++i];
+    else if (!strcmp(argv[i], "--cache-ro") && i + 1 < argc) {
+      cache_ro = 1;
+      cache = argv[++i];
+    } else if (!strcmp(argv[i], "--cache")) return 73;
+  }
+  if (!output || !input || !cache || !cache_ro) return 74;
+  const char *argv_log = getenv("FAKE_AOT_ARGV_LOG");
+  if (argv_log) {
+    int fd = open(argv_log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 75;
+    for (int i = 1; i < argc; ++i) write(fd, argv[i], strlen(argv[i]) + 1);
+    close(fd);
+  }
+  const char *stdin_log = getenv("FAKE_AOT_RUNTIME_ARGS_LOG");
+  if (stdin_log) {
+    int fd = open(stdin_log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    char buffer[4096];
+    ssize_t count;
+    while ((count = read(0, buffer, sizeof(buffer))) > 0)
+      if (write(fd, buffer, (size_t)count) != count) return 76;
+    close(fd);
+  }
+  if (getenv("EXPECT_AOT_SNAPSHOT")) {
+    const char *original_engine = getenv("ORIGINAL_AOT_ENGINE");
+    const char *original_cache = getenv("ORIGINAL_AOT_CACHE");
+    const char *original_weval = getenv("ORIGINAL_AOT_WEVAL");
+    const char *original_sibling = getenv("ORIGINAL_AOT_SIBLING");
+    const char *expected_engine = getenv("EXPECTED_AOT_ENGINE");
+    const char *expected_cache = getenv("EXPECTED_AOT_CACHE");
+    if (!original_engine || !original_cache || !original_weval ||
+        !original_sibling || !expected_engine || !expected_cache)
+      return 77;
+    write_text(original_engine, "replacement engine\n");
+    write_text(original_cache, "replacement cache\n");
+    write_text(original_weval, "replacement weval\n");
+    write_text(original_sibling, "replacement sibling\n");
+    if (!same_file(input, expected_engine) || !same_file(cache, expected_cache))
+      return 78;
+  }
+  if (getenv("FAKE_AOT_FAIL")) return 27;
+  const char *executed = getenv("FAKE_AOT_EXECUTED_MARKER");
+  if (executed) write_text(executed, "sealed executable ran\n");
+  return copy_file(input, output);
+}
+EOF
+cc -static -O2 -o "$FAKE_WEVAL" "$SCRATCH/fake-weval.c"
 cp "$FAKE_WEVAL" "$TOOLS/fake weval"
 chmod +x "$TOOLS"/*
 chmod +x "$FAKE_WEVAL"
@@ -1085,9 +1283,8 @@ expect_external_surface_rejection \
 
 PATH_OVERRIDE_OUTPUT="$WORK/path override output.wasm"
 WABT_EXECUTABLE_LOG="$SCRATCH/wabt executable.log"
-WASM_TOOLS_EXECUTABLE_LOG="$SCRATCH/wasm-tools executable.log"
 FAKE_WABT_EXECUTABLE_LOG="$WABT_EXECUTABLE_LOG" \
-FAKE_WASM_TOOLS_EXECUTABLE_LOG="$WASM_TOOLS_EXECUTABLE_LOG" \
+FAKE_TRY_LIVE_PATH=1 \
 PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
@@ -1099,14 +1296,55 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
-grep -Fxq '/mnt/starling-retained-package/fake wabt' \
+test ! -e "$SCRATCH/live PATH executable consumed"
+grep -Eq '^/\.__starling-package-[0-9a-f]{32}/fake wabt$' \
   "$WABT_EXECUTABLE_LOG"
-grep -Fxq '/mnt/starling-retained-package/fake wasm-tools' \
-  "$WASM_TOOLS_EXECUTABLE_LOG"
-if grep -Fq '/proc/self/fd/' \
-  "$WABT_EXECUTABLE_LOG" "$WASM_TOOLS_EXECUTABLE_LOG"; then
+if grep -Fq '/proc/self/fd/' "$WABT_EXECUTABLE_LOG"; then
   echo "FAIL: retained tools exposed descriptor paths as argv[0]" >&2
   exit 1
+fi
+
+if [ -w /mnt ]; then
+  MNT_PIPELINE_DIR="/mnt/starling-componentizer-$$"
+  mkdir "$MNT_PIPELINE_DIR"
+  cp "$SOURCE" "$MNT_PIPELINE_DIR/source.js"
+  cp -a "$WIT" "$MNT_PIPELINE_DIR/wit"
+  (
+    cd "$MNT_PIPELINE_DIR"
+    PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+      --engine "$ENGINE" \
+      --preview2-adapter "$ADAPTER" \
+      --wit "$MNT_PIPELINE_DIR/wit" \
+      --world-name exports \
+      --wizer-bin path-wizer \
+      --wabt-bin path-wabt \
+      --wasm-tools-bin path-wasm-tools \
+      --out "$MNT_PIPELINE_DIR/output.wasm" \
+      "$MNT_PIPELINE_DIR/source.js"
+  )
+  cmp "$ENGINE" "$MNT_PIPELINE_DIR/output.wasm"
+  echo "Caller-visible /mnt pipeline passed"
+else
+  unshare --user --map-root-user --mount -- bash -c '
+    set -euo pipefail
+    mount -t tmpfs -o mode=700 starling-mnt-pipeline /mnt
+    mkdir /mnt/work
+    cp "$2" /mnt/work/source.js
+    cp -a "$3" /mnt/work/wit
+    cd /mnt/work
+    PATH="$4:$PATH" "$1" \
+      --engine "$5" \
+      --preview2-adapter "$6" \
+      --wit /mnt/work/wit \
+      --world-name exports \
+      --wizer-bin path-wizer \
+      --wabt-bin path-wabt \
+      --wasm-tools-bin path-wasm-tools \
+      --out /mnt/work/output.wasm \
+      /mnt/work/source.js
+    cmp "$5" /mnt/work/output.wasm
+  ' bash "$COMPONENTIZER" "$SOURCE" "$WIT" "$TOOLS" "$ENGINE" "$ADAPTER"
+  echo "Private-namespace /mnt pipeline passed"
 fi
 
 CHILD_REPLACE_HOOK="$SCRATCH/retained child replacement hook"
@@ -2191,17 +2429,28 @@ done
 cp "$input" "$out"
 EOF
 cat > "$WRAPPER_PACKAGE/wrapper weval" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env retained-test-interpreter
 set -eu
 test "$(basename "$0")" = "wrapper weval"
 exec "$(dirname "$0")/weval sibling" "$@"
 EOF
+cat > "$TOOLS/retained-test-interpreter" <<EOF
+#!/bin/sh
+touch "$SCRATCH/live interpreter consumed"
+exit 97
+EOF
 chmod +x "$WRAPPER_PACKAGE/weval sibling" "$WRAPPER_PACKAGE/wrapper weval"
+chmod +x "$TOOLS/retained-test-interpreter"
 seal_fixture_bundle "$WRAPPER_PACKAGE/wrapper weval" "$WRAPPER_BUNDLE"
-run_fixture_aot \
+PATH="$TOOLS:$PATH" expect_fixture_aot_rejection \
   "$WRAPPER_PACKAGE/wrapper weval" \
   "$WRAPPER_BUNDLE" \
-  "$WRAPPER_OUTPUT"
+  script-interpreter
+grep -Fq UnsupportedRetainedExecution \
+  "$SCRATCH/script-interpreter-package-rejection.log"
+test ! -e "$SCRATCH/live interpreter consumed"
+test ! -e "$SCRATCH/live PATH executable consumed"
+echo "Live interpreter and PATH executable closure rejected"
 
 LAYOUT_FLAT_WEVAL="$SCRATCH/layout flat weval package"
 LAYOUT_MANAGED_WEVAL="$SCRATCH/layout managed weval package"
@@ -2289,20 +2538,20 @@ RELOCATED_PACKAGE_ONE="$SCRATCH/relocated package one"
 RELOCATED_PACKAGE_TWO="$SCRATCH/relocated package two"
 RELOCATED_BUNDLE_ONE="$WORK/relocated bundle one"
 RELOCATED_BUNDLE_TWO="$WORK/relocated bundle two"
-cp -a "$WRAPPER_PACKAGE" "$RELOCATED_PACKAGE_ONE"
-cp -a "$WRAPPER_PACKAGE" "$RELOCATED_PACKAGE_TWO"
+cp -a "$LAYOUT_FLAT_WEVAL" "$RELOCATED_PACKAGE_ONE"
+cp -a "$LAYOUT_FLAT_WEVAL" "$RELOCATED_PACKAGE_TWO"
 seal_fixture_bundle \
-  "$RELOCATED_PACKAGE_ONE/wrapper weval" \
+  "$RELOCATED_PACKAGE_ONE/weval" \
   "$RELOCATED_BUNDLE_ONE"
 seal_fixture_bundle \
-  "$RELOCATED_PACKAGE_TWO/wrapper weval" \
+  "$RELOCATED_PACKAGE_TWO/weval" \
   "$RELOCATED_BUNDLE_TWO"
 cmp "$RELOCATED_BUNDLE_ONE/starling-ics.wevalcache" \
   "$RELOCATED_BUNDLE_TWO/starling-ics.wevalcache"
 cmp "$RELOCATED_BUNDLE_ONE/starling-ics.wevalcache.manifest" \
   "$RELOCATED_BUNDLE_TWO/starling-ics.wevalcache.manifest"
 run_fixture_aot \
-  "$RELOCATED_PACKAGE_TWO/wrapper weval" \
+  "$RELOCATED_PACKAGE_TWO/weval" \
   "$RELOCATED_BUNDLE_ONE" \
   "$WORK/relocated package output.wasm"
 
@@ -2330,6 +2579,8 @@ ELF_PACKAGE="$SCRATCH/ELF weval package with spaces"
 ELF_BUNDLE="$WORK/ELF weval bundle"
 ELF_OUTPUT="$WORK/ELF weval output.wasm"
 mkdir -p "$ELF_PACKAGE/bin"
+ELF_LOADER="$ELF_PACKAGE/retained loader"
+cp "$(realpath /lib64/ld-linux-x86-64.so.2)" "$ELF_LOADER"
 cat > "$ELF_PACKAGE/libweval_fixture.c" <<'EOF'
 const char *weval_fixture_marker(void) {
   return "origin-relative-library";
@@ -2360,6 +2611,13 @@ static int copy_file(const char *input, const char *output) {
 }
 
 int main(int argc, char **argv) {
+  const char *executed = getenv("FAKE_AOT_EXECUTED_MARKER");
+  if (executed != NULL) {
+    FILE *marker = fopen(executed, "w");
+    if (marker == NULL) return 79;
+    fputs("sealed executable ran\n", marker);
+    fclose(marker);
+  }
   const char *basename = strrchr(argv[0], '/');
   basename = basename == NULL ? argv[0] : basename + 1;
   if (strcmp(basename, "weval argv0 alias") != 0) return 70;
@@ -2381,6 +2639,7 @@ cc -fPIC -shared \
 cc -o "$ELF_PACKAGE/bin/weval-real" \
   "$ELF_PACKAGE/weval_fixture.c" \
   -L"$ELF_PACKAGE/bin" \
+  -Wl,--dynamic-linker,"$ELF_LOADER" \
   -Wl,-rpath,'$ORIGIN' \
   -lweval_fixture
 ln -s "bin/weval-real" "$ELF_PACKAGE/weval argv0 alias"
@@ -2389,6 +2648,67 @@ run_fixture_aot \
   "$ELF_PACKAGE/weval argv0 alias" \
   "$ELF_BUNDLE" \
   "$ELF_OUTPUT"
+
+ELF_ENV_HOOK="$SCRATCH/ELF environment closure hook"
+ELF_ENV_OUTPUT="$WORK/ELF environment substitution output.wasm"
+ELF_ENV_EXECUTED="$SCRATCH/sealed ELF executable ran"
+ELF_ENV_MALICIOUS="$SCRATCH/malicious library ran"
+ELF_EXTERNAL_PACKAGE="$WORK/$(basename "$ELF_ENV_OUTPUT").external-package"
+ELF_EXTERNAL_LIBRARY="$ELF_EXTERNAL_PACKAGE/weval-package/bin/libweval_fixture.so"
+ELF_LOADER_BASELINE="$SCRATCH/retained-loader.baseline"
+ELF_LIBRARY_BASELINE="$SCRATCH/retained-library.baseline"
+mkdir "$ELF_ENV_HOOK"
+cp -p "$ELF_LOADER" "$ELF_LOADER_BASELINE"
+cp -p "$ELF_PACKAGE/bin/libweval_fixture.so" "$ELF_LIBRARY_BASELINE"
+cat > "$SCRATCH/malicious-lib.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+__attribute__((constructor)) static void loaded(void) {
+  const char *path = getenv("MALICIOUS_LIBRARY_MARKER");
+  if (path) {
+    FILE *file = fopen(path, "w");
+    if (file) { fputs("malicious library ran\n", file); fclose(file); }
+  }
+}
+const char *weval_fixture_marker(void) { return "malicious"; }
+EOF
+cc -fPIC -shared \
+  -o "$SCRATCH/malicious-libweval.so" \
+  "$SCRATCH/malicious-lib.c"
+mkdir "$SCRATCH/malicious library path"
+cp "$SCRATCH/malicious-libweval.so" \
+  "$SCRATCH/malicious library path/libweval_fixture.so"
+printf 'preserved ELF environment output\n' > "$ELF_ENV_OUTPUT"
+LD_LIBRARY_PATH="$SCRATCH/malicious library path" \
+STARLING_COMPONENTIZER_TEST_HOOK_DIR="$ELF_ENV_HOOK" \
+STARLING_COMPONENTIZER_TEST_WAIT_AT=retained-environment-captured-weval \
+FAKE_AOT_EXECUTED_MARKER="$ELF_ENV_EXECUTED" \
+MALICIOUS_LIBRARY_MARKER="$ELF_ENV_MALICIOUS" \
+run_fixture_aot \
+  "$ELF_PACKAGE/weval argv0 alias" \
+  "$ELF_BUNDLE" \
+  "$ELF_ENV_OUTPUT" \
+  >"$SCRATCH/ELF-environment-substitution.log" 2>&1 &
+elf_env_pid=$!
+wait_for_test_hook \
+  "$ELF_ENV_HOOK/retained-environment-captured-weval.ready"
+printf 'substituted loader\n' > "$ELF_LOADER"
+cp "$SCRATCH/malicious-libweval.so" "$ELF_EXTERNAL_LIBRARY"
+touch "$ELF_ENV_HOOK/retained-environment-captured-weval.continue"
+if wait "$elf_env_pid"; then
+  echo "FAIL: loader/library substitution was accepted" >&2
+  exit 1
+fi
+cp -p "$ELF_LOADER_BASELINE" "$ELF_LOADER"
+cp -p "$ELF_LIBRARY_BASELINE" "$ELF_PACKAGE/bin/libweval_fixture.so"
+grep -Fq TransactionChanged "$SCRATCH/ELF-environment-substitution.log" || {
+  cat "$SCRATCH/ELF-environment-substitution.log" >&2
+  exit 1
+}
+test "$(cat "$ELF_ENV_OUTPUT")" = "preserved ELF environment output"
+test -e "$ELF_ENV_EXECUTED"
+test ! -e "$ELF_ENV_MALICIOUS"
+echo "Retained loader and shared-library substitution rejected"
 
 cp -p "$ELF_PACKAGE/bin/libweval_fixture.so" \
   "$SCRATCH/libweval-fixture.baseline"
