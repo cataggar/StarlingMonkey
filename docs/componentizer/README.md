@@ -188,6 +188,11 @@ so swapping and restoring an ancestor cannot redirect a capture. Snapshot
 bytes are read only from those handles, and children receive only private
 snapshot paths. Before/after object, namespace, and digest checks reject
 unrestored substitution or retained-object mutation.
+An external engine package is one descriptor-relative transaction: its root
+is retained once, every required sibling is captured through that root, and
+the complete tree is reverified after test/validation boundaries and before
+publication. A change after the snapshot boundary reports
+`TransactionChanged` and leaves any existing output untouched.
 A transient rename/substitution that is restored may complete, but substituted
 bytes are never copied or executed. The Weval snapshot scope is the selected executable's canonical
 containing directory and all descendants (at most 4,096 entries, 32 levels,
@@ -198,6 +203,14 @@ selected basename and internal symlink target are retained, so scripts using
 `dirname "$0"`, argv[0]-dispatched tools, and `$ORIGIN` sibling libraries see
 their original relative layout. Read and execute permissions are preserved
 while write bits are removed.
+
+Resolved WABT and `wasm-tools` executables are treated the same way. Their
+containing closures are retained, copied to a private executable staging
+directory, and reverified through publication. On Linux, each child is
+started through its retained `/proc/self/fd` executable handle; diagnostics
+and debug command logs continue to identify the originally selected tool.
+Replacing a tool pathname after resolution therefore cannot select different
+bytes.
 
 Cache validation hashes the snapshot regular file actually reached by the
 selected executable, while execution uses the selected snapshot path. A

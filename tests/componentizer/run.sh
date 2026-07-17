@@ -417,6 +417,9 @@ EOF
 cat > "$TOOLS/fake wabt" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${FAKE_WABT_EXECUTABLE_LOG:-}" ]; then
+  printf '%s\n' "$0" >> "$FAKE_WABT_EXECUTABLE_LOG"
+fi
 stage="$1 $2"
 if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
   if [ "${FAKE_LARGE_OUTPUT:-}" = "1" ]; then
@@ -501,6 +504,9 @@ EOF
 cat > "$TOOLS/fake wasm-tools" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${FAKE_WASM_TOOLS_EXECUTABLE_LOG:-}" ]; then
+  printf '%s\n' "$0" >> "$FAKE_WASM_TOOLS_EXECUTABLE_LOG"
+fi
 if [ "$1 $2" = "component embed" ] || [ "$1 $2" = "component wit" ]; then
   exec "$REAL_WASM_TOOLS" "$@"
 fi
@@ -1057,6 +1063,10 @@ expect_external_surface_rejection \
   "$MISMATCHED_SURFACE_WIT" exports surface-tree-mismatch
 
 PATH_OVERRIDE_OUTPUT="$WORK/path override output.wasm"
+WABT_EXECUTABLE_LOG="$SCRATCH/wabt executable.log"
+WASM_TOOLS_EXECUTABLE_LOG="$SCRATCH/wasm-tools executable.log"
+FAKE_WABT_EXECUTABLE_LOG="$WABT_EXECUTABLE_LOG" \
+FAKE_WASM_TOOLS_EXECUTABLE_LOG="$WASM_TOOLS_EXECUTABLE_LOG" \
 PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
@@ -1068,6 +1078,94 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
+grep -Eq '^/proc/self/fd/[0-9]+$' "$WABT_EXECUTABLE_LOG"
+grep -Eq '^/proc/self/fd/[0-9]+$' "$WASM_TOOLS_EXECUTABLE_LOG"
+
+PACKAGE_CAPTURE_HOOK="$SCRATCH/external package capture hook"
+PACKAGE_CAPTURE_OUTPUT="$WORK/external package capture output.wasm"
+PACKAGE_ORIGINAL="$WORK/engine package original"
+PACKAGE_SUBSTITUTE="$WORK/engine package substitute"
+cp -a "$ENGINE_PACKAGE" "$PACKAGE_SUBSTITUTE"
+printf 'substituted-adapter-generation\n' \
+  > "$PACKAGE_SUBSTITUTE/preview1-adapter.wasm"
+cat > "$PACKAGE_SUBSTITUTE/component-wit/world.wit" <<'EOF'
+package test:componentizer;
+world exports {
+  substituted-generation: func();
+}
+EOF
+mkdir "$PACKAGE_CAPTURE_HOOK"
+printf 'preserved package capture output\n' > "$PACKAGE_CAPTURE_OUTPUT"
+STARLING_COMPONENTIZER_TEST_HOOK_DIR="$PACKAGE_CAPTURE_HOOK" \
+STARLING_COMPONENTIZER_TEST_WAIT_AT=external-package-engine-captured \
+PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin path-wizer \
+  --wabt-bin path-wabt \
+  --wasm-tools-bin path-wasm-tools \
+  --out "$PACKAGE_CAPTURE_OUTPUT" \
+  "$SOURCE" >"$SCRATCH/external-package-capture.log" 2>&1 &
+package_capture_pid=$!
+wait_for_test_hook \
+  "$PACKAGE_CAPTURE_HOOK/external-package-engine-captured.ready"
+mv "$ENGINE_PACKAGE" "$PACKAGE_ORIGINAL"
+mv "$PACKAGE_SUBSTITUTE" "$ENGINE_PACKAGE"
+touch "$PACKAGE_CAPTURE_HOOK/external-package-engine-captured.continue"
+if wait "$package_capture_pid"; then
+  echo "FAIL: external package sibling generations were mixed" >&2
+  exit 1
+fi
+mv "$ENGINE_PACKAGE" "$PACKAGE_SUBSTITUTE"
+mv "$PACKAGE_ORIGINAL" "$ENGINE_PACKAGE"
+grep -Fq TransactionChanged "$SCRATCH/external-package-capture.log"
+test "$(cat "$PACKAGE_CAPTURE_OUTPUT")" = \
+  "preserved package capture output"
+rm -rf "$PACKAGE_SUBSTITUTE"
+echo "External package between-child substitution rejected"
+
+assert_tool_replacement_rejected() {
+  local label="$1" target="$2"
+  local hook="$SCRATCH/$label tool replacement hook"
+  local output="$WORK/$label tool replacement output.wasm"
+  local original="$SCRATCH/$label original tool"
+  mkdir "$hook"
+  printf 'preserved tool replacement output\n' > "$output"
+  STARLING_COMPONENTIZER_TEST_HOOK_DIR="$hook" \
+  STARLING_COMPONENTIZER_TEST_WAIT_AT=tools-resolved \
+  PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin path-wizer \
+    --wabt-bin path-wabt \
+    --wasm-tools-bin path-wasm-tools \
+    --out "$output" \
+    "$SOURCE" >"$SCRATCH/$label-tool-replacement.log" 2>&1 &
+  local pid=$!
+  wait_for_test_hook "$hook/tools-resolved.ready"
+  mv "$target" "$original"
+  printf '#!/usr/bin/env bash\nprintf substituted-tool-ran > \"%s\"\nexit 97\n' \
+    "$SCRATCH/$label substituted tool ran" > "$target"
+  chmod +x "$target"
+  touch "$hook/tools-resolved.continue"
+  if wait "$pid"; then
+    echo "FAIL: replaced $label executable was accepted" >&2
+    exit 1
+  fi
+  rm "$target"
+  mv "$original" "$target"
+  grep -Fq TransactionChanged "$SCRATCH/$label-tool-replacement.log"
+  test "$(cat "$output")" = "preserved tool replacement output"
+  test ! -e "$SCRATCH/$label substituted tool ran"
+}
+
+assert_tool_replacement_rejected wasm-tools "$TOOLS/fake wasm-tools"
+assert_tool_replacement_rejected wabt "$TOOLS/fake wabt"
+echo "Retained WABT/wasm-tools replacement matrix passed"
 
 EXTERNAL_SNAPSHOT_HOOK="$SCRATCH/external snapshot hook"
 EXTERNAL_SNAPSHOT_OUTPUT="$WORK/external snapshot mutation output.wasm"
@@ -1111,22 +1209,11 @@ cp -p "$ADAPTER_BASELINE" "$ADAPTER"
 cp -p "$FEATURES_BASELINE" "$ENGINE_PACKAGE/features.json"
 cp -p "$COMPONENT_WIT_BASELINE" \
   "$ENGINE_PACKAGE/component-wit/world.wit"
-grep -Eq 'WevalPackageRace|TransactionChanged' \
-  "$SCRATCH/external-snapshot.log"
+grep -Fq TransactionChanged "$SCRATCH/external-snapshot.log"
 test "$(cat "$EXTERNAL_SNAPSHOT_OUTPUT")" = \
   "preserved external snapshot output"
-grep -Fq 'external-adapter.wasm' "$EXTERNAL_ADAPTER_LOG"
-grep -Fq 'adapter-bytes' "$EXTERNAL_ADAPTER_LOG"
-if grep -Fq 'substituted-adapter-bytes' "$EXTERNAL_ADAPTER_LOG"; then
-  echo "FAIL: substituted adapter bytes reached a child" >&2
-  exit 1
-fi
-grep -Fq 'external-component-wit' "$EXTERNAL_WIT_LOG"
-grep -Fq 'world exports {}' "$EXTERNAL_WIT_LOG"
-if grep -Fq 'substituted component WIT bytes' "$EXTERNAL_WIT_LOG"; then
-  echo "FAIL: substituted WIT bytes reached a child" >&2
-  exit 1
-fi
+test ! -e "$EXTERNAL_ADAPTER_LOG"
+test ! -e "$EXTERNAL_WIT_LOG"
 echo "External adapter/WIT immutable snapshot mutation passed"
 
 PATH_SHADOW="$SCRATCH/non-executable path shadow"
@@ -2585,6 +2672,7 @@ echo "Retained ancestor substitution snapshot passed"
 TRANSIENT_HOOK="$SCRATCH/transient capture hook"
 TRANSIENT_OUTPUT="$WORK/transient substitution output.wasm"
 mkdir "$TRANSIENT_HOOK"
+printf 'preserved restored substitution output\n' > "$TRANSIENT_OUTPUT"
 run_capture_race "$TRANSIENT_HOOK" "$TRANSIENT_OUTPUT" \
   >"$SCRATCH/transient-capture.log" 2>&1 &
 capture_pid=$!
@@ -2592,12 +2680,13 @@ wait_for_capture_hook "$TRANSIENT_HOOK/aot-inputs-captured.ready"
 install_coherent_substitute
 restore_captured_inputs
 touch "$TRANSIENT_HOOK/aot-inputs-captured.continue"
-if ! wait "$capture_pid"; then
-  cat "$SCRATCH/transient-capture.log" >&2
-  echo "FAIL: restored AOT substitution did not use retained inputs" >&2
+if wait "$capture_pid"; then
+  echo "FAIL: restored AOT substitution was accepted" >&2
   exit 1
 fi
-cmp "$ENGINE" "$TRANSIENT_OUTPUT"
+grep -Fq TransactionChanged "$SCRATCH/transient-capture.log"
+test "$(cat "$TRANSIENT_OUTPUT")" = \
+  "preserved restored substitution output"
 
 UNRESTORED_HOOK="$SCRATCH/unrestored capture hook"
 UNRESTORED_OUTPUT="$WORK/unrestored substitution output.wasm"

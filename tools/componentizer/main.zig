@@ -42,6 +42,7 @@ const PipelineError = error{
     UnsupportedWitEntry,
     UnsupportedZigVersion,
     StaleAotCache,
+    TransactionChanged,
 };
 
 const EngineFeatures = struct {
@@ -2339,11 +2340,7 @@ const CapturedFile = struct {
 const CapturedPackageEntry = struct {
     name: []const u8,
     value: union(enum) {
-        file: struct {
-            file: File,
-            identity: PackageIdentity,
-            digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        },
+        file: CapturedPackageFile,
         directory: *CapturedPackageDirectory,
         sym_link: struct {
             file: File,
@@ -2351,6 +2348,12 @@ const CapturedPackageEntry = struct {
             target: []const u8,
         },
     },
+};
+
+const CapturedPackageFile = struct {
+    file: File,
+    identity: PackageIdentity,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 const CapturedPackageDirectory = struct {
@@ -2382,22 +2385,34 @@ const CapturedDirectory = struct {
 };
 
 const CapturedExternalRuntime = struct {
-    adapter: CapturedFile,
-    features: CapturedFile,
-    component_wit: CapturedDirectory,
-    surface_wit: CapturedDirectory,
-    feature_wit: CapturedDirectory,
+    package: CapturedDirectory,
+    engine: CapturedPackageFile,
+    adapter: CapturedPackageFile,
+    features: CapturedPackageFile,
+    component_wit: *CapturedPackageDirectory,
+    surface_wit: *CapturedPackageDirectory,
+    feature_wit: *CapturedPackageDirectory,
     supplied_surface_wit: ?CapturedDirectory,
     supplied_component_wit: ?CapturedDirectory,
 
     fn close(captured: CapturedExternalRuntime, io: Io) void {
-        captured.adapter.close(io);
-        captured.features.close(io);
-        captured.component_wit.close(io);
-        captured.surface_wit.close(io);
-        captured.feature_wit.close(io);
+        captured.package.close(io);
         if (captured.supplied_surface_wit) |tree| tree.close(io);
         if (captured.supplied_component_wit) |tree| tree.close(io);
+    }
+};
+
+const CapturedTool = struct {
+    provenance: []const u8,
+    executable: []const u8,
+    package: CapturedWevalPackage,
+    snapshot_file: ?File = null,
+    snapshot_identity: ?PackageIdentity = null,
+    snapshot_digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+
+    fn close(tool: CapturedTool, io: Io) void {
+        if (tool.snapshot_file) |file| file.close(io);
+        tool.package.close(io);
     }
 };
 
@@ -2407,8 +2422,13 @@ const Tools = struct {
     wasm_tools: Snapshot,
     wizer: ?WizerTool,
     weval: ?WevalTool,
-    wabt: ?[]const u8,
-    wasm_tools: []const u8,
+    wabt: ?CapturedTool,
+    wasm_tools: CapturedTool,
+
+    fn close(tools: Tools, io: Io) void {
+        tools.wasm_tools.close(io);
+        if (tools.wabt) |tool| tool.close(io);
+    }
 };
 
 const FeatureSurfaceCommandContext = struct {
@@ -2893,6 +2913,7 @@ fn execute(
         try externalRuntime(
             allocator,
             io,
+            environ,
             cwd,
             configured,
             environ,
@@ -2967,6 +2988,8 @@ fn execute(
         publication_destination_count += 1;
     }
     var publication_locks = try PublicationLocks.acquire(
+
+    var tools = try resolveTools(
         allocator,
         io,
         publication_directory,
@@ -3002,6 +3025,35 @@ fn execute(
         runtime.component_wit != null,
         needs_initialization,
     );
+    defer tools.close(io);
+
+    var staging_exclusions: std.ArrayList([]const u8) = .empty;
+    staging_exclusions.append(
+        allocator,
+        tools.wasm_tools.package.tree.path,
+    ) catch @panic("out of memory");
+    if (tools.wabt) |tool| {
+        staging_exclusions.append(
+            allocator,
+            tool.package.tree.path,
+        ) catch @panic("out of memory");
+    }
+    if (tools.weval) |tool| {
+        staging_exclusions.append(
+            allocator,
+            tool.package_root,
+        ) catch @panic("out of memory");
+    }
+    const tool_staging_dir = try createAotStagingDir(
+        allocator,
+        io,
+        environ,
+        cwd,
+        executable_dir,
+        staging_exclusions.items,
+        std.fs.path.dirname(resolved_output) orelse return error.InvalidPath,
+    );
+    defer removeAotStagingDir(io, tool_staging_dir);
 
     const aot_staging_dir = if (config.aot)
         try createAotStagingDir(
@@ -3010,7 +3062,7 @@ fn execute(
             environ,
             cwd,
             executable_dir,
-            tools.weval.?.package_root,
+            staging_exclusions.items,
             std.fs.path.dirname(resolved_output) orelse return error.InvalidPath,
         )
     else
@@ -3258,6 +3310,19 @@ fn execute(
         .default_dir;
     try Dir.createDirAbsolute(io, transaction_dir, private_permissions);
     defer removePrivateTree(io, transaction_dir);
+
+    try runComponentizerTestHook(
+        allocator,
+        io,
+        environ,
+        "tools-resolved",
+    );
+    try snapshotTools(
+        allocator,
+        io,
+        tool_staging_dir,
+        &tools,
+    );
 
     if (runtime.external_capture != null) {
         try snapshotExternalRuntime(
@@ -3563,6 +3628,10 @@ fn execute(
     const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
         const use_wabt = config.wit != null and runtime.zig == null;
         var stripped_output = try createChildOutput(
+    if (runtime.component_wit) |component_wit| {
+        const wabt_tool = tools.wabt.?;
+        const wabt = wabt_tool.executable;
+        stripped = try std.fs.path.join(
             allocator,
             io,
             &transaction,
@@ -3579,6 +3648,33 @@ fn execute(
             } else &.{
                 tools.wasm_tools.path, "strip",          "--all", "-o",
                 stripped_output.path,  initialized.path,
+        try runCapturedToolCommand(
+            allocator,
+            io,
+            "wabt module strip",
+            wabt_tool,
+            &.{ wabt, "module", "strip", "-o", stripped.?, initialized },
+            cwd,
+            null,
+            null,
+            config.verbose,
+            &command_log,
+        );
+        try runCapturedToolCommand(
+            allocator,
+            io,
+            "wabt component embed",
+            wabt_tool,
+            &.{
+                wabt,
+                "component",
+                "embed",
+                "--world",
+                runtime.component_world.?,
+                "-o",
+                embedded.?,
+                component_wit,
+                stripped.?,
             },
             cwd,
             null,
@@ -3617,6 +3713,20 @@ fn execute(
                 tools.wasm_tools.path, "component",               "embed", component_wit,
                 "--world",             runtime.component_world.?, "-o",    embedded_output.path,
                 stripped_output.path,
+        try runCapturedToolCommand(
+            allocator,
+            io,
+            "wabt component new",
+            wabt_tool,
+            &.{
+                wabt,
+                "component",
+                "new",
+                "--adapt",
+                adapter_arg,
+                "-o",
+                candidate,
+                embedded.?,
             },
             cwd,
             null,
@@ -3688,11 +3798,14 @@ fn execute(
         );
         diagnostic.begin(.adapt);
         try runCommand(
+        try runCapturedToolCommand(
             allocator,
             io,
             "wasm-tools component new",
+            tools.wasm_tools,
             &.{
                 tools.wasm_tools.path,
+                tools.wasm_tools.executable,
                 "component",
                 "new",
                 "--adapt",
@@ -3838,6 +3951,18 @@ fn execute(
         io,
         "wasm-tools metadata add",
         metadata_args.items,
+    try runCapturedToolCommand(
+        allocator,
+        io,
+        "wasm-tools validate",
+        tools.wasm_tools,
+        &.{
+            tools.wasm_tools.executable,
+            "validate",
+            "--features",
+            "all",
+            candidate,
+        },
         cwd,
         null,
         null,
@@ -4095,8 +4220,22 @@ fn execute(
 
     var candidate_file = try Dir.openFileAbsolute(io, processed.path, .{});
     if (runtime.external_capture) |capture| {
-        try verifyCapturedExternalRuntime(io, capture);
+        verifyCapturedExternalRuntime(io, capture) catch
+            {
+                std.debug.print(
+                    "error: external package changed before publication\n",
+                    .{},
+                );
+                return error.TransactionChanged;
+            };
     }
+    verifyCapturedTools(io, tools) catch {
+        std.debug.print(
+            "error: WABT or wasm-tools package changed before publication\n",
+            .{},
+        );
+        return error.TransactionChanged;
+    };
     if (runtime.engine_capture) |capture| {
         try verifyCapturedFile(io, capture);
     }
@@ -4163,6 +4302,7 @@ fn resolveWizerExecutable(
 fn externalRuntime(
     allocator: Allocator,
     io: Io,
+    environ: *std.process.Environ.Map,
     cwd: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
@@ -4357,38 +4497,57 @@ fn externalRuntime(
         }
     }
     const requested_engine = try absolutePath(allocator, cwd, engine_override);
-    const engine_capture = try captureFile(allocator, io, requested_engine);
-    errdefer engine_capture.close(io);
-    const engine = engine_capture.path;
+    const package_root = std.fs.path.dirname(requested_engine) orelse
+        return error.InvalidPath;
+    const engine_basename = std.fs.path.basename(requested_engine);
+    const package_capture = captureDirectoryWithHook(
+        allocator,
+        io,
+        package_root,
+        false,
+        .{
+            .environ = environ,
+            .entry_name = engine_basename,
+            .phase = "external-package-engine-captured",
+        },
+    ) catch |err| switch (err) {
+        error.WevalPackageRace => return error.TransactionChanged,
+        else => return error.InvalidEngineProvenance,
+    };
+    errdefer package_capture.close(io);
+    const engine_capture = capturedPackageFile(
+        package_capture.root,
+        engine_basename,
+    ) orelse return error.InvalidEngineProvenance;
+    const engine = requested_engine;
     const provenance = try readEngineProvenance(
         allocator,
         io,
         engine_capture,
     );
-    const package_root = std.fs.path.dirname(engine) orelse
-        return error.InvalidPath;
     const adapter = try std.fs.path.join(
         allocator,
         &.{ package_root, "preview1-adapter.wasm" },
     );
-    const adapter_capture = try captureFile(allocator, io, adapter);
-    errdefer adapter_capture.close(io);
+    const adapter_capture = capturedPackageFile(
+        package_capture.root,
+        "preview1-adapter.wasm",
+    ) orelse return error.InvalidEngineProvenance;
     if (config.preview2_adapter) |path| {
         const supplied = try absolutePath(allocator, cwd, path);
         if (!std.mem.eql(u8, supplied, adapter))
             return error.InvalidEngineProvenance;
     }
-    const features_path = try std.fs.path.join(
-        allocator,
-        &.{ package_root, "features.json" },
-    );
-    const features_capture = try validateExternalFeatures(
+    const features_capture = capturedPackageFile(
+        package_capture.root,
+        "features.json",
+    ) orelse return error.InvalidEngineProvenance;
+    try validateExternalFeatures(
         allocator,
         io,
-        features_path,
+        features_capture,
         provenance.features,
     );
-    errdefer features_capture.close(io);
     const component_wit = try std.fs.path.join(
         allocator,
         &.{ package_root, "component-wit" },
@@ -4397,42 +4556,35 @@ fn externalRuntime(
         allocator,
         &.{ package_root, "surface-wit" },
     );
-    const feature_wit = try std.fs.path.join(
-        allocator,
-        &.{ package_root, "feature-wit" },
-    );
-    const component_wit_capture = captureDirectory(
-        allocator,
-        io,
-        component_wit,
-        false,
-    ) catch return error.InvalidEngineProvenance;
-    errdefer component_wit_capture.close(io);
-    const surface_wit_capture = captureDirectory(
-        allocator,
-        io,
-        surface_wit,
-        false,
-    ) catch return error.InvalidEngineProvenance;
-    errdefer surface_wit_capture.close(io);
-    const feature_wit_capture = captureDirectory(
-        allocator,
-        io,
-        feature_wit,
-        false,
-    ) catch return error.InvalidEngineProvenance;
-    errdefer feature_wit_capture.close(io);
+    const component_wit_capture = capturedPackageDirectory(
+        package_capture.root,
+        "component-wit",
+    ) orelse return error.InvalidEngineProvenance;
+    const surface_wit_capture = capturedPackageDirectory(
+        package_capture.root,
+        "surface-wit",
+    ) orelse return error.InvalidEngineProvenance;
+    const feature_wit_capture = capturedPackageDirectory(
+        package_capture.root,
+        "feature-wit",
+    ) orelse return error.InvalidEngineProvenance;
     const supplied_surface_wit = if (config.wit) |path| blk: {
         if (!std.mem.eql(u8, config.world_name.?, provenance.surface_world))
             return error.InvalidEngineProvenance;
+        const supplied_path = try absolutePath(allocator, cwd, path);
+        if (std.mem.eql(u8, supplied_path, surface_wit))
+            break :blk null;
         const captured = captureDirectory(
             allocator,
             io,
-            try absolutePath(allocator, cwd, path),
+            supplied_path,
             false,
-        ) catch return error.InvalidEngineProvenance;
+        ) catch |err| switch (err) {
+            error.TransactionChanged => return err,
+            else => return error.InvalidEngineProvenance,
+        };
         const supplied_digest = capturedDirectoryDigest(captured);
-        const packaged_digest = capturedDirectoryDigest(
+        const packaged_digest = capturedPackageDirectoryDigest(
             surface_wit_capture,
         );
         if (!std.mem.eql(
@@ -4443,18 +4595,24 @@ fn externalRuntime(
             captured.close(io);
             return error.InvalidEngineProvenance;
         }
-        break :blk captured;
+        break :blk @as(?CapturedDirectory, captured);
     } else null;
     errdefer if (supplied_surface_wit) |tree| tree.close(io);
     const supplied_component_wit = if (config.component_wit) |path| blk: {
+        const supplied_path = try absolutePath(allocator, cwd, path);
+        if (std.mem.eql(u8, supplied_path, component_wit))
+            break :blk null;
         const captured = captureDirectory(
             allocator,
             io,
-            try absolutePath(allocator, cwd, path),
+            supplied_path,
             false,
-        ) catch return error.InvalidEngineProvenance;
+        ) catch |err| switch (err) {
+            error.TransactionChanged => return err,
+            else => return error.InvalidEngineProvenance,
+        };
         const supplied_digest = capturedDirectoryDigest(captured);
-        const packaged_digest = capturedDirectoryDigest(
+        const packaged_digest = capturedPackageDirectoryDigest(
             component_wit_capture,
         );
         if (!std.mem.eql(
@@ -4465,7 +4623,7 @@ fn externalRuntime(
             captured.close(io);
             return error.InvalidEngineProvenance;
         }
-        break :blk captured;
+        break :blk @as(?CapturedDirectory, captured);
     } else null;
     errdefer if (supplied_component_wit) |tree| tree.close(io);
     if (config.component_world_name) |world| {
@@ -4473,12 +4631,13 @@ fn externalRuntime(
             return error.InvalidEngineProvenance;
     }
     try validateExternalEngineInventory(
-        io,
-        engine_capture.parent_path.parent(),
-        std.fs.path.basename(engine),
+        package_capture.root,
+        engine_basename,
     );
     const external_capture = try allocator.create(CapturedExternalRuntime);
     external_capture.* = .{
+        .package = package_capture,
+        .engine = engine_capture,
         .adapter = adapter_capture,
         .features = features_capture,
         .component_wit = component_wit_capture,
@@ -4500,7 +4659,7 @@ fn externalRuntime(
     );
     return .{
         .engine = engine,
-        .engine_capture = engine_capture,
+        .engine_capture = null,
         .external_capture = external_capture,
         .adapter = adapter,
         .component_wit = selected_component_wit.absolute,
@@ -4698,7 +4857,7 @@ fn snapshotExternalRuntime(
     environ: *std.process.Environ.Map,
     cwd: []const u8,
     config: *const cli.Config,
-    wasm_tools: []const u8,
+    wasm_tools: CapturedTool,
     transaction_dir: []const u8,
     runtime: *Runtime,
 ) !void {
@@ -4723,19 +4882,19 @@ fn snapshotExternalRuntime(
         allocator,
         &.{ transaction_dir, "external-feature-wit" },
     );
-    try copyCapturedFile(io, runtime.engine_capture.?, snapshot_engine);
-    try copyCapturedFile(io, captured.adapter, snapshot_adapter);
-    try copyCapturedDirectory(
+    try copyCapturedPackageFile(io, captured.engine, snapshot_engine);
+    try copyCapturedPackageFile(io, captured.adapter, snapshot_adapter);
+    try copyCapturedPackageDirectoryToPath(
         io,
         captured.component_wit,
         snapshot_component_wit,
     );
-    try copyCapturedDirectory(
+    try copyCapturedPackageDirectoryToPath(
         io,
         captured.surface_wit,
         snapshot_surface_wit,
     );
-    try copyCapturedDirectory(
+    try copyCapturedPackageDirectoryToPath(
         io,
         captured.feature_wit,
         snapshot_feature_wit,
@@ -4746,7 +4905,6 @@ fn snapshotExternalRuntime(
         .default_file;
     try setRegularFilePermissions(io, snapshot_engine, readonly_permissions);
     try setRegularFilePermissions(io, snapshot_adapter, readonly_permissions);
-    try verifyCapturedFile(io, runtime.engine_capture.?);
     try verifyCapturedExternalRuntime(io, captured);
 
     var command_log: std.ArrayList(u8) = .empty;
@@ -4778,12 +4936,13 @@ fn snapshotExternalRuntime(
         allocator,
         &.{ transaction_dir, "validated-feature-wit.wasm" },
     );
-    runCommand(
+    runCapturedToolCommand(
         allocator,
         io,
         "validate external feature WIT",
+        wasm_tools,
         &.{
-            wasm_tools,
+            wasm_tools.executable,
             "component",
             "wit",
             "--wasm",
@@ -4796,7 +4955,10 @@ fn snapshotExternalRuntime(
         null,
         config.verbose,
         &command_log,
-    ) catch return error.InvalidEngineProvenance;
+    ) catch |err| switch (err) {
+        error.TransactionChanged => return err,
+        else => return error.InvalidEngineProvenance,
+    };
     try verifyCapturedExternalRuntime(io, captured);
     try runComponentizerTestHook(
         allocator,
@@ -4804,7 +4966,16 @@ fn snapshotExternalRuntime(
         environ,
         "external-inputs-snapshotted",
     );
+    verifyCapturedExternalRuntime(io, captured) catch
+        {
+            std.debug.print(
+                "error: external package changed after snapshot validation\n",
+                .{},
+            );
+            return error.TransactionChanged;
+        };
     runtime.engine = snapshot_engine;
+    runtime.engine_capture = null;
     runtime.adapter = snapshot_adapter;
     runtime.component_wit = snapshot_component_wit;
 }
@@ -4814,7 +4985,7 @@ fn validateWitWorld(
     io: Io,
     cwd: []const u8,
     verbose: bool,
-    wasm_tools: []const u8,
+    wasm_tools: CapturedTool,
     wit: []const u8,
     world: []const u8,
     transaction_dir: []const u8,
@@ -4832,12 +5003,13 @@ fn validateWitWorld(
             ),
         },
     );
-    runCommand(
+    runCapturedToolCommand(
         allocator,
         io,
         "validate external WIT world",
+        wasm_tools,
         &.{
-            wasm_tools,
+            wasm_tools.executable,
             "component",
             "embed",
             "--all-features",
@@ -4853,18 +5025,17 @@ fn validateWitWorld(
         null,
         verbose,
         command_log,
-    ) catch return error.InvalidEngineProvenance;
+    ) catch |err| switch (err) {
+        error.TransactionChanged => return err,
+        else => return error.InvalidEngineProvenance,
+    };
 }
 
 fn verifyCapturedExternalRuntime(
     io: Io,
     captured: *CapturedExternalRuntime,
 ) !void {
-    try verifyCapturedFile(io, captured.adapter);
-    try verifyCapturedFile(io, captured.features);
-    try verifyCapturedDirectory(io, captured.component_wit);
-    try verifyCapturedDirectory(io, captured.surface_wit);
-    try verifyCapturedDirectory(io, captured.feature_wit);
+    try verifyCapturedDirectory(io, captured.package);
     if (captured.supplied_surface_wit) |tree|
         try verifyCapturedDirectory(io, tree);
     if (captured.supplied_component_wit) |tree|
@@ -4874,7 +5045,7 @@ fn verifyCapturedExternalRuntime(
 fn readEngineProvenance(
     allocator: Allocator,
     io: Io,
-    engine: CapturedFile,
+    engine: CapturedPackageFile,
 ) !EngineProvenance {
     var header: [8]u8 = undefined;
     try readCapturedExact(io, engine, &header, 0);
@@ -5045,13 +5216,13 @@ fn readUleb(bytes: []const u8, offset: *usize) !usize {
     try validateRuntimeText(parsed.host_api);
     try validateRuntimeText(parsed.component_world);
     try validateRuntimeText(parsed.surface_world);
-    try verifyCapturedFile(io, engine);
+    try verifyCapturedPackageFile(io, engine);
     return parsed;
 }
 
 fn readWasmUleb(
     io: Io,
-    engine: CapturedFile,
+    engine: CapturedPackageFile,
     offset: *u64,
 ) !u64 {
     var result: u64 = 0;
@@ -5073,7 +5244,7 @@ fn readWasmUleb(
 
 fn readCapturedExact(
     io: Io,
-    captured: CapturedFile,
+    captured: CapturedPackageFile,
     buffer: []u8,
     offset: u64,
 ) !void {
@@ -5087,12 +5258,9 @@ fn readCapturedExact(
 fn validateExternalFeatures(
     allocator: Allocator,
     io: Io,
-    path: []const u8,
+    captured: CapturedPackageFile,
     expected: EngineFeatures,
-) !CapturedFile {
-    const captured = captureFile(allocator, io, path) catch
-        return error.InvalidEngineProvenance;
-    errdefer captured.close(io);
+) !void {
     if (captured.identity.stat.size == 0 or
         captured.identity.stat.size > 16 * 1024)
         return error.InvalidEngineProvenance;
@@ -5109,21 +5277,14 @@ fn validateExternalFeatures(
     ) catch return error.InvalidEngineProvenance;
     if (!std.meta.eql(actual, expected))
         return error.InvalidEngineProvenance;
-    try verifyCapturedFile(io, captured);
-    return captured;
 }
 
 fn validateExternalEngineInventory(
-    io: Io,
-    dir: Dir,
+    dir: *CapturedPackageDirectory,
     engine_basename: []const u8,
 ) !void {
-    var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (entry.kind == .sym_link)
-            return error.InvalidEngineProvenance;
-        if (entry.kind == .file and
-            std.mem.endsWith(u8, entry.name, ".wasm") and
+    for (dir.entries) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".wasm") and
             !std.mem.eql(u8, entry.name, engine_basename) and
             !std.mem.eql(u8, entry.name, "preview1-adapter.wasm"))
             return error.InvalidEngineProvenance;
@@ -6310,20 +6471,34 @@ fn resolveTools(
     const wasm_tools_source = if (config.wasm_tools_bin) |path|
         try absolutePath(allocator, cwd, path)
     const wasm_tools = if (config.wasm_tools_bin) |path|
+    const wasm_tools_path = if (config.wasm_tools_bin) |path|
         try resolveExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("WASM_TOOLS_BIN")) |path|
         try resolveExecutable(allocator, io, environ, cwd, path)
     else
-        try siblingOrName(
+        try resolveExecutable(
             allocator,
             io,
-            executable_dir,
-            "wasm-tools",
-            "wasm-tools",
+            environ,
+            cwd,
+            try siblingOrName(
+                allocator,
+                io,
+                executable_dir,
+                "wasm-tools",
+                "wasm-tools",
+            ),
         );
     const wabt_source = if (config.wabt_bin) |path|
         try absolutePath(allocator, cwd, path)
     const wabt = if (!needs_wabt)
+    const wasm_tools = try captureTool(
+        allocator,
+        io,
+        wasm_tools_path,
+    );
+    errdefer wasm_tools.close(io);
+    const wabt_path = if (!needs_wabt)
         null
     else if (config.wabt_bin) |path|
         try resolveExecutable(allocator, io, environ, cwd, path)
@@ -6360,6 +6535,18 @@ fn resolveTools(
     )).snapshot;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
     const weval = if (!config.aot)
+        try resolveExecutable(
+            allocator,
+            io,
+            environ,
+            cwd,
+            try siblingOrName(allocator, io, executable_dir, "wabt", "wabt"),
+        );
+    const wabt = if (wabt_path) |path|
+        try captureTool(allocator, io, path)
+    else
+        null;
+    errdefer if (wabt) |tool| tool.close(io);
     const weval = if (!config.aot or !needs_initialization)
         null
     else if (config.weval_bin) |path|
@@ -6584,8 +6771,15 @@ const CapturePackageState = struct {
     allocator: Allocator,
     io: Io,
     allow_symlinks: bool,
+    hook: ?CaptureDirectoryHook = null,
     entries: usize = 0,
     bytes: u64 = 0,
+};
+
+const CaptureDirectoryHook = struct {
+    environ: *std.process.Environ.Map,
+    entry_name: []const u8,
+    phase: []const u8,
 };
 
 fn captureFile(
@@ -6771,6 +6965,36 @@ fn copyCapturedFile(
     captured: CapturedFile,
     destination: []const u8,
 ) !void {
+    return copyCapturedFileContents(
+        io,
+        captured.file,
+        captured.identity,
+        captured.digest,
+        destination,
+    );
+}
+
+fn copyCapturedPackageFile(
+    io: Io,
+    captured: CapturedPackageFile,
+    destination: []const u8,
+) !void {
+    return copyCapturedFileContents(
+        io,
+        captured.file,
+        captured.identity,
+        captured.digest,
+        destination,
+    );
+}
+
+fn copyCapturedFileContents(
+    io: Io,
+    source_file: File,
+    source_identity: PackageIdentity,
+    source_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    destination: []const u8,
+) !void {
     var output = try Dir.createFileAbsolute(io, destination, .{
         .read = true,
         .truncate = true,
@@ -6779,8 +7003,8 @@ fn copyCapturedFile(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
-    while (offset < captured.identity.stat.size) {
-        const count = try captured.file.readPositional(
+    while (offset < source_identity.stat.size) {
+        const count = try source_file.readPositional(
             io,
             &.{&buffer},
             offset,
@@ -6792,7 +7016,7 @@ fn copyCapturedFile(
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    if (!std.mem.eql(u8, &digest, &captured.digest))
+    if (!std.mem.eql(u8, &digest, &source_digest))
         return error.WevalPackageRace;
     try output.sync(io);
 }
@@ -6811,6 +7035,18 @@ fn verifyCapturedFile(io: Io, captured: CapturedFile) !void {
         captured.name_identity,
     );
     try verifyCapturedPath(io, captured.parent_path);
+}
+
+fn verifyCapturedPackageFile(
+    io: Io,
+    captured: CapturedPackageFile,
+) !void {
+    const identity = try packageFileIdentity(io, captured.file);
+    if (!sameRetainedPackageIdentity(captured.identity, identity))
+        return error.WevalPackageRace;
+    const digest = try hashPackageFile(io, captured.file);
+    if (!std.mem.eql(u8, &digest, &captured.digest))
+        return error.WevalPackageRace;
 }
 
 fn captureWevalPackage(
@@ -6846,6 +7082,22 @@ fn captureDirectory(
     path: []const u8,
     allow_symlinks: bool,
 ) !CapturedDirectory {
+    return captureDirectoryWithHook(
+        allocator,
+        io,
+        path,
+        allow_symlinks,
+        null,
+    );
+}
+
+fn captureDirectoryWithHook(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    allow_symlinks: bool,
+    hook: ?CaptureDirectoryHook,
+) !CapturedDirectory {
     const parent_path = std.fs.path.dirname(path) orelse
         return error.InvalidPath;
     const basename = std.fs.path.basename(path);
@@ -6874,6 +7126,7 @@ fn captureDirectory(
         .allocator = allocator,
         .io = io,
         .allow_symlinks = allow_symlinks,
+        .hook = hook,
     };
     const root = try capturePackageDirectory(
         &state,
@@ -6910,11 +7163,45 @@ fn safePackageRelativePath(relative: []const u8) bool {
 fn capturedDirectoryDigest(
     captured: CapturedDirectory,
 ) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    return capturedPackageDirectoryDigest(captured.root);
+}
+
+fn capturedPackageDirectoryDigest(
+    captured: *CapturedPackageDirectory,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashCapturedPackageDirectory(&hasher, captured.root);
+    hashCapturedPackageDirectory(&hasher, captured);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn capturedPackageFile(
+    captured: *CapturedPackageDirectory,
+    name: []const u8,
+) ?CapturedPackageFile {
+    for (captured.entries) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        return switch (entry.value) {
+            .file => |file| file,
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn capturedPackageDirectory(
+    captured: *CapturedPackageDirectory,
+    name: []const u8,
+) ?*CapturedPackageDirectory {
+    for (captured.entries) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        return switch (entry.value) {
+            .directory => |directory| directory,
+            else => null,
+        };
+    }
+    return null;
 }
 
 fn hashCapturedPackageDirectory(
@@ -7057,6 +7344,19 @@ fn capturePackageDirectory(
             name,
             entry_identity,
         );
+        if (depth == 0) {
+            if (state.hook) |hook| {
+                if (std.mem.eql(u8, name, hook.entry_name)) {
+                    try runComponentizerTestHook(
+                        state.allocator,
+                        state.io,
+                        hook.environ,
+                        hook.phase,
+                    );
+                    state.hook = null;
+                }
+            }
+        }
     }
     if (!sameStablePackageIdentity(
         identity,
@@ -7118,9 +7418,153 @@ fn copyCapturedWevalPackage(
     return .{ .selected = selected, .provenance = provenance };
 }
 
+fn captureTool(
+    allocator: Allocator,
+    io: Io,
+    executable: []const u8,
+) !CapturedTool {
+    const package_root = std.fs.path.dirname(executable) orelse
+        return error.InvalidPath;
+    const package = try captureWevalPackage(
+        allocator,
+        io,
+        .{
+            .selected = executable,
+            .package_root = package_root,
+            .provenance = executable,
+        },
+    );
+    return .{
+        .provenance = try allocator.dupe(u8, executable),
+        .executable = try allocator.dupe(u8, executable),
+        .package = package,
+    };
+}
+
+fn snapshotTools(
+    allocator: Allocator,
+    io: Io,
+    transaction_dir: []const u8,
+    tools: *Tools,
+) !void {
+    try snapshotTool(
+        allocator,
+        io,
+        transaction_dir,
+        "wasm-tools",
+        &tools.wasm_tools,
+    );
+    if (tools.wabt) |*tool| {
+        try snapshotTool(
+            allocator,
+            io,
+            transaction_dir,
+            "wabt",
+            tool,
+        );
+    }
+}
+
+fn snapshotTool(
+    allocator: Allocator,
+    io: Io,
+    transaction_dir: []const u8,
+    label: []const u8,
+    tool: *CapturedTool,
+) !void {
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, try std.fmt.allocPrint(
+            allocator,
+            "tool-{s}",
+            .{label},
+        ) },
+    );
+    const snapshot = copyCapturedWevalPackage(
+        allocator,
+        io,
+        tool.package,
+        destination,
+    ) catch |err| switch (err) {
+        error.WevalPackageRace => {
+            std.debug.print(
+                "error: resolved {s} package changed before snapshot\n",
+                .{tool.provenance},
+            );
+            return error.TransactionChanged;
+        },
+        else => return err,
+    };
+    verifyCapturedWevalPackage(io, tool.package) catch {
+        std.debug.print(
+            "error: resolved {s} package changed during snapshot\n",
+            .{tool.provenance},
+        );
+        return error.TransactionChanged;
+    };
+    const file = try Dir.openFileAbsolute(io, snapshot.selected, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const identity = try packageFileIdentity(io, file);
+    if (identity.stat.kind != .file)
+        return error.MissingBuildArtifact;
+    tool.snapshot_file = file;
+    tool.snapshot_identity = identity;
+    tool.snapshot_digest = try hashPackageFile(io, file);
+    tool.executable = if (builtin.os.tag == .linux) blk: {
+        switch (std.posix.errno(std.posix.system.fcntl(
+            file.handle,
+            std.posix.F.SETFD,
+            @as(usize, 0),
+        ))) {
+            .SUCCESS => {},
+            else => return error.MissingBuildArtifact,
+        }
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "/proc/self/fd/{d}",
+            .{file.handle},
+        );
+    } else snapshot.selected;
+}
+
+fn verifyCapturedTools(io: Io, tools: Tools) !void {
+    try verifyCapturedWevalPackage(io, tools.wasm_tools.package);
+    try verifySnapshotTool(io, tools.wasm_tools);
+    if (tools.wabt) |tool| {
+        try verifyCapturedWevalPackage(io, tool.package);
+        try verifySnapshotTool(io, tool);
+    }
+}
+
+fn verifySnapshotTool(io: Io, tool: CapturedTool) !void {
+    const file = tool.snapshot_file orelse return error.TransactionChanged;
+    if (!sameRetainedPackageIdentity(
+        tool.snapshot_identity.?,
+        try packageFileIdentity(io, file),
+    )) return error.TransactionChanged;
+    const digest = try hashPackageFile(io, file);
+    if (!std.mem.eql(u8, &digest, &tool.snapshot_digest.?))
+        return error.TransactionChanged;
+}
+
 fn copyCapturedDirectory(
     io: Io,
     captured: CapturedDirectory,
+    destination_path: []const u8,
+) !void {
+    return copyCapturedPackageDirectoryToPath(
+        io,
+        captured.root,
+        destination_path,
+    );
+}
+
+fn copyCapturedPackageDirectoryToPath(
+    io: Io,
+    captured: *CapturedPackageDirectory,
     destination_path: []const u8,
 ) !void {
     const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
@@ -7133,7 +7577,7 @@ fn copyCapturedDirectory(
         .follow_symlinks = false,
     });
     defer destination.close(io);
-    try copyCapturedPackageDirectory(io, captured.root, destination);
+    try copyCapturedPackageDirectory(io, captured, destination);
 }
 
 fn copyCapturedPackageDirectory(
@@ -7233,17 +7677,31 @@ fn verifyCapturedPackageDirectory(
     if (!sameRetainedPackageIdentity(
         captured.identity,
         try packageDirectoryIdentity(io, captured.dir),
-    )) return error.WevalPackageRace;
+    )) {
+        std.debug.print("error: retained package directory metadata changed\n", .{});
+        return error.WevalPackageRace;
+    }
     for (captured.entries) |entry| {
         switch (entry.value) {
             .file => |source| {
                 if (!sameRetainedPackageIdentity(
                     source.identity,
                     try packageFileIdentity(io, source.file),
-                )) return error.WevalPackageRace;
-                const digest = try hashPackageFile(io, source.file);
-                if (!std.mem.eql(u8, &digest, &source.digest))
+                )) {
+                    std.debug.print(
+                        "error: retained package file changed: {s}\n",
+                        .{entry.name},
+                    );
                     return error.WevalPackageRace;
+                }
+                const digest = try hashPackageFile(io, source.file);
+                if (!std.mem.eql(u8, &digest, &source.digest)) {
+                    std.debug.print(
+                        "error: retained package file digest changed: {s}\n",
+                        .{entry.name},
+                    );
+                    return error.WevalPackageRace;
+                }
             },
             .directory => |source| try verifyCapturedPackageDirectory(
                 io,
@@ -7253,7 +7711,13 @@ fn verifyCapturedPackageDirectory(
                 if (!sameRetainedPackageIdentity(
                     source.identity,
                     try packageFileIdentity(io, source.file),
-                )) return error.WevalPackageRace;
+                )) {
+                    std.debug.print(
+                        "error: retained package symlink changed: {s}\n",
+                        .{entry.name},
+                    );
+                    return error.WevalPackageRace;
+                }
             },
         }
         try verifyRetainedNameIdentity(
@@ -7758,7 +8222,7 @@ fn createAotStagingDir(
     environ: *std.process.Environ.Map,
     cwd: []const u8,
     executable_dir: []const u8,
-    weval_package_root: []const u8,
+    excluded_roots: []const []const u8,
     output_parent: []const u8,
 ) ![]const u8 {
     var candidates: std.ArrayList([]const u8) = .empty;
@@ -7799,7 +8263,14 @@ fn createAotStagingDir(
             allocator,
         ) catch continue;
         if (pathContains(output_parent, root)) continue;
-        if (pathContains(weval_package_root, root)) continue;
+        var excluded = false;
+        for (excluded_roots) |excluded_root| {
+            if (pathContains(excluded_root, root)) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
         var random_bytes: [8]u8 = undefined;
         io.random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -13386,6 +13857,63 @@ fn runCommandRedacted(
     redactions: []const Redaction,
     transaction: *Transaction,
 ) !void {
+    return runCommandWithDisplay(
+        allocator,
+        io,
+        stage,
+        argv,
+        null,
+        cwd,
+        environ,
+        stdin_path,
+        verbose,
+        command_log,
+    );
+}
+
+fn runCapturedToolCommand(
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    tool: CapturedTool,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+) !void {
+    verifySnapshotTool(io, tool) catch
+        return error.TransactionChanged;
+    const result = runCommandWithDisplay(
+        allocator,
+        io,
+        stage,
+        argv,
+        tool.provenance,
+        cwd,
+        environ,
+        stdin_path,
+        verbose,
+        command_log,
+    );
+    verifySnapshotTool(io, tool) catch
+        return error.TransactionChanged;
+    return result;
+}
+
+fn runCommandWithDisplay(
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    argv: []const []const u8,
+    display_argv0: ?[]const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+) !void {
     command_log.appendSlice(allocator, stage) catch @panic("out of memory");
     command_log.append(allocator, '\n') catch @panic("out of memory");
     for (argv) |arg| {
@@ -13409,6 +13937,21 @@ fn runCommandRedacted(
                 .{stable_arg},
             );
             try File.stderr().writeStreamingAll(io, line);
+    for (argv, 0..) |arg, index| {
+        command_log.appendSlice(allocator, "  ") catch @panic("out of memory");
+        command_log.appendSlice(
+            allocator,
+            if (index == 0) display_argv0 orelse arg else arg,
+        ) catch @panic("out of memory");
+        command_log.append(allocator, '\n') catch @panic("out of memory");
+    }
+    if (verbose) {
+        std.debug.print("[{s}]\n", .{stage});
+        for (argv, 0..) |arg, index| {
+            std.debug.print(
+                "  {s}\n",
+                .{if (index == 0) display_argv0 orelse arg else arg},
+            );
         }
     }
 
