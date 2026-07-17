@@ -40,11 +40,14 @@ const Snapshot = struct {
     path: []const u8,
     storage_path: []const u8,
     digest: []const u8,
+    protection: usize,
 };
 
 const ChildOutput = struct {
     path: []const u8,
     storage_path: []const u8,
+    relative: []const u8,
+    protection: ?usize = null,
 };
 
 const InputSnapshot = struct {
@@ -85,6 +88,469 @@ const EntryIdentity = struct {
 const OwnedEntry = struct {
     path: []const u8,
     identity: EntryIdentity,
+};
+
+const ManifestEntry = struct {
+    path: []const u8,
+    kind: File.Kind,
+    device_major: u32,
+    device_minor: u32,
+    inode: File.INode,
+    nlink: File.NLink,
+    size: u64,
+    mode: std.posix.mode_t,
+    mtime: Io.Timestamp,
+    ctime: Io.Timestamp,
+    link_target: ?[]const u8,
+    content_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+    fn matches(self: ManifestEntry, other: ManifestEntry) bool {
+        return std.mem.eql(u8, self.path, other.path) and
+            self.kind == other.kind and
+            self.device_major == other.device_major and
+            self.device_minor == other.device_minor and
+            self.inode == other.inode and
+            self.nlink == other.nlink and
+            self.size == other.size and
+            self.mode == other.mode and
+            self.mtime.nanoseconds == other.mtime.nanoseconds and
+            self.ctime.nanoseconds == other.ctime.nanoseconds and
+            optionalBytesEqual(self.link_target, other.link_target) and
+            std.mem.eql(
+                u8,
+                &self.content_digest,
+                &other.content_digest,
+            );
+    }
+};
+
+const TreeManifest = struct {
+    entries: []const ManifestEntry,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+    fn matches(self: TreeManifest, other: TreeManifest) bool {
+        if (!std.mem.eql(u8, &self.digest, &other.digest) or
+            self.entries.len != other.entries.len)
+        {
+            return false;
+        }
+        for (self.entries, other.entries) |expected, actual| {
+            if (!expected.matches(actual)) return false;
+        }
+        return true;
+    }
+
+    fn matchesAfterRootRename(
+        self: TreeManifest,
+        other: TreeManifest,
+    ) bool {
+        if (self.entries.len != other.entries.len) return false;
+        for (self.entries, other.entries) |expected, actual| {
+            if (!std.mem.eql(u8, expected.path, actual.path) or
+                expected.kind != actual.kind or
+                expected.device_major != actual.device_major or
+                expected.device_minor != actual.device_minor or
+                expected.inode != actual.inode or
+                expected.nlink != actual.nlink or
+                expected.size != actual.size or
+                expected.mode != actual.mode or
+                expected.mtime.nanoseconds != actual.mtime.nanoseconds or
+                (!std.mem.eql(u8, expected.path, ".") and
+                    expected.ctime.nanoseconds != actual.ctime.nanoseconds) or
+                !optionalBytesEqual(
+                    expected.link_target,
+                    actual.link_target,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &expected.content_digest,
+                    &actual.content_digest,
+                ))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn matchesWithAdditions(
+        self: TreeManifest,
+        other: TreeManifest,
+    ) bool {
+        if (other.entries.len < self.entries.len) return false;
+        for (self.entries) |expected| {
+            var actual: ?ManifestEntry = null;
+            for (other.entries) |candidate| {
+                if (std.mem.eql(u8, expected.path, candidate.path)) {
+                    actual = candidate;
+                    break;
+                }
+            }
+            const retained = actual orelse return false;
+            if (std.mem.eql(u8, expected.path, ".")) {
+                if (expected.kind != retained.kind or
+                    expected.device_major != retained.device_major or
+                    expected.device_minor != retained.device_minor or
+                    expected.inode != retained.inode or
+                    expected.mode != retained.mode or
+                    !optionalBytesEqual(
+                        expected.link_target,
+                        retained.link_target,
+                    ))
+                {
+                    return false;
+                }
+            } else if (!expected.matches(retained)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn matchesDebugMerge(
+        self: TreeManifest,
+        backup: ?TreeManifest,
+        other: TreeManifest,
+    ) bool {
+        if (!self.matchesWithAdditions(other)) return false;
+        const source = backup orelse
+            return self.entries.len == other.entries.len;
+        var expected_count = self.entries.len;
+        for (source.entries) |expected| {
+            if (std.mem.eql(u8, expected.path, ".") or
+                isGeneratedDebugPath(expected.path))
+            {
+                continue;
+            }
+            expected_count += 1;
+            var matched = false;
+            for (other.entries) |actual| {
+                if (!std.mem.eql(u8, expected.path, actual.path)) continue;
+                if (!copiedManifestEntryMatches(expected, actual)) {
+                    return false;
+                }
+                matched = true;
+                break;
+            }
+            if (!matched) return false;
+        }
+        return expected_count == other.entries.len;
+    }
+};
+
+fn isGeneratedDebugPath(path: []const u8) bool {
+    const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
+    return isGeneratedDebugName(path[0..end]);
+}
+
+fn copiedManifestEntryMatches(
+    expected: ManifestEntry,
+    actual: ManifestEntry,
+) bool {
+    if (expected.kind != actual.kind or
+        expected.mode != actual.mode or
+        (expected.kind != .directory and expected.size != actual.size) or
+        !optionalBytesEqual(expected.link_target, actual.link_target))
+    {
+        return false;
+    }
+    return expected.kind == .directory or std.mem.eql(
+        u8,
+        &expected.content_digest,
+        &actual.content_digest,
+    );
+}
+
+fn manifestContainsPath(manifest: TreeManifest, path: []const u8) bool {
+    for (manifest.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, path)) return true;
+    }
+    return false;
+}
+
+const ProtectionLocation = enum {
+    storage,
+    publication,
+};
+
+const ProtectedTree = struct {
+    location: ProtectionLocation,
+    path: []const u8,
+    manifest: TreeManifest,
+    active: bool = true,
+    namespace_changed: bool = false,
+    attribute_changed: bool = false,
+};
+
+const IntegrityWatch = struct {
+    descriptor: i32,
+    protection: usize,
+    root: bool,
+};
+
+const MutationMonitor = struct {
+    descriptor: ?std.posix.fd_t,
+    watches: std.ArrayList(IntegrityWatch) = .empty,
+
+    fn init() !MutationMonitor {
+        if (builtin.os.tag != .linux) return .{ .descriptor = null };
+        const linux = std.os.linux;
+        while (true) {
+            const result = linux.inotify_init1(
+                linux.IN.CLOEXEC | linux.IN.NONBLOCK,
+            );
+            switch (linux.errno(result)) {
+                .SUCCESS => return .{
+                    .descriptor = @intCast(result),
+                },
+                .INTR => continue,
+                .MFILE, .NFILE, .NOMEM => return error.SystemResources,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+    }
+
+    fn deinit(self: *MutationMonitor, allocator: Allocator) void {
+        if (self.descriptor) |descriptor| {
+            if (builtin.os.tag == .linux) {
+                _ = std.os.linux.close(descriptor);
+            }
+        }
+        self.watches.deinit(allocator);
+    }
+
+    fn add(
+        self: *MutationMonitor,
+        allocator: Allocator,
+        path: []const u8,
+        protection: usize,
+        root: bool,
+    ) !void {
+        const descriptor = self.descriptor orelse return;
+        const linux = std.os.linux;
+        const path_z = try std.posix.toPosixPath(path);
+        const mask = linux.IN.MODIFY |
+            linux.IN.ATTRIB |
+            linux.IN.CLOSE_WRITE |
+            linux.IN.MOVED_FROM |
+            linux.IN.MOVED_TO |
+            linux.IN.CREATE |
+            linux.IN.DELETE |
+            linux.IN.DELETE_SELF |
+            linux.IN.MOVE_SELF |
+            linux.IN.UNMOUNT |
+            linux.IN.DONT_FOLLOW;
+        while (true) {
+            const result = linux.inotify_add_watch(
+                descriptor,
+                &path_z,
+                mask,
+            );
+            switch (linux.errno(result)) {
+                .SUCCESS => {
+                    self.watches.append(allocator, .{
+                        .descriptor = @intCast(result),
+                        .protection = protection,
+                        .root = root,
+                    }) catch @panic("out of memory");
+                    return;
+                },
+                .INTR => continue,
+                .ACCES => return error.AccessDenied,
+                .NOENT, .NOTDIR => return error.TransactionChanged,
+                .NOSPC, .NOMEM => return error.SystemResources,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+    }
+
+    fn check(
+        self: *MutationMonitor,
+        protections: []ProtectedTree,
+        allowed_move: ?usize,
+        allowed_additions: ?usize,
+    ) !void {
+        const descriptor = self.descriptor orelse return;
+        const linux = std.os.linux;
+        var buffer: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) =
+            undefined;
+        read_events: while (true) {
+            const count = std.posix.read(descriptor, &buffer) catch |err| switch (err) {
+                error.WouldBlock => break :read_events,
+                else => return err,
+            };
+            if (count == 0) return error.TransactionChanged;
+            var offset: usize = 0;
+            while (offset < count) {
+                if (count - offset < @sizeOf(linux.inotify_event)) {
+                    return error.TransactionChanged;
+                }
+                const event: *align(1) const linux.inotify_event =
+                    @ptrCast(buffer[offset..].ptr);
+                const event_size = @sizeOf(linux.inotify_event) + event.len;
+                if (event_size > count - offset) {
+                    return error.TransactionChanged;
+                }
+                offset += event_size;
+                if (event.mask & linux.IN.Q_OVERFLOW != 0) {
+                    return error.TransactionChanged;
+                }
+                var matched: ?IntegrityWatch = null;
+                for (self.watches.items) |watch| {
+                    if (watch.descriptor != event.wd) continue;
+                    if (matched != null and
+                        matched.?.protection != watch.protection)
+                    {
+                        return error.TransactionChanged;
+                    }
+                    matched = watch;
+                }
+                const watch = matched orelse return error.TransactionChanged;
+                if (!protections[watch.protection].active) {
+                    continue;
+                }
+                if (allowed_move) |protection| {
+                    if (watch.protection == protection and watch.root and
+                        event.mask & ~@as(u32, linux.IN.MOVE_SELF) == 0)
+                    {
+                        continue;
+                    }
+                }
+                if (allowed_additions) |protection| {
+                    if (watch.protection == protection and watch.root and
+                        event.len != 0)
+                    {
+                        const name_bytes = buffer[offset - event.len .. offset];
+                        const name_end = std.mem.indexOfScalar(
+                            u8,
+                            name_bytes,
+                            0,
+                        ) orelse name_bytes.len;
+                        if (name_end != 0 and
+                            !isGeneratedDebugName(name_bytes[0..name_end]))
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if (isNamespaceOnlyMutation(event.mask)) {
+                    if (watch.root and
+                        event.mask & std.os.linux.IN.MOVE_SELF != 0)
+                    {
+                        protections[watch.protection].namespace_changed = true;
+                    }
+                    continue;
+                }
+                if (watch.root and
+                    event.mask & ~@as(u32, std.os.linux.IN.ATTRIB) == 0)
+                {
+                    protections[watch.protection].attribute_changed = true;
+                    continue;
+                }
+                return error.TransactionChanged;
+            }
+        }
+        for (protections) |protected| {
+            if (protected.active and protected.attribute_changed and
+                !protected.namespace_changed)
+            {
+                return error.TransactionChanged;
+            }
+        }
+    }
+};
+
+fn isNamespaceOnlyMutation(mask: u32) bool {
+    if (builtin.os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const namespace_actions = linux.IN.MOVED_FROM |
+        linux.IN.MOVED_TO |
+        linux.IN.MOVE_SELF |
+        linux.IN.CREATE |
+        linux.IN.DELETE;
+    const namespace_events = namespace_actions | linux.IN.ISDIR;
+    return mask & namespace_actions != 0 and
+        mask & ~@as(u32, namespace_events) == 0;
+}
+
+const SourceManifestGuard = struct {
+    root: []const u8,
+    protected: [1]ProtectedTree,
+    monitor: MutationMonitor,
+
+    fn init(
+        allocator: Allocator,
+        io: Io,
+        root: []const u8,
+    ) !SourceManifestGuard {
+        if (!std.fs.path.isAbsolute(root)) return error.InvalidPath;
+        const manifest = try buildTreeManifest(
+            allocator,
+            io,
+            .cwd(),
+            root,
+        );
+        var guard = SourceManifestGuard{
+            .root = try allocator.dupe(u8, root),
+            .protected = .{.{
+                .location = .storage,
+                .path = root,
+                .manifest = manifest,
+            }},
+            .monitor = try MutationMonitor.init(),
+        };
+        errdefer guard.monitor.deinit(allocator);
+        for (manifest.entries) |entry| {
+            if (entry.kind == .sym_link) continue;
+            const absolute = if (std.mem.eql(u8, entry.path, "."))
+                root
+            else
+                try std.fs.path.join(
+                    allocator,
+                    &.{ root, entry.path },
+                );
+            try guard.monitor.add(
+                allocator,
+                absolute,
+                0,
+                std.mem.eql(u8, entry.path, "."),
+            );
+        }
+        try guard.monitor.check(&guard.protected, null, null);
+        const confirmed = try buildTreeManifest(
+            allocator,
+            io,
+            .cwd(),
+            root,
+        );
+        if (!manifest.matches(confirmed)) return error.InputChanged;
+        try guard.monitor.check(&guard.protected, null, null);
+        return guard;
+    }
+
+    fn verify(
+        self: *SourceManifestGuard,
+        allocator: Allocator,
+        io: Io,
+    ) !void {
+        self.monitor.check(&self.protected, null, null) catch
+            return error.InputChanged;
+        const current = buildTreeManifest(
+            allocator,
+            io,
+            .cwd(),
+            self.root,
+        ) catch return error.InputChanged;
+        if (!self.protected[0].manifest.matches(current)) {
+            return error.InputChanged;
+        }
+        self.monitor.check(&self.protected, null, null) catch
+            return error.InputChanged;
+    }
+
+    fn deinit(self: *SourceManifestGuard, allocator: Allocator) void {
+        self.monitor.deinit(allocator);
+    }
 };
 
 const ChildAnchor = struct {
@@ -182,6 +648,7 @@ const InputExclusion = struct {
 };
 
 const Transaction = struct {
+    allocator: Allocator,
     name: []const u8,
     cleanup_name: []const u8,
     storage_path: []const u8,
@@ -196,6 +663,8 @@ const Transaction = struct {
     environ: *std.process.Environ.Map,
     owned: std.ArrayList(OwnedEntry) = .empty,
     child_anchors: std.ArrayList(ChildAnchor) = .empty,
+    protected: std.ArrayList(ProtectedTree) = .empty,
+    mutation_monitor: MutationMonitor,
 
     fn create(
         allocator: Allocator,
@@ -235,8 +704,11 @@ const Transaction = struct {
         );
         errdefer storage.close(io);
         const storage_identity = EntryIdentity.fromStat(try storage.stat(io));
+        var mutation_monitor = try MutationMonitor.init();
+        errdefer mutation_monitor.deinit(allocator);
 
         return .{
+            .allocator = allocator,
             .name = name,
             .cleanup_name = try std.fmt.allocPrint(
                 allocator,
@@ -256,6 +728,7 @@ const Transaction = struct {
             .storage_identity = storage_identity,
             .owner_identity = owner_identity,
             .environ = environ,
+            .mutation_monitor = mutation_monitor,
         };
     }
 
@@ -272,6 +745,8 @@ const Transaction = struct {
         self.publication.close(io);
         self.child_anchors.deinit(allocator);
         self.owned.deinit(allocator);
+        self.mutation_monitor.deinit(allocator);
+        self.protected.deinit(allocator);
     }
 
     fn retainStorageFile(
@@ -365,6 +840,129 @@ const Transaction = struct {
         return child_path;
     }
 
+    fn sealChildOutput(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        output: *ChildOutput,
+    ) !void {
+        if (output.protection != null) return error.TransactionChanged;
+        for (self.child_anchors.items) |*anchor| {
+            if (!std.mem.eql(u8, anchor.storage_path, output.relative)) {
+                continue;
+            }
+            const old_file = switch (anchor.handle) {
+                .file => |file| file,
+                .directory => return error.TransactionChanged,
+            };
+            try old_file.sync(io);
+            const initial = try old_file.stat(io);
+            if (!anchor.identity.matches(initial) or initial.kind != .file) {
+                return error.TransactionChanged;
+            }
+            try old_file.setPermissions(
+                io,
+                .fromMode(
+                    initial.permissions.toMode() &
+                        ~@as(std.posix.mode_t, 0o222),
+                ),
+            );
+            try old_file.sync(io);
+            const sealed_stat = try old_file.stat(io);
+            if (!anchor.identity.matches(sealed_stat) or
+                !try entryHasIdentity(
+                    self.storage,
+                    io,
+                    output.relative,
+                    anchor.identity,
+                ))
+            {
+                return error.TransactionChanged;
+            }
+            var replacement = try self.storage.openFile(
+                io,
+                output.relative,
+                .{
+                    .mode = .read_only,
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                },
+            );
+            errdefer replacement.close(io);
+            const replacement_stat = try replacement.stat(io);
+            if (!SourceIdentity.fromStat(sealed_stat).matches(
+                replacement_stat,
+            )) {
+                return error.TransactionChanged;
+            }
+            try setFileInherited(replacement, false);
+            const child_path = try stableHandlePath(
+                allocator,
+                replacement.handle,
+                output.storage_path,
+            );
+            try setFileInherited(old_file, false);
+            old_file.close(io);
+            anchor.handle = .{ .file = replacement };
+            anchor.child_path = child_path;
+            anchor.source_identity = SourceIdentity.fromStat(
+                replacement_stat,
+            );
+            output.path = child_path;
+            output.protection = try self.protectStoragePath(
+                allocator,
+                io,
+                output.relative,
+            );
+            return;
+        }
+        return error.TransactionChanged;
+    }
+
+    fn sealStorageTree(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !usize {
+        var directory = try self.storage.openDir(
+            io,
+            path,
+            .{ .iterate = true, .follow_symlinks = false },
+        );
+        defer directory.close(io);
+        try sealSnapshotDirectory(io, directory);
+        return self.protectStoragePath(allocator, io, path);
+    }
+
+    fn sealStorageFile(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !usize {
+        var file = try self.storage.openFile(io, path, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
+        var file_open = true;
+        defer if (file_open) file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.TransactionChanged;
+        try file.setPermissions(
+            io,
+            .fromMode(
+                stat.permissions.toMode() &
+                    ~@as(std.posix.mode_t, 0o222),
+            ),
+        );
+        try file.sync(io);
+        file.close(io);
+        file_open = false;
+        return self.protectStoragePath(allocator, io, path);
+    }
+
     fn verifyChildAnchors(self: *const Transaction, io: Io) !void {
         try self.verifyAttached(io);
         for (self.child_anchors.items) |anchor| {
@@ -411,7 +1009,8 @@ const Transaction = struct {
         }
     }
 
-    fn prepareChild(self: *const Transaction, io: Io) !void {
+    fn prepareChild(self: *Transaction, io: Io) !void {
+        try self.verifyIntegrity(self.allocator, io);
         try self.verifyChildAnchors(io);
         var inherited_count: usize = 0;
         errdefer {
@@ -429,7 +1028,7 @@ const Transaction = struct {
         }
     }
 
-    fn finishChild(self: *const Transaction, io: Io) !void {
+    fn finishChild(self: *Transaction, io: Io) !void {
         var first_error: ?anyerror = null;
         for (self.child_anchors.items) |anchor| {
             setHandleInherited(anchor.handle.raw(), false) catch |err| {
@@ -437,6 +1036,9 @@ const Transaction = struct {
             };
         }
         self.verifyChildAnchors(io) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+        self.verifyIntegrity(self.allocator, io) catch |err| {
             if (first_error == null) first_error = err;
         };
         if (first_error) |err| return err;
@@ -639,6 +1241,414 @@ const Transaction = struct {
         return null;
     }
 
+    fn directoryForLocation(
+        self: *const Transaction,
+        location: ProtectionLocation,
+    ) Dir {
+        return switch (location) {
+            .storage => self.storage,
+            .publication => self.publication,
+        };
+    }
+
+    fn absoluteProtectedPath(
+        self: *const Transaction,
+        allocator: Allocator,
+        location: ProtectionLocation,
+        path: []const u8,
+    ) ![]const u8 {
+        const fallback = switch (location) {
+            .storage => self.storage_path,
+            .publication => self.publication_path,
+        };
+        const root = try stableHandlePath(
+            allocator,
+            self.directoryForLocation(location).handle,
+            fallback,
+        );
+        return std.fs.path.join(allocator, &.{
+            root,
+            path,
+        });
+    }
+
+    fn protectPath(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        location: ProtectionLocation,
+        path: []const u8,
+    ) !usize {
+        for (self.protected.items, 0..) |protected, index| {
+            if (!protected.active or protected.location != location or
+                !std.mem.eql(u8, protected.path, path))
+            {
+                continue;
+            }
+            const current = try buildTreeManifest(
+                allocator,
+                io,
+                self.directoryForLocation(location),
+                path,
+            );
+            if (!protected.manifest.matches(current)) {
+                return error.TransactionChanged;
+            }
+            return index;
+        }
+        const manifest = try buildTreeManifest(
+            allocator,
+            io,
+            self.directoryForLocation(location),
+            path,
+        );
+        const index = self.protected.items.len;
+        self.protected.append(allocator, .{
+            .location = location,
+            .path = try allocator.dupe(u8, path),
+            .manifest = manifest,
+        }) catch @panic("out of memory");
+        const absolute_root = try self.absoluteProtectedPath(
+            allocator,
+            location,
+            path,
+        );
+        for (manifest.entries) |entry| {
+            if (entry.kind == .sym_link) continue;
+            const absolute = if (std.mem.eql(u8, entry.path, "."))
+                absolute_root
+            else
+                try std.fs.path.join(
+                    allocator,
+                    &.{ absolute_root, entry.path },
+                );
+            try self.mutation_monitor.add(
+                allocator,
+                absolute,
+                index,
+                std.mem.eql(u8, entry.path, "."),
+            );
+        }
+        try self.mutation_monitor.check(self.protected.items, null, null);
+        const confirmed = try buildTreeManifest(
+            allocator,
+            io,
+            self.directoryForLocation(location),
+            path,
+        );
+        if (!manifest.matches(confirmed)) return error.TransactionChanged;
+        try self.mutation_monitor.check(self.protected.items, null, null);
+        return index;
+    }
+
+    fn protectStoragePath(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !usize {
+        return self.protectPath(allocator, io, .storage, path);
+    }
+
+    fn protectPublicationPath(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) !usize {
+        return self.protectPath(allocator, io, .publication, path);
+    }
+
+    fn refreshProtectedStorageAdditions(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        protection: usize,
+        additions: ?TreeManifest,
+    ) !void {
+        if (protection >= self.protected.items.len) {
+            return error.TransactionChanged;
+        }
+        const protected = &self.protected.items[protection];
+        if (!protected.active or protected.location != .storage) {
+            return error.TransactionChanged;
+        }
+        try self.mutation_monitor.check(self.protected.items, null, protection);
+        const previous = protected.manifest;
+        const current = try buildTreeManifest(
+            allocator,
+            io,
+            self.storage,
+            protected.path,
+        );
+        if (!previous.matchesDebugMerge(additions, current)) {
+            return error.TransactionChanged;
+        }
+        const absolute_root = try self.absoluteProtectedPath(
+            allocator,
+            .storage,
+            protected.path,
+        );
+        for (current.entries) |entry| {
+            if (entry.kind == .sym_link or
+                manifestContainsPath(previous, entry.path))
+            {
+                continue;
+            }
+            const absolute = if (std.mem.eql(u8, entry.path, "."))
+                absolute_root
+            else
+                try std.fs.path.join(
+                    allocator,
+                    &.{ absolute_root, entry.path },
+                );
+            try self.mutation_monitor.add(
+                allocator,
+                absolute,
+                protection,
+                false,
+            );
+        }
+        protected.manifest = current;
+        try self.mutation_monitor.check(self.protected.items, null, protection);
+        const confirmed = try buildTreeManifest(
+            allocator,
+            io,
+            self.storage,
+            protected.path,
+        );
+        if (!current.matches(confirmed)) return error.TransactionChanged;
+        protected.manifest = confirmed;
+    }
+
+    fn verifyProtectedManifests(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+    ) !void {
+        for (self.protected.items) |*protected| {
+            if (!protected.active) continue;
+            const current = buildTreeManifest(
+                allocator,
+                io,
+                self.directoryForLocation(protected.location),
+                protected.path,
+            ) catch return error.TransactionChanged;
+            if (!protected.manifest.matches(current)) {
+                if ((builtin.os.tag == .linux and
+                    !protected.namespace_changed) or
+                    !protected.manifest.matchesAfterRootRename(current))
+                {
+                    return error.TransactionChanged;
+                }
+                protected.manifest = current;
+            }
+            protected.namespace_changed = false;
+            protected.attribute_changed = false;
+        }
+    }
+
+    fn verifyIntegrity(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+    ) !void {
+        try self.mutation_monitor.check(self.protected.items, null, null);
+        try self.verifyProtectedManifests(allocator, io);
+        try self.mutation_monitor.check(self.protected.items, null, null);
+    }
+
+    fn verifyRetainedIntegrity(self: *Transaction) !void {
+        try self.mutation_monitor.check(self.protected.items, null, null);
+    }
+
+    fn moveProtected(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        protection: usize,
+        new_location: ProtectionLocation,
+        new_path: []const u8,
+    ) !void {
+        if (protection >= self.protected.items.len or
+            !self.protected.items[protection].active)
+        {
+            return error.TransactionChanged;
+        }
+        try self.verifyIntegrity(allocator, io);
+        const old_location = self.protected.items[protection].location;
+        const old_path = self.protected.items[protection].path;
+        const old_manifest = self.protected.items[protection].manifest;
+        const owned_new_path = try allocator.dupe(u8, new_path);
+        try self.directoryForLocation(old_location).renamePreserve(
+            old_path,
+            self.directoryForLocation(new_location),
+            new_path,
+            io,
+        );
+        self.protected.items[protection].location = new_location;
+        self.protected.items[protection].path = owned_new_path;
+        self.mutation_monitor.check(
+            self.protected.items,
+            protection,
+            null,
+        ) catch |move_error| return self.failProtectedMove(
+            allocator,
+            io,
+            protection,
+            old_location,
+            old_path,
+            old_manifest,
+            move_error,
+        );
+        const moved_manifest = buildTreeManifest(
+            allocator,
+            io,
+            self.directoryForLocation(new_location),
+            new_path,
+        ) catch |move_error| return self.failProtectedMove(
+            allocator,
+            io,
+            protection,
+            old_location,
+            old_path,
+            old_manifest,
+            move_error,
+        );
+        if (!old_manifest.matchesAfterRootRename(moved_manifest)) {
+            return self.failProtectedMove(
+                allocator,
+                io,
+                protection,
+                old_location,
+                old_path,
+                old_manifest,
+                error.TransactionChanged,
+            );
+        }
+        self.protected.items[protection].manifest = moved_manifest;
+        self.protected.items[protection].namespace_changed = false;
+        self.protected.items[protection].attribute_changed = false;
+        self.verifyProtectedManifests(allocator, io) catch |move_error|
+            return self.failProtectedMove(
+                allocator,
+                io,
+                protection,
+                old_location,
+                old_path,
+                old_manifest,
+                move_error,
+            );
+        self.mutation_monitor.check(
+            self.protected.items,
+            null,
+            null,
+        ) catch |move_error| return self.failProtectedMove(
+            allocator,
+            io,
+            protection,
+            old_location,
+            old_path,
+            old_manifest,
+            move_error,
+        );
+    }
+
+    fn failProtectedMove(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        protection: usize,
+        old_location: ProtectionLocation,
+        old_path: []const u8,
+        old_manifest: TreeManifest,
+        move_error: anyerror,
+    ) anyerror {
+        self.restoreProtectedMove(
+            allocator,
+            io,
+            protection,
+            old_location,
+            old_path,
+            old_manifest,
+        ) catch return error.RollbackIncomplete;
+        return move_error;
+    }
+
+    fn restoreProtectedMove(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        protection: usize,
+        old_location: ProtectionLocation,
+        old_path: []const u8,
+        old_manifest: TreeManifest,
+    ) !void {
+        const moved = self.protected.items[protection];
+        try self.directoryForLocation(moved.location).renamePreserve(
+            moved.path,
+            self.directoryForLocation(old_location),
+            old_path,
+            io,
+        );
+        self.protected.items[protection].location = old_location;
+        self.protected.items[protection].path = old_path;
+        self.mutation_monitor.check(
+            self.protected.items,
+            protection,
+            null,
+        ) catch {};
+        const restored = try buildTreeManifest(
+            allocator,
+            io,
+            self.directoryForLocation(old_location),
+            old_path,
+        );
+        if (!old_manifest.matchesAfterRootRename(restored)) {
+            return error.RollbackIncomplete;
+        }
+        self.protected.items[protection].manifest = restored;
+        self.protected.items[protection].namespace_changed = false;
+        self.protected.items[protection].attribute_changed = false;
+    }
+
+    fn withdrawPublished(
+        self: *Transaction,
+        io: Io,
+        protection: usize,
+        destination: []const u8,
+        staged: []const u8,
+        identity: EntryIdentity,
+    ) !void {
+        if (protection >= self.protected.items.len) {
+            return error.TransactionChanged;
+        }
+        const protected = &self.protected.items[protection];
+        if (!protected.active or protected.location != .publication or
+            !std.mem.eql(u8, protected.path, destination) or
+            !try entryHasIdentity(
+                self.publication,
+                io,
+                destination,
+                identity,
+            ))
+        {
+            return error.TransactionChanged;
+        }
+        try self.publication.renamePreserve(
+            destination,
+            self.storage,
+            staged,
+            io,
+        );
+        protected.location = .storage;
+        protected.path = staged;
+        protected.active = false;
+        if (!try entryHasIdentity(self.storage, io, staged, identity)) {
+            return error.TransactionChanged;
+        }
+    }
+
     fn isRootEntry(
         self: *const Transaction,
         absolute_path: []const u8,
@@ -687,6 +1697,36 @@ const Transaction = struct {
                     child,
                     child_path,
                 );
+            }
+        }
+    }
+
+    fn verifyOwnedSubtreeExact(
+        self: *const Transaction,
+        allocator: Allocator,
+        io: Io,
+        directory: Dir,
+        relative: []const u8,
+    ) !void {
+        try self.verifyOwnedDirectory(
+            allocator,
+            io,
+            directory,
+            relative,
+        );
+        for (self.owned.items) |entry| {
+            if (!std.mem.eql(u8, entry.path, relative) and
+                !pathContains(relative, entry.path))
+            {
+                continue;
+            }
+            const stat = try self.storage.statFile(
+                io,
+                entry.path,
+                .{ .follow_symlinks = false },
+            );
+            if (!entry.identity.matches(stat)) {
+                return error.TransactionChanged;
             }
         }
     }
@@ -908,7 +1948,6 @@ fn execute(
         return error.InputOutputCollision;
     }
 
-    if (config.metadata_out != null) diagnostic.begin(.metadata);
     const metadata_output = if (config.metadata_out) |path| blk: {
         const destination = try absolutePath(allocator, cwd, path);
         const parent = std.fs.path.dirname(destination) orelse
@@ -936,7 +1975,6 @@ fn execute(
         break :blk resolved;
     } else null;
 
-    if (config.debug_bindings) diagnostic.begin(.debug);
     const debug_dir = if (config.debug_bindings) blk: {
         const destination = if (config.debug_dir) |path|
             try absolutePath(allocator, cwd, path)
@@ -1153,6 +2191,11 @@ fn execute(
         .data = runtime_args,
     });
     try transaction.recordStorageAbsolute(allocator, io, runtime_args_path);
+    _ = try transaction.sealStorageFile(
+        allocator,
+        io,
+        "runtime-args.txt",
+    );
     const runtime_args_child_path = try transaction.retainStorageFile(
         allocator,
         io,
@@ -1161,7 +2204,7 @@ fn execute(
     );
 
     var command_log: std.ArrayList(u8) = .empty;
-    const initialized = try createChildOutput(
+    var initialized = try createChildOutput(
         allocator,
         io,
         &transaction,
@@ -1235,28 +2278,21 @@ fn execute(
         transaction_storage,
         &transaction,
     );
+    try transaction.sealChildOutput(
+        allocator,
+        io,
+        &initialized,
+    );
 
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
-    const candidate = try createChildOutput(
-        allocator,
-        io,
-        &transaction,
-        "candidate.wasm",
-    );
-    if (runtime.component_wit) |component_wit| {
+    const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
         const wabt = tools.wabt.?.path;
-        stripped = try createChildOutput(
+        var stripped_output = try createChildOutput(
             allocator,
             io,
             &transaction,
             "stripped.wasm",
-        );
-        embedded = try createChildOutput(
-            allocator,
-            io,
-            &transaction,
-            "embedded.wasm",
         );
         diagnostic.begin(.strip);
         try runCommand(
@@ -1268,7 +2304,7 @@ fn execute(
                 "module",
                 "strip",
                 "-o",
-                stripped.?.path,
+                stripped_output.path,
                 initialized.path,
             },
             cwd,
@@ -1279,6 +2315,18 @@ fn execute(
             diagnostic,
             transaction_storage,
             &transaction,
+        );
+        try transaction.sealChildOutput(
+            allocator,
+            io,
+            &stripped_output,
+        );
+        stripped = stripped_output;
+        var embedded_output = try createChildOutput(
+            allocator,
+            io,
+            &transaction,
+            "embedded.wasm",
         );
         diagnostic.begin(.embed);
         try runCommand(
@@ -1292,9 +2340,9 @@ fn execute(
                 "--world",
                 runtime.component_world.?,
                 "-o",
-                embedded.?.path,
+                embedded_output.path,
                 component_wit,
-                stripped.?.path,
+                stripped_output.path,
             },
             cwd,
             null,
@@ -1304,6 +2352,18 @@ fn execute(
             diagnostic,
             transaction_storage,
             &transaction,
+        );
+        try transaction.sealChildOutput(
+            allocator,
+            io,
+            &embedded_output,
+        );
+        embedded = embedded_output;
+        var candidate_output = try createChildOutput(
+            allocator,
+            io,
+            &transaction,
+            "candidate.wasm",
         );
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
@@ -1322,8 +2382,8 @@ fn execute(
                 "--adapt",
                 adapter_arg,
                 "-o",
-                candidate.path,
-                embedded.?.path,
+                candidate_output.path,
+                embedded_output.path,
             },
             cwd,
             null,
@@ -1334,7 +2394,19 @@ fn execute(
             transaction_storage,
             &transaction,
         );
-    } else {
+        try transaction.sealChildOutput(
+            allocator,
+            io,
+            &candidate_output,
+        );
+        break :blk candidate_output;
+    } else blk: {
+        var candidate_output = try createChildOutput(
+            allocator,
+            io,
+            &transaction,
+            "candidate.wasm",
+        );
         const adapter_arg = try std.fmt.allocPrint(
             allocator,
             "wasi_snapshot_preview1={s}",
@@ -1352,7 +2424,7 @@ fn execute(
                 "--adapt",
                 adapter_arg,
                 "--output",
-                candidate.path,
+                candidate_output.path,
                 initialized.path,
             },
             cwd,
@@ -1364,9 +2436,15 @@ fn execute(
             transaction_storage,
             &transaction,
         );
-    }
+        try transaction.sealChildOutput(
+            allocator,
+            io,
+            &candidate_output,
+        );
+        break :blk candidate_output;
+    };
 
-    const processed = try createChildOutput(
+    var processed = try createChildOutput(
         allocator,
         io,
         &transaction,
@@ -1423,6 +2501,11 @@ fn execute(
         transaction_storage,
         &transaction,
     );
+    try transaction.sealChildOutput(
+        allocator,
+        io,
+        &processed,
+    );
 
     diagnostic.begin(.validate);
     try runCommand(
@@ -1445,6 +2528,8 @@ fn execute(
         transaction_storage,
         &transaction,
     );
+    try transaction.verifyChildAnchors(io);
+    try transaction.verifyIntegrity(allocator, io);
     try requireFile(io, processed.path);
 
     diagnostic.begin(.metadata);
@@ -1484,6 +2569,7 @@ fn execute(
         metadata_json = try metadata.render(allocator, document);
     }
 
+    var metadata_protection: ?usize = null;
     const metadata_staged = if (metadata_output != null) blk: {
         const path = try std.fs.path.join(
             allocator,
@@ -1494,9 +2580,15 @@ fn execute(
             .data = metadata_json.?,
         });
         try transaction.recordStorageAbsolute(allocator, io, path);
+        metadata_protection = try transaction.sealStorageFile(
+            allocator,
+            io,
+            "metadata.json",
+        );
         break :blk path;
     } else null;
 
+    var debug_protection: ?usize = null;
     const debug_staged = if (debug_dir != null) blk: {
         diagnostic.begin(.debug);
         const directory = try std.fs.path.join(
@@ -1512,7 +2604,7 @@ fn execute(
         var debug_dir_handle = try Dir.openDirAbsolute(
             io,
             directory,
-            .{ .follow_symlinks = false },
+            .{ .iterate = true, .follow_symlinks = false },
         );
         defer debug_dir_handle.close(io);
         const command_log_path = try std.fs.path.join(
@@ -1567,6 +2659,19 @@ fn execute(
             });
             try transaction.recordStoragePath(allocator, io, "debug/imports.json");
         }
+        try transaction.verifyOwnedSubtreeExact(
+            allocator,
+            io,
+            debug_dir_handle,
+            "debug",
+        );
+        try sealSnapshotDirectory(io, debug_dir_handle);
+        try debug_dir_handle.setPermissions(io, .fromMode(0o700));
+        debug_protection = try transaction.protectStoragePath(
+            allocator,
+            io,
+            "debug",
+        );
         break :blk directory;
     } else null;
 
@@ -1585,10 +2690,13 @@ fn execute(
         io,
         &transaction,
         processed.storage_path,
+        processed.protection.?,
         output_name,
         metadata_staged,
+        metadata_protection,
         if (metadata_output) |path| std.fs.path.basename(path) else null,
         debug_staged,
+        debug_protection,
         if (debug_dir) |path| std.fs.path.basename(path) else null,
         &transaction_safe_to_remove,
         source,
@@ -1928,7 +3036,6 @@ fn buildRuntime(
         inherited_count += 1;
     }
     try runtime_prefix.setPermissions(io, .fromMode(0o500));
-    defer runtime_prefix.setPermissions(io, .fromMode(0o700)) catch {};
     try runCommandRedacted(
         allocator,
         io,
@@ -1962,6 +3069,11 @@ fn buildRuntime(
         io,
         transaction,
         runtime_prefix,
+        "runtime-prefix",
+    );
+    _ = try transaction.sealStorageTree(
+        allocator,
+        io,
         "runtime-prefix",
     );
     try verifyCacheLayout(
@@ -2156,6 +3268,7 @@ fn discoverZigLibDir(
             "zig env",
             .before,
         );
+        try transaction.verifyRetainedIntegrity();
         try transaction.verifyChildHandleIdentities(io);
         const result = try std.process.run(allocator, io, .{
             .argv = &.{ zig, "env" },
@@ -2167,6 +3280,7 @@ fn discoverZigLibDir(
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         try transaction.verifyChildHandleIdentities(io);
+        try transaction.verifyRetainedIntegrity();
         try waitForSpawnTestBarrier(
             allocator,
             io,
@@ -2256,6 +3370,12 @@ fn snapshotDirectoryTree(
     destination_path: []const u8,
     transaction: *Transaction,
 ) ![]const u8 {
+    var source_guard = try SourceManifestGuard.init(
+        allocator,
+        io,
+        source_path,
+    );
+    defer source_guard.deinit(allocator);
     var source = try Dir.openDirAbsolute(
         io,
         source_path,
@@ -2300,7 +3420,13 @@ fn snapshotDirectoryTree(
     {
         return error.InputChanged;
     }
+    try source_guard.verify(allocator, io);
     try sealSnapshotDirectory(io, destination);
+    _ = try transaction.protectStoragePath(
+        allocator,
+        io,
+        destination_relative,
+    );
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const encoded = std.fmt.bytesToHex(digest, .lower);
@@ -2471,6 +3597,12 @@ fn stageWit(
     stage_path: []const u8,
     transaction: *Transaction,
 ) !StagedWit {
+    var source_guard = try SourceManifestGuard.init(
+        allocator,
+        io,
+        source_path,
+    );
+    defer source_guard.deinit(allocator);
     var source_dir = try Dir.openDirAbsolute(io, source_path, .{ .iterate = true });
     defer source_dir.close(io);
     var walker = try source_dir.walk(allocator);
@@ -2540,6 +3672,12 @@ fn stageWit(
     );
     defer staged_directory.close(io);
     try sealSnapshotDirectory(io, staged_directory);
+    _ = try transaction.protectStoragePath(
+        allocator,
+        io,
+        stage_relative,
+    );
+    try source_guard.verify(allocator, io);
     return .{
         .absolute = try transaction.retainStorageDirectory(
             allocator,
@@ -3017,6 +4155,7 @@ fn snapshotInputs(
                             &.{ source_child_host, entry },
                         ),
                     ),
+                    .protection = source_snapshot.file.protection,
                 }
             else
                 distinct_tree.?.file,
@@ -3083,6 +4222,358 @@ const SourceIdentity = struct {
     }
 };
 
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+const DeviceIdentity = struct {
+    major: u32,
+    minor: u32,
+};
+
+fn linuxDeviceForHandle(handle: std.posix.fd_t) !DeviceIdentity {
+    if (builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    const linux = std.os.linux;
+    while (true) {
+        var statx = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(
+            handle,
+            "",
+            linux.AT.EMPTY_PATH | linux.AT.NO_AUTOMOUNT,
+            linux.STATX.BASIC_STATS,
+            &statx,
+        ))) {
+            .SUCCESS => return .{
+                .major = statx.dev_major,
+                .minor = statx.dev_minor,
+            },
+            .INTR => continue,
+            .NOMEM => return error.SystemResources,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn linuxDeviceAt(
+    directory: Dir,
+    path: []const u8,
+) !DeviceIdentity {
+    if (builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    const linux = std.os.linux;
+    const path_z = try std.posix.toPosixPath(path);
+    while (true) {
+        var statx = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(
+            directory.handle,
+            &path_z,
+            linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
+            linux.STATX.BASIC_STATS,
+            &statx,
+        ))) {
+            .SUCCESS => return .{
+                .major = statx.dev_major,
+                .minor = statx.dev_minor,
+            },
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .NOENT, .NOTDIR => return error.TransactionChanged,
+            .NOMEM => return error.SystemResources,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn updateManifestDigest(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    entry: ManifestEntry,
+) void {
+    var buffer: [256]u8 = undefined;
+    hasher.update(entry.path);
+    hasher.update(&.{0});
+    hasher.update(@tagName(entry.kind));
+    hasher.update(&.{0});
+    const fields = std.fmt.bufPrint(
+        &buffer,
+        "{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}",
+        .{
+            entry.device_major,
+            entry.device_minor,
+            entry.inode,
+            entry.nlink,
+            entry.size,
+            entry.mode,
+            entry.mtime.nanoseconds,
+            entry.ctime.nanoseconds,
+            if (entry.link_target) |target| target.len else 0,
+        },
+    ) catch unreachable;
+    hasher.update(fields);
+    hasher.update(&.{0});
+    if (entry.link_target) |target| hasher.update(target);
+    hasher.update(&.{0});
+    hasher.update(&entry.content_digest);
+    hasher.update(&.{0xff});
+}
+
+fn digestManifestEntries(
+    entries: []const ManifestEntry,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("starling-componentizer-exact-tree-manifest-v1\x00");
+    for (entries) |entry| updateManifestDigest(&hasher, entry);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashOpenFile(
+    io: Io,
+    file: File,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (count == 0) continue;
+        hasher.update(buffer[0..count]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn appendManifestEntry(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    relative: []const u8,
+    expected: SourceIdentity,
+    entries: *std.ArrayList(ManifestEntry),
+) !void {
+    const current = try parent.statFile(
+        io,
+        name,
+        .{ .follow_symlinks = false },
+    );
+    if (!expected.matches(current)) return error.TransactionChanged;
+    switch (expected.entry.kind) {
+        .file => {
+            var file = try parent.openFile(io, name, .{
+                .mode = .read_only,
+                .allow_directory = false,
+                .follow_symlinks = false,
+            });
+            defer file.close(io);
+            if (!expected.matches(try file.stat(io))) {
+                return error.TransactionChanged;
+            }
+            const device = try linuxDeviceForHandle(file.handle);
+            const digest = try hashOpenFile(io, file);
+            if (!expected.matches(try file.stat(io)) or
+                !expected.matches(try parent.statFile(
+                    io,
+                    name,
+                    .{ .follow_symlinks = false },
+                )))
+            {
+                return error.TransactionChanged;
+            }
+            entries.append(allocator, .{
+                .path = try allocator.dupe(u8, relative),
+                .kind = .file,
+                .device_major = device.major,
+                .device_minor = device.minor,
+                .inode = current.inode,
+                .nlink = current.nlink,
+                .size = current.size,
+                .mode = current.permissions.toMode(),
+                .mtime = current.mtime,
+                .ctime = current.ctime,
+                .link_target = null,
+                .content_digest = digest,
+            }) catch @panic("out of memory");
+        },
+        .sym_link => {
+            var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const target_length = try parent.readLink(
+                io,
+                name,
+                &target_buffer,
+            );
+            const target = try allocator.dupe(
+                u8,
+                target_buffer[0..target_length],
+            );
+            if (!expected.matches(try parent.statFile(
+                io,
+                name,
+                .{ .follow_symlinks = false },
+            ))) return error.TransactionChanged;
+            const device = try linuxDeviceAt(parent, name);
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(target);
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+                undefined;
+            hasher.final(&digest);
+            entries.append(allocator, .{
+                .path = try allocator.dupe(u8, relative),
+                .kind = .sym_link,
+                .device_major = device.major,
+                .device_minor = device.minor,
+                .inode = current.inode,
+                .nlink = current.nlink,
+                .size = current.size,
+                .mode = current.permissions.toMode(),
+                .mtime = current.mtime,
+                .ctime = current.ctime,
+                .link_target = target,
+                .content_digest = digest,
+            }) catch @panic("out of memory");
+        },
+        .directory => {
+            var directory = try parent.openDir(
+                io,
+                name,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            defer directory.close(io);
+            if (!expected.matches(try directory.stat(io))) {
+                return error.TransactionChanged;
+            }
+            const device = try linuxDeviceForHandle(directory.handle);
+            const manifest_index = entries.items.len;
+            entries.append(allocator, .{
+                .path = try allocator.dupe(u8, relative),
+                .kind = .directory,
+                .device_major = device.major,
+                .device_minor = device.minor,
+                .inode = current.inode,
+                .nlink = current.nlink,
+                .size = current.size,
+                .mode = current.permissions.toMode(),
+                .mtime = current.mtime,
+                .ctime = current.ctime,
+                .link_target = null,
+                .content_digest = @splat(0),
+            }) catch @panic("out of memory");
+
+            const Child = struct {
+                name: []const u8,
+                identity: SourceIdentity,
+            };
+            var children: std.ArrayList(Child) = .empty;
+            defer children.deinit(allocator);
+            var iterator = directory.iterate();
+            while (try iterator.next(io)) |child| {
+                try validatePathUtf8(child.name);
+                const stat = try directory.statFile(
+                    io,
+                    child.name,
+                    .{ .follow_symlinks = false },
+                );
+                if (stat.kind != .file and
+                    stat.kind != .directory and
+                    stat.kind != .sym_link)
+                {
+                    return error.TransactionChanged;
+                }
+                children.append(allocator, .{
+                    .name = try allocator.dupe(u8, child.name),
+                    .identity = SourceIdentity.fromStat(stat),
+                }) catch @panic("out of memory");
+            }
+            std.mem.sort(Child, children.items, {}, struct {
+                fn lessThan(_: void, left: Child, right: Child) bool {
+                    return std.mem.lessThan(u8, left.name, right.name);
+                }
+            }.lessThan);
+            const descendants_start = entries.items.len;
+            for (children.items) |child| {
+                try appendManifestEntry(
+                    allocator,
+                    io,
+                    directory,
+                    child.name,
+                    if (std.mem.eql(u8, relative, "."))
+                        try allocator.dupe(u8, child.name)
+                    else
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "{s}/{s}",
+                            .{ relative, child.name },
+                        ),
+                    child.identity,
+                    entries,
+                );
+            }
+            var seen: usize = 0;
+            var final_iterator = directory.iterate();
+            while (try final_iterator.next(io)) |child| {
+                const stat = try directory.statFile(
+                    io,
+                    child.name,
+                    .{ .follow_symlinks = false },
+                );
+                for (children.items) |initial| {
+                    if (!std.mem.eql(u8, initial.name, child.name)) continue;
+                    if (!initial.identity.matches(stat)) {
+                        return error.TransactionChanged;
+                    }
+                    seen += 1;
+                    break;
+                } else return error.TransactionChanged;
+            }
+            if (seen != children.items.len or
+                !expected.matches(try directory.stat(io)) or
+                !expected.matches(try parent.statFile(
+                    io,
+                    name,
+                    .{ .follow_symlinks = false },
+                )))
+            {
+                return error.TransactionChanged;
+            }
+            entries.items[manifest_index].content_digest =
+                digestManifestEntries(entries.items[descendants_start..]);
+        },
+        else => return error.TransactionChanged,
+    }
+}
+
+fn buildTreeManifest(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    path: []const u8,
+) !TreeManifest {
+    const stat = try parent.statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    );
+    var entries: std.ArrayList(ManifestEntry) = .empty;
+    try appendManifestEntry(
+        allocator,
+        io,
+        parent,
+        path,
+        ".",
+        SourceIdentity.fromStat(stat),
+        &entries,
+    );
+    const owned = entries.toOwnedSlice(allocator) catch
+        @panic("out of memory");
+    return .{
+        .entries = owned,
+        .digest = digestManifestEntries(owned),
+    };
+}
+
 fn sourceFileIdentity(io: Io, path: []const u8) !SourceIdentity {
     const stat = try Dir.cwd().statFile(
         io,
@@ -3142,6 +4633,11 @@ fn snapshotInputTree(
         return error.InputChanged;
     }
     try sealSnapshotDirectory(io, destination_dir);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        destination_relative,
+    );
     const file_relative = try std.fs.path.join(
         allocator,
         &.{ destination_relative, normalized_entry },
@@ -3164,6 +4660,7 @@ fn snapshotInputTree(
                 &.{ destination_path, entry_name },
             ),
             .digest = file_digest orelse return error.MissingBuildArtifact,
+            .protection = protection,
         },
         .entry = normalized_entry,
         .digest = try allocator.dupe(u8, &tree_digest_hex),
@@ -3524,15 +5021,20 @@ fn snapshotFile(
     destination_path: []const u8,
     transaction: *Transaction,
 ) !Snapshot {
-    const source_stat = try Dir.cwd().statFile(
+    const canonical = try Dir.realPathFileAbsoluteAlloc(
         io,
         source_path,
-        .{ .follow_symlinks = true },
+        allocator,
+    );
+    const source_stat = try Dir.cwd().statFile(
+        io,
+        canonical,
+        .{ .follow_symlinks = false },
     );
     return snapshotFileExpected(
         allocator,
         io,
-        source_path,
+        canonical,
         destination_path,
         transaction,
         SourceIdentity.fromStat(source_stat),
@@ -3594,6 +5096,7 @@ fn snapshotFileAt(
     destination_path: []const u8,
     transaction: *Transaction,
 ) !Snapshot {
+    try transaction.verifyIntegrity(allocator, io);
     var source = try openFileNoFollowPath(
         io,
         source_directory,
@@ -3618,7 +5121,8 @@ fn snapshotFileAt(
         std.fs.path.basename(destination_path),
         destination_identity,
     ) catch {};
-    defer destination.close(io);
+    var destination_open = true;
+    defer if (destination_open) destination.close(io);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
@@ -3652,6 +5156,8 @@ fn snapshotFileAt(
         ),
     );
     try destination.sync(io);
+    destination.close(io);
+    destination_open = false;
     const storage_relative = try std.fs.path.relative(
         allocator,
         transaction.storage_path,
@@ -3668,10 +5174,27 @@ fn snapshotFileAt(
     var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest_bytes);
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        storage_relative,
+    );
+    const manifest = transaction.protected.items[protection].manifest;
+    if (manifest.entries.len != 1 or
+        !std.mem.eql(
+            u8,
+            &manifest.entries[0].content_digest,
+            &digest_bytes,
+        ))
+    {
+        return error.TransactionChanged;
+    }
+    try transaction.verifyIntegrity(allocator, io);
     return .{
         .path = child_path,
         .storage_path = destination_path,
         .digest = try allocator.dupe(u8, &digest_hex),
+        .protection = protection,
     };
 }
 
@@ -3700,6 +5223,7 @@ fn createChildOutput(
             allocator,
             &.{ transaction.storage_path, relative },
         ),
+        .relative = try allocator.dupe(u8, relative),
     };
 }
 
@@ -3711,6 +5235,12 @@ fn snapshotFileExpected(
     transaction: *Transaction,
     expected_identity: SourceIdentity,
 ) !Snapshot {
+    var source_guard = try SourceManifestGuard.init(
+        allocator,
+        io,
+        source_path,
+    );
+    defer source_guard.deinit(allocator);
     var source = try Dir.openFileAbsolute(
         io,
         source_path,
@@ -3735,7 +5265,8 @@ fn snapshotFileExpected(
         std.fs.path.basename(destination_path),
         destination_identity,
     ) catch {};
-    defer destination.close(io);
+    var destination_open = true;
+    defer if (destination_open) destination.close(io);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
@@ -3757,6 +5288,7 @@ fn snapshotFileExpected(
     {
         return error.InputChanged;
     }
+    try source_guard.verify(allocator, io);
     try destination.setPermissions(
         io,
         .fromMode(
@@ -3765,6 +5297,8 @@ fn snapshotFileExpected(
         ),
     );
     try destination.sync(io);
+    destination.close(io);
+    destination_open = false;
     const storage_relative = try std.fs.path.relative(
         allocator,
         transaction.storage_path,
@@ -3781,10 +5315,26 @@ fn snapshotFileExpected(
     var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest_bytes);
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        storage_relative,
+    );
+    const manifest = transaction.protected.items[protection].manifest;
+    if (manifest.entries.len != 1 or
+        !std.mem.eql(
+            u8,
+            &manifest.entries[0].content_digest,
+            &digest_bytes,
+        ))
+    {
+        return error.TransactionChanged;
+    }
     return .{
         .path = child_path,
         .storage_path = destination_path,
         .digest = try allocator.dupe(u8, &digest_hex),
+        .protection = protection,
     };
 }
 
@@ -4187,10 +5737,13 @@ fn publishArtifacts(
     io: Io,
     transaction: *Transaction,
     component_staged: []const u8,
+    component_protection: usize,
     component_output: []const u8,
     metadata_staged: ?[]const u8,
+    metadata_protection: ?usize,
     metadata_output: ?[]const u8,
     debug_staged: ?[]const u8,
+    debug_protection: ?usize,
     debug_output: ?[]const u8,
     transaction_safe_to_remove: *bool,
     source: []const u8,
@@ -4203,17 +5756,25 @@ fn publishArtifacts(
     var component = ArtifactState{
         .destination = component_output,
         .staged = "component.wasm",
+        .staged_protection = component_protection,
         .backup_name = "previous-component",
     };
     var metadata_state: ?ArtifactState = if (metadata_staged != null) .{
         .destination = metadata_output.?,
         .staged = "metadata.json",
+        .staged_protection = metadata_protection.?,
         .backup_name = "previous-metadata",
     } else null;
     var debug_state = DebugPublication{
         .destination = debug_output,
         .staged = if (debug_staged != null) "debug" else null,
+        .staged_protection = debug_protection,
+        .staged_manifest = if (debug_protection) |protection|
+            transaction.protected.items[protection].manifest
+        else
+            null,
     };
+    try transaction.verifyIntegrity(allocator, io);
     try transaction.verifyCanonicalPublication(io);
     try publication_locks.verify(transaction.publication, io);
 
@@ -4278,6 +5839,7 @@ fn publishArtifacts(
         return verification_error;
     };
     verifyPublishedBundle(
+        allocator,
         transaction,
         publication_locks,
         component,
@@ -4299,6 +5861,25 @@ fn publishArtifacts(
         };
         return verification_error;
     };
+    releasePublishedRegularFiles(
+        io,
+        transaction,
+        component,
+        metadata_state,
+    ) catch |release_error| {
+        rollbackPublication(
+            allocator,
+            io,
+            transaction,
+            component,
+            metadata_state,
+            debug_state,
+        ) catch {
+            transaction_safe_to_remove.* = false;
+            return error.RollbackIncomplete;
+        };
+        return release_error;
+    };
 
     const PublicationState = enum { rollback_armed, committed };
     var publication_state: PublicationState = .rollback_armed;
@@ -4317,6 +5898,67 @@ fn publishArtifacts(
         environ,
     ) catch return;
     transaction_safe_to_remove.* = true;
+}
+
+fn releasePublishedRegularFiles(
+    io: Io,
+    transaction: *Transaction,
+    component: ArtifactState,
+    metadata_state: ?ArtifactState,
+) !void {
+    try setPublishedFilePermissions(
+        io,
+        transaction,
+        component.destination,
+        component.published.?,
+    );
+    if (metadata_state) |state| {
+        try setPublishedFilePermissions(
+            io,
+            transaction,
+            state.destination,
+            state.published.?,
+        );
+    }
+    transaction.protected.items[component.staged_protection].active = false;
+    if (metadata_state) |state| {
+        transaction.protected.items[state.staged_protection].active = false;
+    }
+}
+
+fn setPublishedFilePermissions(
+    io: Io,
+    transaction: *Transaction,
+    path: []const u8,
+    identity: EntryIdentity,
+) !void {
+    var file = try transaction.publication.openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    if (!identity.matches(try file.stat(io)) or
+        !try entryHasIdentity(
+            transaction.publication,
+            io,
+            path,
+            identity,
+        ))
+    {
+        return error.TransactionChanged;
+    }
+    try file.setPermissions(io, .fromMode(0o644));
+    if (!identity.matches(try file.stat(io)) or
+        !try entryHasIdentity(
+            transaction.publication,
+            io,
+            path,
+            identity,
+        ))
+    {
+        return error.TransactionChanged;
+    }
 }
 
 fn cleanupCommittedBackups(
@@ -4363,7 +6005,8 @@ fn cleanupCommittedBackups(
 }
 
 fn verifyPublishedBundle(
-    transaction: *const Transaction,
+    allocator: Allocator,
+    transaction: *Transaction,
     publication_locks: *const PublicationLocks,
     component: ArtifactState,
     metadata_state: ?ArtifactState,
@@ -4371,6 +6014,7 @@ fn verifyPublishedBundle(
     io: Io,
     environ: *std.process.Environ.Map,
 ) !void {
+    try transaction.verifyIntegrity(allocator, io);
     try injectPublicationFault(environ, "final-publication-before");
     try transaction.verifyCanonicalPublication(io);
     try injectPublicationFault(environ, "final-publication-parent-before");
@@ -4405,11 +6049,21 @@ fn verifyPublishedBundle(
             debug_state.destination.?,
             identity,
         )) return error.TransactionChanged;
+        const manifest = try buildTreeManifest(
+            allocator,
+            io,
+            transaction.publication,
+            debug_state.destination.?,
+        );
+        if (!debug_state.staged_manifest.?.matchesAfterRootRename(manifest)) {
+            return error.TransactionChanged;
+        }
         try injectPublicationFault(environ, "final-debug");
     }
     try publication_locks.verify(transaction.publication, io);
     try injectPublicationFault(environ, "final-lock-after");
     try transaction.verifyCanonicalPublication(io);
+    try transaction.verifyIntegrity(allocator, io);
     try injectPublicationFault(environ, "final-publication-after");
     try injectPublicationFault(environ, "final-before-commit");
 }
@@ -4417,12 +6071,13 @@ fn verifyPublishedBundle(
 fn verifyRecoveryAnchors(
     allocator: Allocator,
     io: Io,
-    transaction: *const Transaction,
+    transaction: *Transaction,
     component: ArtifactState,
     metadata_state: ?ArtifactState,
     debug_state: DebugPublication,
     environ: *std.process.Environ.Map,
 ) !void {
+    try transaction.verifyIntegrity(allocator, io);
     try transaction.verifyAttached(io);
     try injectPublicationFault(environ, "final-recovery-attached");
     if (component.backup) |identity| {
@@ -4455,7 +6110,16 @@ fn verifyRecoveryAnchors(
         if (!backup.identity.matches(try directory.stat(io))) {
             return error.TransactionChanged;
         }
-        try transaction.verifyOwnedDirectory(
+        const manifest = try buildTreeManifest(
+            allocator,
+            io,
+            transaction.storage,
+            "previous-debug",
+        );
+        if (!backup.manifest.matchesAfterRootRename(manifest)) {
+            return error.TransactionChanged;
+        }
+        try transaction.verifyOwnedSubtreeExact(
             allocator,
             io,
             directory,
@@ -4464,6 +6128,7 @@ fn verifyRecoveryAnchors(
     }
     try injectPublicationFault(environ, "final-recovery-debug");
     try transaction.verifyAttached(io);
+    try transaction.verifyIntegrity(allocator, io);
     try injectPublicationFault(environ, "final-recovery-after");
 }
 
@@ -4590,13 +6255,24 @@ fn publishArtifactsAttempt(
             transaction_safe_to_remove,
             environ,
         );
+        try transaction.refreshProtectedStorageAdditions(
+            allocator,
+            io,
+            debug_state.staged_protection.?,
+            if (debug_state.backup) |backup| backup.manifest else null,
+        );
+        debug_state.staged_manifest = transaction.protected.items[
+            debug_state.staged_protection.?
+        ].manifest;
     }
 
     component.published = try publishEntry(
+        allocator,
         io,
         transaction,
         component.staged,
         component.destination,
+        component.staged_protection,
     );
     try transaction.verifyAttached(io);
     if (!try entryHasIdentity(
@@ -4607,18 +6283,22 @@ fn publishArtifactsAttempt(
     )) return error.TransactionChanged;
     if (metadata_state.*) |*state| {
         state.published = try publishEntry(
+            allocator,
             io,
             transaction,
             state.staged,
             state.destination,
+            state.staged_protection,
         );
     }
     if (debug_state.staged) |staged| {
         debug_state.published = try publishEntry(
+            allocator,
             io,
             transaction,
             staged,
             debug_state.destination.?,
+            debug_state.staged_protection.?,
         );
     }
 }
@@ -4644,11 +6324,15 @@ fn isGeneratedDebugName(name: []const u8) bool {
 
 const DebugBackup = struct {
     identity: EntryIdentity,
+    protection: usize,
+    manifest: TreeManifest,
 };
 
 const DebugPublication = struct {
     destination: ?[]const u8,
     staged: ?[]const u8,
+    staged_protection: ?usize,
+    staged_manifest: ?TreeManifest,
     backup: ?DebugBackup = null,
     published: ?EntryIdentity = null,
 };
@@ -4656,6 +6340,7 @@ const DebugPublication = struct {
 const ArtifactState = struct {
     destination: []const u8,
     staged: []const u8,
+    staged_protection: usize,
     backup_name: []const u8,
     backup: ?EntryIdentity = null,
     published: ?EntryIdentity = null,
@@ -4754,11 +6439,18 @@ fn prepareDebugDestination(
     ) orelse return null;
     if (initial.kind != .directory) return error.DebugOutputCollision;
     const backup_identity = EntryIdentity.fromStat(initial);
-    try transaction.publication.renamePreserve(
-        destination,
-        transaction.storage,
-        "previous-debug",
+    const protection = try transaction.protectPublicationPath(
+        allocator,
         io,
+        destination,
+    );
+    const manifest = transaction.protected.items[protection].manifest;
+    try transaction.moveProtected(
+        allocator,
+        io,
+        protection,
+        .storage,
+        "previous-debug",
     );
     return finishPrepareDebugDestination(
         allocator,
@@ -4766,14 +6458,20 @@ fn prepareDebugDestination(
         transaction,
         destination,
         backup_identity,
+        protection,
+        manifest,
         environ,
     ) catch |err| {
-        restoreBackup(
+        restoreDebugBackup(
+            allocator,
             io,
             transaction,
             destination,
-            "previous-debug",
-            backup_identity,
+            .{
+                .identity = backup_identity,
+                .protection = protection,
+                .manifest = manifest,
+            },
         ) catch {
             transaction_safe_to_remove.* = false;
             return error.RollbackIncomplete;
@@ -4788,6 +6486,8 @@ fn finishPrepareDebugDestination(
     transaction: *Transaction,
     destination: []const u8,
     backup_identity: EntryIdentity,
+    protection: usize,
+    manifest: TreeManifest,
     environ: *std.process.Environ.Map,
 ) !?DebugBackup {
     _ = destination;
@@ -4870,7 +6570,11 @@ fn finishPrepareDebugDestination(
     try injectPublicationFault(environ, "backup-debug-after-copy");
     try verifyDirectoryEntries(io, backup_dir, entries.items);
     try injectPublicationFault(environ, "backup-debug-after-final-verify");
-    return .{ .identity = backup_identity };
+    return .{
+        .identity = backup_identity,
+        .protection = protection,
+        .manifest = manifest,
+    };
 }
 
 fn recordDebugBackupTree(
@@ -5058,10 +6762,12 @@ fn copyDebugBackupEntry(
 }
 
 fn publishEntry(
+    allocator: Allocator,
     io: Io,
     transaction: *Transaction,
     staged: []const u8,
     destination: []const u8,
+    protection: usize,
 ) !EntryIdentity {
     const stat = try transaction.storage.statFile(
         io,
@@ -5071,11 +6777,12 @@ fn publishEntry(
     const identity = transaction.ownedIdentity(staged) orelse
         return error.TransactionChanged;
     if (!identity.matches(stat)) return error.TransactionChanged;
-    try transaction.storage.renamePreserve(
-        staged,
-        transaction.publication,
-        destination,
+    try transaction.moveProtected(
+        allocator,
         io,
+        protection,
+        .publication,
+        destination,
     );
     const published = try transaction.publication.statFile(
         io,
@@ -5083,11 +6790,12 @@ fn publishEntry(
         .{ .follow_symlinks = false },
     );
     if (!identity.matches(published)) {
-        transaction.publication.renamePreserve(
-            destination,
-            transaction.storage,
-            staged,
+        transaction.moveProtected(
+            allocator,
             io,
+            protection,
+            .storage,
+            staged,
         ) catch {};
         return error.TransactionChanged;
     }
@@ -5105,11 +6813,13 @@ fn rollbackPublication(
     var first_error: ?anyerror = null;
     if (debug_state.published) |identity| {
         returnPublishedEntry(
+            allocator,
             io,
             transaction,
             debug_state.destination.?,
             debug_state.staged.?,
             identity,
+            debug_state.staged_protection.?,
         ) catch |err| if (first_error == null) {
             first_error = err;
         };
@@ -5117,11 +6827,13 @@ fn rollbackPublication(
     if (metadata_state) |state| {
         if (state.published) |identity| {
             returnPublishedEntry(
+                allocator,
                 io,
                 transaction,
                 state.destination,
                 state.staged,
                 identity,
+                state.staged_protection,
             ) catch |err| if (first_error == null) {
                 first_error = err;
             };
@@ -5129,11 +6841,13 @@ fn rollbackPublication(
     }
     if (component.published) |identity| {
         returnPublishedEntry(
+            allocator,
             io,
             transaction,
             component.destination,
             component.staged,
             identity,
+            component.staged_protection,
         ) catch |err| if (first_error == null) {
             first_error = err;
         };
@@ -5178,38 +6892,22 @@ fn rollbackPublication(
 }
 
 fn returnPublishedEntry(
+    allocator: Allocator,
     io: Io,
     transaction: *Transaction,
     destination: []const u8,
     staged: []const u8,
     identity: EntryIdentity,
+    protection: usize,
 ) !void {
-    if (!try entryHasIdentity(
-        transaction.publication,
+    _ = allocator;
+    try transaction.withdrawPublished(
         io,
+        protection,
         destination,
-        identity,
-    )) return error.TransactionChanged;
-    try transaction.publication.renamePreserve(
-        destination,
-        transaction.storage,
         staged,
-        io,
+        identity,
     );
-    if (!try entryHasIdentity(
-        transaction.storage,
-        io,
-        staged,
-        identity,
-    )) {
-        transaction.storage.renamePreserve(
-            staged,
-            transaction.publication,
-            destination,
-            io,
-        ) catch {};
-        return error.TransactionChanged;
-    }
 }
 
 fn restoreBackup(
@@ -5249,14 +6947,51 @@ fn restoreDebugBackup(
     destination: []const u8,
     backup: DebugBackup,
 ) !void {
-    _ = allocator;
-    try restoreBackup(
+    if (try statEntry(transaction.publication, io, destination) != null) {
+        return error.TransactionChanged;
+    }
+    const current = try buildTreeManifest(
+        allocator,
         io,
-        transaction,
-        destination,
+        transaction.storage,
         "previous-debug",
-        backup.identity,
     );
+    if (!backup.manifest.matchesAfterRootRename(current)) {
+        return error.TransactionChanged;
+    }
+    if (backup.protection >= transaction.protected.items.len) {
+        return error.TransactionChanged;
+    }
+    const protected = &transaction.protected.items[backup.protection];
+    if (!protected.active or protected.location != .storage or
+        !std.mem.eql(u8, protected.path, "previous-debug"))
+    {
+        return error.TransactionChanged;
+    }
+    try transaction.storage.renamePreserve(
+        "previous-debug",
+        transaction.publication,
+        destination,
+        io,
+    );
+    protected.location = .publication;
+    protected.path = destination;
+    if (!try entryHasIdentity(
+        transaction.publication,
+        io,
+        destination,
+        backup.identity,
+    )) return error.TransactionChanged;
+    const restored = try buildTreeManifest(
+        allocator,
+        io,
+        transaction.publication,
+        destination,
+    );
+    if (!backup.manifest.matchesAfterRootRename(restored)) {
+        return error.TransactionChanged;
+    }
+    protected.manifest = restored;
 }
 
 fn finalizeDebugBackup(
@@ -5274,8 +7009,18 @@ fn finalizeDebugBackup(
     if (!backup.identity.matches(try backup_dir.stat(io))) {
         return error.TransactionChanged;
     }
+    const current = try buildTreeManifest(
+        allocator,
+        io,
+        transaction.storage,
+        "previous-debug",
+    );
+    if (!backup.manifest.matchesAfterRootRename(current)) {
+        return error.TransactionChanged;
+    }
+    transaction.protected.items[backup.protection].active = false;
     try backup_dir.setPermissions(io, .fromMode(0o700));
-    try transaction.verifyOwnedDirectory(
+    try transaction.verifyOwnedSubtreeExact(
         allocator,
         io,
         backup_dir,
@@ -5597,6 +7342,7 @@ fn runCommandRedacted(
         stage,
         .before,
     );
+    try transaction.verifyRetainedIntegrity();
     try transaction.verifyChildHandleIdentities(io);
     var child = try std.process.spawn(io, .{
         .argv = argv,
@@ -5646,6 +7392,7 @@ fn runCommandRedacted(
     try multi_reader.checkAnyError();
     const term = try child.wait(io);
     try transaction.verifyChildHandleIdentities(io);
+    try transaction.verifyRetainedIntegrity();
     try waitForSpawnTestBarrier(
         allocator,
         io,
@@ -6108,12 +7855,13 @@ fn stableHandlePath(
     handle: std.posix.fd_t,
     fallback: []const u8,
 ) ![]const u8 {
-    if (builtin.os.tag != .linux) return allocator.dupe(u8, fallback);
-    return std.fmt.allocPrint(
-        allocator,
-        "/proc/self/fd/{d}",
-        .{handle},
-    );
+    _ = fallback;
+    const prefix = switch (builtin.os.tag) {
+        .linux => "/proc/self/fd",
+        .macos, .freebsd, .netbsd, .openbsd, .dragonfly => "/dev/fd",
+        else => return error.UnsupportedOperatingSystem,
+    };
+    return std.fmt.allocPrint(allocator, "{s}/{d}", .{ prefix, handle });
 }
 
 fn setDirectoryInherited(directory: Dir, inherited: bool) !void {
@@ -6125,7 +7873,6 @@ fn setFileInherited(file: File, inherited: bool) !void {
 }
 
 fn setHandleInherited(handle: std.posix.fd_t, inherited: bool) !void {
-    if (builtin.os.tag != .linux) return;
     const flags: usize = if (inherited) 0 else std.posix.FD_CLOEXEC;
     while (true) switch (std.posix.errno(std.posix.system.fcntl(
         handle,
@@ -6242,6 +7989,7 @@ test "child output capture retains a bounded marked tail" {
     while (index < child_capture_limit / chunk.len + 2) : (index += 1) {
         try capture.append(std.testing.allocator, chunk);
     }
+
     try std.testing.expectEqual(child_capture_limit, capture.bytes.items.len);
     try std.testing.expect(capture.truncated);
 
@@ -6258,4 +8006,16 @@ test "child output capture retains a bounded marked tail" {
         "[child stderr truncated; showing final output]\n",
     ));
     try std.testing.expect(std.mem.endsWith(u8, rendered, chunk));
+}
+
+test "monitor distinguishes namespace changes from integrity failures" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    try std.testing.expect(isNamespaceOnlyMutation(linux.IN.MOVE_SELF));
+    try std.testing.expect(isNamespaceOnlyMutation(
+        linux.IN.CREATE | linux.IN.ISDIR,
+    ));
+    try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.ATTRIB));
+    try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.MODIFY));
+    try std.testing.expect(!isNamespaceOnlyMutation(linux.IN.Q_OVERFLOW));
 }

@@ -131,11 +131,17 @@ paths remain visible.
 Filesystem paths must be valid UTF-8. Invalid source, initializer, output, WIT,
 tool, or traversed tree paths fail during input diagnostics with
 `InvalidUtf8Path`, ensuring every public diagnostic path remains a JSON string.
+Component, metadata, and debug destination validation is also input preflight
+and therefore reports `SMC1001`/`inputs`; the later metadata and debug phase
+codes describe generation, not destination parsing.
 
 ## Imports and provenance metadata
 
-`--metadata-out <file>` writes `starling-componentize-metadata/v2` JSON next
-to the component. Its `imports` array uses ComponentizeJS 0.21's public
+`--metadata-out <file>` writes componentizer-owned
+`starling-componentize-metadata/v2` JSON next to the component; debug import
+output remains `starling-componentize-imports/v1`. Schema meanings and
+required fields are stable within each version. Its `imports` array uses
+ComponentizeJS 0.21's public
 `[[specifier, binding], ...]` convention, including default-import records for
 world-level functions. The typed `bindings` array adds function arity,
 canonical dispatch keys, resource classes, and constructor/method/static
@@ -172,10 +178,16 @@ executables are copied to immutable per-run snapshots in controlled transaction
 storage before use; hashes are computed while creating those snapshots. On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
-pre-created output files. Handles are identity-checked immediately around each
-spawn; publication and cache lock descriptors remain close-on-exec. Thus a
-snapshot name can be replaced and restored without the substituted bytes ever
-being executed, consumed, or written. This retains
+pre-created output files. Supported BSD-family hosts use inherited `/dev/fd`
+handles; hosts without a retained-handle path fail closed. Handles are
+identity-checked immediately around each spawn; publication and cache lock
+descriptors remain close-on-exec. Thus a snapshot name can be replaced and
+restored without the substituted bytes ever being executed, consumed, or
+written. Namespace substitutions that are restored may complete. An
+unrestored identity or manifest change, in-place mutation of a retained
+object, or monitor overflow fails the active phase with `TransactionChanged`
+and publishes nothing. Existing component, metadata, and debug outputs are
+restored by identity-checked rollback. This retains
 relative sibling and nested-module visibility even for read-only source trees.
 Source-tree traversal order, permissions, timestamps, and absolute root
 location do not affect tree hashes. Relative symlinks that remain within the

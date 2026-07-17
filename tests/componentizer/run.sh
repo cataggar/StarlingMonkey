@@ -1050,6 +1050,41 @@ assert "injected component embed failure" in diagnostic["detail"]
 PY
 test ! -e "$WORK/json failure.wasm"
 
+for invalid_destination in metadata debug; do
+  invalid_output="$WORK/invalid-$invalid_destination-destination.wasm"
+  invalid_log="$SCRATCH/invalid-$invalid_destination-destination.jsonl"
+  destination_args=(--metadata-out "$invalid_output")
+  expected_cause=InvalidMetadataDestination
+  if [ "$invalid_destination" = debug ]; then
+    destination_args=(--debug-dir "$invalid_output")
+    expected_cause=DebugOutputCollision
+  fi
+  if "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    "${destination_args[@]}" \
+    --out "$invalid_output" \
+    "$SOURCE" >/dev/null 2> "$invalid_log"
+  then
+    echo "FAIL: invalid $invalid_destination destination succeeded" >&2
+    exit 1
+  fi
+  python3 - "$invalid_log" "$expected_cause" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["schema"] == "starling-componentize-diagnostic/v1"
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == sys.argv[2], diagnostic
+PY
+  test ! -e "$invalid_output"
+done
+
 PARSE_ERROR="$SCRATCH/parse-error.log"
 if "$COMPONENTIZER" --diagnostic-format=json --not-an-option 2> "$PARSE_ERROR"; then
   echo "FAIL: invalid CLI unexpectedly succeeded" >&2
@@ -1780,6 +1815,72 @@ PY
     rm -f "$commit_output" "$commit_metadata" \
       "$commit_barrier.ready" "$commit_barrier.release"
   done
+done
+
+for mutation_artifact in component metadata debug; do
+  mutation_output="$WORK/mutation-$mutation_artifact.wasm"
+  mutation_metadata="$WORK/mutation-$mutation_artifact.json"
+  mutation_debug="$WORK/mutation-$mutation_artifact.debug"
+  mutation_error="$SCRATCH/mutation-$mutation_artifact.jsonl"
+  mutation_barrier="$SCRATCH/mutation-$mutation_artifact-barrier"
+  printf 'old-component-%s\n' "$mutation_artifact" > "$mutation_output"
+  printf 'old-metadata-%s\n' "$mutation_artifact" > "$mutation_metadata"
+  mkdir "$mutation_debug"
+  printf 'old-debug-%s\n' "$mutation_artifact" > \
+    "$mutation_debug/unrelated.txt"
+
+  STARLING_COMPONENTIZER_TEST_COMMIT_BARRIER="$mutation_barrier" \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --metadata-out "$mutation_metadata" \
+    --debug-dir "$mutation_debug" \
+    --out "$mutation_output" \
+    "$SOURCE" >/dev/null 2> "$mutation_error" &
+  mutation_pid=$!
+  wait_for_marker "$mutation_barrier.ready" "$mutation_pid" \
+    "$mutation_artifact publication mutation"
+
+  mutation_target="$mutation_output"
+  if [ "$mutation_artifact" = metadata ]; then
+    mutation_target="$mutation_metadata"
+  elif [ "$mutation_artifact" = debug ]; then
+    mutation_target="$mutation_debug/component.wasm"
+  fi
+  chmod u+w "$mutation_target"
+  printf 'mutated-published-%s\n' "$mutation_artifact" > "$mutation_target"
+  : > "$mutation_barrier.release"
+  if wait "$mutation_pid"; then
+    echo "FAIL: in-place $mutation_artifact mutation reported success" >&2
+    exit 1
+  fi
+  python3 - "$mutation_error" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+  test "$(cat "$mutation_output")" = \
+    "old-component-$mutation_artifact"
+  test "$(cat "$mutation_metadata")" = \
+    "old-metadata-$mutation_artifact"
+  test "$(cat "$mutation_debug/unrelated.txt")" = \
+    "old-debug-$mutation_artifact"
+  if find "$WORK" -maxdepth 1 -type d \
+    -name ".mutation-$mutation_artifact.wasm.starling-componentize-*" \
+    | grep -q .; then
+    echo "FAIL: $mutation_artifact mutation retained a transaction" >&2
+    exit 1
+  fi
+  remove_tree "$mutation_debug"
+  rm -f "$mutation_output" "$mutation_metadata" \
+    "$mutation_barrier.ready" "$mutation_barrier.release"
 done
 
 publication_fault_rollback() {
@@ -2523,6 +2624,94 @@ SNAPSHOT_SOURCE_ROOT="$SCRATCH/stable snapshot source"
 SNAPSHOT_SOURCE="$SNAPSHOT_SOURCE_ROOT/main.js"
 mkdir "$SNAPSHOT_SOURCE_ROOT"
 printf 'export const stableSnapshot = true;\n' > "$SNAPSHOT_SOURCE"
+
+SNAPSHOT_MUTATION_OUTPUT="$WORK/snapshot-mutation.wasm"
+SNAPSHOT_MUTATION_ERROR="$SCRATCH/snapshot-mutation.jsonl"
+SNAPSHOT_MUTATION_BARRIER="$SCRATCH/snapshot-mutation"
+printf 'old-snapshot-mutation-output\n' > "$SNAPSHOT_MUTATION_OUTPUT"
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_MUTATION_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$SNAPSHOT_MUTATION_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2> "$SNAPSHOT_MUTATION_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_MUTATION_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "retained snapshot mutation"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-mutation.wasm.starling-componentize-*' -print -quit)"
+test -n "$snapshot_root"
+chmod u+w "$snapshot_root/data/engine.wasm"
+printf 'mutated-retained-engine\n' > "$snapshot_root/data/engine.wasm"
+: > "$SNAPSHOT_MUTATION_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: retained snapshot mutation reported success" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$SNAPSHOT_MUTATION_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC3001", diagnostic
+assert diagnostic["phase"] == "initialize", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+test "$(cat "$SNAPSHOT_MUTATION_OUTPUT")" = \
+  "old-snapshot-mutation-output"
+
+SNAPSHOT_UNRESTORED_OUTPUT="$WORK/snapshot-unrestored.wasm"
+SNAPSHOT_UNRESTORED_ERROR="$SCRATCH/snapshot-unrestored.jsonl"
+SNAPSHOT_UNRESTORED_BARRIER="$SCRATCH/snapshot-unrestored"
+SNAPSHOT_UNRESTORED_ORIGINAL="$SCRATCH/snapshot-unrestored-engine"
+printf 'old-snapshot-unrestored-output\n' > "$SNAPSHOT_UNRESTORED_OUTPUT"
+STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_UNRESTORED_BARRIER" \
+STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$SNAPSHOT_UNRESTORED_OUTPUT" \
+  "$SNAPSHOT_SOURCE" >/dev/null 2> "$SNAPSHOT_UNRESTORED_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SNAPSHOT_UNRESTORED_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "unrestored snapshot substitution"
+snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
+  -name '.snapshot-unrestored.wasm.starling-componentize-*' -print -quit)"
+test -n "$snapshot_root"
+mv "$snapshot_root/data/engine.wasm" "$SNAPSHOT_UNRESTORED_ORIGINAL"
+printf 'substituted-unrestored-engine\n' > "$snapshot_root/data/engine.wasm"
+: > "$SNAPSHOT_UNRESTORED_BARRIER.release"
+wait_for_marker "$SNAPSHOT_UNRESTORED_BARRIER.complete" \
+  "$SNAPSHOT_TEST_PID" "unrestored snapshot completion"
+: > "$SNAPSHOT_UNRESTORED_BARRIER.verify"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: unrestored snapshot substitution reported success" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$SNAPSHOT_UNRESTORED_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC3001", diagnostic
+assert diagnostic["phase"] == "initialize", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+test "$(cat "$SNAPSHOT_UNRESTORED_OUTPUT")" = \
+  "old-snapshot-unrestored-output"
+test "$(cat "$snapshot_root/data/engine.wasm")" = \
+  "substituted-unrestored-engine"
+remove_tree "$snapshot_root"
+rm -f "$SNAPSHOT_UNRESTORED_ORIGINAL"
 
 SNAPSHOT_WIZER_OUTPUT="$WORK/snapshot-wizer.wasm"
 SNAPSHOT_WIZER_METADATA="$WORK/snapshot-wizer.json"
