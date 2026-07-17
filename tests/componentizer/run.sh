@@ -847,6 +847,7 @@ cp "${!#}" "$out"
 EOF
 cat > "$SCRATCH/fake-wabt.c" <<'EOF'
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -873,6 +874,52 @@ static void wait_for(const char *path) {
   while (access(path, F_OK) != 0) usleep(1000);
 }
 
+static void write_marker(const char *name, const char *text) {
+  const char *path = getenv(name);
+  if (!path) return;
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd >= 0) {
+    write(fd, text, strlen(text));
+    close(fd);
+  }
+}
+
+static void probe_inherited_directories(void) {
+  DIR *fds = opendir("/proc/self/fd");
+  if (!fds) return;
+  int scan_fd = dirfd(fds);
+  struct dirent *entry;
+  while ((entry = readdir(fds)) != NULL) {
+    char *end = NULL;
+    long candidate = strtol(entry->d_name, &end, 10);
+    if (!end || *end || candidate < 3 || candidate == scan_fd) continue;
+    int sibling = openat((int)candidate, "tool sibling", O_RDONLY);
+    if (sibling < 0) continue;
+    char content[128] = {0};
+    ssize_t count = read(sibling, content, sizeof(content) - 1);
+    close(sibling);
+    if (count <= 0 || !strstr(content, "substituted-sibling")) continue;
+    write_marker("FAKE_FD_READ_LEAK_MARKER", "leaked sibling bytes\n");
+    int executable = openat(
+      (int)candidate,
+      "fd leak executable",
+      O_RDONLY
+    );
+    if (executable >= 0) {
+      pid_t child = fork();
+      if (child == 0) {
+        char *const args[] = {"fd leak executable", NULL};
+        fexecve(executable, args, environ);
+        _exit(126);
+      }
+      int status = 0;
+      if (child > 0) waitpid(child, &status, 0);
+      close(executable);
+    }
+  }
+  closedir(fds);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) return 70;
   char executable[4096], sibling[4096], value[64] = {0};
@@ -887,6 +934,7 @@ int main(int argc, char **argv) {
       close(open(path, O_WRONLY | O_CREAT, 0600));
       snprintf(path, sizeof(path), "%s/continue", hook);
       wait_for(path);
+      probe_inherited_directories();
       FILE *marker = fopen(sibling, "r");
       if (!marker || !fgets(value, sizeof(value), marker) ||
           strcmp(value, "wabt-sibling-ok\n") != 0) return 71;
@@ -932,6 +980,25 @@ int main(int argc, char **argv) {
 }
 EOF
 cc -static -O2 -o "$TOOLS/fake wabt" "$SCRATCH/fake-wabt.c"
+cat > "$SCRATCH/fd-leak-executable.c" <<'EOF'
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+  const char *path = getenv("FAKE_FD_EXEC_LEAK_MARKER");
+  if (!path) return 1;
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return 2;
+  const char message[] = "executed leaked sibling bytes\n";
+  int failed = write(fd, message, strlen(message)) != strlen(message);
+  close(fd);
+  return failed;
+}
+EOF
+cc -static -O2 \
+  -o "$TOOLS/fd leak executable" \
+  "$SCRATCH/fd-leak-executable.c"
 cp "$REAL_WASM_TOOLS" "$TOOLS/fake wasm-tools"
 cat > "$TOOLS/retained-live-path" <<EOF
 #!/bin/sh
@@ -1351,9 +1418,14 @@ CHILD_REPLACE_HOOK="$SCRATCH/retained child replacement hook"
 CHILD_REPLACE_OUTPUT="$WORK/retained child replacement output.wasm"
 WABT_ORIGINAL="$SCRATCH/fake wabt original"
 SIBLING_ORIGINAL="$SCRATCH/tool sibling original"
+FD_EXECUTABLE_ORIGINAL="$SCRATCH/fd leak executable original"
+FD_READ_LEAK_MARKER="$SCRATCH/inherited directory bytes consumed"
+FD_EXEC_LEAK_MARKER="$SCRATCH/inherited directory executable ran"
 mkdir "$CHILD_REPLACE_HOOK"
 printf 'preserved retained child output\n' > "$CHILD_REPLACE_OUTPUT"
 FAKE_WABT_CHILD_HOOK="$CHILD_REPLACE_HOOK" \
+FAKE_FD_READ_LEAK_MARKER="$FD_READ_LEAK_MARKER" \
+FAKE_FD_EXEC_LEAK_MARKER="$FD_EXEC_LEAK_MARKER" \
 PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
@@ -1368,6 +1440,7 @@ child_replace_pid=$!
 wait_for_test_hook "$CHILD_REPLACE_HOOK/ready"
 mv "$TOOLS/fake wabt" "$WABT_ORIGINAL"
 mv "$TOOLS/tool sibling" "$SIBLING_ORIGINAL"
+mv "$TOOLS/fd leak executable" "$FD_EXECUTABLE_ORIGINAL"
 cat > "$TOOLS/fake wabt" <<EOF
 #!/bin/sh
 touch "$SCRATCH/substituted wabt consumed"
@@ -1379,11 +1452,13 @@ touch "$SCRATCH/substituted sibling consumed"
 printf 'substituted-sibling\n'
 EOF
 chmod +x "$TOOLS/fake wabt" "$TOOLS/tool sibling"
+cp "$FD_EXECUTABLE_ORIGINAL" "$TOOLS/fd leak executable"
 touch "$CHILD_REPLACE_HOOK/continue"
 wait_for_test_hook "$CHILD_REPLACE_HOOK/consumed"
-rm "$TOOLS/fake wabt" "$TOOLS/tool sibling"
+rm "$TOOLS/fake wabt" "$TOOLS/tool sibling" "$TOOLS/fd leak executable"
 mv "$WABT_ORIGINAL" "$TOOLS/fake wabt"
 mv "$SIBLING_ORIGINAL" "$TOOLS/tool sibling"
+mv "$FD_EXECUTABLE_ORIGINAL" "$TOOLS/fd leak executable"
 touch "$CHILD_REPLACE_HOOK/finish"
 if wait "$child_replace_pid"; then
   echo "FAIL: during-child closure substitution was accepted" >&2
@@ -1393,6 +1468,8 @@ grep -Fq TransactionChanged "$SCRATCH/retained-child-replacement.log"
 test "$(cat "$CHILD_REPLACE_OUTPUT")" = "preserved retained child output"
 test ! -e "$SCRATCH/substituted wabt consumed"
 test ! -e "$SCRATCH/substituted sibling consumed"
+test ! -e "$FD_READ_LEAK_MARKER"
+test ! -e "$FD_EXEC_LEAK_MARKER"
 echo "During-child executable and sibling substitutions isolated"
 
 PACKAGE_CAPTURE_HOOK="$SCRATCH/external package capture hook"
@@ -2648,6 +2725,63 @@ run_fixture_aot \
   "$ELF_PACKAGE/weval argv0 alias" \
   "$ELF_BUNDLE" \
   "$ELF_OUTPUT"
+
+build_rejected_runpath_package() {
+  local label="$1" runpath="$2" soname="$3" dtags="$4"
+  local package="$SCRATCH/$label runpath package"
+  local bundle="$WORK/$label runpath bundle"
+  mkdir -p \
+    "$package/bin/lib" \
+    "$package/bin/lib64" \
+    "$package/bin/lib/x86_64-linux-gnu"
+  cp "$ELF_LOADER" "$package/retained loader"
+  cp "$ELF_PACKAGE/libweval_fixture.c" "$package/"
+  cp "$ELF_PACKAGE/weval_fixture.c" "$package/"
+  cc -fPIC -shared \
+    -Wl,-soname,"$soname" \
+    -o "$package/bin/$soname" \
+    "$package/libweval_fixture.c"
+  cp "$package/bin/$soname" "$package/bin/lib/$soname"
+  cp "$package/bin/$soname" "$package/bin/lib64/$soname"
+  cp "$package/bin/$soname" \
+    "$package/bin/lib/x86_64-linux-gnu/$soname"
+  local dtags_args=()
+  if [ "$dtags" = rpath ]; then
+    dtags_args=(-Wl,--disable-new-dtags)
+  fi
+  cc -o "$package/bin/weval-real" \
+    "$package/weval_fixture.c" \
+    -L"$package/bin" \
+    -Wl,--dynamic-linker,"$package/retained loader" \
+    "${dtags_args[@]}" \
+    -Wl,-rpath,"$runpath" \
+    -Wl,-l:"$soname"
+  ln -s "bin/weval-real" "$package/weval argv0 alias"
+  seal_fixture_bundle "$package/weval argv0 alias" "$bundle"
+  expect_fixture_aot_rejection \
+    "$package/weval argv0 alias" \
+    "$bundle" \
+    "$label"
+  grep -Fq UnsupportedRetainedExecution \
+    "$SCRATCH/$label-package-rejection.log"
+}
+
+build_rejected_runpath_package \
+  unsupported-token \
+  '$ORIGIN/$LIB' \
+  libz.so.1 \
+  runpath
+build_rejected_runpath_package \
+  absolute-rpath \
+  "$ELF_PACKAGE/bin" \
+  libweval_absolute.so \
+  rpath
+build_rejected_runpath_package \
+  ambiguous-runpath \
+  "\$ORIGIN:$ELF_PACKAGE/bin" \
+  libweval_ambiguous.so \
+  runpath
+echo "Unsupported and ambiguous RUNPATH/RPATH closure matrix passed"
 
 ELF_ENV_HOOK="$SCRATCH/ELF environment closure hook"
 ELF_ENV_OUTPUT="$WORK/ELF environment substitution output.wasm"

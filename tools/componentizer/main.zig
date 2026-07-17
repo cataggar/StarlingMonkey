@@ -2750,6 +2750,7 @@ fn retainedExecHelper(
     io: Io,
     args: []const []const u8,
     child_env: ?[*:null]const ?[*:0]const u8,
+    retained_inputs: []const std.posix.fd_t,
 ) !void {
     if (builtin.os.tag != .linux or args.len < 8)
         return error.UnsupportedRetainedExecution;
@@ -3011,6 +3012,10 @@ fn retainedExecHelper(
         for (child_args[1..], fixed.len..) |arg, arg_index|
             loader_argv[arg_index] =
                 (try allocator.dupeSentinel(u8, arg, 0)).ptr;
+        try closeUnallowlistedDescriptors(
+            loader.handle,
+            retained_inputs,
+        );
         break :dynamic_exec linux.execveat(
             loader.handle,
             "",
@@ -3024,6 +3029,10 @@ fn retainedExecHelper(
             selected_relative,
             .{ .follow_symlinks = true },
         );
+        try closeUnallowlistedDescriptors(
+            immutable_executable.handle,
+            retained_inputs,
+        );
         break :static_exec linux.execveat(
             immutable_executable.handle,
             "",
@@ -3032,8 +3041,46 @@ fn retainedExecHelper(
             .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = false },
         );
     };
-    _ = rc;
+    std.debug.print(
+        "error: retained executable could not start: {t}\n",
+        .{linux.errno(rc)},
+    );
     return error.UnsupportedRetainedExecution;
+}
+
+fn closeUnallowlistedDescriptors(
+    executable: std.posix.fd_t,
+    retained_inputs: []const std.posix.fd_t,
+) !void {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    // Linux UAPI CLOSE_RANGE_CLOEXEC is bit 2.
+    const close_range_cloexec: linux.CLOSE_RANGE =
+        @bitCast(@as(u32, 1) << 2);
+    switch (linux.errno(linux.close_range(
+        3,
+        std.math.maxInt(std.posix.fd_t),
+        close_range_cloexec,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    try allowDescriptorAcrossExec(executable);
+    for (retained_inputs) |handle|
+        try allowDescriptorAcrossExec(handle);
+}
+
+fn allowDescriptorAcrossExec(handle: std.posix.fd_t) !void {
+    if (handle < 3) return error.UnsupportedRetainedExecution;
+    switch (std.posix.errno(std.posix.system.fcntl(
+        handle,
+        std.posix.F.SETFD,
+        @as(usize, 0),
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
 }
 
 fn namespaceMirrorLinkTarget(
@@ -3981,6 +4028,10 @@ fn execute(
                 "weval AOT",
                 snapshot.weval_capture,
                 null,
+                &.{
+                    snapshot.engine_capture.file.handle,
+                    snapshot.cache_capture.file.handle,
+                },
                 initialization_args.items,
                 snapshot.weval,
                 cwd,
@@ -8392,19 +8443,9 @@ fn retainedPackageExecutablePath(
 ) ![]const u8 {
     if (builtin.os.tag != .linux)
         return error.UnsupportedRetainedExecution;
-    const handle = package.tree.root.dir.handle;
-    switch (std.posix.errno(std.posix.system.fcntl(
-        handle,
-        std.posix.F.SETFD,
-        @as(usize, 0),
-    ))) {
-        .SUCCESS => {},
-        else => return error.MissingBuildArtifact,
-    }
-    return std.fmt.allocPrint(
+    return std.fs.path.join(
         allocator,
-        "/proc/self/fd/{d}/{s}",
-        .{ handle, package.selected_relative },
+        &.{ package.tree.path, package.selected_relative },
     );
 }
 
@@ -8673,6 +8714,26 @@ fn normalizePackageLibraryPath(
     return std.mem.join(allocator, "/", normalized.items);
 }
 
+fn validatePackageRunpath(runpath: []const u8) !void {
+    if (runpath.len == 0)
+        return error.UnsupportedRetainedExecution;
+    var paths = std.mem.splitScalar(u8, runpath, ':');
+    while (paths.next()) |path| {
+        if (path.len == 0 or std.fs.path.isAbsolute(path))
+            return error.UnsupportedRetainedExecution;
+        const suffix = if (std.mem.startsWith(u8, path, "$ORIGIN"))
+            path["$ORIGIN".len..]
+        else if (std.mem.startsWith(u8, path, "${ORIGIN}"))
+            path["${ORIGIN}".len..]
+        else
+            return error.UnsupportedRetainedExecution;
+        if (suffix.len != 0 and suffix[0] != '/')
+            return error.UnsupportedRetainedExecution;
+        if (std.mem.indexOfScalar(u8, suffix, '$') != null)
+            return error.UnsupportedRetainedExecution;
+    }
+}
+
 fn resolvePackageRuntimeLibrary(
     allocator: Allocator,
     root: *CapturedPackageDirectory,
@@ -8681,6 +8742,7 @@ fn resolvePackageRuntimeLibrary(
     library: []const u8,
 ) !?struct { relative: []const u8, source: CapturedPackageFile } {
     const value = runpath orelse return null;
+    try validatePackageRunpath(value);
     var paths = std.mem.splitScalar(u8, value, ':');
     while (paths.next()) |path| {
         const relative = normalizePackageLibraryPath(
@@ -8688,7 +8750,7 @@ fn resolvePackageRuntimeLibrary(
             object_relative,
             path,
             library,
-        ) catch continue;
+        ) catch return error.UnsupportedRetainedExecution;
         const resolved = resolveCapturedPackageEntry(
             allocator,
             root,
@@ -8801,6 +8863,10 @@ fn captureExecutableRuntimeClosure(
         if (objects.items.len > 128)
             return error.UnsupportedRetainedExecution;
         const current = objects.items[object_index];
+        if (current.object.package_relative != null) {
+            if (current.info.runpath) |runpath|
+                try validatePackageRunpath(runpath);
+        }
         for (current.info.needed) |name| {
             if (seen.contains(name)) continue;
             seen.put(allocator, name, {}) catch @panic("out of memory");
@@ -9057,7 +9123,6 @@ fn createRetainedExecPlan(
             }) catch @panic("out of memory");
         }
     }
-    try clearCloseOnExec(package.tree.root.dir.handle);
     var namespace_random: [16]u8 = undefined;
     io.random(&namespace_random);
     const namespace_hex = std.fmt.bytesToHex(namespace_random, .lower);
@@ -9087,17 +9152,6 @@ fn createRetainedExecPlan(
         .files = try files.toOwnedSlice(allocator),
         .captures = try captures.toOwnedSlice(allocator),
     };
-}
-
-fn clearCloseOnExec(handle: std.posix.fd_t) !void {
-    switch (std.posix.errno(std.posix.system.fcntl(
-        handle,
-        std.posix.F.SETFD,
-        @as(usize, 0),
-    ))) {
-        .SUCCESS => {},
-        else => return error.UnsupportedRetainedExecution,
-    }
 }
 
 fn copyCapturedDirectory(
@@ -15449,6 +15503,7 @@ fn runCapturedToolCommand(
         stage,
         tool.snapshot_package orelse return error.TransactionChanged,
         tool.retained_plan,
+        &.{},
         argv,
         tool.provenance,
         cwd,
@@ -15667,6 +15722,7 @@ fn runRetainedPackageCommand(
     stage: []const u8,
     package: CapturedWevalPackage,
     prepared_plan: ?RetainedExecPlan,
+    retained_inputs: []const std.posix.fd_t,
     argv: []const []const u8,
     display_argv0: ?[]const u8,
     cwd: []const u8,
@@ -15713,6 +15769,7 @@ fn runRetainedPackageCommand(
         io,
         stage,
         helper_args.items,
+        retained_inputs,
         cwd,
         environ,
         stdin_path,
@@ -15726,6 +15783,7 @@ fn runRetainedHelperProcess(
     io: Io,
     stage: []const u8,
     helper_args: []const []const u8,
+    retained_inputs: []const std.posix.fd_t,
     cwd: []const u8,
     environ: ?*const std.process.Environ.Map,
     stdin_path: ?[]const u8,
@@ -15776,6 +15834,7 @@ fn runRetainedHelperProcess(
             io,
             helper_args,
             @ptrCast(env_block.view().slice.ptr),
+            retained_inputs,
         ) catch |err| {
             std.debug.print(
                 "error: retained execution helper failed: {t}\n",
