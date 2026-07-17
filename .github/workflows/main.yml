@@ -24,17 +24,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build: [release, debug, weval]
+        build: [release, debug]
         os: [ubuntu-latest]
     outputs:
       SM_TAG_EXISTS: ${{ steps.check-sm-release.outputs.SM_TAG_EXISTS }}
       SM_TAG: ${{ steps.check-sm-release.outputs.SM_TAG }}
       SM_CACHE_KEY_debug: ${{ steps.check-sm-release.outputs.SM_CACHE_KEY_debug }}
       SM_CACHE_KEY_release: ${{ steps.check-sm-release.outputs.SM_CACHE_KEY_release }}
-      SM_CACHE_KEY_weval: ${{ steps.check-sm-release.outputs.SM_CACHE_KEY_weval }}
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0-dev.902+7255f3e72
 
     - name: Check if SpiderMonkey Release Exists
       id: check-sm-release
@@ -73,8 +77,7 @@ jobs:
     - name: Configure StarlingMonkey
       run: |
         cmake -S . -B cmake-build-${{ matrix.build }}\
-          -DCMAKE_BUILD_TYPE=${{ (matrix.build == 'release' || matrix.build == 'weval') && 'Release' || 'Debug' }}\
-          ${{matrix.build == 'weval' && '-DUSE_WASM_OPT=OFF -DWEVAL=ON' || ''}}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build == 'release' && 'Release' || 'Debug' }}
 
     - name: Build StarlingMonkey
       run: |
@@ -121,8 +124,33 @@ jobs:
       if: matrix.build == 'debug'
       run: just lint
 
+  feature-surface-acceptance:
+    name: Required Zig and CMake feature-surface matrices
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-feature-surface
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-feature-surface
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0-dev.902+7255f3e72
+
+    - name: Install Rust WASI target
+      run: rustup target add wasm32-wasip1
+
+    - name: Build Zig runtime dependencies
+      run: ./deps/build-deps.sh --all
+
+    - name: Run required host API production gate
+      run: |
+        zig build host-api-production-matrix-test \
+          -Doptimize=ReleaseSmall
+
   release-spidermonkey:
-    needs: test
+    needs: [test, feature-surface-acceptance]
     if: needs.test.outputs.SM_TAG_EXISTS == 'false' && (github.event_name == 'push' && 
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
@@ -145,21 +173,11 @@ jobs:
           spidermonkey-dist-release
         key: ${{ needs.test.outputs.SM_CACHE_KEY_release }}
         fail-on-cache-miss: true
-    - name: Restore SpiderMonkey Weval Cache
-      uses: actions/cache/restore@v4
-      id: sm-cache-weval
-      with:
-        path: |
-          spidermonkey-dist-weval
-        key: ${{ needs.test.outputs.SM_CACHE_KEY_weval }}
-        fail-on-cache-miss: true
-
     - name: Create SpiderMonkey Tar Balls
       run: |
         mkdir -p release-artifacts
         tar -a -cf release-artifacts/spidermonkey-static-debug.tar.gz spidermonkey-dist-debug/*
         tar -a -cf release-artifacts/spidermonkey-static-release.tar.gz spidermonkey-dist-release/*
-        tar -a -cf release-artifacts/spidermonkey-static-release_weval.tar.gz spidermonkey-dist-weval/*
         tree release-artifacts
 
     - name: Do the Release

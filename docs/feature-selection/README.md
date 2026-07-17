@@ -58,14 +58,16 @@ For a caller world without explicit WASI imports, the frozen ComponentizeJS
 | `clocks=false` | monotonic clock; wall clock remains |
 | `http=false` | outgoing handler; HTTP types remain while fetch-event is enabled |
 | `fetch-event=false` | no import change |
+| `http=false`, `fetch-event=false` | outgoing handler and HTTP types |
+| only `fetch-event` enabled | HTTP types plus their `wasi:io/error`, `poll`, and `streams` resource identities |
 | all disabled | every `wasi:*` import |
 
 The executable oracle is
 `tests/feature-selection/reference/expected/import-surfaces.json`.
 The runtime matrix and native componentizer E2E tests compare complete sorted
 import and export lists from real production components against that file.
-The native E2E runs both `starling-componentize` and its installed
-`componentize.sh` for default, pure, and representative feature selections.
+The native E2E runs `starling-componentize`, installed `componentize.sh`, and
+the external-engine path for all ten supported feature selections.
 
 User-declared non-feature imports remain external. Runtime-only filesystem,
 socket, environment, and exit imports are internalized when they are not part
@@ -116,6 +118,16 @@ feature syscalls before adaptation; generated preview2 provider adapters remove
 the remaining component-level closure after snapshotting. Default builds with
 no caller WIT and all features enabled are copied through unchanged.
 
+`fetch-event` depends on incoming HTTP types, which in turn share
+identity-bearing `wasi:io` resources. Those dependencies remain external as a
+closure even when stdio, clocks, and outgoing HTTP are disabled; value aliases
+such as monotonic `duration` can still be internalized.
+
+Legacy `CMake WEVAL=ON` is rejected before configuration can create build or
+release artifacts. Sealed AOT engines and their cache/manifest pair are built
+only by the dedicated Zig AOT path. Non-AOT CMake installations remain
+relocatable componentizer packages and never contain an unsealed Weval cache.
+
 ## Tests
 
 Fast tests:
@@ -128,8 +140,8 @@ This runs:
 
 - 16 build-option positive/negative cases;
 - 8 C/C++ default-macro cases;
-- exact frozen surface checks for defaults, every oracle disable case, and
-  pure mode.
+- exact frozen surface checks for defaults, every oracle disable case,
+  fetch-event dependency minima, and pure mode.
 
 Full runtime tests:
 
@@ -137,7 +149,26 @@ Full runtime tests:
 zig build feature-selection-runtime-test -Doptimize=ReleaseSmall
 ```
 
-The runtime matrix builds all eight production combinations, componentizes
+The required all-host production gate runs both build systems (WASI
+0.2.0/0.2.2/0.2.3/0.2.10) plus the custom-host fixture:
+
+```sh
+zig build host-api-production-matrix-test -Doptimize=ReleaseSmall
+```
+
+The two halves can be selected as
+`host-api-zig-production-matrix-test` and
+`host-api-cmake-production-matrix-test`.
+
+For CMake custom host APIs, set `HOST_API_WORLD` when the root world is not
+`bindings`. The built-in WASI exact-surface oracle is skipped explicitly for
+custom APIs while the production component is still validated. A custom exact
+oracle requires all four cache variables:
+`CUSTOM_FEATURE_SURFACE_ORACLE`, `CUSTOM_FEATURE_SURFACE_CASE`,
+`CUSTOM_HOST_API_VERSION`, and
+`CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS`.
+
+The runtime matrix builds all ten production combinations, componentizes
 real JavaScript, validates resulting components, checks exact disabled
 interface absence (including zero-import pure mode), and exercises
 representative enabled and disabled behavior through Wasmtime.

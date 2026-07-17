@@ -290,8 +290,10 @@ surface_case() {
   local case_cache="$CACHE/surface runtime cache"
   local native_output="$WORK/$name native.wasm"
   local shell_output="$WORK/$name shell.wasm"
+  local engine_output="$WORK/$name external engine.wasm"
   local native_wit="$WORK/$name native.wit"
   local shell_wit="$WORK/$name shell.wit"
+  local engine_wit="$WORK/$name external engine.wit"
   local -a feature_args=()
   if [ -n "$disabled" ]; then
     feature_args+=(--disable "$disabled")
@@ -321,21 +323,32 @@ surface_case() {
   "$runtime_bin/componentize.sh" \
     "$ROOT/tests/fixtures/js-dispatch.js" \
     -o "$shell_output"
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
+    --engine "$runtime_bin/starling-raw.wasm" \
+    --wasmtime-bin "$WASMTIME" \
+    --wac-bin "$WAC" \
+    --wasm-tools-bin "$WASM_TOOLS" \
+    --out "$engine_output" \
+    "$ROOT/tests/fixtures/js-dispatch.js"
 
   "$WASM_TOOLS" validate --features all "$native_output"
   "$WASM_TOOLS" validate --features all "$shell_output"
+  "$WASM_TOOLS" validate --features all "$engine_output"
   "$WASM_TOOLS" component wit "$native_output" -o "$native_wit"
   "$WASM_TOOLS" component wit "$shell_output" -o "$shell_wit"
+  "$WASM_TOOLS" component wit "$engine_output" -o "$engine_wit"
   python3 "$ROOT/tests/feature-selection/check-production-surface.py" \
     "$ROOT/tests/feature-selection/reference/expected/import-surfaces.json" \
     "$oracle_case" \
     "starling:js/api,wasi:cli/run@$HOST_VERSION,wasi:http/incoming-handler@$HOST_VERSION" \
-    "$native_wit" "$shell_wit"
+    "$native_wit" "$shell_wit" "$engine_wit"
   if [ "$name" = pure ]; then
     STARLINGMONKEY_CONFIG=--invalid-if-visible \
       "$WASMTIME" run -S cli -S inherit-env "$native_output" -- --invalid-if-visible
     STARLINGMONKEY_CONFIG=--invalid-if-visible \
       "$WASMTIME" run -S cli -S inherit-env "$shell_output" -- --invalid-if-visible
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$engine_output" -- --invalid-if-visible
   fi
 }
 
@@ -345,6 +358,10 @@ surface_case no-stdio disable-stdio "stdio"
 surface_case no-random disable-random "random"
 surface_case no-clocks disable-clocks "clocks"
 surface_case no-http disable-http-only "http"
+surface_case no-fetch-event disable-fetch-event-only "fetch-event"
+surface_case no-http-or-fetch-event disable-http-fetch-event "http,fetch-event"
+surface_case fetch-event-dependency-closure fetch-event-random-only "stdio,clocks,http"
+surface_case fetch-event-only fetch-event-only "stdio,random,clocks,http"
 
 # A different dispatch and component world must produce an observably
 # different relink rather than reusing or restaging the first runtime.

@@ -53,6 +53,13 @@ version_index=0
 for version in "${VERSIONS[@]}"; do
   version_index=$((version_index + 1))
   echo "== $MODE wasi-$version pure production surface =="
+  if [ "${STARLING_MATRIX_PROBE_ONLY:-0}" = 1 ]; then
+    if [ "${STARLING_MATRIX_FAIL_VERSION:-}" = "$version" ]; then
+      echo "injected matrix failure at wasi-$version" >&2
+      exit 97
+    fi
+    continue
+  fi
   case "$MODE" in
     zig)
       prefix="$BUILD_ROOT/wasi-$version"
@@ -95,6 +102,15 @@ for version in "${VERSIONS[@]}"; do
         sed -n 's/.*import wasi:cli\/environment@\([^;]*\);.*/\1/p' | head -1)"
       test "$nested_adapter_version" = "$version"
       check_component "$version" "$runtime" "$native_component"
+      external_component="$prefix/pure-external-engine.wasm"
+      WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
+        --engine "$runtime/starling-raw.wasm" \
+        --wasmtime-bin "$runtime/wasmtime" \
+        --wac-bin "$runtime/wac" \
+        --wasm-tools-bin "$runtime/wasm-tools" \
+        --out "$external_component" \
+        "$FIXTURE"
+      check_component "$version" "$runtime" "$external_component"
       ;;
     cmake)
       prefix="$BUILD_ROOT/wasi-$version"

@@ -12,6 +12,7 @@ wasm_tools="${WASM_TOOLS:-$script_dir/wasm-tools}"
 weval="${WEVAL:-$script_dir/weval}"
 feature_surface="${FEATURE_SURFACE:-$script_dir/starling-feature-surface}"
 wac="${WAC:-$script_dir/wac}"
+external_runtime="$script_dir/@EXTERNAL_RUNTIME_FILE@"
 component_world="@COMPONENT_WORLD@"
 component_wit="$script_dir/component-wit"
 surface_target_world="@SURFACE_TARGET_WORLD@"
@@ -165,7 +166,7 @@ if [[ -n "$IN_FILE" ]]; then
   fi
 else
   echo "Creating runtime-eval component $OUT_FILE"
-  cp "$script_dir/starling-raw.wasm" "$OUT_FILE"
+  cp "$external_runtime" "$OUT_FILE"
 fi
 
 stripped="${OUT_FILE}.stripped.$$"

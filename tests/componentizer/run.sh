@@ -86,14 +86,31 @@ trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
 ENGINE="$WORK/fake engine.wasm"
+ENGINE_BASE="$WORK/fake engine base.wasm"
 ADAPTER="$WORK/fake adapter.wasm"
 WIT="$WORK/wit package"
 printf 'export const api = {};\n' > "$SOURCE"
-printf 'engine-bytes\n' > "$ENGINE"
+printf '\0asm\1\0\0\0\0\6\4seedA' > "$ENGINE_BASE"
+python3 "$ROOT/tools/embed-engine-provenance.py" \
+  "$ENGINE_BASE" "$ENGINE" "$(basename "$EXPECTED_HOST_API")" 11111 \
+  bindings caller
 printf 'adapter-bytes\n' > "$ADAPTER"
 cat > "$WIT/world.wit" <<'EOF'
 package test:componentizer;
 world exports {}
+EOF
+mkdir -p "$WORK/feature-wit"
+cat > "$WORK/features.json" <<EOF
+{
+  "host-api": "$(basename "$EXPECTED_HOST_API")",
+  "component-world": "bindings",
+  "surface-world": "caller",
+  "stdio": true,
+  "random": true,
+  "clocks": true,
+  "http": true,
+  "fetch-event": true
+}
 EOF
 
 cat > "$TOOLS/fake wizer" <<'EOF'
@@ -375,11 +392,13 @@ elif [ "$1 $2" = "component wit" ]; then
   done
   if [ -n "$out_dir" ]; then
     mkdir -p "$out_dir"
-    out="$out_dir/bindings.wit"
-    cat > "$out_dir/component.wit" <<'WIT'
-package test:fake;
-world root {}
+    out="$out_dir/custom-runtime.wit"
+    if [ "${FAKE_AMBIGUOUS_WIT:-0}" = 1 ]; then
+      cat > "$out_dir/second-root.wit" <<'WIT'
+package test:second;
+world second {}
 WIT
+    fi
   fi
   cat > "$out" <<'WIT'
 package test:fake;
@@ -656,6 +675,107 @@ if find "$WORK" -name '*.starling-componentize-source-*' -o \
   echo "FAIL: immutable input snapshots were not cleaned up" >&2
   exit 1
 fi
+
+make_engine_bundle() {
+  local name="$1" tuple="$2"
+  local bundle="$WORK/$name engine bundle"
+  mkdir -p "$bundle/feature-wit"
+  python3 "$ROOT/tools/embed-engine-provenance.py" \
+    "$ENGINE_BASE" "$bundle/starling-raw.wasm" \
+    "$(basename "$EXPECTED_HOST_API")" "$tuple" bindings caller
+  local stdio="${tuple:0:1}" random="${tuple:1:1}" clocks="${tuple:2:1}"
+  local http="${tuple:3:1}" fetch_event="${tuple:4:1}"
+  cat > "$bundle/features.json" <<EOF
+{
+  "host-api": "$(basename "$EXPECTED_HOST_API")",
+  "component-world": "bindings",
+  "surface-world": "caller",
+  "stdio": $([ "$stdio" = 1 ] && echo true || echo false),
+  "random": $([ "$random" = 1 ] && echo true || echo false),
+  "clocks": $([ "$clocks" = 1 ] && echo true || echo false),
+  "http": $([ "$http" = 1 ] && echo true || echo false),
+  "fetch-event": $([ "$fetch_event" = 1 ] && echo true || echo false),
+  "future-compatible-field": {"ignored": true}
+}
+EOF
+  printf '%s\n' "$bundle"
+}
+
+componentize_external_engine() {
+  local engine="$1" output="$2"
+  "$COMPONENTIZER" \
+    --engine "$engine" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$output" \
+    "$SOURCE"
+}
+
+PURE_ENGINE_DIR="$(make_engine_bundle pure 00000)"
+MIXED_ENGINE_DIR="$(make_engine_bundle mixed 01001)"
+componentize_external_engine \
+  "$PURE_ENGINE_DIR/starling-raw.wasm" "$WORK/pure engine output.wasm"
+componentize_external_engine \
+  "$MIXED_ENGINE_DIR/starling-raw.wasm" "$WORK/mixed engine output.wasm"
+
+MISSING_ENGINE_DIR="$WORK/missing provenance engine bundle"
+mkdir -p "$MISSING_ENGINE_DIR/feature-wit"
+printf '\0asm\1\0\0\0' > "$MISSING_ENGINE_DIR/starling-raw.wasm"
+cp "$WORK/features.json" "$MISSING_ENGINE_DIR/features.json"
+if componentize_external_engine \
+    "$MISSING_ENGINE_DIR/starling-raw.wasm" "$WORK/missing provenance.wasm" \
+    >"$WORK/missing provenance.out" 2>"$WORK/missing provenance.err"
+then
+  echo "FAIL: engine without provenance unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'missing embedded feature/host provenance' \
+  "$WORK/missing provenance.err"
+
+TAMPERED_ENGINE_DIR="$WORK/tampered provenance engine bundle"
+cp -a "$PURE_ENGINE_DIR" "$TAMPERED_ENGINE_DIR"
+python3 - "$TAMPERED_ENGINE_DIR/starling-raw.wasm" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+data[15] ^= 1
+path.write_bytes(data)
+PY
+if componentize_external_engine \
+    "$TAMPERED_ENGINE_DIR/starling-raw.wasm" "$WORK/tampered provenance.wasm" \
+    >"$WORK/tampered provenance.out" 2>"$WORK/tampered provenance.err"
+then
+  echo "FAIL: engine with tampered bytes unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'provenance digest does not match' "$WORK/tampered provenance.err"
+
+MISMATCH_ENGINE_DIR="$WORK/mismatched provenance engine bundle"
+cp -a "$PURE_ENGINE_DIR" "$MISMATCH_ENGINE_DIR"
+sed -i 's/"random": false/"random": true/' \
+  "$MISMATCH_ENGINE_DIR/features.json"
+if componentize_external_engine \
+    "$MISMATCH_ENGINE_DIR/starling-raw.wasm" "$WORK/mismatched provenance.wasm" \
+    >"$WORK/mismatched provenance.out" 2>"$WORK/mismatched provenance.err"
+then
+  echo "FAIL: mismatched sibling provenance unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'does not match sibling features.json' \
+  "$WORK/mismatched provenance.err"
+
+if FAKE_AMBIGUOUS_WIT=1 componentize_external_engine \
+    "$ENGINE" "$WORK/ambiguous generated WIT.wasm" \
+    >"$WORK/ambiguous WIT.out" 2>"$WORK/ambiguous WIT.err"
+then
+  echo "FAIL: ambiguous generated root WIT unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'multiple root packages' "$WORK/ambiguous WIT.err"
 
 SOURCE_ALIAS_DIR="$SCRATCH/real sources"
 SOURCE_ALIAS="$WORK/source alias.js"

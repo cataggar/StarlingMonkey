@@ -158,14 +158,28 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 
 pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
-        @panic("StarlingMonkey v0.4 requires Zig " ++ required_zig_version);
+        std.debug.print(
+            "error: StarlingMonkey requires Zig {s}; found {s}\n",
+            .{ required_zig_version, builtin.zig_version_string },
+        );
+        @panic("unsupported Zig version");
     }
     const optimize = b.standardOptimizeOption(.{});
-    const host_api_name = b.option(
+    const host_api_selection = b.option(
         []const u8,
         "host-api",
-        "Host API implementation under host-apis/",
+        "Host API name under host-apis/ or a repository-relative implementation path",
     ) orelse "wasi-0.2.10";
+    const host_api_dir = if (std.mem.indexOfScalar(u8, host_api_selection, '/') != null)
+        host_api_selection
+    else
+        b.pathJoin(&.{ "host-apis", host_api_selection });
+    const host_api_identity = std.fs.path.basename(host_api_dir);
+    const host_api_world = b.option(
+        []const u8,
+        "host-api-world",
+        "Default component world in the selected host API WIT package",
+    ) orelse "bindings";
     const download_wac = b.addSystemCommand(&.{
         "bash",
         "tools/download-wac.sh",
@@ -181,7 +195,7 @@ pub fn build(b: *std.Build) void {
     const componentizer_options = b.addOptions();
     componentizer_options.addOption([]const u8, "version", "0.3.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
-    componentizer_options.addOption([]const u8, "host_api", host_api_name);
+    componentizer_options.addOption([]const u8, "host_api", host_api_selection);
     const componentizer_mod = b.createModule(.{
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
@@ -250,7 +264,7 @@ pub fn build(b: *std.Build) void {
         &.{ "bash", "tests/componentizer/run.sh" },
     );
     componentizer_orchestration.addArtifactArg(componentizer);
-    componentizer_orchestration.addArg(host_api_name);
+    componentizer_orchestration.addArg(host_api_selection);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
@@ -276,13 +290,12 @@ pub fn build(b: *std.Build) void {
     componentizer_e2e.addArtifactArg(wabt);
     componentizer_e2e.addFileArg(
         b.path(b.pathJoin(&.{
-            "host-apis",
-            host_api_name,
+            host_api_dir,
             "preview1-adapter-release",
             "wasi_snapshot_preview1.wasm",
         })),
     );
-    componentizer_e2e.addArg(host_api_name);
+    componentizer_e2e.addArg(host_api_identity);
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
 
@@ -450,7 +463,7 @@ pub fn build(b: *std.Build) void {
         .c_flags = c_flags.items,
         .common_includes = &common_includes,
         .builtins_incl_dir = builtins_incl_dir,
-        .host_api_dir = b.pathJoin(&.{ "host-apis", host_api_name }),
+        .host_api_dir = host_api_dir,
         .wasi020 = "host-apis/wasi-0.2.0",
         .wasi023 = "host-apis/wasi-0.2.3",
     };
@@ -573,6 +586,28 @@ pub fn build(b: *std.Build) void {
             raw_wasm = opt_out;
         }
     }
+    const feature_tuple = b.fmt(
+        "{d}{d}{d}{d}{d}",
+        .{
+            @intFromBool(features.stdio),
+            @intFromBool(features.random),
+            @intFromBool(features.clocks),
+            @intFromBool(features.http),
+            @intFromBool(features.fetch_event),
+        },
+    );
+    const provenance = b.addSystemCommand(&.{"python3"});
+    provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
+    provenance.addFileArg(raw_wasm);
+    const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
+    provenance.addArgs(&.{
+        host_api_identity,
+        feature_tuple,
+        component_world orelse host_api_world,
+        dispatch_world orelse "caller",
+    });
+    raw_wasm = provenanced_raw;
+
     const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
     b.getInstallStep().dependOn(&install_raw.step);
 
@@ -655,7 +690,7 @@ pub fn build(b: *std.Build) void {
 
     const componentize_sh = renderComponentizeScript(
         b,
-        component_world orelse "bindings",
+        component_world orelse host_api_world,
         dispatch_world orelse "caller",
         features,
     );
@@ -678,6 +713,8 @@ pub fn build(b: *std.Build) void {
     const features_json = b.fmt(
         \\{{
         \\  "host-api": "{s}",
+        \\  "component-world": "{s}",
+        \\  "surface-world": "{s}",
         \\  "stdio": {},
         \\  "random": {},
         \\  "clocks": {},
@@ -685,7 +722,16 @@ pub fn build(b: *std.Build) void {
         \\  "fetch-event": {}
         \\}}
         \\
-    , .{ host_api_name, features.stdio, features.random, features.clocks, features.http, features.fetch_event });
+    , .{
+        host_api_identity,
+        component_world orelse host_api_world,
+        dispatch_world orelse "caller",
+        features.stdio,
+        features.random,
+        features.clocks,
+        features.http,
+        features.fetch_event,
+    });
     const features_json_file = b.addWriteFiles().add("features.json", features_json);
     b.getInstallStep().dependOn(&b.addInstallBinFile(features_json_file, "features.json").step);
 
@@ -883,13 +929,17 @@ pub fn build(b: *std.Build) void {
     const feature_selection_macro_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-macro-default-tests.sh" });
     feature_selection_macro_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_test_step.dependOn(&feature_selection_macro_run.step);
+    const host_api_matrix_failure_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix-failure-proof.sh" },
+    );
+    feature_selection_test_step.dependOn(&host_api_matrix_failure_run.step);
     test_step.dependOn(feature_selection_test_step);
 
     // `zig build feature-selection-runtime-test`: the REQUIRED/FULL
     // component-level feature-selection suite
     // (tests/feature-selection/run-runtime-tests.sh). Unlike
     // `feature-selection-test` above, this actually builds a full
-    // StarlingMonkey runtime for each of 8 feature combinations,
+    // StarlingMonkey runtime for each of 10 feature combinations,
     // componentizes representative fixtures, inspects the resulting
     // import/export surface with `wasm-tools component wit`, and invokes
     // representative behavior through `wasmtime serve` -- see
@@ -904,13 +954,38 @@ pub fn build(b: *std.Build) void {
     feature_selection_runtime_test_step.dependOn(&feature_selection_runtime_run.step);
     const host_api_matrix_step = b.step(
         "host-api-production-matrix-test",
-        "Run version-matched pure production component tests for every host API",
+        "Run required Zig and CMake production matrices for every host API",
     );
-    const host_api_matrix_run = b.addSystemCommand(
+    const host_api_zig_matrix_step = b.step(
+        "host-api-zig-production-matrix-test",
+        "Run version-matched Zig production component tests for every host API",
+    );
+    const host_api_zig_matrix_run = b.addSystemCommand(
         &.{ "bash", "tests/feature-selection/run-host-api-matrix.sh", "zig" },
     );
-    host_api_matrix_run.addArg(b.graph.zig_exe);
-    host_api_matrix_step.dependOn(&host_api_matrix_run.step);
+    host_api_zig_matrix_run.addArg(b.graph.zig_exe);
+    host_api_zig_matrix_step.dependOn(&host_api_zig_matrix_run.step);
+    const host_api_cmake_matrix_step = b.step(
+        "host-api-cmake-production-matrix-test",
+        "Run version-matched CMake production component tests for every host API",
+    );
+    const host_api_cmake_matrix_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix.sh", "cmake" },
+    );
+    host_api_cmake_matrix_run.addArg(b.graph.zig_exe);
+    host_api_cmake_matrix_step.dependOn(&host_api_cmake_matrix_run.step);
+    const custom_host_step = b.step(
+        "custom-host-production-test",
+        "Run non-bindings custom host production tests through Zig and CMake",
+    );
+    const custom_host_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-custom-host-test.sh" },
+    );
+    custom_host_run.addArg(b.graph.zig_exe);
+    custom_host_step.dependOn(&custom_host_run.step);
+    host_api_matrix_step.dependOn(host_api_zig_matrix_step);
+    host_api_matrix_step.dependOn(host_api_cmake_matrix_step);
+    host_api_matrix_step.dependOn(custom_host_step);
     // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
     // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
     // reactor against a fixture-specific WIT world that additionally
@@ -1070,6 +1145,7 @@ fn renderComponentizeScript(
     var rest: []const u8 = template;
     const subs = [_]struct { from: []const u8, to: []const u8 }{
         .{ .from = "@AOT@", .to = "0" },
+        .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
         .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },
         .{ .from = "@FEATURE_STDIO@", .to = if (features.stdio) "1" else "0" },

@@ -14,7 +14,7 @@
 # `wasmtime serve -S common --addr 0.0.0.0:0` / poll-stderr-for-"Serving
 # HTTP" / extract-port pattern as tests/test.sh. It is deliberately NOT a
 # dependency of `zig build test` (each full build takes on the order of a
-# minute or more; ~8 combinations add up), matching the
+# minute or more; 10 combinations add up), matching the
 # `compat-bridge-test` precedent (tests/compat/runtime) of keeping slow,
 # real-build verification in its own opt-in step
 # (`feature-selection-runtime-test`).
@@ -149,7 +149,18 @@ serve_and_curl() {
 # case-specific check function (defined below the table).
 # ---------------------------------------------------------------------
 
-ALL_COMBOS=(defaults stdio-disabled random-disabled clocks-disabled http-disabled fetch-event-disabled http-and-fetch-event-disabled all-disabled)
+ALL_COMBOS=(
+  defaults
+  stdio-disabled
+  random-disabled
+  clocks-disabled
+  http-disabled
+  fetch-event-disabled
+  http-and-fetch-event-disabled
+  fetch-event-dependency-closure
+  fetch-event-only
+  all-disabled
+)
 REQUESTED=("${@:-${ALL_COMBOS[@]}}")
 
 flags_for() {
@@ -161,6 +172,8 @@ flags_for() {
     http-disabled) echo "-Dfeature-http=false" ;;
     fetch-event-disabled) echo "-Dfeature-fetch-event=false" ;;
     http-and-fetch-event-disabled) echo "-Dfeature-http=false -Dfeature-fetch-event=false" ;;
+    fetch-event-dependency-closure) echo "-Dfeature-stdio=false -Dfeature-clocks=false -Dfeature-http=false" ;;
+    fetch-event-only) echo "-Dfeature-stdio=false -Dfeature-random=false -Dfeature-clocks=false -Dfeature-http=false" ;;
     all-disabled) echo "-Dfeature-stdio=false -Dfeature-random=false -Dfeature-clocks=false -Dfeature-http=false -Dfeature-fetch-event=false" ;;
     *) echo "" ;;
   esac
@@ -296,6 +309,33 @@ check_combo() {
       assert_contains "$name/diagnostic" "$err" "addEventListener('fetch', ...) is disabled by build configuration (feature-selection: fetch-event disabled)"
       ;;
 
+    fetch-event-dependency-closure|fetch-event-only)
+      assert_contains "$name/features.json" "$features_json" '"stdio": false'
+      assert_contains "$name/features.json" "$features_json" '"clocks": false'
+      assert_contains "$name/features.json" "$features_json" '"http": false'
+      assert_contains "$name/features.json" "$features_json" '"fetch-event": true'
+      componentize "$bin" "$HERE/fixtures/probe.js" "probe.wasm" ||
+        { fail_case "$name/componentize" "probe componentization failed"; return; }
+      local wit; wit="$(wit_surface "$bin" "$bin/probe.wasm")"
+      assert_contains "$name/imports" "$wit" "wasi:io/error@0.2.10"
+      assert_contains "$name/imports" "$wit" "wasi:io/poll@0.2.10"
+      assert_contains "$name/imports" "$wit" "wasi:io/streams@0.2.10"
+      assert_contains "$name/imports" "$wit" "wasi:http/types@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:http/outgoing-handler@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:cli/stdin@0.2.10"
+      assert_not_contains "$name/imports" "$wit" "wasi:clocks/monotonic-clock@0.2.10"
+      if [ "$name" = fetch-event-dependency-closure ]; then
+        assert_contains "$name/features.json" "$features_json" '"random": true'
+        assert_contains "$name/imports" "$wit" "wasi:random/random@0.2.10"
+      else
+        assert_contains "$name/features.json" "$features_json" '"random": false'
+        assert_not_contains "$name/imports" "$wit" "wasi:random/random@0.2.10"
+      fi
+      local result; result="$(serve_and_curl "$bin" "$bin/probe.wasm" "")"
+      assert_contains "$name/serve" "$result" "STATUS:200"
+      assert_contains "$name/serve" "$result" "random:ok:"
+      ;;
+
     all-disabled)
       assert_contains "$name/features.json" "$features_json" '"stdio": false'
       assert_contains "$name/features.json" "$features_json" '"random": false'
@@ -345,7 +385,10 @@ check_combo() {
     clocks-disabled) oracle_case="disable-clocks" ;;
     http-disabled) oracle_case="disable-http-only" ;;
     fetch-event-disabled) oracle_case="disable-fetch-event-only" ;;
+    http-and-fetch-event-disabled) oracle_case="disable-http-fetch-event" ;;
     all-disabled) oracle_case="disable-all" ;;
+    fetch-event-dependency-closure) oracle_case="fetch-event-random-only" ;;
+    fetch-event-only) oracle_case="fetch-event-only" ;;
   esac
   if [ -n "$oracle_case" ]; then
     "$bin/wasm-tools" component wit "$bin/probe.wasm" -o "$bin/probe.wit"

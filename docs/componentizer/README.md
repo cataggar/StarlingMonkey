@@ -124,12 +124,16 @@ replacement. Only the exact effective-cache
 directory identity is excluded if it is nested inside a snapshotted source
 tree.
 
-Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
-and feature selection. Build-changing feature/debug options are rejected with
-that override. Public imports metadata for a WIT-selected run requires the
-generated bindings retained by the native runtime build, so `--metadata-out`
-with both `--engine` and `--wit` is rejected rather than reporting an
-incomplete imports list.
+`--engine` accepts only a `starling-raw.wasm` carrying StarlingMonkey's
+integrity-bound embedded engine provenance and a matching sibling
+`features.json`. The provenance records the host API, complete five-feature
+tuple, component world, and surface world and is bound to the core module by a
+SHA-256 digest. The componentizer selects the adapter and WIT closures beside
+that engine, so pure/mixed engines and older supported WASI versions retain
+their exact surface instead of inheriting the componentizer executable's
+defaults. Missing, tampered, or mismatched provenance is rejected before
+Wizer runs. Build-changing feature/debug options remain incompatible with an
+external engine.
 
 ## Diagnostics
 

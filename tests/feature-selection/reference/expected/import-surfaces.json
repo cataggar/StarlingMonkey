@@ -54,6 +54,29 @@
       "handler: func() -> u32"
     ]
   },
+  "disable-http-fetch-event": {
+    "imports": [
+      "wasi:io/error@0.2.10",
+      "wasi:io/poll@0.2.10",
+      "wasi:io/streams@0.2.10",
+      "wasi:cli/stdin@0.2.10",
+      "wasi:cli/stdout@0.2.10",
+      "wasi:cli/stderr@0.2.10",
+      "wasi:cli/terminal-input@0.2.10",
+      "wasi:cli/terminal-output@0.2.10",
+      "wasi:cli/terminal-stdin@0.2.10",
+      "wasi:cli/terminal-stdout@0.2.10",
+      "wasi:cli/terminal-stderr@0.2.10",
+      "wasi:clocks/monotonic-clock@0.2.10",
+      "wasi:clocks/wall-clock@0.2.10",
+      "wasi:filesystem/types@0.2.10",
+      "wasi:filesystem/preopens@0.2.10",
+      "wasi:random/random@0.2.10"
+    ],
+    "exports": [
+      "handler: func() -> u32"
+    ]
+  },
   "disable-fetch-event-only": {
     "imports": [
       "wasi:io/error@0.2.10",
@@ -138,6 +161,31 @@
       "wasi:random/random@0.2.10",
       "wasi:http/types@0.2.10",
       "wasi:http/outgoing-handler@0.2.10"
+    ],
+    "exports": [
+      "handler: func() -> u32"
+    ]
+  },
+  "fetch-event-random-only": {
+    "imports": [
+      "wasi:cli/stderr@0.2.10",
+      "wasi:io/error@0.2.10",
+      "wasi:io/poll@0.2.10",
+      "wasi:io/streams@0.2.10",
+      "wasi:random/random@0.2.10",
+      "wasi:http/types@0.2.10"
+    ],
+    "exports": [
+      "handler: func() -> u32"
+    ]
+  },
+  "fetch-event-only": {
+    "imports": [
+      "wasi:cli/stderr@0.2.10",
+      "wasi:io/error@0.2.10",
+      "wasi:io/poll@0.2.10",
+      "wasi:io/streams@0.2.10",
+      "wasi:http/types@0.2.10"
     ],
     "exports": [
       "handler: func() -> u32"

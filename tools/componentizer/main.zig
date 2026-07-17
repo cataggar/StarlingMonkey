@@ -18,7 +18,9 @@ const PipelineError = error{
     CommandFailed,
     DebugOutputCollision,
     EmptyRuntimeArgument,
+    EngineProvenanceMismatch,
     IncompatibleEngineOptions,
+    InvalidEngineProvenance,
     InvalidBuildRoot,
     InvalidBindingsManifest,
     InvalidMetadataDestination,
@@ -27,6 +29,7 @@ const PipelineError = error{
     InvalidUtf8Path,
     MetadataUnavailable,
     MissingBuildArtifact,
+    MissingEngineProvenance,
     MissingWitFiles,
     PublicationDirectoryChanged,
     RollbackIncomplete,
@@ -2217,6 +2220,24 @@ const Runtime = struct {
     cache_lock: ?File,
 };
 
+const EngineProvenance = struct {
+    host_api: []const u8,
+    features: feature_surface.Features,
+    component_world: []const u8,
+    surface_world: []const u8,
+};
+
+const FeatureManifest = struct {
+    @"host-api": []const u8,
+    @"component-world": []const u8,
+    @"surface-world": []const u8,
+    stdio: bool,
+    random: bool,
+    clocks: bool,
+    http: bool,
+    @"fetch-event": bool,
+};
+
 const WizerTool = struct {
     executable: Snapshot,
     wasmtime_subcommand: bool,
@@ -3345,19 +3366,32 @@ fn externalRuntime(
         transaction,
         "engine",
     )).snapshot;
+    const engine_dir = std.fs.path.dirname(engine_source) orelse
+        return error.InvalidPath;
+    const manifest_source = try std.fs.path.join(
+        allocator,
+        &.{ engine_dir, "features.json" },
+    );
+    const manifest = (try captureInputFile(
+        allocator,
+        io,
+        manifest_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "features.json" }),
+        transaction,
+        "engine provenance",
+    )).snapshot;
+    const provenance = try loadEngineProvenance(
+        allocator,
+        io,
+        engine.path,
+        manifest.path,
+    );
     const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
     else
-        try absolutePath(
+        try std.fs.path.join(
             allocator,
-            cwd,
-            try siblingOrName(
-                allocator,
-                io,
-                executable_dir,
-                "preview1-adapter.wasm",
-                "preview1-adapter.wasm",
-            ),
+            &.{ engine_dir, "preview1-adapter.wasm" },
         );
     const adapter = (try captureInputFile(
         allocator,
@@ -3370,12 +3404,9 @@ fn externalRuntime(
     const component_wit_source = if (config.component_wit orelse config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
-        try siblingOrName(
+        try std.fs.path.join(
             allocator,
-            io,
-            executable_dir,
-            "component-wit",
-            "component-wit",
+            &.{ engine_dir, "component-wit" },
         );
     const dispatch_wit_source = if (config.wit) |path|
         try absolutePath(allocator, cwd, path)
@@ -3406,12 +3437,9 @@ fn externalRuntime(
     const surface_target_wit_source = if (config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
-        try siblingOrName(
+        try std.fs.path.join(
             allocator,
-            io,
-            executable_dir,
-            "surface-wit",
-            "surface-wit",
+            &.{ engine_dir, "surface-wit" },
         );
     const surface_target_wit =
         if (std.mem.eql(u8, surface_target_wit_source, component_wit_source))
@@ -3427,12 +3455,9 @@ fn externalRuntime(
                 try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
                 transaction,
             );
-    const platform_wit_source = try siblingOrName(
+    const platform_wit_source = try std.fs.path.join(
         allocator,
-        io,
-        executable_dir,
-        "feature-wit",
-        "feature-wit",
+        &.{ engine_dir, "feature-wit" },
     );
     const platform_wit = try stageWit(
         allocator,
@@ -3441,24 +3466,284 @@ fn externalRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
         transaction,
     );
+    _ = executable_dir;
     return .{
         .engine = engine,
         .adapter = adapter,
         .component_wit = component_wit.absolute,
-        .component_world = config.component_world_name orelse config.world_name orelse "bindings",
+        .component_world = config.component_world_name orelse
+            config.world_name orelse
+            provenance.component_world,
         .surface_target_wit = surface_target_wit.absolute,
-        .surface_target_world = config.world_name orelse "caller",
+        .surface_target_world = config.world_name orelse provenance.surface_world,
         .platform_wit = platform_wit.absolute,
-        .features = resolveFeatures(config),
+        .features = provenance.features,
         .bindings = null,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
         .component_wit_digest = component_wit.digest,
-        .features_known = false,
+        .features_known = true,
         .zig = null,
         .build_tools = &.{},
         .build_root_digest = null,
         .cache_lock = null,
     };
+}
+
+fn loadEngineProvenance(
+    allocator: Allocator,
+    io: Io,
+    engine: []const u8,
+    manifest_path: []const u8,
+) !EngineProvenance {
+    const module = try readAbsoluteFile(allocator, io, engine);
+    const section = findEngineProvenanceSection(module) catch |err| {
+        std.debug.print(
+            "error: --engine '{s}' has invalid embedded feature/host provenance ({t})\n",
+            .{ engine, err },
+        );
+        return error.InvalidEngineProvenance;
+    } orelse {
+        std.debug.print(
+            "error: --engine '{s}' is missing embedded feature/host provenance\n",
+            .{engine},
+        );
+        return error.MissingEngineProvenance;
+    };
+    const parsed = parseEngineProvenance(section.metadata) catch |err| {
+        std.debug.print(
+            "error: --engine '{s}' has malformed embedded feature/host provenance ({t})\n",
+            .{ engine, err },
+        );
+        return error.InvalidEngineProvenance;
+    };
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(module[0..section.section_start]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, parsed.sha256, &digest_hex)) {
+        std.debug.print(
+            "error: --engine '{s}' provenance digest does not match the engine bytes\n",
+            .{engine},
+        );
+        return error.EngineProvenanceMismatch;
+    }
+
+    const manifest_text = readAbsoluteFile(
+        allocator,
+        io,
+        manifest_path,
+    ) catch {
+        std.debug.print(
+            "error: --engine '{s}' requires sibling features.json provenance\n",
+            .{engine},
+        );
+        return error.MissingEngineProvenance;
+    };
+    const manifest = std.json.parseFromSliceLeaky(
+        FeatureManifest,
+        allocator,
+        manifest_text,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| {
+        std.debug.print(
+            "error: --engine sibling provenance '{s}' is invalid JSON ({t})\n",
+            .{ manifest_path, err },
+        );
+        return error.InvalidEngineProvenance;
+    };
+    const manifest_features = feature_surface.Features{
+        .stdio = manifest.stdio,
+        .random = manifest.random,
+        .clocks = manifest.clocks,
+        .http = manifest.http,
+        .fetch_event = manifest.@"fetch-event",
+    };
+    if (!std.mem.eql(u8, parsed.host_api, manifest.@"host-api") or
+        !std.mem.eql(
+            u8,
+            parsed.component_world,
+            manifest.@"component-world",
+        ) or
+        !std.mem.eql(u8, parsed.surface_world, manifest.@"surface-world") or
+        !featuresEqual(parsed.features, manifest_features))
+    {
+        std.debug.print(
+            "error: --engine '{s}' embedded provenance does not match sibling features.json\n",
+            .{engine},
+        );
+        return error.EngineProvenanceMismatch;
+    }
+    return .{
+        .host_api = parsed.host_api,
+        .features = parsed.features,
+        .component_world = parsed.component_world,
+        .surface_world = parsed.surface_world,
+    };
+}
+
+const EngineProvenanceSection = struct {
+    section_start: usize,
+    metadata: []const u8,
+};
+
+fn findEngineProvenanceSection(
+    module: []const u8,
+) !?EngineProvenanceSection {
+    const wasm_magic = "\x00asm\x01\x00\x00\x00";
+    if (module.len < wasm_magic.len or
+        !std.mem.eql(u8, module[0..wasm_magic.len], wasm_magic))
+    {
+        return error.InvalidWasm;
+    }
+
+    var found: ?EngineProvenanceSection = null;
+    var offset: usize = wasm_magic.len;
+    while (offset < module.len) {
+        const section_start = offset;
+        const section_id = module[offset];
+        offset += 1;
+        const size = try readUleb(module, &offset);
+        const section_end = std.math.add(usize, offset, size) catch
+            return error.InvalidWasm;
+        if (section_end > module.len) return error.InvalidWasm;
+        if (section_id == 0) {
+            var name_offset = offset;
+            const name_len = try readUleb(module, &name_offset);
+            const name_end = std.math.add(usize, name_offset, name_len) catch
+                return error.InvalidWasm;
+            if (name_end > section_end) return error.InvalidWasm;
+            if (std.mem.eql(
+                u8,
+                module[name_offset..name_end],
+                "starling:engine-provenance",
+            )) {
+                if (found != null or section_end != module.len) {
+                    return error.InvalidProvenanceSection;
+                }
+                found = .{
+                    .section_start = section_start,
+                    .metadata = module[name_end..section_end],
+                };
+            }
+        }
+        offset = section_end;
+    }
+    return found;
+}
+
+const ParsedEngineProvenance = struct {
+    sha256: []const u8,
+    host_api: []const u8,
+    features: feature_surface.Features,
+    component_world: []const u8,
+    surface_world: []const u8,
+};
+
+fn parseEngineProvenance(metadata: []const u8) !ParsedEngineProvenance {
+    var lines = std.mem.splitScalar(u8, metadata, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse return error.InvalidMetadata, "schema=1")) {
+        return error.InvalidMetadata;
+    }
+    const digest = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "sha256=",
+    );
+    if (digest.len != 64) return error.InvalidMetadata;
+    for (digest) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) {
+            return error.InvalidMetadata;
+        }
+    }
+    const host_api = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "host-api=",
+    );
+    const feature_tuple = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "features=",
+    );
+    const component_world = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "component-world=",
+    );
+    const surface_world = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "surface-world=",
+    );
+    if ((lines.next() orelse return error.InvalidMetadata).len != 0 or
+        lines.next() != null or
+        !validMetadataValue(host_api) or
+        !validMetadataValue(component_world) or
+        !validMetadataValue(surface_world))
+    {
+        return error.InvalidMetadata;
+    }
+    return .{
+        .sha256 = digest,
+        .host_api = host_api,
+        .features = try featuresFromTuple(feature_tuple),
+        .component_world = component_world,
+        .surface_world = surface_world,
+    };
+}
+
+fn metadataField(line: []const u8, prefix: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, line, prefix) or line.len == prefix.len) {
+        return error.InvalidMetadata;
+    }
+    return line[prefix.len..];
+}
+
+fn validMetadataValue(value: []const u8) bool {
+    return value.len <= 256 and
+        std.unicode.utf8ValidateSlice(value) and
+        std.mem.indexOfAny(u8, value, "\x00\r\n=") == null;
+}
+
+fn featuresFromTuple(tuple: []const u8) !feature_surface.Features {
+    if (tuple.len != 5) return error.InvalidMetadata;
+    var values: [5]bool = undefined;
+    for (tuple, 0..) |byte, index| {
+        values[index] = switch (byte) {
+            '0' => false,
+            '1' => true,
+            else => return error.InvalidMetadata,
+        };
+    }
+    return .{
+        .stdio = values[0],
+        .random = values[1],
+        .clocks = values[2],
+        .http = values[3],
+        .fetch_event = values[4],
+    };
+}
+
+fn featuresEqual(
+    lhs: feature_surface.Features,
+    rhs: feature_surface.Features,
+) bool {
+    return lhs.stdio == rhs.stdio and
+        lhs.random == rhs.random and
+        lhs.clocks == rhs.clocks and
+        lhs.http == rhs.http and
+        lhs.fetch_event == rhs.fetch_event;
+}
+
+fn readUleb(bytes: []const u8, offset: *usize) !usize {
+    var value: usize = 0;
+    var shift: u6 = 0;
+    for (0..5) |_| {
+        if (offset.* >= bytes.len) return error.InvalidWasm;
+        const byte = bytes[offset.*];
+        offset.* += 1;
+        value |= @as(usize, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return value;
+        shift += 7;
+    }
+    return error.InvalidWasm;
 }
 
 fn buildRuntime(
@@ -9944,6 +10229,22 @@ fn requireFile(io: Io, path: []const u8) !void {
     if (stat.kind != .file) return error.MissingBuildArtifact;
 }
 
+fn readAbsoluteFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) ![]const u8 {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var dir = try Dir.openDirAbsolute(io, parent, .{});
+    defer dir.close(io);
+    return dir.readFileAlloc(
+        io,
+        std.fs.path.basename(path),
+        allocator,
+        .unlimited,
+    );
+}
+
 fn requireDestinationFileOrMissing(
     io: Io,
     path: []const u8,
@@ -10468,4 +10769,34 @@ test "runtime build selections include only selected closures" {
     ));
     try std.testing.expect(!treePathSelected("deps/source", &selected));
     try std.testing.expect(!treePathSelected(".zig-cache", &selected));
+}
+
+test "engine provenance requires a complete feature and topology tuple" {
+    const parsed = try parseEngineProvenance(
+        "schema=1\n" ++
+            "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
+            "host-api=wasi-0.2.3\n" ++
+            "features=01001\n" ++
+            "component-world=custom-bindings\n" ++
+            "surface-world=caller\n",
+    );
+    try std.testing.expectEqualStrings("wasi-0.2.3", parsed.host_api);
+    try std.testing.expect(!parsed.features.stdio);
+    try std.testing.expect(parsed.features.random);
+    try std.testing.expect(parsed.features.fetch_event);
+    try std.testing.expectEqualStrings(
+        "custom-bindings",
+        parsed.component_world,
+    );
+    try std.testing.expectError(
+        error.InvalidMetadata,
+        parseEngineProvenance(
+            "schema=1\n" ++
+                "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
+                "host-api=wasi-0.2.3\n" ++
+                "features=1111\n" ++
+                "component-world=bindings\n" ++
+                "surface-world=caller\n",
+        ),
+    );
 }

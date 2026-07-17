@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.27)
+
+if(WEVAL)
+    message(FATAL_ERROR
+        "CMake WEVAL builds are no longer supported. "
+        "Use the sealed Zig AOT path: "
+        "zig build -Doptimize=ReleaseSmall -Daot-engine=true."
+    )
+endif()
+
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
@@ -20,10 +29,51 @@ else()
 endif()
 message(STATUS "Using host API: ${HOST_API}")
 get_filename_component(HOST_API_NAME "${HOST_API}" NAME)
+set(
+    HOST_API_WORLD "bindings"
+    CACHE STRING "Default component world in the selected host API WIT package"
+)
 if(HOST_API_NAME MATCHES "^wasi-(.+)$")
     set(HOST_API_VERSION "${CMAKE_MATCH_1}")
 else()
     set(HOST_API_VERSION "")
+endif()
+set(
+    CUSTOM_FEATURE_SURFACE_ORACLE ""
+    CACHE FILEPATH "Exact import/export oracle JSON for a custom host API"
+)
+set(
+    CUSTOM_FEATURE_SURFACE_CASE ""
+    CACHE STRING "Case key in CUSTOM_FEATURE_SURFACE_ORACLE"
+)
+set(
+    CUSTOM_HOST_API_VERSION ""
+    CACHE STRING "Version substituted into a custom exact-surface oracle"
+)
+set(
+    CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS ""
+    CACHE STRING "Comma-separated exact exports for a custom host API"
+)
+set(CUSTOM_SURFACE_ORACLE_VALUES
+    CUSTOM_FEATURE_SURFACE_ORACLE
+    CUSTOM_FEATURE_SURFACE_CASE
+    CUSTOM_HOST_API_VERSION
+    CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS
+)
+set(CUSTOM_SURFACE_ORACLE_COUNT 0)
+foreach(CUSTOM_SURFACE_ORACLE_VALUE IN LISTS CUSTOM_SURFACE_ORACLE_VALUES)
+    if(NOT "${${CUSTOM_SURFACE_ORACLE_VALUE}}" STREQUAL "")
+        math(EXPR CUSTOM_SURFACE_ORACLE_COUNT "${CUSTOM_SURFACE_ORACLE_COUNT} + 1")
+    endif()
+endforeach()
+if(NOT CUSTOM_SURFACE_ORACLE_COUNT EQUAL 0 AND
+   NOT CUSTOM_SURFACE_ORACLE_COUNT EQUAL 4)
+    message(FATAL_ERROR
+        "Custom exact-surface validation requires all of "
+        "CUSTOM_FEATURE_SURFACE_ORACLE, CUSTOM_FEATURE_SURFACE_CASE, "
+        "CUSTOM_HOST_API_VERSION, and "
+        "CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS"
+    )
 endif()
 
 # Ensure that the CPM cache is created outside the build dir, even if no location is specified by the developer.
@@ -35,6 +85,7 @@ include("toolchain")
 
 project(StarlingMonkey)
 find_program(BASH_PROGRAM NAMES bash REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 option(FEATURE_STDIO "Enable WASI stdio capabilities" ON)
 option(FEATURE_RANDOM "Enable WASI random capabilities" ON)
@@ -57,6 +108,8 @@ file(GENERATE
     CONTENT
 "{
   \"host-api\": \"${HOST_API_NAME}\",
+  \"component-world\": \"${HOST_API_WORLD}\",
+  \"surface-world\": \"caller\",
   \"stdio\": ${FEATURE_STDIO_JSON},
   \"random\": ${FEATURE_RANDOM_JSON},
   \"clocks\": ${FEATURE_CLOCKS_JSON},
@@ -84,6 +137,12 @@ elseif(FEATURE_TUPLE STREQUAL "11101")
     set(FEATURE_SURFACE_CASE "disable-http-only")
 elseif(FEATURE_TUPLE STREQUAL "11110")
     set(FEATURE_SURFACE_CASE "disable-fetch-event-only")
+elseif(FEATURE_TUPLE STREQUAL "11100")
+    set(FEATURE_SURFACE_CASE "disable-http-fetch-event")
+elseif(FEATURE_TUPLE STREQUAL "01001")
+    set(FEATURE_SURFACE_CASE "fetch-event-random-only")
+elseif(FEATURE_TUPLE STREQUAL "00001")
+    set(FEATURE_SURFACE_CASE "fetch-event-only")
 endif()
 
 add_compile_definitions(
@@ -98,7 +157,6 @@ include("init-corrosion")
 
 include("wasm-tools")
 include("binaryen")
-include("weval")
 include("wasmtime")
 include("cbindgen")
 
@@ -170,39 +228,38 @@ else()
     endif()
 endif()
 
-# build a compilation cache of ICs
-if(WEVAL)
-    include("weval")
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/null.js "function main() {}")
-    set(WEVAL_CACHE_FILE "starling-ics.wevalcache")
-    set(WEVAL_CACHE_PATH "${CMAKE_CURRENT_BINARY_DIR}/${WEVAL_CACHE_FILE}")
-    set(WEVAL_CACHE_STAMP "${WEVAL_CACHE_PATH}.stamp")
-    add_custom_command(
-        OUTPUT "${WEVAL_CACHE_STAMP}"
-        BYPRODUCTS "${WEVAL_CACHE_PATH}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-        COMMAND
-            ${BASH_PROGRAM} "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-weval-cache.sh"
-            "${WEVAL_BIN}"
-            "${CMAKE_CURRENT_BINARY_DIR}/starling-raw.wasm"
-            "${CMAKE_CURRENT_BINARY_DIR}/null.js"
-            "${WEVAL_CACHE_PATH}"
-        COMMAND "${CMAKE_COMMAND}" -E touch "${WEVAL_CACHE_STAMP}"
-        DEPENDS
-            starling-raw.wasm
-            "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-weval-cache.sh"
-            "${CMAKE_CURRENT_BINARY_DIR}/null.js"
-        VERBATIM
-    )
-    add_custom_target(
-        starling-ics.wevalcache
-        ALL
-        DEPENDS "${WEVAL_CACHE_STAMP}"
-    )
-    set(AOT 1)
-else()
-    set(AOT 0)
-endif()
+set(ENGINE_PROVENANCE_SCRIPT
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-engine-provenance.py"
+)
+set(ENGINE_PROVENANCE_SETTINGS
+    "${CMAKE_CURRENT_BINARY_DIR}/engine-provenance.settings"
+)
+file(GENERATE
+    OUTPUT "${ENGINE_PROVENANCE_SETTINGS}"
+    CONTENT "host-api=${HOST_API_NAME}\nfeatures=${FEATURE_TUPLE}\ncomponent-world=${HOST_API_WORLD}\nsurface-world=caller\n"
+)
+set_property(
+    TARGET starling-raw.wasm APPEND
+    PROPERTY LINK_DEPENDS
+        "${ENGINE_PROVENANCE_SCRIPT}" "${ENGINE_PROVENANCE_SETTINGS}"
+)
+add_custom_command(
+    TARGET starling-raw.wasm
+    POST_BUILD
+    COMMAND
+        "${Python3_EXECUTABLE}" "${ENGINE_PROVENANCE_SCRIPT}"
+        "$<TARGET_FILE:starling-raw.wasm>"
+        "$<TARGET_FILE:starling-raw.wasm>.provenance"
+        "${HOST_API_NAME}" "${FEATURE_TUPLE}" "${HOST_API_WORLD}" "caller"
+    COMMAND
+        "${CMAKE_COMMAND}" -E rename
+        "$<TARGET_FILE:starling-raw.wasm>.provenance"
+        "$<TARGET_FILE:starling-raw.wasm>"
+    VERBATIM
+)
+
+set(EXTERNAL_RUNTIME_FILE "starling-raw.wasm")
+set(AOT 0)
 
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")
@@ -250,8 +307,11 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY
 )
-if(ZIG_VERSION VERSION_LESS 0.17)
-    message(FATAL_ERROR "starling-feature-surface requires Zig 0.17 or newer; found ${ZIG_VERSION}")
+set(STARLING_ZIG_VERSION "0.17.0-dev.902+7255f3e72")
+if(NOT ZIG_VERSION STREQUAL STARLING_ZIG_VERSION)
+    message(FATAL_ERROR
+        "StarlingMonkey requires Zig ${STARLING_ZIG_VERSION}; found ${ZIG_VERSION}"
+    )
 endif()
 
 set(FEATURE_SURFACE_BIN "${CMAKE_CURRENT_BINARY_DIR}/starling-feature-surface")
@@ -314,8 +374,7 @@ endforeach()
 
 configure_file("${WASM_TOOLS_BIN}" "${CMAKE_CURRENT_BINARY_DIR}/wasm-tools" COPYONLY)
 configure_file("${WASMTIME}" "${CMAKE_CURRENT_BINARY_DIR}/wasmtime" COPYONLY)
-configure_file("${WEVAL_BIN}" "${CMAKE_CURRENT_BINARY_DIR}/weval" COPYONLY)
-set(COMPONENT_WORLD "bindings")
+set(COMPONENT_WORLD "${HOST_API_WORLD}")
 set(SURFACE_TARGET_WORLD "caller")
 set(FEATURE_STDIO "${FEATURE_STDIO_VALUE}")
 set(FEATURE_RANDOM "${FEATURE_RANDOM_VALUE}")
@@ -357,15 +416,11 @@ install(
         "${FEATURE_SURFACE_BIN}"
         "${CMAKE_CURRENT_BINARY_DIR}/wasm-tools"
         "${CMAKE_CURRENT_BINARY_DIR}/wasmtime"
-        "${CMAKE_CURRENT_BINARY_DIR}/weval"
         "${WAC_BIN}"
     DESTINATION bin
 )
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${ADAPTER_FILE}" DESTINATION bin)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/features.json" DESTINATION bin)
-if(WEVAL)
-    install(FILES "${WEVAL_CACHE_PATH}" DESTINATION bin)
-endif()
 install(
     DIRECTORY
         "${FEATURE_WIT_DIR}"

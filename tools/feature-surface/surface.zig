@@ -121,8 +121,9 @@ pub fn apply(
             platform_dir,
         },
     );
-    const platform_root = try path(allocator, platform_dir, "bindings.wit");
+    const platform_root = try generatedRootWit(allocator, io, platform_dir);
     const platform_text = try readFile(allocator, io, platform_root);
+    try validateGeneratedRootWit(platform_text);
     const platform_imports = try collectWasiImports(allocator, platform_text);
     var actual_imports: []const []const u8 = &.{};
     if (options.inspect_candidate) {
@@ -251,8 +252,9 @@ fn buildProvider(
             provider_dir,
         },
     );
-    const provider_wit = try path(allocator, provider_dir, "component.wit");
+    const provider_wit = try generatedRootWit(allocator, io, provider_dir);
     const provider_base_text = try readFile(allocator, io, provider_wit);
+    try validateGeneratedRootWit(provider_base_text);
     const provider_text = try renderProviderWit(
         allocator,
         provider_base_text,
@@ -360,6 +362,7 @@ fn shouldProvide(
     runtime_config: RuntimeConfig,
 ) bool {
     const target_requires = contains(target_imports, name);
+    const dependencies = featureDependencies(features);
 
     if (interface(name, "wasi:random/random")) return !features.random;
     if (interface(name, "wasi:random/insecure") or
@@ -386,12 +389,10 @@ fn shouldProvide(
         return !features.stdio;
     }
     if (interface(name, "wasi:http/outgoing-handler")) return !features.http;
-    if (interface(name, "wasi:http/types")) {
-        return !features.http and !features.fetch_event;
-    }
+    if (interface(name, "wasi:http/types")) return !dependencies.http_types;
     if (std.mem.startsWith(u8, name, "wasi:io/")) {
         if (target_requires) return false;
-        return !features.stdio and !features.clocks and !features.http;
+        return !dependencies.io_resource_identities;
     }
     if (std.mem.startsWith(u8, name, "wasi:filesystem/")) {
         if (target_requires) return false;
@@ -403,6 +404,7 @@ fn shouldProvide(
         if (target_requires) return false;
         return demand_driven or features.pure();
     }
+
     if (interface(name, "wasi:cli/environment")) {
         if (runtime_config == .external or target_requires) return false;
         return demand_driven or features.pure();
@@ -410,6 +412,21 @@ fn shouldProvide(
 
     if (target_requires) return false;
     return demand_driven or features.pure();
+}
+
+const FeatureDependencies = struct {
+    http_types: bool,
+    io_resource_identities: bool,
+};
+
+fn featureDependencies(features: Features) FeatureDependencies {
+    const http_types = features.http or features.fetch_event;
+    return .{
+        .http_types = http_types,
+        .io_resource_identities = features.stdio or
+            features.clocks or
+            http_types,
+    };
 }
 
 fn interface(name: []const u8, prefix: []const u8) bool {
@@ -522,6 +539,61 @@ fn contains(values: []const []const u8, needle: []const u8) bool {
 
 fn path(allocator: Allocator, directory: []const u8, basename: []const u8) ![]const u8 {
     return std.fs.path.join(allocator, &.{ directory, basename });
+}
+
+fn generatedRootWit(
+    allocator: Allocator,
+    io: Io,
+    directory: []const u8,
+) ![]const u8 {
+    var dir = try Dir.openDirAbsolute(io, directory, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    var root: ?[]const u8 = null;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or
+            !std.mem.endsWith(u8, entry.path, ".wit") or
+            std.fs.path.dirname(entry.path) != null)
+        {
+            continue;
+        }
+        if (root != null) {
+            std.debug.print(
+                "error: generated WIT directory '{s}' has multiple root packages ('{s}' and '{s}')\n",
+                .{ directory, root.?, entry.path },
+            );
+            return error.AmbiguousGeneratedWitRoot;
+        }
+        root = try allocator.dupe(u8, entry.path);
+    }
+    const relative = root orelse {
+        std.debug.print(
+            "error: generated WIT directory '{s}' has no root package\n",
+            .{directory},
+        );
+        return error.MissingGeneratedWitRoot;
+    };
+    return path(allocator, directory, relative);
+}
+
+fn validateGeneratedRootWit(text: []const u8) !void {
+    var packages: usize = 0;
+    var worlds: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "package ") and
+            std.mem.endsWith(u8, trimmed, ";"))
+        {
+            packages += 1;
+        }
+        if (std.mem.startsWith(u8, trimmed, "world ")) worlds += 1;
+    }
+    if (packages != 1 or worlds == 0) {
+        return error.InvalidGeneratedWitRoot;
+    }
 }
 
 fn passPath(
@@ -680,6 +752,57 @@ test "pure mode provides every residual for a world without WASI imports" {
         true,
         .external,
     ));
+}
+
+test "fetch-event preserves HTTP resource dependency identities" {
+    const fetch_only = Features{
+        .stdio = false,
+        .random = false,
+        .clocks = false,
+        .http = false,
+        .fetch_event = true,
+    };
+    for ([_][]const u8{
+        "wasi:http/types@0.2.10",
+        "wasi:io/error@0.2.10",
+        "wasi:io/poll@0.2.10",
+        "wasi:io/streams@0.2.10",
+    }) |name| {
+        try std.testing.expect(!shouldProvide(
+            name,
+            &.{},
+            fetch_only,
+            true,
+            .snapshotted,
+        ));
+    }
+    try std.testing.expect(shouldProvide(
+        "wasi:http/outgoing-handler@0.2.10",
+        &.{},
+        fetch_only,
+        true,
+        .snapshotted,
+    ));
+    try std.testing.expect(shouldProvide(
+        "wasi:random/random@0.2.10",
+        &.{},
+        fetch_only,
+        true,
+        .snapshotted,
+    ));
+}
+
+test "generated root WIT metadata is validated independently of its filename" {
+    try validateGeneratedRootWit(
+        \\package custom:runtime-package;
+        \\
+        \\world non-bindings {}
+        \\
+    );
+    try std.testing.expectError(
+        error.InvalidGeneratedWitRoot,
+        validateGeneratedRootWit("world missing-package {}\n"),
+    );
 }
 
 test "provider WIT exports only selected interfaces" {
