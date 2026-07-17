@@ -46,6 +46,7 @@ SM_REPO="https://github.com/bytecodealliance/firefox.git"
 OPENSSL_VERSION="3.0.17"
 
 command -v zig >/dev/null || { echo "zig not found on PATH"; exit 1; }
+"$ROOT/scripts/require-zig-version.sh" "$(command -v zig)"
 command -v cargo >/dev/null || { echo "cargo not found on PATH"; exit 1; }
 command -v flock >/dev/null || { echo "flock not found on PATH"; exit 1; }
 

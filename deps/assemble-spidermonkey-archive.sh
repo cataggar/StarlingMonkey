@@ -20,6 +20,8 @@ base_archive="$6"
 object_root="$7"
 shift 7
 objects=("$@")
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"$ROOT/scripts/require-zig-version.sh" "$zig"
 schema=starling-spidermonkey-archive-v1
 
 input_key() {

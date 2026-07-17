@@ -8,6 +8,7 @@ fi
 
 ZIG="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"$ROOT/scripts/require-zig-version.sh" "$ZIG"
 ASSEMBLER="$ROOT/deps/assemble-spidermonkey-archive.sh"
 SCRATCH="$ROOT/deps/.spidermonkey-archive-test"
 OBJECT_ROOT="$SCRATCH/objects"

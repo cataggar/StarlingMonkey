@@ -163,11 +163,25 @@ defaults to a bundle beside the engine. `--weval-bin` must identify the exact
 selected package path in the seal. A Zig AOT installation owns the complete
 closure under `weval-package/`, with `weval-package/weval` as the managed
 selection. `bin/weval` is only a convenience entry point and resolves to that
-managed selection; it is not a second compatibility identity. Missing artifacts, malformed manifests, non-SQLite or
+managed selection; it is not a second compatibility identity.
+
+An external engine package must carry schema-1
+`starling:engine-provenance`, a matching five-feature `features.json`,
+`preview1-adapter.wasm`, and nonempty `component-wit/`, `surface-wit/`, and
+`feature-wit/` trees containing the declared component and surface worlds.
+Missing or incompatible provenance, features, or worlds is rejected before
+the engine is used. AOT derives the required feature ABI from that validated
+provenance and requires the seal to match it.
+
+Missing artifacts, malformed manifests, non-SQLite or
 checksum-corrupt caches, and engine/tool/feature mismatches all fail before
 initialization or output publication; there is no Wizer fallback.
-The validated engine, cache, and manifest are copied into a private per-run
-snapshot. The Weval snapshot scope is the selected executable's canonical
+The engine, cache, manifest, and every Weval package entry are retained by
+no-follow handles before a private per-run snapshot is assembled. Snapshot
+bytes are read only from those handles; before/after object, namespace, and
+digest checks reject unrestored substitution or retained-object mutation.
+A transient rename/substitution that is restored may complete, but substituted
+bytes are never copied or executed. The Weval snapshot scope is the selected executable's canonical
 containing directory and all descendants (at most 4,096 entries, 32 levels,
 and 1 GiB of regular-file data). Descriptor-relative, no-follow traversal
 copies stable regular files, directories, and relative symlinks; dangling,

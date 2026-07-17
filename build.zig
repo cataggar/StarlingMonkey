@@ -8,6 +8,7 @@ const RuntimeBuildTool = struct {
     executable: std.Build.LazyPath,
 };
 
+
 fn dependencyExecutable(
     dependency: *std.Build.Dependency,
     name: []const u8,
@@ -198,6 +199,7 @@ pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
         std.debug.print(
             "error: StarlingMonkey requires Zig {s}; found {s}\n",
+            "error: StarlingMonkey v0.4 requires Zig {s}; found {s}\n",
             .{ required_zig_version, builtin.zig_version_string },
         );
         @panic("unsupported Zig version");
@@ -382,6 +384,12 @@ pub fn build(b: *std.Build) void {
         b.path("scripts/check-release-artifacts.sh"),
     );
     componentizer_test_step.dependOn(&release_inventory_test.step);
+    const zig_version_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-zig-version.sh" },
+    );
+    zig_version_test.addFileArg(b.path("scripts/require-zig-version.sh"));
+    zig_version_test.addArg(b.graph.zig_exe);
+    componentizer_test_step.dependOn(&zig_version_test.step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
@@ -785,6 +793,31 @@ pub fn build(b: *std.Build) void {
 
     const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
 
+    const provenance_tool = b.addExecutable(.{
+        .name = "starling-engine-provenance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "tools/componentizer/engine_provenance.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const add_provenance = b.addRunArtifact(provenance_tool);
+    add_provenance.addFileArg(raw_wasm);
+    const provenance_wasm =
+        add_provenance.addOutputFileArg("starling-raw.wasm");
+    add_provenance.addArgs(&.{
+        host_api_name,
+        component_world orelse "js-dispatch",
+        dispatch_world orelse "js-exports",
+        if (features.stdio) "true" else "false",
+        if (features.random) "true" else "false",
+        if (features.clocks) "true" else "false",
+        if (features.http) "true" else "false",
+        if (features.fetch_event) "true" else "false",
+    });
+    raw_wasm = provenance_wasm;
     var aot_bundle_publish: ?*std.Build.Step.Run = null;
     if (!aot_engine)
         _ = addPrefixBinFile(b, null, raw_wasm, "starling-raw.wasm");
@@ -944,12 +977,26 @@ pub fn build(b: *std.Build) void {
         b.path(adapter),
         "preview1-adapter.wasm",
     );
-    if (component_wit) |wit_dir| {
+    const default_wit = b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    for ([_]struct { source: []const u8, destination: []const u8 }{
+        .{
+            .source = component_wit orelse default_wit,
+            .destination = "component-wit",
+        },
+        .{
+            .source = dispatch_wit orelse default_wit,
+            .destination = "surface-wit",
+        },
+        .{
+            .source = default_wit,
+            .destination = "feature-wit",
+        },
+    }) |wit| {
         _ = addPrefixBinDirectory(
             b,
             aot_generation,
-            b.path(wit_dir),
-            "component-wit",
+            b.path(wit.source),
+            wit.destination,
             &.{".wit"},
         );
     }

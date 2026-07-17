@@ -89,8 +89,12 @@ touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
 printf 'adapter-bytes\n' > \
   "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
+ENGINE_PACKAGE="$WORK/external engine package"
+FEATURE_ABI='starling-features-v1;stdio=1;random=1;clocks=1;http=1;fetch-event=1;optimize=ReleaseSmall;host-api=wasi-0.2.10;debugger=1'
 rm -rf "$SCRATCH"
-mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package"
+mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package" \
+  "$ENGINE_PACKAGE/component-wit" "$ENGINE_PACKAGE/surface-wit" \
+  "$ENGINE_PACKAGE/feature-wit"
 NOEXEC_MOUNTED=0
 NOEXEC_OUTPUT_DIR=""
 unmount_noexec() {
@@ -123,6 +127,8 @@ ENGINE_BUNDLE="$WORK/default engine bundle"
 ENGINE="$ENGINE_BUNDLE/fake engine.wasm"
 ENGINE_BASE="$WORK/fake engine base.wasm"
 ADAPTER="$ENGINE_BUNDLE/preview1-adapter.wasm"
+ENGINE="$ENGINE_PACKAGE/fake engine.wasm"
+ADAPTER="$ENGINE_PACKAGE/preview1-adapter.wasm"
 WIT="$WORK/wit package"
 mkdir -p "$ENGINE_BUNDLE"
 printf 'export const api = {};\n' > "$SOURCE"
@@ -130,7 +136,56 @@ printf '\0asm\1\0\0\0\0\6\4seedA' > "$ENGINE_BASE"
 python3 "$ROOT/tools/embed-engine-provenance.py" \
   "$ENGINE_BASE" "$ENGINE" "$(basename "$EXPECTED_HOST_API")" 11111 \
   exports exports
+
 printf 'adapter-bytes\n' > "$ADAPTER"
+cat > "$ENGINE_PACKAGE/features.json" <<'EOF'
+{"stdio":true,"random":true,"clocks":true,"http":true,"fetch-event":true}
+EOF
+cat > "$ENGINE_PACKAGE/component-wit/world.wit" <<'EOF'
+package test:componentizer;
+world exports {}
+EOF
+cat > "$ENGINE_PACKAGE/surface-wit/world.wit" <<'EOF'
+package test:surface;
+world surface {}
+EOF
+cat > "$ENGINE_PACKAGE/feature-wit/world.wit" <<'EOF'
+package test:feature;
+world feature {}
+EOF
+python3 - "$ENGINE" <<'PY'
+import json
+import sys
+
+name = b"starling:engine-provenance"
+provenance = json.dumps({
+    "schema": 1,
+    "host_api": "wasi-0.2.10",
+    "features": {
+        "stdio": True,
+        "random": True,
+        "clocks": True,
+        "http": True,
+        "fetch-event": True,
+    },
+    "component_world": "exports",
+    "surface_world": "surface",
+}, separators=(",", ":")).encode()
+
+def uleb(value):
+    result = bytearray()
+    while True:
+        byte = value & 0x7f
+        value >>= 7
+        result.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(result)
+
+payload = uleb(len(name)) + name + provenance
+open(sys.argv[1], "wb").write(
+    b"\0asm\1\0\0\0" + b"\0" + uleb(len(payload)) + payload
+)
+PY
 cat > "$WIT/world.wit" <<'EOF'
 package test:componentizer;
 world exports {}
@@ -833,6 +888,74 @@ pub const js_import_manifest: []const u8 =
 EOF
 EXPECTED_ZIG_GLOBAL_CACHE="${ZIG_GLOBAL_CACHE_DIR:-}"
 
+expect_external_package_rejection() {
+  local package="$1" label="$2"
+  local output="$WORK/$label external rejection.wasm"
+  printf 'preserved external rejection\n' > "$output"
+  if PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+    --engine "$package/fake engine.wasm" \
+    --preview2-adapter "$package/preview1-adapter.wasm" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin path-wizer \
+    --wabt-bin path-wabt \
+    --wasm-tools-bin path-wasm-tools \
+    --out "$output" \
+    "$SOURCE" >"$SCRATCH/$label-external.log" 2>&1
+  then
+    echo "FAIL: $label external engine package was accepted" >&2
+    exit 1
+  fi
+  grep -Fq InvalidEngineProvenance "$SCRATCH/$label-external.log"
+  test "$(cat "$output")" = "preserved external rejection"
+}
+
+MISSING_PROVENANCE_PACKAGE="$WORK/missing provenance package"
+cp -a "$ENGINE_PACKAGE" "$MISSING_PROVENANCE_PACKAGE"
+printf '\0asm\1\0\0\0' \
+  > "$MISSING_PROVENANCE_PACKAGE/fake engine.wasm"
+expect_external_package_rejection \
+  "$MISSING_PROVENANCE_PACKAGE" missing-provenance
+
+INCOMPATIBLE_PROVENANCE_PACKAGE="$WORK/incompatible provenance package"
+cp -a "$ENGINE_PACKAGE" "$INCOMPATIBLE_PROVENANCE_PACKAGE"
+sed -i 's/"schema":1/"schema":2/' \
+  "$INCOMPATIBLE_PROVENANCE_PACKAGE/fake engine.wasm"
+expect_external_package_rejection \
+  "$INCOMPATIBLE_PROVENANCE_PACKAGE" incompatible-provenance
+
+MISSING_FEATURES_PACKAGE="$WORK/missing features package"
+cp -a "$ENGINE_PACKAGE" "$MISSING_FEATURES_PACKAGE"
+rm "$MISSING_FEATURES_PACKAGE/features.json"
+expect_external_package_rejection \
+  "$MISSING_FEATURES_PACKAGE" missing-features
+
+INCOMPATIBLE_FEATURES_PACKAGE="$WORK/incompatible features package"
+cp -a "$ENGINE_PACKAGE" "$INCOMPATIBLE_FEATURES_PACKAGE"
+sed -i 's/"http":true/"http":false/' \
+  "$INCOMPATIBLE_FEATURES_PACKAGE/features.json"
+expect_external_package_rejection \
+  "$INCOMPATIBLE_FEATURES_PACKAGE" incompatible-features
+
+MISSING_WORLD_PACKAGE="$WORK/missing world package"
+cp -a "$ENGINE_PACKAGE" "$MISSING_WORLD_PACKAGE"
+sed -i 's/world exports/world absent/' \
+  "$MISSING_WORLD_PACKAGE/component-wit/world.wit"
+expect_external_package_rejection \
+  "$MISSING_WORLD_PACKAGE" missing-component-world
+
+MISSING_SURFACE_PACKAGE="$WORK/missing surface package"
+cp -a "$ENGINE_PACKAGE" "$MISSING_SURFACE_PACKAGE"
+rm -rf "$MISSING_SURFACE_PACKAGE/surface-wit"
+expect_external_package_rejection \
+  "$MISSING_SURFACE_PACKAGE" missing-surface-world
+
+MISSING_FEATURE_WIT_PACKAGE="$WORK/missing feature WIT package"
+cp -a "$ENGINE_PACKAGE" "$MISSING_FEATURE_WIT_PACKAGE"
+rm -rf "$MISSING_FEATURE_WIT_PACKAGE/feature-wit"
+expect_external_package_rejection \
+  "$MISSING_FEATURE_WIT_PACKAGE" missing-feature-wit
+
 PATH_OVERRIDE_OUTPUT="$WORK/path override output.wasm"
 PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --engine "$ENGINE" \
@@ -880,6 +1003,7 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
   --wasmtime-bin path-wasmtime \
+  --wabt-bin path-wabt \
   --wasm-tools-bin path-wasm-tools \
   --out "$PATH_WASMTIME_OUTPUT" \
   "$SOURCE"
@@ -891,6 +1015,7 @@ env PATH="$TOOLS:$PATH" \
   "$COMPONENTIZER" \
     --engine "$ENGINE" \
     --preview2-adapter "$ADAPTER" \
+    --wabt-bin path-wabt \
     --out "$PATH_WASMTIME_ENV_OUTPUT" \
     "$SOURCE"
 cmp "$ENGINE" "$PATH_WASMTIME_ENV_OUTPUT"
@@ -1650,14 +1775,14 @@ PY
   --weval "$FAKE_WEVAL" \
   --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
   --primer "$SOURCE" \
-  --feature-abi 'starling-features-v1;fake=1' \
+  --feature-abi "$FEATURE_ABI" \
   --out "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
 "$CACHE_TOOL" validate \
   --engine "$ENGINE" \
   --weval "$FAKE_WEVAL" \
   --cache "$AOT_BUNDLE/starling-ics.wevalcache" \
   --manifest "$AOT_BUNDLE/starling-ics.wevalcache.manifest" \
-  --feature-abi 'starling-features-v1;fake=1'
+  --feature-abi "$FEATURE_ABI"
 python3 - "$AOT_BUNDLE/starling-ics.wevalcache" <<'PY'
 import sqlite3
 import sys
@@ -1678,7 +1803,7 @@ seal_fixture_bundle() {
     --weval "$weval" \
     --cache "$bundle/starling-ics.wevalcache" \
     --primer "$SOURCE" \
-    --feature-abi 'starling-features-v1;fake=1' \
+    --feature-abi "$FEATURE_ABI" \
     --out "$bundle/starling-ics.wevalcache.manifest"
 }
 
@@ -2001,7 +2126,7 @@ expect_seal_failure() {
     --weval "$FAKE_WEVAL" \
     --cache "$cache" \
     --primer "$SOURCE" \
-    --feature-abi 'starling-features-v1;fake=1' \
+    --feature-abi "$FEATURE_ABI" \
     --out "$WORK/$label.manifest"
   then
     echo "FAIL: $label cache unexpectedly sealed" >&2
@@ -2155,7 +2280,150 @@ DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
   "$SOURCE"
 cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
 
-RACE_ENGINE="$WORK/race engine.wasm"
+SUBSTITUTE_ROOT="$SCRATCH/coherent substituted AOT inputs"
+SUBSTITUTE_ENGINE="$SUBSTITUTE_ROOT/substituted engine.wasm"
+SUBSTITUTE_WEVAL_PACKAGE="$SUBSTITUTE_ROOT/substituted weval package"
+SUBSTITUTE_WEVAL="$SUBSTITUTE_WEVAL_PACKAGE/fake weval"
+SUBSTITUTE_BUNDLE="$SUBSTITUTE_ROOT/substituted bundle"
+mkdir -p "$SUBSTITUTE_WEVAL_PACKAGE" "$SUBSTITUTE_BUNDLE"
+cp "$ENGINE" "$SUBSTITUTE_ENGINE"
+printf '\0\1\0' >> "$SUBSTITUTE_ENGINE"
+cp -a "$WEVAL_PACKAGE/." "$SUBSTITUTE_WEVAL_PACKAGE/"
+printf '# coherent substituted package\n' >> "$SUBSTITUTE_WEVAL"
+python3 - "$SUBSTITUTE_BUNDLE/raw.wevalcache" \
+  "$SUBSTITUTE_ENGINE" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+with open(sys.argv[2], "rb") as engine:
+    engine_hash = hashlib.sha256(engine.read()).digest()
+db = sqlite3.connect(sys.argv[1])
+db.execute("""create table weval_cache(
+    module_hash blob not null,
+    key blob not null,
+    result blob not null,
+    created_time integer not null
+)""")
+db.execute("create index idx on weval_cache(module_hash, key)")
+db.execute(
+    "insert into weval_cache values (?, ?, ?, 1)",
+    (engine_hash, b"substituted-key", b"substituted-result"),
+)
+db.commit()
+db.close()
+PY
+"$CACHE_TOOL" seal \
+  --engine "$SUBSTITUTE_ENGINE" \
+  --weval "$SUBSTITUTE_WEVAL" \
+  --cache "$SUBSTITUTE_BUNDLE/raw.wevalcache" \
+  --cache-out "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache" \
+  --primer "$SOURCE" \
+  --feature-abi "$FEATURE_ABI" \
+  --out "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache.manifest"
+"$CACHE_TOOL" validate \
+  --engine "$SUBSTITUTE_ENGINE" \
+  --weval "$SUBSTITUTE_WEVAL" \
+  --cache "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache" \
+  --manifest "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache.manifest" \
+  --feature-abi "$FEATURE_ABI"
+
+wait_for_capture_hook() {
+  local ready="$1"
+  for _ in $(seq 1 10000); do
+    test -e "$ready" && return
+    sleep 0.001
+  done
+  echo "FAIL: timed out waiting for AOT capture hook" >&2
+  exit 1
+}
+
+install_coherent_substitute() {
+  mv "$ENGINE" "$ENGINE.capture-original"
+  cp "$SUBSTITUTE_ENGINE" "$ENGINE"
+  mv "$AOT_BUNDLE/starling-ics.wevalcache" \
+    "$AOT_BUNDLE/starling-ics.wevalcache.capture-original"
+  cp "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache" \
+    "$AOT_BUNDLE/starling-ics.wevalcache"
+  mv "$AOT_BUNDLE/starling-ics.wevalcache.manifest" \
+    "$AOT_BUNDLE/starling-ics.wevalcache.manifest.capture-original"
+  cp "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache.manifest" \
+    "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+  mv "$WEVAL_PACKAGE" "$WEVAL_PACKAGE.capture-original"
+  cp -a "$SUBSTITUTE_WEVAL_PACKAGE" "$WEVAL_PACKAGE"
+}
+
+restore_captured_inputs() {
+  rm -f "$ENGINE"
+  mv "$ENGINE.capture-original" "$ENGINE"
+  rm -f "$AOT_BUNDLE/starling-ics.wevalcache"
+  mv "$AOT_BUNDLE/starling-ics.wevalcache.capture-original" \
+    "$AOT_BUNDLE/starling-ics.wevalcache"
+  rm -f "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+  mv "$AOT_BUNDLE/starling-ics.wevalcache.manifest.capture-original" \
+    "$AOT_BUNDLE/starling-ics.wevalcache.manifest"
+  rm -rf "$WEVAL_PACKAGE"
+  mv "$WEVAL_PACKAGE.capture-original" "$WEVAL_PACKAGE"
+}
+
+run_capture_race() {
+  local hook="$1" output="$2"
+  STARLING_COMPONENTIZER_TEST_HOOK_DIR="$hook" \
+  STARLING_COMPONENTIZER_TEST_WAIT_AT=aot-inputs-captured \
+    "$COMPONENTIZER" \
+      --aot \
+      --engine "$ENGINE" \
+      --aot-cache-dir "$AOT_BUNDLE" \
+      --weval-bin "$FAKE_WEVAL" \
+      --preview2-adapter "$ADAPTER" \
+      --wit "$WIT" \
+      --world-name exports \
+      --wabt-bin "$TOOLS/fake wabt" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --out "$output" \
+      "$SOURCE"
+}
+
+TRANSIENT_HOOK="$SCRATCH/transient capture hook"
+TRANSIENT_OUTPUT="$WORK/transient substitution output.wasm"
+mkdir "$TRANSIENT_HOOK"
+run_capture_race "$TRANSIENT_HOOK" "$TRANSIENT_OUTPUT" \
+  >"$SCRATCH/transient-capture.log" 2>&1 &
+capture_pid=$!
+wait_for_capture_hook "$TRANSIENT_HOOK/aot-inputs-captured.ready"
+install_coherent_substitute
+restore_captured_inputs
+touch "$TRANSIENT_HOOK/aot-inputs-captured.continue"
+if ! wait "$capture_pid"; then
+  cat "$SCRATCH/transient-capture.log" >&2
+  echo "FAIL: restored AOT substitution did not use retained inputs" >&2
+  exit 1
+fi
+cmp "$ENGINE" "$TRANSIENT_OUTPUT"
+
+UNRESTORED_HOOK="$SCRATCH/unrestored capture hook"
+UNRESTORED_OUTPUT="$WORK/unrestored substitution output.wasm"
+mkdir "$UNRESTORED_HOOK"
+printf 'preserved unrestored output\n' > "$UNRESTORED_OUTPUT"
+run_capture_race "$UNRESTORED_HOOK" "$UNRESTORED_OUTPUT" \
+  >"$SCRATCH/unrestored-capture.log" 2>&1 &
+capture_pid=$!
+wait_for_capture_hook "$UNRESTORED_HOOK/aot-inputs-captured.ready"
+install_coherent_substitute
+touch "$UNRESTORED_HOOK/aot-inputs-captured.continue"
+if wait "$capture_pid"; then
+  echo "FAIL: unrestored coherent AOT substitution was accepted" >&2
+  exit 1
+fi
+restore_captured_inputs
+grep -Eq 'WevalPackageRace|TransactionChanged' \
+  "$SCRATCH/unrestored-capture.log"
+test "$(cat "$UNRESTORED_OUTPUT")" = "preserved unrestored output"
+echo "Retained AOT input substitution matrix passed"
+
+RACE_ENGINE_PACKAGE="$WORK/race engine package"
+cp -R "$ENGINE_PACKAGE" "$RACE_ENGINE_PACKAGE"
+RACE_ENGINE="$RACE_ENGINE_PACKAGE/fake engine.wasm"
 RACE_PACKAGE="$SCRATCH/race weval package"
 RACE_WEVAL="$RACE_PACKAGE/race weval"
 RACE_SIBLING="$RACE_PACKAGE/race sibling"
@@ -2163,7 +2431,6 @@ RACE_BUNDLE="$WORK/race cache bundle"
 RACE_ENGINE_BASELINE="$WORK/race engine baseline.wasm"
 RACE_CACHE_BASELINE="$WORK/race cache baseline.sqlite"
 RACE_OUTPUT="$WORK/race output component.wasm"
-cp "$ENGINE" "$RACE_ENGINE"
 mkdir "$RACE_PACKAGE"
 cp "$FAKE_WEVAL" "$RACE_WEVAL"
 printf 'snapshot sibling\n' > "$RACE_SIBLING"
@@ -2175,7 +2442,7 @@ cp "$AOT_BUNDLE/starling-ics.wevalcache" \
   --weval "$RACE_WEVAL" \
   --cache "$RACE_BUNDLE/starling-ics.wevalcache" \
   --primer "$SOURCE" \
-  --feature-abi 'starling-features-v1;fake=1' \
+  --feature-abi "$FEATURE_ABI" \
   --out "$RACE_BUNDLE/starling-ics.wevalcache.manifest"
 cp "$RACE_ENGINE" "$RACE_ENGINE_BASELINE"
 cp "$RACE_BUNDLE/starling-ics.wevalcache" "$RACE_CACHE_BASELINE"
@@ -2191,7 +2458,7 @@ EXPECTED_AOT_CACHE="$RACE_CACHE_BASELINE" \
   --engine "$RACE_ENGINE" \
   --aot-cache-dir "$RACE_BUNDLE" \
   --weval-bin "$RACE_WEVAL" \
-  --preview2-adapter "$ADAPTER" \
+  --preview2-adapter "$RACE_ENGINE_PACKAGE/preview1-adapter.wasm" \
   --wit "$WIT" \
   --world-name exports \
   --wabt-bin "$TOOLS/fake wabt" \
@@ -2255,9 +2522,10 @@ expect_aot_cache_failure() {
 
 expect_aot_cache_failure "$WORK/missing bundle" "$ENGINE" "$FAKE_WEVAL" missing
 
-STALE_ENGINE="$WORK/stale engine.wasm"
-cp "$ENGINE" "$STALE_ENGINE"
-printf 'stale\n' >> "$STALE_ENGINE"
+STALE_ENGINE_PACKAGE="$WORK/stale engine package"
+cp -R "$ENGINE_PACKAGE" "$STALE_ENGINE_PACKAGE"
+STALE_ENGINE="$STALE_ENGINE_PACKAGE/fake engine.wasm"
+printf '\0\1\0' >> "$STALE_ENGINE"
 expect_aot_cache_failure "$AOT_BUNDLE" "$STALE_ENGINE" "$FAKE_WEVAL" stale
 
 CORRUPT_BUNDLE="$WORK/corrupt cache bundle"
