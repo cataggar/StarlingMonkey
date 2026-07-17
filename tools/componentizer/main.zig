@@ -45,6 +45,7 @@ const PipelineError = error{
     TransactionChanged,
     UnsupportedRetainedExecution,
 };
+const retained_exec_marker = "__starling-retained-exec-v1";
 
 const EngineFeatures = struct {
     stdio: bool,
@@ -2696,6 +2697,10 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
         .format = cli.detectDiagnosticFormat(args),
     };
+    if (args.len >= 2 and std.mem.eql(u8, args[1], retained_exec_marker)) {
+        retainedExecHelper(allocator, init.io, args[2..]) catch |err|
+            std.process.fatal("retained execution helper failed: {t}", .{err});
+    }
     var action = cli.parse(allocator, args) catch |err| {
         diagnostic.reportParse(err, parseErrorMessage(err));
         std.process.exit(1);
@@ -2737,6 +2742,154 @@ fn parseErrorMessage(err: cli.ParseError) []const u8 {
         error.UnknownArgument => "unknown option",
         error.UnknownFeature => "unknown feature (expected stdio, random, clocks, http, or fetch-event)",
     };
+}
+
+fn retainedExecHelper(
+    allocator: Allocator,
+    io: Io,
+    args: []const []const u8,
+) !void {
+    if (builtin.os.tag != .linux or args.len < 6)
+        return error.UnsupportedRetainedExecution;
+    _ = args[0];
+    const execution_mount = "/mnt";
+    const root_path = "/mnt/starling-retained-package";
+    const selected_relative = args[1];
+    const selected_fd = try std.fmt.parseInt(std.posix.fd_t, args[2], 10);
+    const entry_args = try std.fmt.parseInt(usize, args[3], 10);
+    if (args.len < 4 + entry_args + 2 or
+        !std.mem.eql(u8, args[4 + entry_args], "--"))
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    const mount_z = try allocator.dupeSentinel(u8, execution_mount, 0);
+    switch (linux.errno(linux.mount(
+        "starling-retained-package",
+        mount_z,
+        "tmpfs",
+        linux.MS.NOSUID | linux.MS.NODEV,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    try Dir.createDirAbsolute(
+        io,
+        root_path,
+        File.Permissions.fromMode(0o700),
+    );
+    var root = try Dir.openDirAbsolute(io, root_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer root.close(io);
+    var index: usize = 4;
+    const entries_end = index + entry_args;
+    while (index < entries_end) {
+        const kind = args[index];
+        if (std.mem.eql(u8, kind, "d")) {
+            if (index + 3 > entries_end)
+                return error.UnsupportedRetainedExecution;
+            const relative = args[index + 1];
+            const mode = try std.fmt.parseInt(std.posix.mode_t, args[index + 2], 10);
+            try root.createDirPath(io, relative);
+            var child = try root.openDir(io, relative, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            });
+            defer child.close(io);
+            try child.setPermissions(io, File.Permissions.fromMode(mode));
+            index += 3;
+        } else if (std.mem.eql(u8, kind, "f")) {
+            if (index + 4 > entries_end)
+                return error.UnsupportedRetainedExecution;
+            const relative = args[index + 1];
+            const fd = try std.fmt.parseInt(std.posix.fd_t, args[index + 2], 10);
+            const mode = try std.fmt.parseInt(std.posix.mode_t, args[index + 3], 10);
+            const source: File = .{
+                .handle = fd,
+                .flags = .{ .nonblocking = false },
+            };
+            const stat = try source.stat(io);
+            var output = try root.createFile(io, relative, .{
+                .read = true,
+                .truncate = true,
+            });
+            defer output.close(io);
+            var buffer: [64 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < stat.size) {
+                const count = try source.readPositional(io, &.{&buffer}, offset);
+                if (count == 0) return error.TransactionChanged;
+                try output.writePositionalAll(io, buffer[0..count], offset);
+                offset += count;
+            }
+            try output.setPermissions(io, File.Permissions.fromMode(mode));
+            index += 4;
+        } else if (std.mem.eql(u8, kind, "l")) {
+            if (index + 3 > entries_end)
+                return error.UnsupportedRetainedExecution;
+            try root.symLink(io, args[index + 2], args[index + 1], .{});
+            index += 3;
+        } else {
+            return error.UnsupportedRetainedExecution;
+        }
+    }
+    try root.setPermissions(io, File.Permissions.fromMode(0o500));
+    switch (linux.errno(linux.mount(
+        null,
+        mount_z,
+        null,
+        linux.MS.REMOUNT | linux.MS.RDONLY |
+            linux.MS.NOSUID | linux.MS.NODEV,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    _ = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    const selected_path = try std.fs.path.join(
+        allocator,
+        &.{ root_path, selected_relative },
+    );
+    const child_args = args[5 + entry_args ..];
+    if (child_args.len == 0)
+        return error.UnsupportedRetainedExecution;
+    var argv_z = try allocator.allocSentinel(
+        ?[*:0]const u8,
+        child_args.len,
+        null,
+    );
+    argv_z[0] = (try allocator.dupeSentinel(u8, selected_path, 0)).ptr;
+    for (child_args[1..], 1..) |arg, arg_index|
+        argv_z[arg_index] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
+    var magic: [2]u8 = undefined;
+    const selected_file: File = .{
+        .handle = selected_fd,
+        .flags = .{ .nonblocking = false },
+    };
+    const magic_len = try selected_file.readPositional(io, &.{&magic}, 0);
+    const rc = if (magic_len == 2 and std.mem.eql(u8, &magic, "#!"))
+        linux.execve(
+            (try allocator.dupeSentinel(u8, selected_path, 0)).ptr,
+            argv_z.ptr,
+            @ptrCast(std.c.environ),
+        )
+    else binary: {
+        const immutable_executable = try root.openFile(
+            io,
+            selected_relative,
+            .{ .follow_symlinks = true },
+        );
+        break :binary linux.execveat(
+            immutable_executable.handle,
+            "",
+            argv_z.ptr,
+            @ptrCast(std.c.environ),
+            .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = false },
+        );
+    };
+    _ = rc;
+    return error.UnsupportedRetainedExecution;
 }
 
 fn execute(
@@ -3602,19 +3755,39 @@ fn execute(
                 aot_snapshot.?,
             );
         }
-        try runCommand(
-            allocator,
-            io,
-            if (config.aot) "weval AOT" else "wizer",
-            initialization_args.items,
-            cwd,
-            &pipeline_env,
-            runtime_args_path,
-            config.verbose,
-            &command_log,
-        );
         if (aot_snapshot) |snapshot| {
-            try verifyWevalPackageSnapshot(allocator, io, snapshot);
+            const result = runRetainedPackageCommand(
+                allocator,
+                io,
+                "weval AOT",
+                snapshot.weval_capture,
+                initialization_args.items,
+                snapshot.weval,
+                cwd,
+                &pipeline_env,
+                runtime_args_path,
+                config.verbose,
+                &command_log,
+            );
+            const verification = verifyWevalPackageSnapshot(
+                allocator,
+                io,
+                snapshot,
+            );
+            try verification;
+            try result;
+        } else {
+            try runCommand(
+                allocator,
+                io,
+                "wizer",
+                initialization_args.items,
+                cwd,
+                &pipeline_env,
+                runtime_args_path,
+                config.verbose,
+                &command_log,
+            );
         }
     } else {
         try Dir.copyFileAbsolute(runtime.engine, initialized, io, .{});
@@ -4518,18 +4691,6 @@ fn externalRuntime(
     const requested_engine = try absolutePath(allocator, cwd, engine_override);
     const runtime_root_path = std.fs.path.dirname(requested_engine) orelse
         return error.InvalidPath;
-    const package_root = if (config.aot and
-        std.mem.eql(u8, std.fs.path.basename(runtime_root_path), "bin"))
-        std.fs.path.dirname(runtime_root_path) orelse return error.InvalidPath
-    else
-        runtime_root_path;
-    const runtime_relative = try std.fs.path.relative(
-        allocator,
-        "/",
-        null,
-        package_root,
-        runtime_root_path,
-    );
     const bundle = if (config.aot and needs_initialization)
         try resolveAotBundle(
             allocator,
@@ -4553,10 +4714,21 @@ fn externalRuntime(
                 path,
             )
         else blk: {
-            const selected = try std.fs.path.join(
+            const flat = try std.fs.path.join(
                 allocator,
-                &.{ package_root, "weval-package", "weval" },
+                &.{ runtime_root_path, "weval-package", "weval" },
             );
+            const parent = std.fs.path.dirname(runtime_root_path) orelse
+                return error.InvalidPath;
+            const managed = try std.fs.path.join(
+                allocator,
+                &.{ parent, "weval-package", "weval" },
+            );
+            const selected = if (pathExists(io, flat) or
+                !std.mem.eql(u8, std.fs.path.basename(runtime_root_path), "bin"))
+                flat
+            else
+                managed;
             break :blk WevalTool{
                 .selected = selected,
                 .package_root = std.fs.path.dirname(selected).?,
@@ -4566,6 +4738,27 @@ fn externalRuntime(
     else
         null;
     const requested_weval = if (resolved_weval) |tool| tool.selected else null;
+    const parent_root = std.fs.path.dirname(runtime_root_path) orelse
+        return error.InvalidPath;
+    const managed_weval_root = try std.fs.path.join(
+        allocator,
+        &.{ parent_root, "weval-package" },
+    );
+    const managed_layout = if (bundle) |value|
+        std.mem.eql(u8, std.fs.path.basename(runtime_root_path), "bin") and
+            pathContains(runtime_root_path, value.cache) and
+            pathContains(runtime_root_path, value.manifest) and
+            pathContains(managed_weval_root, requested_weval.?)
+    else
+        false;
+    const package_root = if (managed_layout) parent_root else runtime_root_path;
+    const runtime_relative = try std.fs.path.relative(
+        allocator,
+        "/",
+        null,
+        package_root,
+        runtime_root_path,
+    );
     const engine_basename = std.fs.path.basename(requested_engine);
     const package_capture = captureDirectoryWithHook(
         allocator,
@@ -7367,6 +7560,8 @@ fn captureDirectoryWithHook(
         root_identity,
         0,
     );
+    if (allow_symlinks)
+        try validateCapturedPackageSymlinks(allocator, root);
     try verifyPackageNameIdentity(io, parent, basename, name_identity);
     try verifyCapturedPath(io, captured_parent);
     return .{
@@ -7391,6 +7586,139 @@ fn safePackageRelativePath(relative: []const u8) bool {
             return false;
     }
     return true;
+}
+
+fn capturedPackageEntry(
+    captured: *CapturedPackageDirectory,
+    name: []const u8,
+) ?*const CapturedPackageEntry {
+    for (captured.entries) |*entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+fn normalizeCapturedSymlinkPath(
+    allocator: Allocator,
+    link_relative: []const u8,
+    target: []const u8,
+    remaining: []const []const u8,
+) ![]const u8 {
+    if (target.len == 0 or std.fs.path.isAbsolute(target) or
+        std.mem.indexOfScalar(u8, target, '\\') != null)
+        return error.UnsafeWevalPackage;
+    var components: std.ArrayList([]const u8) = .empty;
+    const parent = std.fs.path.dirname(link_relative) orelse "";
+    var parent_parts = std.mem.splitScalar(u8, parent, '/');
+    while (parent_parts.next()) |component| {
+        if (component.len != 0 and !std.mem.eql(u8, component, "."))
+            components.append(allocator, component) catch @panic("out of memory");
+    }
+    var target_parts = std.mem.splitScalar(u8, target, '/');
+    while (target_parts.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (components.items.len == 0)
+                return error.UnsafeWevalPackage;
+            _ = components.pop();
+        } else {
+            components.append(allocator, component) catch @panic("out of memory");
+        }
+    }
+    for (remaining) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, "."))
+            return error.UnsafeWevalPackage;
+        if (std.mem.eql(u8, component, ".."))
+            return error.UnsafeWevalPackage;
+        components.append(allocator, component) catch @panic("out of memory");
+    }
+    if (components.items.len == 0)
+        return error.UnsafeWevalPackage;
+    return std.mem.join(allocator, "/", components.items);
+}
+
+fn resolveCapturedPackageEntry(
+    allocator: Allocator,
+    root: *CapturedPackageDirectory,
+    initial_relative: []const u8,
+) !struct {
+    relative: []const u8,
+    entry: *const CapturedPackageEntry,
+} {
+    var relative = initial_relative;
+    var link_count: usize = 0;
+    restart: while (true) {
+        if (!safePackageRelativePath(relative))
+            return error.UnsafeWevalPackage;
+        var parts: std.ArrayList([]const u8) = .empty;
+        var iterator = std.mem.splitScalar(u8, relative, '/');
+        while (iterator.next()) |component|
+            parts.append(allocator, component) catch @panic("out of memory");
+        var directory = root;
+        var prefix: std.ArrayList(u8) = .empty;
+        for (parts.items, 0..) |component, index| {
+            const entry = capturedPackageEntry(directory, component) orelse
+                return error.UnsafeWevalPackage;
+            if (entry.value == .sym_link) {
+                link_count += 1;
+                if (link_count > weval_package_max_depth)
+                    return error.UnsafeWevalPackage;
+                if (prefix.items.len != 0)
+                    prefix.append(allocator, '/') catch @panic("out of memory");
+                prefix.appendSlice(allocator, component) catch @panic("out of memory");
+                relative = try normalizeCapturedSymlinkPath(
+                    allocator,
+                    prefix.items,
+                    entry.value.sym_link.target,
+                    parts.items[index + 1 ..],
+                );
+                continue :restart;
+            }
+            if (index + 1 == parts.items.len)
+                return .{ .relative = relative, .entry = entry };
+            directory = switch (entry.value) {
+                .directory => |child| child,
+                else => return error.UnsafeWevalPackage,
+            };
+            if (prefix.items.len != 0)
+                prefix.append(allocator, '/') catch @panic("out of memory");
+            prefix.appendSlice(allocator, component) catch @panic("out of memory");
+        }
+        return error.UnsafeWevalPackage;
+    }
+}
+
+fn validateCapturedPackageSymlinks(
+    allocator: Allocator,
+    root: *CapturedPackageDirectory,
+) !void {
+    try validateCapturedPackageDirectorySymlinks(allocator, root, root, "");
+}
+
+fn validateCapturedPackageDirectorySymlinks(
+    allocator: Allocator,
+    root: *CapturedPackageDirectory,
+    directory: *CapturedPackageDirectory,
+    prefix: []const u8,
+) !void {
+    for (directory.entries) |entry| {
+        const relative = if (prefix.len == 0)
+            entry.name
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        switch (entry.value) {
+            .directory => |child| try validateCapturedPackageDirectorySymlinks(
+                allocator,
+                root,
+                child,
+                relative,
+            ),
+            .sym_link => {
+                _ = try resolveCapturedPackageEntry(allocator, root, relative);
+            },
+            .file => {},
+        }
+    }
 }
 
 fn capturedDirectoryDigest(
@@ -7850,6 +8178,193 @@ fn retainedPackageExecutablePath(
         "/proc/self/fd/{d}/{s}",
         .{ handle, package.selected_relative },
     );
+}
+
+const RetainedExecPlan = struct {
+    helper_argv: []const []const u8,
+    files: []const File,
+
+    fn close(plan: RetainedExecPlan, io: Io) void {
+        for (plan.files) |file| file.close(io);
+    }
+};
+
+fn createSealedPackageFile(
+    io: Io,
+    source: CapturedPackageFile,
+) !File {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    const fd = try std.posix.memfd_create(
+        "starling-retained-package",
+        linux.MFD.ALLOW_SEALING,
+    );
+    const sealed: File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    errdefer sealed.close(io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < source.identity.stat.size) {
+        const count = try source.file.readPositional(
+            io,
+            &.{&buffer},
+            offset,
+        );
+        if (count == 0) return error.TransactionChanged;
+        hasher.update(buffer[0..count]);
+        try sealed.writePositionalAll(io, buffer[0..count], offset);
+        offset += count;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    if (!std.mem.eql(u8, &digest, &source.digest))
+        return error.TransactionChanged;
+    switch (std.posix.errno(std.posix.system.fcntl(
+        sealed.handle,
+        linux.F.ADD_SEALS,
+        @as(usize, linux.F.SEAL_SEAL | linux.F.SEAL_SHRINK |
+            linux.F.SEAL_GROW | linux.F.SEAL_WRITE),
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    return sealed;
+}
+
+fn appendRetainedPackageEntries(
+    allocator: Allocator,
+    io: Io,
+    directory: *CapturedPackageDirectory,
+    prefix: []const u8,
+    selected_entry: *const CapturedPackageEntry,
+    args: *std.ArrayList([]const u8),
+    files: *std.ArrayList(File),
+    selected_fd: *?std.posix.fd_t,
+) !void {
+    if (prefix.len != 0) {
+        args.appendSlice(allocator, &.{
+            "d",
+            prefix,
+            try std.fmt.allocPrint(
+                allocator,
+                "{d}",
+                .{directory.identity.stat.permissions.toMode() & 0o777},
+            ),
+        }) catch @panic("out of memory");
+    }
+    for (directory.entries) |*entry| {
+        const relative = if (prefix.len == 0)
+            entry.name
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        switch (entry.value) {
+            .file => |source| {
+                const sealed = try createSealedPackageFile(io, source);
+                files.append(allocator, sealed) catch @panic("out of memory");
+                if (entry == selected_entry) selected_fd.* = sealed.handle;
+                args.appendSlice(allocator, &.{
+                    "f",
+                    relative,
+                    try std.fmt.allocPrint(allocator, "{d}", .{sealed.handle}),
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{d}",
+                        .{source.identity.stat.permissions.toMode() & 0o777},
+                    ),
+                }) catch @panic("out of memory");
+            },
+            .directory => |child| try appendRetainedPackageEntries(
+                allocator,
+                io,
+                child,
+                relative,
+                selected_entry,
+                args,
+                files,
+                selected_fd,
+            ),
+            .sym_link => |link| {
+                args.appendSlice(
+                    allocator,
+                    &.{ "l", relative, link.target },
+                ) catch @panic("out of memory");
+            },
+        }
+    }
+}
+
+fn createRetainedExecPlan(
+    allocator: Allocator,
+    io: Io,
+    package: CapturedWevalPackage,
+    argv: []const []const u8,
+) !RetainedExecPlan {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const selected = try resolveCapturedPackageEntry(
+        allocator,
+        package.tree.root,
+        package.selected_relative,
+    );
+    if (selected.entry.value != .file)
+        return error.UnsafeWevalPackage;
+    var entries: std.ArrayList([]const u8) = .empty;
+    var files: std.ArrayList(File) = .empty;
+    errdefer for (files.items) |file| file.close(io);
+    var selected_fd: ?std.posix.fd_t = null;
+    try appendRetainedPackageEntries(
+        allocator,
+        io,
+        package.tree.root,
+        "",
+        selected.entry,
+        &entries,
+        &files,
+        &selected_fd,
+    );
+    const self = try Dir.openFileAbsolute(io, "/proc/self/exe", .{
+        .allow_directory = false,
+        .follow_symlinks = true,
+    });
+    errdefer self.close(io);
+    try clearCloseOnExec(self.handle);
+    files.append(allocator, self) catch @panic("out of memory");
+    var helper: std.ArrayList([]const u8) = .empty;
+    helper.appendSlice(allocator, &.{
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--",
+        try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{self.handle}),
+        retained_exec_marker,
+        package.tree.path,
+        package.selected_relative,
+        try std.fmt.allocPrint(allocator, "{d}", .{selected_fd.?}),
+        try std.fmt.allocPrint(allocator, "{d}", .{entries.items.len}),
+    }) catch @panic("out of memory");
+    helper.appendSlice(allocator, entries.items) catch @panic("out of memory");
+    helper.append(allocator, "--") catch @panic("out of memory");
+    helper.appendSlice(allocator, argv) catch @panic("out of memory");
+    return .{
+        .helper_argv = try helper.toOwnedSlice(allocator),
+        .files = try files.toOwnedSlice(allocator),
+    };
+}
+
+fn clearCloseOnExec(handle: std.posix.fd_t) !void {
+    switch (std.posix.errno(std.posix.system.fcntl(
+        handle,
+        std.posix.F.SETFD,
+        @as(usize, 0),
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
 }
 
 fn copyCapturedDirectory(
@@ -14195,10 +14710,11 @@ fn runCapturedToolCommand(
 ) !void {
     verifyToolTransaction(io, tool) catch
         return error.TransactionChanged;
-    const result = runCommandWithDisplay(
+    const result = runRetainedPackageCommand(
         allocator,
         io,
         stage,
+        tool.snapshot_package orelse return error.TransactionChanged,
         argv,
         tool.provenance,
         cwd,
@@ -14224,6 +14740,25 @@ fn runCommandWithDisplay(
     verbose: bool,
     command_log: *std.ArrayList(u8),
 ) !void {
+    recordCommand(
+        allocator,
+        stage,
+        argv,
+        display_argv0,
+        verbose,
+        command_log,
+    );
+    try spawnCommand(io, stage, argv, cwd, environ, stdin_path);
+}
+
+fn recordCommand(
+    allocator: Allocator,
+    stage: []const u8,
+    argv: []const []const u8,
+    display_argv0: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+) void {
     command_log.appendSlice(allocator, stage) catch @panic("out of memory");
     command_log.append(allocator, '\n') catch @panic("out of memory");
     for (argv) |arg| {
@@ -14264,7 +14799,16 @@ fn runCommandWithDisplay(
             );
         }
     }
+}
 
+fn spawnCommand(
+    io: Io,
+    stage: []const u8,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+) !void {
     const stdin_file: ?File = if (stdin_path) |path|
         try Dir.openFileAbsolute(io, path, .{})
     else
@@ -14383,6 +14927,40 @@ fn termSucceeded(term: std.process.Child.Term) bool {
 }
 
 fn addMappedPreopen(
+fn runRetainedPackageCommand(
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    package: CapturedWevalPackage,
+    argv: []const []const u8,
+    display_argv0: ?[]const u8,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+) !void {
+    recordCommand(
+        allocator,
+        stage,
+        argv,
+        display_argv0,
+        verbose,
+        command_log,
+    );
+    const plan = try createRetainedExecPlan(allocator, io, package, argv);
+    defer plan.close(io);
+    try spawnCommand(
+        io,
+        stage,
+        plan.helper_argv,
+        cwd,
+        environ,
+        stdin_path,
+    );
+}
+
+fn addPreopen(
     allocator: Allocator,
     args: *std.ArrayList([]const u8),
     host: []const u8,

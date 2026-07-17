@@ -368,13 +368,9 @@ for ((i = 1; i <= $#; i++)); do
   esac
 done
 if [ "${EXPECT_AOT_SNAPSHOT:-0}" = 1 ]; then
-  test "$0" != "$ORIGINAL_AOT_WEVAL"
   test "$(basename "$0")" = "$(basename "$ORIGINAL_AOT_WEVAL")"
-  test "$input" != "$ORIGINAL_AOT_ENGINE"
-  test "$cache" != "$ORIGINAL_AOT_CACHE"
   test "$(dirname "$input")" = "$(dirname "$cache")"
-  test "$(dirname "$(dirname "$0")")" = "$(dirname "$input")"
-  test "$(stat -c %a "$(dirname "$input")")" = 500
+  test "$(stat -c %a "$(dirname "$0")")" = 500
   case "$(stat -c %A "$0")" in
     *w*) exit 30 ;;
   esac
@@ -394,16 +390,16 @@ if [ -n "${EXPECT_AOT_EXEC_STAGE_OUTSIDE:-}" ]; then
       exit 28
       ;;
   esac
-  test "$(stat -c %a "$(dirname "$(dirname "$0")")")" = 500
+  test "$(stat -c %a "$(dirname "$0")")" = 500
   case "$(stat -c %A "$0")" in
     *w*) exit 31 ;;
   esac
 fi
 if [ -n "${EXPECT_AOT_EXEC_STAGE_ROOT:-}" ]; then
   case "$0" in
-    "$EXPECT_AOT_EXEC_STAGE_ROOT"/*) ;;
+    /mnt/starling-retained-package/*) ;;
     *)
-      echo "AOT executable snapshot did not use the default temp root" >&2
+      echo "AOT executable did not use the private immutable namespace" >&2
       exit 29
       ;;
   esac
@@ -418,7 +414,20 @@ cat > "$TOOLS/fake wabt" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 test "$(basename "$0")" = "fake wabt"
+if [ -n "${FAKE_WABT_CHILD_HOOK:-}" ] &&
+  mkdir "$FAKE_WABT_CHILD_HOOK/claimed" 2>/dev/null
+then
+  touch "$FAKE_WABT_CHILD_HOOK/ready"
+  while [ ! -e "$FAKE_WABT_CHILD_HOOK/continue" ]; do sleep 0.001; done
+fi
 test "$("$(dirname "$0")/tool sibling" wabt)" = "wabt-sibling-ok"
+if [ -n "${FAKE_WABT_CHILD_HOOK:-}" ] &&
+  [ -d "$FAKE_WABT_CHILD_HOOK/claimed" ] &&
+  [ ! -e "$FAKE_WABT_CHILD_HOOK/consumed" ]
+then
+  touch "$FAKE_WABT_CHILD_HOOK/consumed"
+  while [ ! -e "$FAKE_WABT_CHILD_HOOK/finish" ]; do sleep 0.001; done
+fi
 if [ -n "${FAKE_WABT_EXECUTABLE_LOG:-}" ]; then
   printf '%s\n' "$0" >> "$FAKE_WABT_EXECUTABLE_LOG"
 fi
@@ -834,6 +843,7 @@ for ((i = 1; i <= $#; i++)); do
 done
 cp "${!#}" "$out"
 EOF
+cp "$FAKE_WEVAL" "$TOOLS/fake weval"
 chmod +x "$TOOLS"/*
 chmod +x "$FAKE_WEVAL"
 for tool in zig wizer wasmtime wabt wasm-tools weval; do
@@ -1089,9 +1099,63 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
-grep -Eq '^/proc/self/fd/[0-9]+/fake wabt$' "$WABT_EXECUTABLE_LOG"
-grep -Eq '^/proc/self/fd/[0-9]+/fake wasm-tools$' \
+grep -Fxq '/mnt/starling-retained-package/fake wabt' \
+  "$WABT_EXECUTABLE_LOG"
+grep -Fxq '/mnt/starling-retained-package/fake wasm-tools' \
   "$WASM_TOOLS_EXECUTABLE_LOG"
+if grep -Fq '/proc/self/fd/' \
+  "$WABT_EXECUTABLE_LOG" "$WASM_TOOLS_EXECUTABLE_LOG"; then
+  echo "FAIL: retained tools exposed descriptor paths as argv[0]" >&2
+  exit 1
+fi
+
+CHILD_REPLACE_HOOK="$SCRATCH/retained child replacement hook"
+CHILD_REPLACE_OUTPUT="$WORK/retained child replacement output.wasm"
+WABT_ORIGINAL="$SCRATCH/fake wabt original"
+SIBLING_ORIGINAL="$SCRATCH/tool sibling original"
+mkdir "$CHILD_REPLACE_HOOK"
+printf 'preserved retained child output\n' > "$CHILD_REPLACE_OUTPUT"
+FAKE_WABT_CHILD_HOOK="$CHILD_REPLACE_HOOK" \
+PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin path-wizer \
+  --wabt-bin path-wabt \
+  --wasm-tools-bin path-wasm-tools \
+  --out "$CHILD_REPLACE_OUTPUT" \
+  "$SOURCE" >"$SCRATCH/retained-child-replacement.log" 2>&1 &
+child_replace_pid=$!
+wait_for_test_hook "$CHILD_REPLACE_HOOK/ready"
+mv "$TOOLS/fake wabt" "$WABT_ORIGINAL"
+mv "$TOOLS/tool sibling" "$SIBLING_ORIGINAL"
+cat > "$TOOLS/fake wabt" <<EOF
+#!/bin/sh
+touch "$SCRATCH/substituted wabt consumed"
+exit 97
+EOF
+cat > "$TOOLS/tool sibling" <<EOF
+#!/bin/sh
+touch "$SCRATCH/substituted sibling consumed"
+printf 'substituted-sibling\n'
+EOF
+chmod +x "$TOOLS/fake wabt" "$TOOLS/tool sibling"
+touch "$CHILD_REPLACE_HOOK/continue"
+wait_for_test_hook "$CHILD_REPLACE_HOOK/consumed"
+rm "$TOOLS/fake wabt" "$TOOLS/tool sibling"
+mv "$WABT_ORIGINAL" "$TOOLS/fake wabt"
+mv "$SIBLING_ORIGINAL" "$TOOLS/tool sibling"
+touch "$CHILD_REPLACE_HOOK/finish"
+if wait "$child_replace_pid"; then
+  echo "FAIL: during-child closure substitution was accepted" >&2
+  exit 1
+fi
+grep -Fq TransactionChanged "$SCRATCH/retained-child-replacement.log"
+test "$(cat "$CHILD_REPLACE_OUTPUT")" = "preserved retained child output"
+test ! -e "$SCRATCH/substituted wabt consumed"
+test ! -e "$SCRATCH/substituted sibling consumed"
+echo "During-child executable and sibling substitutions isolated"
 
 PACKAGE_CAPTURE_HOOK="$SCRATCH/external package capture hook"
 PACKAGE_CAPTURE_OUTPUT="$WORK/external package capture output.wasm"
@@ -2139,6 +2203,72 @@ run_fixture_aot \
   "$WRAPPER_BUNDLE" \
   "$WRAPPER_OUTPUT"
 
+LAYOUT_FLAT_WEVAL="$SCRATCH/layout flat weval package"
+LAYOUT_MANAGED_WEVAL="$SCRATCH/layout managed weval package"
+LAYOUT_FLAT_BUNDLE="$WORK/layout flat bundle"
+LAYOUT_MANAGED_BUNDLE="$WORK/layout managed bundle"
+mkdir "$LAYOUT_FLAT_WEVAL" "$LAYOUT_MANAGED_WEVAL"
+cp "$FAKE_WEVAL" "$LAYOUT_FLAT_WEVAL/weval"
+cp "$FAKE_WEVAL" "$LAYOUT_MANAGED_WEVAL/weval"
+printf 'managed closure marker\n' > "$LAYOUT_MANAGED_WEVAL/managed-marker"
+seal_fixture_bundle "$LAYOUT_FLAT_WEVAL/weval" "$LAYOUT_FLAT_BUNDLE"
+seal_fixture_bundle "$LAYOUT_MANAGED_WEVAL/weval" "$LAYOUT_MANAGED_BUNDLE"
+
+run_layout_aot() {
+  local runtime="$1" output="$2"
+  shift 2
+  "$COMPONENTIZER" \
+    --aot \
+    --engine "$runtime/$(basename "$ENGINE")" \
+    --aot-cache-dir "$runtime" \
+    --preview2-adapter "$runtime/$(basename "$ADAPTER")" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    "$@" \
+    --out "$output" \
+    "$SOURCE"
+  cmp "$ENGINE" "$output"
+}
+
+FLAT_BIN_PARENT="$WORK/flat package parent"
+FLAT_BIN_RUNTIME="$FLAT_BIN_PARENT/bin"
+mkdir -p "$FLAT_BIN_PARENT"
+cp -a "$ENGINE_PACKAGE" "$FLAT_BIN_RUNTIME"
+rm -rf "$FLAT_BIN_RUNTIME/weval-package"
+cp -a "$LAYOUT_FLAT_WEVAL" "$FLAT_BIN_RUNTIME/weval-package"
+cp "$LAYOUT_FLAT_BUNDLE/starling-ics.wevalcache" \
+  "$LAYOUT_FLAT_BUNDLE/starling-ics.wevalcache.manifest" \
+  "$FLAT_BIN_RUNTIME/"
+run_layout_aot \
+  "$FLAT_BIN_RUNTIME" \
+  "$WORK/flat bin layout output.wasm"
+
+AMBIGUOUS_ROOT="$WORK/ambiguous managed package"
+AMBIGUOUS_RUNTIME="$AMBIGUOUS_ROOT/bin"
+mkdir -p "$AMBIGUOUS_ROOT"
+cp -a "$ENGINE_PACKAGE" "$AMBIGUOUS_RUNTIME"
+rm -rf "$AMBIGUOUS_RUNTIME/weval-package"
+cp -a "$LAYOUT_FLAT_WEVAL" "$AMBIGUOUS_RUNTIME/weval-package"
+cp -a "$LAYOUT_MANAGED_WEVAL" "$AMBIGUOUS_ROOT/weval-package"
+cp "$LAYOUT_FLAT_BUNDLE/starling-ics.wevalcache" \
+  "$AMBIGUOUS_RUNTIME/starling-ics.wevalcache"
+cp "$LAYOUT_FLAT_BUNDLE/starling-ics.wevalcache.manifest" \
+  "$AMBIGUOUS_RUNTIME/starling-ics.wevalcache.manifest"
+run_layout_aot \
+  "$AMBIGUOUS_RUNTIME" \
+  "$WORK/ambiguous default flat output.wasm"
+cp "$LAYOUT_MANAGED_BUNDLE/starling-ics.wevalcache" \
+  "$AMBIGUOUS_RUNTIME/starling-ics.wevalcache"
+cp "$LAYOUT_MANAGED_BUNDLE/starling-ics.wevalcache.manifest" \
+  "$AMBIGUOUS_RUNTIME/starling-ics.wevalcache.manifest"
+run_layout_aot \
+  "$AMBIGUOUS_RUNTIME" \
+  "$WORK/ambiguous explicit managed output.wasm" \
+  --weval-bin "$AMBIGUOUS_ROOT/weval-package/weval"
+echo "Flat-bin and managed-layout ambiguity matrix passed"
+
 cp -p "$WRAPPER_PACKAGE/weval sibling" \
   "$SCRATCH/wrapper-sibling.baseline"
 printf '# sibling mutation\n' >> "$WRAPPER_PACKAGE/weval sibling"
@@ -2300,6 +2430,86 @@ then
   exit 1
 fi
 grep -Fq UnsafeWevalPackage "$SCRATCH/unsafe-weval.log"
+
+SAFE_LINK_PACKAGE="$SCRATCH/safe intermediate symlink package"
+SAFE_LINK_BUNDLE="$WORK/safe intermediate symlink bundle"
+SAFE_LINK_OUTPUT="$WORK/safe intermediate symlink output.wasm"
+mkdir -p "$SAFE_LINK_PACKAGE/bin" "$SAFE_LINK_PACKAGE/aliases"
+cp "$FAKE_WEVAL" "$SAFE_LINK_PACKAGE/bin/weval-real"
+ln -s "../bin" "$SAFE_LINK_PACKAGE/aliases/tool-dir"
+ln -s "aliases/tool-dir/weval-real" "$SAFE_LINK_PACKAGE/selected weval"
+seal_fixture_bundle \
+  "$SAFE_LINK_PACKAGE/selected weval" \
+  "$SAFE_LINK_BUNDLE"
+run_fixture_aot \
+  "$SAFE_LINK_PACKAGE/selected weval" \
+  "$SAFE_LINK_BUNDLE" \
+  "$SAFE_LINK_OUTPUT"
+
+EXTERNAL_UNSAFE_PACKAGE="$SCRATCH/external unsafe symlink package"
+EXTERNAL_UNSAFE_BUNDLE="$WORK/external unsafe symlink bundle"
+mkdir "$EXTERNAL_UNSAFE_PACKAGE"
+cp "$FAKE_WEVAL" "$EXTERNAL_UNSAFE_PACKAGE/weval"
+seal_fixture_bundle \
+  "$EXTERNAL_UNSAFE_PACKAGE/weval" \
+  "$EXTERNAL_UNSAFE_BUNDLE"
+ln -s ".." "$EXTERNAL_UNSAFE_PACKAGE/parent"
+ln -s "parent/outside package sibling" \
+  "$EXTERNAL_UNSAFE_PACKAGE/through-parent"
+expect_fixture_aot_rejection \
+  "$EXTERNAL_UNSAFE_PACKAGE/weval" \
+  "$EXTERNAL_UNSAFE_BUNDLE" \
+  external-intermediate-escape
+grep -Fq InvalidEngineProvenance \
+  "$SCRATCH/external-intermediate-escape-package-rejection.log"
+
+assert_unsafe_symlink_package() {
+  local label="$1" link="$2" target="$3"
+  local package="$SCRATCH/$label symlink package"
+  local bundle="$WORK/$label symlink bundle"
+  mkdir "$package"
+  cp "$FAKE_WEVAL" "$package/weval"
+  ln -s "$target" "$package/$link"
+  if seal_fixture_bundle \
+    "$package/weval" \
+    "$bundle" >"$SCRATCH/$label-symlink.log" 2>&1
+  then
+    echo "FAIL: $label package symlink was accepted" >&2
+    exit 1
+  fi
+  grep -Fq UnsafeWevalPackage "$SCRATCH/$label-symlink.log"
+}
+
+assert_unsafe_symlink_package dangling dangling missing
+assert_unsafe_symlink_package cycle-a cycle-a cycle-b
+ln -s cycle-a "$SCRATCH/cycle-a symlink package/cycle-b"
+if seal_fixture_bundle \
+  "$SCRATCH/cycle-a symlink package/weval" \
+  "$WORK/cycle-a symlink retry bundle" \
+  >"$SCRATCH/cycle-symlink.log" 2>&1
+then
+  echo "FAIL: cyclic package symlink was accepted" >&2
+  exit 1
+fi
+grep -Fq UnsafeWevalPackage "$SCRATCH/cycle-symlink.log"
+
+INTERMEDIATE_ESCAPE_PACKAGE="$SCRATCH/intermediate escape symlink package"
+INTERMEDIATE_ESCAPE_BUNDLE="$WORK/intermediate escape symlink bundle"
+mkdir "$INTERMEDIATE_ESCAPE_PACKAGE"
+cp "$FAKE_WEVAL" "$INTERMEDIATE_ESCAPE_PACKAGE/weval"
+ln -s ".." "$INTERMEDIATE_ESCAPE_PACKAGE/parent"
+ln -s "parent/outside package sibling" \
+  "$INTERMEDIATE_ESCAPE_PACKAGE/through-parent"
+if seal_fixture_bundle \
+  "$INTERMEDIATE_ESCAPE_PACKAGE/weval" \
+  "$INTERMEDIATE_ESCAPE_BUNDLE" \
+  >"$SCRATCH/intermediate-escape-symlink.log" 2>&1
+then
+  echo "FAIL: intermediate escaping symlink was accepted" >&2
+  exit 1
+fi
+grep -Fq UnsafeWevalPackage "$SCRATCH/intermediate-escape-symlink.log"
+echo "Descriptor-relative package symlink matrix passed"
 
 NOEXEC_OUTPUT_DIR="$SCRATCH/noexec output"
 mkdir "$NOEXEC_OUTPUT_DIR"

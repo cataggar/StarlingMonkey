@@ -197,27 +197,37 @@ For AOT, the root must also own the sealed cache and manifest plus
 `weval-package/`; an installed generation may place the runtime surface and
 seal under `bin/` with `weval-package/` beside it. Cache, manifest, or Weval
 overrides outside that same root are rejected rather than captured as a
-second transaction.
-A transient rename/substitution that is restored may complete, but substituted
-bytes are never copied or executed. The Weval snapshot scope is the selected executable's canonical
+second transaction. The managed two-level layout is selected only from that
+validated structure and the selected Weval path, never merely because the
+runtime directory is named `bin`. A complete flat package named `bin` remains
+flat. If both flat and managed closures exist, the default flat
+`weval-package/weval` wins; an explicit path selects the matching validated
+closure.
+A transient rename/substitution is either detected as `TransactionChanged` or
+the original retained bytes are used; substituted bytes are never copied or
+executed. The Weval snapshot scope is the selected executable's canonical
 containing directory and all descendants (at most 4,096 entries, 32 levels,
 and 1 GiB of regular-file data). Descriptor-relative, no-follow traversal
-copies stable regular files, directories, and relative symlinks; dangling,
+copies stable regular files, directories, and relative symlinks. Every
+relative symlink target, including each intermediate symlink, is recursively
+resolved against the captured package model and retained. Dangling, cyclic,
 absolute, package-escaping, and special-file layouts are rejected. The
 selected basename and internal symlink target are retained, so scripts using
 `dirname "$0"`, argv[0]-dispatched tools, and `$ORIGIN` sibling libraries see
-their original relative layout. Read and execute permissions are preserved
-while write bits are removed.
+their original relative layout.
 
 Resolved WABT and `wasm-tools` executables are treated the same way. Their
-containing closures are retained, copied to a private executable staging
-directory, and reverified through publication. On Linux, each child is
-started as `/proc/self/fd/<retained-package-directory>/<selected-relative-path>`.
-This retains package-relative argv[0], sibling lookup, and script
-`dirname "$0"` behavior while preventing pathname reopening. Engine and cache
-reads likewise use retained file descriptors. Platforms without equivalent
-retained-handle execution fail closed. Diagnostics and debug command logs
-continue to identify the originally selected tool.
+containing closures are retained and reverified through publication. On
+Linux, every captured regular file is copied from its retained descriptor into
+a write/grow/shrink-sealed memfd. A retained copy of the componentizer enters
+a private user and mount namespace, reconstructs the complete closure on
+private tmpfs, and remounts it read-only. Native tools execute an immutable
+file descriptor with `execveat`; shebang scripts execute the private immutable
+pathname so package-relative argv[0], sibling lookup, script `dirname "$0"`,
+argv0 dispatch, and ELF `$ORIGIN` all retain their package semantics. Engine
+and cache reads likewise use retained file descriptors. Platforms without
+equivalent retained-handle execution fail closed. Diagnostics and debug
+command logs continue to identify the originally selected tool.
 Replacing a tool pathname after resolution therefore cannot select different
 bytes.
 
