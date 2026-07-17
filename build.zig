@@ -196,6 +196,7 @@ pub fn build(b: *std.Build) void {
     componentizer_options.addOption([]const u8, "version", "0.3.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     componentizer_options.addOption([]const u8, "host_api", host_api_selection);
+    componentizer_options.addOption([]const u8, "host_api_world", host_api_world);
     const componentizer_mod = b.createModule(.{
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,

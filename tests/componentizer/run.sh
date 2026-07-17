@@ -3750,6 +3750,7 @@ while IFS='|' read -r local_cache global_cache zig_lib; do
   esac
 done < "$FAKE_ZIG_ENV_LOG"
 test "$(grep -c -- "-Dhost-api=$EXPECTED_HOST_API" "$FAKE_ZIG_ARGS_LOG")" -eq 5
+test "$(grep -c -- '-Dhost-api-world=bindings' "$FAKE_ZIG_ARGS_LOG")" -eq 5
 cmp "$ENGINE" "$BUILD_OUTPUT_1"
 cmp "$ENGINE" "$BUILD_OUTPUT_2"
 cmp "$ENGINE" "$BUILD_OUTPUT_3"

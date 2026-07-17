@@ -39,11 +39,64 @@ ZIG_PREFIX="$BUILD_ROOT/Zig install with spaces"
 ZIG_COMPONENT="$BUILD_ROOT/Zig custom component.wasm"
 "$ZIG_PREFIX/bin/componentize.sh" "$FIXTURE" -o "$ZIG_COMPONENT"
 "$ZIG_PREFIX/bin/wasm-tools" validate --features all "$ZIG_COMPONENT"
-"$ZIG_PREFIX/bin/wasm-tools" component wit "$ZIG_COMPONENT" |
-  grep -q 'export wasi:cli/run@0.2.10;'
+ZIG_WIT="$BUILD_ROOT/Zig custom component.wit"
+"$ZIG_PREFIX/bin/wasm-tools" component wit "$ZIG_COMPONENT" -o "$ZIG_WIT"
 grep -q '"host-api": "custom runtime api"' "$ZIG_PREFIX/bin/features.json"
 grep -q '"component-world": "custom-bindings"' \
   "$ZIG_PREFIX/bin/features.json"
+
+NATIVE_CACHE="$BUILD_ROOT/native componentizer cache"
+NATIVE_COMPONENT="$BUILD_ROOT/native custom component.wasm"
+WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
+  "$ZIG_PREFIX/bin/starling-componentize" \
+  --build-root "$ROOT" \
+  --cache-dir "$NATIVE_CACHE" \
+  --zig-bin "$ZIG" \
+  --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
+  --wac-bin "$ZIG_PREFIX/bin/wac" \
+  --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
+  --out "$NATIVE_COMPONENT" \
+  "$FIXTURE"
+"$ZIG_PREFIX/bin/wasm-tools" validate --features all "$NATIVE_COMPONENT"
+NATIVE_WIT="$BUILD_ROOT/native custom component.wit"
+"$ZIG_PREFIX/bin/wasm-tools" component wit "$NATIVE_COMPONENT" -o "$NATIVE_WIT"
+
+mapfile -t NATIVE_MANIFESTS < <(
+  find "$NATIVE_CACHE/runtimes" -mindepth 3 -maxdepth 3 \
+    -type f -name features.json
+)
+test "${#NATIVE_MANIFESTS[@]}" -eq 1
+NATIVE_RUNTIME="$(dirname "${NATIVE_MANIFESTS[0]}")"
+grep -q '"host-api": "custom runtime api"' "$NATIVE_RUNTIME/features.json"
+grep -q '"component-world": "custom-bindings"' \
+  "$NATIVE_RUNTIME/features.json"
+python3 - "$NATIVE_RUNTIME/starling-raw.wasm" <<'PY'
+import pathlib
+import sys
+
+module = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"component-world=custom-bindings\n" in module
+assert b"component-world=bindings\n" not in module
+PY
+
+EXTERNAL_COMPONENT="$BUILD_ROOT/native external custom component.wasm"
+WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
+  "$ZIG_PREFIX/bin/starling-componentize" \
+  --engine "$NATIVE_RUNTIME/starling-raw.wasm" \
+  --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
+  --wac-bin "$ZIG_PREFIX/bin/wac" \
+  --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
+  --out "$EXTERNAL_COMPONENT" \
+  "$FIXTURE"
+"$ZIG_PREFIX/bin/wasm-tools" validate --features all "$EXTERNAL_COMPONENT"
+EXTERNAL_WIT="$BUILD_ROOT/native external custom component.wit"
+"$ZIG_PREFIX/bin/wasm-tools" component wit "$EXTERNAL_COMPONENT" \
+  -o "$EXTERNAL_WIT"
+python3 "$ROOT/tests/feature-selection/check-production-surface.py" \
+  "$ROOT/tests/feature-selection/reference/expected/import-surfaces.json" \
+  defaults \
+  "wasi:cli/run@0.2.10,wasi:http/incoming-handler@0.2.10" \
+  "$ZIG_WIT" "$NATIVE_WIT" "$EXTERNAL_WIT"
 
 CMAKE_BUILD="$BUILD_ROOT/CMake build with spaces"
 CMAKE_INSTALL="$BUILD_ROOT/CMake install with spaces"

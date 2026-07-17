@@ -168,6 +168,10 @@ oracle requires all four cache variables:
 `CUSTOM_HOST_API_VERSION`, and
 `CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS`.
 
+For Zig custom host APIs, `-Dhost-api-world` is embedded in
+`starling-componentize`, forwarded to its nested runtime builds, and included
+in their cache identity and engine provenance.
+
 The runtime matrix builds all ten production combinations, componentizes
 real JavaScript, validates resulting components, checks exact disabled
 interface absence (including zero-import pure mode), and exercises

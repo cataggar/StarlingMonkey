@@ -3890,6 +3890,7 @@ fn buildRuntime(
         config,
         if (dispatch_wit) |wit| wit.digest else null,
         if (component_wit) |wit| wit.digest else null,
+        build_options.host_api_world,
         build_snapshot.digest,
         zig_install,
     );
@@ -4017,6 +4018,11 @@ fn buildRuntime(
             .{adapter_input.path},
         ),
         try std.fmt.allocPrint(allocator, "-Dhost-api={s}", .{build_options.host_api}),
+        try std.fmt.allocPrint(
+            allocator,
+            "-Dhost-api-world={s}",
+            .{build_options.host_api_world},
+        ),
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
         argv.appendSlice(allocator, &.{
@@ -4204,7 +4210,7 @@ fn buildRuntime(
         );
     const runtime_component_world = config.component_world_name orelse
         config.world_name orelse
-        "bindings";
+        build_options.host_api_world;
     const surface_target_wit = if (dispatch_wit) |wit|
         wit.absolute
     else
@@ -5047,6 +5053,7 @@ fn runtimeKey(
     config: *const cli.Config,
     dispatch_digest: ?[]const u8,
     component_digest: ?[]const u8,
+    host_api_world: []const u8,
     build_root_digest: []const u8,
     zig: ZigSnapshot,
 ) ![]const u8 {
@@ -5054,6 +5061,7 @@ fn runtimeKey(
     hashField(&hasher, "schema", "2");
     hashField(&hasher, "version", build_options.version);
     hashField(&hasher, "host-api", build_options.host_api);
+    hashField(&hasher, "host-api-world", host_api_world);
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
@@ -10670,6 +10678,7 @@ test "runtime cache key excludes JavaScript source" {
         &config,
         "a",
         "b",
+        "bindings",
         "root",
         zig,
     );
@@ -10680,6 +10689,7 @@ test "runtime cache key excludes JavaScript source" {
         &config,
         "a",
         "b",
+        "bindings",
         "root",
         zig,
     );
@@ -10769,6 +10779,42 @@ test "runtime build selections include only selected closures" {
     ));
     try std.testing.expect(!treePathSelected("deps/source", &selected));
     try std.testing.expect(!treePathSelected(".zig-cache", &selected));
+}
+
+test "runtime cache key includes the authoritative host API world" {
+    var config = cli.Config{ .source = "source.js" };
+    const snapshot = Snapshot{
+        .path = "zig",
+        .storage_path = "zig",
+        .digest = "zig-digest",
+        .protection = 0,
+    };
+    const zig = ZigSnapshot{
+        .executable = snapshot,
+        .lib_dir = "lib",
+        .lib_digest = "lib-digest",
+    };
+    const bindings = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        null,
+        null,
+        "bindings",
+        "root",
+        zig,
+    );
+    defer std.testing.allocator.free(bindings);
+    const custom = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        null,
+        null,
+        "custom-bindings",
+        "root",
+        zig,
+    );
+    defer std.testing.allocator.free(custom);
+    try std.testing.expect(!std.mem.eql(u8, bindings, custom));
 }
 
 test "engine provenance requires a complete feature and topology tuple" {
