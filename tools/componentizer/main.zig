@@ -43,6 +43,7 @@ const PipelineError = error{
     UnsupportedZigVersion,
     StaleAotCache,
     TransactionChanged,
+    UnsupportedRetainedExecution,
 };
 
 const EngineFeatures = struct {
@@ -2240,6 +2241,17 @@ const AotSnapshot = struct {
     weval_package_root: []const u8,
     validated: ?aot_cache.Validated = null,
     bundle: AotCache,
+    engine_capture: CapturedFile,
+    cache_capture: CapturedFile,
+    manifest_capture: CapturedFile,
+    weval_capture: CapturedWevalPackage,
+
+    fn close(snapshot: AotSnapshot, io: Io) void {
+        snapshot.engine_capture.close(io);
+        snapshot.cache_capture.close(io);
+        snapshot.manifest_capture.close(io);
+        snapshot.weval_capture.close(io);
+    }
 };
 
 const Runtime = struct {
@@ -2386,12 +2398,18 @@ const CapturedDirectory = struct {
 
 const CapturedExternalRuntime = struct {
     package: CapturedDirectory,
+    runtime_root: *CapturedPackageDirectory,
     engine: CapturedPackageFile,
     adapter: CapturedPackageFile,
     features: CapturedPackageFile,
     component_wit: *CapturedPackageDirectory,
     surface_wit: *CapturedPackageDirectory,
     feature_wit: *CapturedPackageDirectory,
+    aot_cache: ?CapturedPackageFile,
+    aot_manifest: ?CapturedPackageFile,
+    weval_package: ?*CapturedPackageDirectory,
+    weval_selected_relative: ?[]const u8,
+    weval: ?WevalTool,
     supplied_surface_wit: ?CapturedDirectory,
     supplied_component_wit: ?CapturedDirectory,
 
@@ -2406,12 +2424,10 @@ const CapturedTool = struct {
     provenance: []const u8,
     executable: []const u8,
     package: CapturedWevalPackage,
-    snapshot_file: ?File = null,
-    snapshot_identity: ?PackageIdentity = null,
-    snapshot_digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+    snapshot_package: ?CapturedWevalPackage = null,
 
     fn close(tool: CapturedTool, io: Io) void {
-        if (tool.snapshot_file) |file| file.close(io);
+        if (tool.snapshot_package) |package| package.close(io);
         tool.package.close(io);
     }
 };
@@ -3022,6 +3038,7 @@ fn execute(
         cwd,
         executable_dir,
         config,
+        if (runtime.external_capture) |capture| capture.weval else null,
         runtime.component_wit != null,
         needs_initialization,
     );
@@ -3346,6 +3363,7 @@ fn execute(
             aot_staging_dir.?,
             runtime.engine,
             runtime.engine_capture,
+            runtime.external_capture,
             tools.weval.?,
             bundle,
         );
@@ -3374,6 +3392,7 @@ fn execute(
         };
         break :blk snapshot;
     } else null;
+    defer if (aot_snapshot) |snapshot| snapshot.close(io);
     const initialization_engine = if (aot_snapshot) |snapshot|
         snapshot.engine
     else
@@ -4497,17 +4516,69 @@ fn externalRuntime(
         }
     }
     const requested_engine = try absolutePath(allocator, cwd, engine_override);
-    const package_root = std.fs.path.dirname(requested_engine) orelse
+    const runtime_root_path = std.fs.path.dirname(requested_engine) orelse
         return error.InvalidPath;
+    const package_root = if (config.aot and
+        std.mem.eql(u8, std.fs.path.basename(runtime_root_path), "bin"))
+        std.fs.path.dirname(runtime_root_path) orelse return error.InvalidPath
+    else
+        runtime_root_path;
+    const runtime_relative = try std.fs.path.relative(
+        allocator,
+        "/",
+        null,
+        package_root,
+        runtime_root_path,
+    );
+    const bundle = if (config.aot and needs_initialization)
+        try resolveAotBundle(
+            allocator,
+            io,
+            cwd,
+            config.aot_cache_dir,
+            runtime_root_path,
+            null,
+        )
+    else
+        null;
+    const requested_weval_name = config.weval_bin orelse
+        environ.get("WEVAL_BIN");
+    const resolved_weval = if (bundle != null)
+        if (requested_weval_name) |path|
+            try resolveWevalExecutable(
+                allocator,
+                io,
+                environ,
+                cwd,
+                path,
+            )
+        else blk: {
+            const selected = try std.fs.path.join(
+                allocator,
+                &.{ package_root, "weval-package", "weval" },
+            );
+            break :blk WevalTool{
+                .selected = selected,
+                .package_root = std.fs.path.dirname(selected).?,
+                .provenance = selected,
+            };
+        }
+    else
+        null;
+    const requested_weval = if (resolved_weval) |tool| tool.selected else null;
     const engine_basename = std.fs.path.basename(requested_engine);
     const package_capture = captureDirectoryWithHook(
         allocator,
         io,
         package_root,
-        false,
+        config.aot,
         .{
             .environ = environ,
-            .entry_name = engine_basename,
+            .entry_name = if (runtime_relative.len == 0 or
+                std.mem.eql(u8, runtime_relative, "."))
+                engine_basename
+            else
+                std.fs.path.basename(runtime_root_path),
             .phase = "external-package-engine-captured",
         },
     ) catch |err| switch (err) {
@@ -4515,8 +4586,12 @@ fn externalRuntime(
         else => return error.InvalidEngineProvenance,
     };
     errdefer package_capture.close(io);
-    const engine_capture = capturedPackageFile(
+    const runtime_root = capturedPackageDirectoryPath(
         package_capture.root,
+        runtime_relative,
+    ) orelse return error.InvalidEngineProvenance;
+    const engine_capture = capturedPackageFile(
+        runtime_root,
         engine_basename,
     ) orelse return error.InvalidEngineProvenance;
     const engine = requested_engine;
@@ -4527,10 +4602,10 @@ fn externalRuntime(
     );
     const adapter = try std.fs.path.join(
         allocator,
-        &.{ package_root, "preview1-adapter.wasm" },
+        &.{ runtime_root_path, "preview1-adapter.wasm" },
     );
     const adapter_capture = capturedPackageFile(
-        package_capture.root,
+        runtime_root,
         "preview1-adapter.wasm",
     ) orelse return error.InvalidEngineProvenance;
     if (config.preview2_adapter) |path| {
@@ -4539,7 +4614,7 @@ fn externalRuntime(
             return error.InvalidEngineProvenance;
     }
     const features_capture = capturedPackageFile(
-        package_capture.root,
+        runtime_root,
         "features.json",
     ) orelse return error.InvalidEngineProvenance;
     try validateExternalFeatures(
@@ -4550,22 +4625,22 @@ fn externalRuntime(
     );
     const component_wit = try std.fs.path.join(
         allocator,
-        &.{ package_root, "component-wit" },
+        &.{ runtime_root_path, "component-wit" },
     );
     const surface_wit = try std.fs.path.join(
         allocator,
-        &.{ package_root, "surface-wit" },
+        &.{ runtime_root_path, "surface-wit" },
     );
     const component_wit_capture = capturedPackageDirectory(
-        package_capture.root,
+        runtime_root,
         "component-wit",
     ) orelse return error.InvalidEngineProvenance;
     const surface_wit_capture = capturedPackageDirectory(
-        package_capture.root,
+        runtime_root,
         "surface-wit",
     ) orelse return error.InvalidEngineProvenance;
     const feature_wit_capture = capturedPackageDirectory(
-        package_capture.root,
+        runtime_root,
         "feature-wit",
     ) orelse return error.InvalidEngineProvenance;
     const supplied_surface_wit = if (config.wit) |path| blk: {
@@ -4631,18 +4706,85 @@ fn externalRuntime(
             return error.InvalidEngineProvenance;
     }
     try validateExternalEngineInventory(
-        package_capture.root,
+        runtime_root,
         engine_basename,
     );
+    const cache_relative = if (bundle) |value|
+        try std.fs.path.relative(
+            allocator,
+            "/",
+            null,
+            package_root,
+            value.cache,
+        )
+    else
+        null;
+    const manifest_relative = if (bundle) |value|
+        try std.fs.path.relative(
+            allocator,
+            "/",
+            null,
+            package_root,
+            value.manifest,
+        )
+    else
+        null;
+    const captured_cache = if (cache_relative) |relative|
+        if (safePackageRelativePath(relative))
+            capturedPackageFilePath(package_capture.root, relative)
+        else
+            null
+    else
+        null;
+    const captured_manifest = if (manifest_relative) |relative|
+        if (safePackageRelativePath(relative))
+            capturedPackageFilePath(package_capture.root, relative)
+        else
+            null
+    else
+        null;
+    if (bundle != null and (captured_cache == null or captured_manifest == null))
+        return error.MissingAotCache;
+    const weval_package_relative = "weval-package";
+    const weval_package_capture = if (bundle != null)
+        capturedPackageDirectoryPath(
+            package_capture.root,
+            weval_package_relative,
+        ) orelse return error.MissingAotCache
+    else
+        null;
+    const selected_weval_relative = if (requested_weval) |path|
+        try std.fs.path.relative(
+            allocator,
+            "/",
+            null,
+            try std.fs.path.join(
+                allocator,
+                &.{ package_root, weval_package_relative },
+            ),
+            path,
+        )
+    else
+        null;
+    if (selected_weval_relative) |relative| {
+        if (!safePackageRelativePath(relative))
+            return error.MissingAotCache;
+    }
     const external_capture = try allocator.create(CapturedExternalRuntime);
     external_capture.* = .{
         .package = package_capture,
+        .runtime_root = runtime_root,
         .engine = engine_capture,
         .adapter = adapter_capture,
         .features = features_capture,
         .component_wit = component_wit_capture,
         .surface_wit = surface_wit_capture,
         .feature_wit = feature_wit_capture,
+        .aot_cache = captured_cache,
+        .aot_manifest = captured_manifest,
+        .weval_package = weval_package_capture,
+        .weval_selected_relative = selected_weval_relative,
+        .weval = resolved_weval,
         .supplied_surface_wit = supplied_surface_wit,
         .supplied_component_wit = supplied_component_wit,
     };
@@ -4678,18 +4820,11 @@ fn externalRuntime(
         .zig = null,
         .build_tools = &.{},
         .build_root_digest = null,
-        .aot_cache = if (config.aot)
-        .aot_cache = if (config.aot and needs_initialization)
-            try resolveAotBundle(
-                allocator,
-                io,
-                cwd,
-                config.aot_cache_dir,
-                package_root,
-                expected_feature_abi,
-            )
-        else
-            null,
+        .aot_cache = if (bundle) |value| .{
+            .cache = value.cache,
+            .manifest = value.manifest,
+            .expected_feature_abi = expected_feature_abi,
+        } else null,
         .cache_lock = null,
     };
 }
@@ -6390,6 +6525,7 @@ fn resolveTools(
     executable_dir: []const u8,
     config: *const cli.Config,
     transaction: *Transaction,
+    retained_weval: ?WevalTool,
     needs_wabt: bool,
     needs_initialization: bool,
 ) !Tools {
@@ -6549,6 +6685,8 @@ fn resolveTools(
     errdefer if (wabt) |tool| tool.close(io);
     const weval = if (!config.aot or !needs_initialization)
         null
+    else if (retained_weval) |tool|
+        tool
     else if (config.weval_bin) |path|
         try resolveWevalExecutable(allocator, io, environ, cwd, path)
     else if (environ.get("WEVAL_BIN")) |path|
@@ -6646,37 +6784,43 @@ fn snapshotAotInputs(
     transaction_dir: []const u8,
     engine: []const u8,
     retained_engine: ?CapturedFile,
+    external: ?*CapturedExternalRuntime,
     weval: WevalTool,
     bundle: AotCache,
 ) !AotSnapshot {
-    const captured_engine = if (retained_engine) |capture|
-        capture
+    const captured_engine = if (external == null)
+        if (retained_engine) |capture|
+            capture
+        else
+            try captureFile(allocator, io, engine)
     else
-        try captureFile(allocator, io, engine);
-    defer if (retained_engine == null) captured_engine.close(io);
-    const captured_cache = try captureFileWithHook(
-        allocator,
-        io,
-        bundle.cache,
-        .{
-            .environ = environ,
-            .parent_phase = "aot-cache-parent-captured",
-            .captured_phase = "aot-cache-file-captured",
-        },
-    );
-    defer captured_cache.close(io);
-    const captured_manifest = try captureFile(
-        allocator,
-        io,
-        bundle.manifest,
-    );
-    defer captured_manifest.close(io);
-    const captured_package = try captureWevalPackage(
-        allocator,
-        io,
-        weval,
-    );
-    defer captured_package.close(io);
+        null;
+    defer if (external == null and retained_engine == null)
+        captured_engine.?.close(io);
+    const captured_cache = if (external == null)
+        try captureFileWithHook(
+            allocator,
+            io,
+            bundle.cache,
+            .{
+                .environ = environ,
+                .parent_phase = "aot-cache-parent-captured",
+                .captured_phase = "aot-cache-file-captured",
+            },
+        )
+    else
+        null;
+    defer if (captured_cache) |capture| capture.close(io);
+    const captured_manifest = if (external == null)
+        try captureFile(allocator, io, bundle.manifest)
+    else
+        null;
+    defer if (captured_manifest) |capture| capture.close(io);
+    const captured_package = if (external == null)
+        try captureWevalPackage(allocator, io, weval)
+    else
+        null;
+    defer if (captured_package) |capture| capture.close(io);
     try runComponentizerTestHook(
         allocator,
         io,
@@ -6700,19 +6844,60 @@ fn snapshotAotInputs(
         allocator,
         &.{ transaction_dir, aot_cache.manifest_basename },
     );
-    try copyCapturedFile(io, captured_engine, snapshot_engine);
-    try copyCapturedFile(io, captured_cache, snapshot_cache);
-    try copyCapturedFile(io, captured_manifest, snapshot_manifest);
-    const snapshot_weval = try copyCapturedWevalPackage(
-        allocator,
-        io,
-        captured_package,
-        snapshot_package_root,
-    );
-    try verifyCapturedFile(io, captured_engine);
-    try verifyCapturedFile(io, captured_cache);
-    try verifyCapturedFile(io, captured_manifest);
-    try verifyCapturedWevalPackage(io, captured_package);
+    const snapshot_weval = if (external) |captured| blk: {
+        copyCapturedPackageFile(io, captured.engine, snapshot_engine) catch |err|
+            return switch (err) {
+                error.WevalPackageRace => error.TransactionChanged,
+                else => err,
+            };
+        copyCapturedPackageFile(
+            io,
+            captured.aot_cache orelse return error.MissingAotCache,
+            snapshot_cache,
+        ) catch |err| return switch (err) {
+            error.WevalPackageRace => error.TransactionChanged,
+            else => err,
+        };
+        copyCapturedPackageFile(
+            io,
+            captured.aot_manifest orelse return error.MissingAotCache,
+            snapshot_manifest,
+        ) catch |err| return switch (err) {
+            error.WevalPackageRace => error.TransactionChanged,
+            else => err,
+        };
+        const copied = copyCapturedExecutablePackage(
+            allocator,
+            io,
+            captured.weval_package orelse return error.MissingAotCache,
+            captured.weval_selected_relative orelse return error.MissingAotCache,
+            snapshot_package_root,
+        ) catch |err| return switch (err) {
+            error.WevalPackageRace => error.TransactionChanged,
+            else => err,
+        };
+        verifyCapturedDirectory(io, captured.package) catch |err|
+            return switch (err) {
+                error.WevalPackageRace => error.TransactionChanged,
+                else => err,
+            };
+        break :blk copied;
+    } else blk: {
+        try copyCapturedFile(io, captured_engine.?, snapshot_engine);
+        try copyCapturedFile(io, captured_cache.?, snapshot_cache);
+        try copyCapturedFile(io, captured_manifest.?, snapshot_manifest);
+        const copied = try copyCapturedWevalPackage(
+            allocator,
+            io,
+            captured_package.?,
+            snapshot_package_root,
+        );
+        try verifyCapturedFile(io, captured_engine.?);
+        try verifyCapturedFile(io, captured_cache.?);
+        try verifyCapturedFile(io, captured_manifest.?);
+        try verifyCapturedWevalPackage(io, captured_package.?);
+        break :blk copied;
+    };
     const readonly_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
         File.Permissions.fromMode(0o400)
     else
@@ -6724,6 +6909,50 @@ fn snapshotAotInputs(
     for ([_][]const u8{ snapshot_engine, snapshot_cache, snapshot_manifest }) |path| {
         try setRegularFilePermissions(io, path, readonly_permissions);
     }
+    const snapshot_engine_capture = try captureFile(
+        allocator,
+        io,
+        snapshot_engine,
+    );
+    errdefer snapshot_engine_capture.close(io);
+    const snapshot_cache_capture = try captureFile(
+        allocator,
+        io,
+        snapshot_cache,
+    );
+    errdefer snapshot_cache_capture.close(io);
+    const snapshot_manifest_capture = try captureFile(
+        allocator,
+        io,
+        snapshot_manifest,
+    );
+    errdefer snapshot_manifest_capture.close(io);
+    const snapshot_weval_capture = try captureWevalPackage(
+        allocator,
+        io,
+        .{
+            .selected = snapshot_weval.selected,
+            .package_root = snapshot_package_root,
+            .provenance = snapshot_weval.provenance,
+        },
+    );
+    errdefer snapshot_weval_capture.close(io);
+    const handle_engine = try retainedFilePath(
+        allocator,
+        snapshot_engine_capture.file,
+    );
+    const handle_cache = try retainedFilePath(
+        allocator,
+        snapshot_cache_capture.file,
+    );
+    const handle_manifest = try retainedFilePath(
+        allocator,
+        snapshot_manifest_capture.file,
+    );
+    const handle_weval = try retainedPackageExecutablePath(
+        allocator,
+        snapshot_weval_capture,
+    );
     var snapshot_dir = try Dir.openDirAbsolute(
         io,
         transaction_dir,
@@ -6734,14 +6963,18 @@ fn snapshotAotInputs(
         return error.InvalidPath;
     try snapshot_dir.setPermissions(io, executable_permissions);
     return .{
-        .engine = snapshot_engine,
-        .weval = snapshot_weval.selected,
+        .engine = handle_engine,
+        .weval = handle_weval,
         .weval_package_root = snapshot_package_root,
         .bundle = .{
-            .cache = snapshot_cache,
-            .manifest = snapshot_manifest,
+            .cache = handle_cache,
+            .manifest = handle_manifest,
             .expected_feature_abi = bundle.expected_feature_abi,
         },
+        .engine_capture = snapshot_engine_capture,
+        .cache_capture = snapshot_cache_capture,
+        .manifest_capture = snapshot_manifest_capture,
+        .weval_capture = snapshot_weval_capture,
     };
 }
 
@@ -7204,6 +7437,29 @@ fn capturedPackageDirectory(
     return null;
 }
 
+fn capturedPackageDirectoryPath(
+    root: *CapturedPackageDirectory,
+    relative: []const u8,
+) ?*CapturedPackageDirectory {
+    if (relative.len == 0 or std.mem.eql(u8, relative, ".")) return root;
+    var current = root;
+    var components = std.mem.tokenizeScalar(u8, relative, std.fs.path.sep);
+    while (components.next()) |component| {
+        if (!safePackageRelativePath(component)) return null;
+        current = capturedPackageDirectory(current, component) orelse return null;
+    }
+    return current;
+}
+
+fn capturedPackageFilePath(
+    root: *CapturedPackageDirectory,
+    relative: []const u8,
+) ?CapturedPackageFile {
+    const dirname = std.fs.path.dirname(relative) orelse ".";
+    const parent = capturedPackageDirectoryPath(root, dirname) orelse return null;
+    return capturedPackageFile(parent, std.fs.path.basename(relative));
+}
+
 fn hashCapturedPackageDirectory(
     hasher: *std.crypto.hash.sha2.Sha256,
     captured: *CapturedPackageDirectory,
@@ -7392,6 +7648,22 @@ fn copyCapturedWevalPackage(
     captured: CapturedWevalPackage,
     destination_path: []const u8,
 ) !SnapshotWeval {
+    return copyCapturedExecutablePackage(
+        allocator,
+        io,
+        captured.tree.root,
+        captured.selected_relative,
+        destination_path,
+    );
+}
+
+fn copyCapturedExecutablePackage(
+    allocator: Allocator,
+    io: Io,
+    root: *CapturedPackageDirectory,
+    selected_relative: []const u8,
+    destination_path: []const u8,
+) !SnapshotWeval {
     const private_permissions: File.Permissions = if (File.Permissions.has_executable_bit)
         File.Permissions.fromMode(0o700)
     else
@@ -7402,10 +7674,10 @@ fn copyCapturedWevalPackage(
         .follow_symlinks = false,
     });
     defer destination.close(io);
-    try copyCapturedPackageDirectory(io, captured.tree.root, destination);
+    try copyCapturedPackageDirectory(io, root, destination);
     const selected = try std.fs.path.join(
         allocator,
-        &.{ destination_path, captured.selected_relative },
+        &.{ destination_path, selected_relative },
     );
     const provenance = Dir.realPathFileAbsoluteAlloc(
         io,
@@ -7502,32 +7774,21 @@ fn snapshotTool(
         );
         return error.TransactionChanged;
     };
-    const file = try Dir.openFileAbsolute(io, snapshot.selected, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
-    errdefer file.close(io);
-    const identity = try packageFileIdentity(io, file);
-    if (identity.stat.kind != .file)
-        return error.MissingBuildArtifact;
-    tool.snapshot_file = file;
-    tool.snapshot_identity = identity;
-    tool.snapshot_digest = try hashPackageFile(io, file);
-    tool.executable = if (builtin.os.tag == .linux) blk: {
-        switch (std.posix.errno(std.posix.system.fcntl(
-            file.handle,
-            std.posix.F.SETFD,
-            @as(usize, 0),
-        ))) {
-            .SUCCESS => {},
-            else => return error.MissingBuildArtifact,
-        }
-        break :blk try std.fmt.allocPrint(
-            allocator,
-            "/proc/self/fd/{d}",
-            .{file.handle},
-        );
-    } else snapshot.selected;
+    const snapshot_package = try captureWevalPackage(
+        allocator,
+        io,
+        .{
+            .selected = snapshot.selected,
+            .package_root = destination,
+            .provenance = snapshot.provenance,
+        },
+    );
+    errdefer snapshot_package.close(io);
+    tool.executable = try retainedPackageExecutablePath(
+        allocator,
+        snapshot_package,
+    );
+    tool.snapshot_package = snapshot_package;
 }
 
 fn verifyCapturedTools(io: Io, tools: Tools) !void {
@@ -7540,14 +7801,55 @@ fn verifyCapturedTools(io: Io, tools: Tools) !void {
 }
 
 fn verifySnapshotTool(io: Io, tool: CapturedTool) !void {
-    const file = tool.snapshot_file orelse return error.TransactionChanged;
-    if (!sameRetainedPackageIdentity(
-        tool.snapshot_identity.?,
-        try packageFileIdentity(io, file),
-    )) return error.TransactionChanged;
-    const digest = try hashPackageFile(io, file);
-    if (!std.mem.eql(u8, &digest, &tool.snapshot_digest.?))
-        return error.TransactionChanged;
+    try verifyCapturedWevalPackage(
+        io,
+        tool.snapshot_package orelse return error.TransactionChanged,
+    );
+}
+
+fn verifyToolTransaction(io: Io, tool: CapturedTool) !void {
+    try verifyCapturedWevalPackage(io, tool.package);
+    try verifySnapshotTool(io, tool);
+}
+
+fn retainedFilePath(allocator: Allocator, file: File) ![]const u8 {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    switch (std.posix.errno(std.posix.system.fcntl(
+        file.handle,
+        std.posix.F.SETFD,
+        @as(usize, 0),
+    ))) {
+        .SUCCESS => {},
+        else => return error.MissingBuildArtifact,
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "/proc/self/fd/{d}",
+        .{file.handle},
+    );
+}
+
+fn retainedPackageExecutablePath(
+    allocator: Allocator,
+    package: CapturedWevalPackage,
+) ![]const u8 {
+    if (builtin.os.tag != .linux)
+        return error.UnsupportedRetainedExecution;
+    const handle = package.tree.root.dir.handle;
+    switch (std.posix.errno(std.posix.system.fcntl(
+        handle,
+        std.posix.F.SETFD,
+        @as(usize, 0),
+    ))) {
+        .SUCCESS => {},
+        else => return error.MissingBuildArtifact,
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "/proc/self/fd/{d}/{s}",
+        .{ handle, package.selected_relative },
+    );
 }
 
 fn copyCapturedDirectory(
@@ -8164,6 +8466,14 @@ fn verifyWevalPackageSnapshot(
     io: Io,
     snapshot: AotSnapshot,
 ) !void {
+    verifyCapturedFile(io, snapshot.engine_capture) catch
+        return error.TransactionChanged;
+    verifyCapturedFile(io, snapshot.cache_capture) catch
+        return error.TransactionChanged;
+    verifyCapturedFile(io, snapshot.manifest_capture) catch
+        return error.TransactionChanged;
+    verifyCapturedWevalPackage(io, snapshot.weval_capture) catch
+        return error.TransactionChanged;
     try aot_cache.validateWevalPackage(
         allocator,
         io,
@@ -13883,7 +14193,7 @@ fn runCapturedToolCommand(
     verbose: bool,
     command_log: *std.ArrayList(u8),
 ) !void {
-    verifySnapshotTool(io, tool) catch
+    verifyToolTransaction(io, tool) catch
         return error.TransactionChanged;
     const result = runCommandWithDisplay(
         allocator,
@@ -13897,7 +14207,7 @@ fn runCapturedToolCommand(
         verbose,
         command_log,
     );
-    verifySnapshotTool(io, tool) catch
+    verifyToolTransaction(io, tool) catch
         return error.TransactionChanged;
     return result;
 }

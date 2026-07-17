@@ -16,8 +16,6 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 BARRIERS="$SCRATCH/test barriers"
 TOOLS="$SCRATCH/fake tools"
-WEVAL_PACKAGE="$SCRATCH/fake weval package"
-FAKE_WEVAL="$WEVAL_PACKAGE/fake weval"
 WORK="$SCRATCH/work with spaces"
 FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
 FAKE_HOST_API_DIR="$FAKE_BUILD_ROOT/host-apis/$EXPECTED_HOST_API"
@@ -91,6 +89,8 @@ printf 'adapter-bytes\n' > \
   "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
 ENGINE_PACKAGE="$WORK/external engine package"
+WEVAL_PACKAGE="$ENGINE_PACKAGE/weval-package"
+FAKE_WEVAL="$WEVAL_PACKAGE/fake weval"
 FEATURE_ABI='starling-features-v1;stdio=1;random=1;clocks=1;http=1;fetch-event=1;optimize=ReleaseSmall;host-api=wasi-0.2.10;debugger=1'
 rm -rf "$SCRATCH"
 mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package" \
@@ -417,6 +417,8 @@ EOF
 cat > "$TOOLS/fake wabt" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+test "$(basename "$0")" = "fake wabt"
+test "$("$(dirname "$0")/tool sibling" wabt)" = "wabt-sibling-ok"
 if [ -n "${FAKE_WABT_EXECUTABLE_LOG:-}" ]; then
   printf '%s\n' "$0" >> "$FAKE_WABT_EXECUTABLE_LOG"
 fi
@@ -504,6 +506,9 @@ EOF
 cat > "$TOOLS/fake wasm-tools" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+test "$(basename "$0")" = "fake wasm-tools"
+test "$("$(dirname "$0")/tool sibling" wasm-tools)" = \
+  "wasm-tools-sibling-ok"
 if [ -n "${FAKE_WASM_TOOLS_EXECUTABLE_LOG:-}" ]; then
   printf '%s\n' "$0" >> "$FAKE_WASM_TOOLS_EXECUTABLE_LOG"
 fi
@@ -687,6 +692,12 @@ elif [ "$1 $2" = "component embed" ]; then
     printf 'dummy-core\n' > "$out"
   fi
 fi
+EOF
+
+cat > "$TOOLS/tool sibling" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s-sibling-ok\n' "$1"
 EOF
 
 cat > "$TOOLS/fake zig" <<'EOF'
@@ -1078,8 +1089,9 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
 cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
-grep -Eq '^/proc/self/fd/[0-9]+$' "$WABT_EXECUTABLE_LOG"
-grep -Eq '^/proc/self/fd/[0-9]+$' "$WASM_TOOLS_EXECUTABLE_LOG"
+grep -Eq '^/proc/self/fd/[0-9]+/fake wabt$' "$WABT_EXECUTABLE_LOG"
+grep -Eq '^/proc/self/fd/[0-9]+/fake wasm-tools$' \
+  "$WASM_TOOLS_EXECUTABLE_LOG"
 
 PACKAGE_CAPTURE_HOOK="$SCRATCH/external package capture hook"
 PACKAGE_CAPTURE_OUTPUT="$WORK/external package capture output.wasm"
@@ -1165,6 +1177,7 @@ assert_tool_replacement_rejected() {
 
 assert_tool_replacement_rejected wasm-tools "$TOOLS/fake wasm-tools"
 assert_tool_replacement_rejected wabt "$TOOLS/fake wabt"
+assert_tool_replacement_rejected tool-sibling "$TOOLS/tool sibling"
 echo "Retained WABT/wasm-tools replacement matrix passed"
 
 EXTERNAL_SNAPSHOT_HOOK="$SCRATCH/external snapshot hook"
@@ -1992,9 +2005,8 @@ fi
 grep -Eq 'FileNotFound|MissingBuildArtifact|failed to resolve executable' \
   "$SCRATCH/invalid-required-wizer.log"
 
-AOT_BUNDLE="$WORK/aot cache bundle"
+AOT_BUNDLE="$ENGINE_PACKAGE"
 AOT_OUTPUT="$WORK/aot output component.wasm"
-mkdir -p "$AOT_BUNDLE"
 python3 - "$AOT_BUNDLE/starling-ics.wevalcache" "$ENGINE" <<'PY'
 import hashlib
 import sqlite3
@@ -2056,12 +2068,19 @@ seal_fixture_bundle() {
 
 run_fixture_aot() {
   local weval="$1" bundle="$2" output="$3"
+  local package="$WORK/$(basename "$output").external-package"
+  rm -rf "$package"
+  cp -a "$ENGINE_PACKAGE" "$package"
+  rm -rf "$package/weval-package"
+  cp -a "$(dirname "$weval")" "$package/weval-package"
+  cp "$bundle/starling-ics.wevalcache" "$package/"
+  cp "$bundle/starling-ics.wevalcache.manifest" "$package/"
   "$COMPONENTIZER" \
     --aot \
-    --engine "$ENGINE" \
-    --aot-cache-dir "$bundle" \
-    --weval-bin "$weval" \
-    --preview2-adapter "$ADAPTER" \
+    --engine "$package/$(basename "$ENGINE")" \
+    --aot-cache-dir "$package" \
+    --weval-bin "$package/weval-package/$(basename "$weval")" \
+    --preview2-adapter "$package/$(basename "$ADAPTER")" \
     --wit "$WIT" \
     --world-name exports \
     --wabt-bin "$TOOLS/fake wabt" \
@@ -2633,11 +2652,10 @@ run_capture_race() {
 
 ANCESTOR_HOOK="$SCRATCH/ancestor capture hook"
 ANCESTOR_OUTPUT="$WORK/ancestor substitution output.wasm"
-ANCESTOR_ORIGINAL="$WORK/aot cache bundle ancestor original"
 mkdir "$ANCESTOR_HOOK"
+printf 'preserved package transaction output\n' > "$ANCESTOR_OUTPUT"
 STARLING_COMPONENTIZER_TEST_HOOK_DIR="$ANCESTOR_HOOK" \
-STARLING_COMPONENTIZER_TEST_WAIT_AT=\
-aot-cache-parent-captured,aot-cache-file-captured \
+STARLING_COMPONENTIZER_TEST_WAIT_AT=external-inputs-snapshotted \
   "$COMPONENTIZER" \
     --aot \
     --engine "$ENGINE" \
@@ -2651,23 +2669,18 @@ aot-cache-parent-captured,aot-cache-file-captured \
     --out "$ANCESTOR_OUTPUT" \
     "$SOURCE" >"$SCRATCH/ancestor-capture.log" 2>&1 &
 ancestor_pid=$!
-wait_for_capture_hook "$ANCESTOR_HOOK/aot-cache-parent-captured.ready"
-mv "$AOT_BUNDLE" "$ANCESTOR_ORIGINAL"
-mkdir "$AOT_BUNDLE"
-cp "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache" "$AOT_BUNDLE/"
-cp "$SUBSTITUTE_BUNDLE/starling-ics.wevalcache.manifest" "$AOT_BUNDLE/"
-touch "$ANCESTOR_HOOK/aot-cache-parent-captured.continue"
-wait_for_capture_hook "$ANCESTOR_HOOK/aot-cache-file-captured.ready"
-rm -rf "$AOT_BUNDLE"
-mv "$ANCESTOR_ORIGINAL" "$AOT_BUNDLE"
-touch "$ANCESTOR_HOOK/aot-cache-file-captured.continue"
-if ! wait "$ancestor_pid"; then
-  cat "$SCRATCH/ancestor-capture.log" >&2
-  echo "FAIL: restored ancestor substitution did not use retained inputs" >&2
+wait_for_capture_hook \
+  "$ANCESTOR_HOOK/external-inputs-snapshotted.ready"
+install_coherent_substitute
+touch "$ANCESTOR_HOOK/external-inputs-snapshotted.continue"
+if wait "$ancestor_pid"; then
+  echo "FAIL: runtime-to-AOT package substitution was accepted" >&2
   exit 1
 fi
-cmp "$ENGINE" "$ANCESTOR_OUTPUT"
-echo "Retained ancestor substitution snapshot passed"
+restore_captured_inputs
+grep -Fq TransactionChanged "$SCRATCH/ancestor-capture.log"
+test "$(cat "$ANCESTOR_OUTPUT")" = "preserved package transaction output"
+echo "Unified runtime-to-AOT package substitution rejected"
 
 TRANSIENT_HOOK="$SCRATCH/transient capture hook"
 TRANSIENT_OUTPUT="$WORK/transient substitution output.wasm"
@@ -2711,19 +2724,16 @@ echo "Retained AOT input substitution matrix passed"
 RACE_ENGINE_PACKAGE="$WORK/race engine package"
 cp -R "$ENGINE_PACKAGE" "$RACE_ENGINE_PACKAGE"
 RACE_ENGINE="$RACE_ENGINE_PACKAGE/fake engine.wasm"
-RACE_PACKAGE="$SCRATCH/race weval package"
+RACE_PACKAGE="$RACE_ENGINE_PACKAGE/weval-package"
 RACE_WEVAL="$RACE_PACKAGE/race weval"
 RACE_SIBLING="$RACE_PACKAGE/race sibling"
-RACE_BUNDLE="$WORK/race cache bundle"
+RACE_BUNDLE="$RACE_ENGINE_PACKAGE"
 RACE_ENGINE_BASELINE="$WORK/race engine baseline.wasm"
 RACE_CACHE_BASELINE="$WORK/race cache baseline.sqlite"
 RACE_OUTPUT="$WORK/race output component.wasm"
-mkdir "$RACE_PACKAGE"
 cp "$FAKE_WEVAL" "$RACE_WEVAL"
 printf 'snapshot sibling\n' > "$RACE_SIBLING"
-mkdir "$RACE_BUNDLE"
-cp "$AOT_BUNDLE/starling-ics.wevalcache" \
-  "$RACE_BUNDLE/starling-ics.wevalcache"
+rm -rf "$RACE_BUNDLE"/.starling-aot-seal-*
 "$CACHE_TOOL" seal \
   --engine "$RACE_ENGINE" \
   --weval "$RACE_WEVAL" \
