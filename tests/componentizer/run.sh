@@ -633,13 +633,12 @@ SYMLINK_OUTPUT="$WORK/symlinked inputs.wasm"
 SYMLINK_INPUT_DIR="$SCRATCH/symlinked tool inputs"
 mkdir "$SYMLINK_INPUT_DIR"
 ln -s "$ENGINE" "$SYMLINK_INPUT_DIR/engine link.wasm"
-ln -s "$ADAPTER" "$SYMLINK_INPUT_DIR/adapter link.wasm"
 ln -s "$TOOLS/fake wizer" "$SYMLINK_INPUT_DIR/wizer link"
 ln -s "$TOOLS/fake wabt" "$SYMLINK_INPUT_DIR/wabt link"
 ln -s "$TOOLS/fake wasm-tools" "$SYMLINK_INPUT_DIR/wasm-tools link"
 "$COMPONENTIZER" \
   --engine "$SYMLINK_INPUT_DIR/engine link.wasm" \
-  --preview2-adapter "$SYMLINK_INPUT_DIR/adapter link.wasm" \
+  --preview2-adapter "$ADAPTER" \
   --wit "$WIT" \
   --world-name exports \
   --wizer-bin "$SYMLINK_INPUT_DIR/wizer link" \
@@ -2667,6 +2666,85 @@ assert diagnostic["phase"] == "inputs", diagnostic
 assert diagnostic["cause"] == "InputChanged", diagnostic
 PY
 
+run_adapter_ancestor_alternation_test() {
+  local flow="$1"
+  local parent="$SCRATCH/$flow adapter capture parent"
+  local saved="$SCRATCH/$flow adapter capture saved"
+  local replacement="$SCRATCH/$flow adapter capture replacement"
+  local displaced="$SCRATCH/$flow adapter capture displaced"
+  local adapter="$parent/adapter input.wasm"
+  local barrier="$SCRATCH/$flow-adapter-retain"
+  local error="$SCRATCH/$flow-adapter-retain.jsonl"
+  local output="$WORK/$flow adapter retain preserved.wasm"
+  local metadata="$WORK/$flow adapter retain preserved.json"
+  local debug="$WORK/$flow adapter retain preserved.debug"
+  local component
+  component="$(basename "$parent")"
+  mkdir "$parent" "$replacement" "$debug"
+  cp "$ADAPTER" "$adapter"
+  printf 'substituted-adapter\n' > "$replacement/adapter input.wasm"
+  printf '%s-output\n' "$flow" > "$output"
+  printf '%s-metadata\n' "$flow" > "$metadata"
+  printf '%s-debug\n' "$flow" > "$debug/unrelated.txt"
+  local command=(
+    "$COMPONENTIZER"
+    --json-diagnostics
+    --wit "$WIT"
+    --world-name exports
+    --wizer-bin "$TOOLS/fake wizer"
+    --wabt-bin "$TOOLS/fake wabt"
+    --wasm-tools-bin "$TOOLS/fake wasm-tools"
+    --preview2-adapter "$adapter"
+    --metadata-out "$metadata"
+    --debug-dir "$debug"
+    --out "$output"
+  )
+  if [ "$flow" = external ]; then
+    command+=(--engine "$ENGINE" "$SOURCE")
+  else
+    command+=(
+      --build-root "$FAKE_BUILD_ROOT"
+      --cache-dir "$WORK/$flow adapter retain cache"
+      --zig-bin "$TOOLS/fake zig"
+      "$BUILD_SOURCE"
+    )
+  fi
+  STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_BARRIER="$barrier" \
+  STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_COMPONENT="$component" \
+    "${command[@]}" 2> "$error" &
+  SNAPSHOT_TEST_PID=$!
+  wait_for_marker "$barrier.before_open.ready" "$SNAPSHOT_TEST_PID" \
+    "$flow adapter ancestor baseline"
+  mv "$parent" "$saved"
+  mv "$replacement" "$parent"
+  : > "$barrier.before_open.release"
+  wait_for_marker "$barrier.after_open.ready" "$SNAPSHOT_TEST_PID" \
+    "$flow adapter retained ancestor"
+  mv "$parent" "$displaced"
+  mv "$saved" "$parent"
+  : > "$barrier.after_open.release"
+  if wait "$SNAPSHOT_TEST_PID"; then
+    echo "FAIL: $flow alternating adapter ancestor was accepted" >&2
+    exit 1
+  fi
+  SNAPSHOT_TEST_PID=""
+  python3 - "$error" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+  test "$(cat "$output")" = "$flow-output"
+  test "$(cat "$metadata")" = "$flow-metadata"
+  test "$(cat "$debug/unrelated.txt")" = "$flow-debug"
+}
+
+run_adapter_ancestor_alternation_test external
+run_adapter_ancestor_alternation_test build
+
 FALLBACK_TOOL_DIR="$SCRATCH/fallback adapter tool"
 FALLBACK_COMPONENTIZER="$FALLBACK_TOOL_DIR/starling-componentize"
 FALLBACK_ADAPTER="$FALLBACK_TOOL_DIR/preview1-adapter.wasm"
@@ -2777,9 +2855,7 @@ STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=adapter \
 STARLING_COMPONENTIZER_TEST_ADAPTER_SNAPSHOT_BARRIER="$FALLBACK_SYMLINK_SNAPSHOT_BARRIER" \
 "$FALLBACK_COMPONENTIZER" \
   --json-diagnostics \
-  --build-root "$FAKE_BUILD_ROOT" \
-  --cache-dir "$WORK/fallback symlink cache" \
-  --zig-bin "$TOOLS/fake zig" \
+  --engine "$ENGINE" \
   --wit "$WIT" \
   --world-name exports \
   --wizer-bin "$TOOLS/fake wizer" \
@@ -2788,7 +2864,7 @@ STARLING_COMPONENTIZER_TEST_ADAPTER_SNAPSHOT_BARRIER="$FALLBACK_SYMLINK_SNAPSHOT
   --metadata-out "$FALLBACK_SYMLINK_METADATA" \
   --debug-dir "$FALLBACK_SYMLINK_DEBUG" \
   --out "$FALLBACK_SYMLINK_OUTPUT" \
-  "$BUILD_SOURCE" 2> "$FALLBACK_SYMLINK_ERROR" &
+  "$SOURCE" 2> "$FALLBACK_SYMLINK_ERROR" &
 SNAPSHOT_TEST_PID=$!
 wait_for_marker "$FALLBACK_SYMLINK_CAPTURE_BARRIER.ready" \
   "$SNAPSHOT_TEST_PID" "fallback adapter symlink substitution"

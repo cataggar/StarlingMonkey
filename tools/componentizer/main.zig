@@ -58,30 +58,47 @@ const SnapshotSymlinkPolicy = enum {
 const AnchoredTargetDirectory = struct {
     name: []const u8,
     identity: SourceIdentity,
+    device: DeviceIdentity = .{ .major = 0, .minor = 0 },
     directory: Dir,
 };
 
 const RetainedInputFile = struct {
     root: Dir,
-    root_identity: EntryIdentity,
+    root_identity: SourceIdentity,
+    root_device: DeviceIdentity,
     directories: []const AnchoredTargetDirectory,
     basename: []const u8,
-    entry_identity: EntryIdentity,
+    entry_identity: SourceIdentity,
+    entry_device: DeviceIdentity,
     file: File,
     file_identity: SourceIdentity,
+    file_device: DeviceIdentity,
 
     fn verify(self: *const RetainedInputFile, io: Io) !void {
-        if (!self.root_identity.matches(try self.root.stat(io))) {
+        if (!self.root_identity.matches(try self.root.stat(io)) or
+            !deviceIdentityMatches(
+                self.root_device,
+                try linuxDeviceForHandle(self.root.handle),
+            ))
+        {
             return error.InputChanged;
         }
         var parent = self.root;
         for (self.directories) |anchored| {
-            if (!anchored.identity.entry.matches(try parent.statFile(
+            if (!anchored.identity.matches(try parent.statFile(
                 io,
                 anchored.name,
                 .{ .follow_symlinks = false },
             )) or
-                !anchored.identity.entry.matches(try anchored.directory.stat(io)))
+                !anchored.identity.matches(try anchored.directory.stat(io)) or
+                !deviceIdentityMatches(
+                    anchored.device,
+                    try linuxDeviceAt(parent, anchored.name),
+                ) or
+                !deviceIdentityMatches(
+                    anchored.device,
+                    try linuxDeviceForHandle(anchored.directory.handle),
+                ))
             {
                 return error.InputChanged;
             }
@@ -92,7 +109,15 @@ const RetainedInputFile = struct {
             self.basename,
             .{ .follow_symlinks = false },
         )) or
-            !self.file_identity.matchesRetained(try self.file.stat(io)))
+            !self.file_identity.matchesRetained(try self.file.stat(io)) or
+            !deviceIdentityMatches(
+                self.entry_device,
+                try linuxDeviceAt(parent, self.basename),
+            ) or
+            !deviceIdentityMatches(
+                self.file_device,
+                try linuxDeviceForHandle(self.file.handle),
+            ))
         {
             return error.InputChanged;
         }
@@ -104,8 +129,10 @@ const RetainedInputFile = struct {
         while (index > 0) {
             index -= 1;
             self.directories[index].directory.close(io);
+            allocator.free(self.directories[index].name);
         }
         allocator.free(self.directories);
+        allocator.free(self.basename);
         self.root.close(io);
     }
 };
@@ -2935,8 +2962,18 @@ fn externalRuntime(
     const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
     else
-        try siblingOrName(allocator, io, executable_dir, "preview1-adapter.wasm", "preview1-adapter.wasm");
-    const adapter = try snapshotFile(
+        try absolutePath(
+            allocator,
+            cwd,
+            try siblingOrName(
+                allocator,
+                io,
+                executable_dir,
+                "preview1-adapter.wasm",
+                "preview1-adapter.wasm",
+            ),
+        );
+    const adapter = try snapshotAdapterInput(
         allocator,
         io,
         adapter_source,
@@ -3106,58 +3143,26 @@ fn buildRuntime(
         allocator,
         &.{ transaction_dir, "runtime-adapter-input.wasm" },
     );
-    const adapter_input = if (adapter_source) |path| blk: {
-        var adapter_guard = try SourceManifestGuard.init(
+    const adapter_input = if (adapter_source) |path|
+        try snapshotAdapterInput(
             allocator,
             io,
             path,
-        );
-        defer adapter_guard.deinit(allocator);
-        var retained_adapter = retainAbsoluteInputFile(
-            allocator,
-            io,
-            path,
-        ) catch |err| switch (err) {
-            error.SystemResources,
-            error.ProcessFdQuotaExceeded,
-            error.SystemFdQuotaExceeded,
-            => return err,
-            else => return error.InputChanged,
-        };
-        defer retained_adapter.deinit(allocator, io);
-        try adapter_guard.verify(allocator, io);
-        try waitForCaptureTestBarrier(
-            allocator,
-            io,
-            transaction.environ,
-            "adapter",
-        );
-        const snapshot = snapshotRetainedInputFile(
-            allocator,
-            io,
-            &retained_adapter,
             adapter_destination,
             transaction,
-        ) catch |err| switch (err) {
-            error.SystemResources,
-            error.ProcessFdQuotaExceeded,
-            error.SystemFdQuotaExceeded,
-            => return err,
-            else => return error.InputChanged,
-        };
-        try adapter_guard.verify(allocator, io);
-        break :blk snapshot;
-    } else try snapshotFileAt(
-        allocator,
-        io,
-        transaction.storage,
-        if (config.use_debug_build)
-            "build-root/host-apis/wasi-0.2.0/preview1-adapter-debug/wasi_snapshot_preview1.wasm"
-        else
-            "build-root/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm",
-        adapter_destination,
-        transaction,
-    );
+        )
+    else
+        try snapshotFileAt(
+            allocator,
+            io,
+            transaction.storage,
+            if (config.use_debug_build)
+                "build-root/host-apis/wasi-0.2.0/preview1-adapter-debug/wasi_snapshot_preview1.wasm"
+            else
+                "build-root/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm",
+            adapter_destination,
+            transaction,
+        );
 
     const key = try runtimeKey(
         allocator,
@@ -4826,6 +4831,10 @@ const DeviceIdentity = struct {
     minor: u32,
 };
 
+fn deviceIdentityMatches(expected: DeviceIdentity, actual: DeviceIdentity) bool {
+    return expected.major == actual.major and expected.minor == actual.minor;
+}
+
 fn linuxDeviceForHandle(handle: std.posix.fd_t) !DeviceIdentity {
     if (builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
     const linux = std.os.linux;
@@ -6147,6 +6156,7 @@ fn retainAbsoluteInputFile(
     allocator: Allocator,
     io: Io,
     path: []const u8,
+    environ: *std.process.Environ.Map,
 ) !RetainedInputFile {
     if (std.fs.path.sep != '/' or
         !std.fs.path.isAbsolute(path) or
@@ -6160,13 +6170,15 @@ fn retainAbsoluteInputFile(
         .{ .iterate = true, .follow_symlinks = false },
     );
     errdefer root.close(io);
-    const root_identity = EntryIdentity.fromStat(try root.stat(io));
+    const root_identity = SourceIdentity.fromStat(try root.stat(io));
+    const root_device = try linuxDeviceForHandle(root.handle);
     var directories: std.ArrayList(AnchoredTargetDirectory) = .empty;
     errdefer {
         var index = directories.items.len;
         while (index > 0) {
             index -= 1;
             directories.items[index].directory.close(io);
+            allocator.free(directories.items[index].name);
         }
         directories.deinit(allocator);
     }
@@ -6191,24 +6203,48 @@ fn retainAbsoluteInputFile(
         );
         if (stat.kind != .directory) return error.UnsupportedInputEntry;
         const identity = SourceIdentity.fromStat(stat);
+        const device = try linuxDeviceAt(parent, component);
+        try waitForAdapterRetainTestBarrier(
+            allocator,
+            io,
+            environ,
+            component,
+            .before_open,
+        );
         const child = try parent.openDir(
             io,
             component,
             .{ .iterate = true, .follow_symlinks = false },
         );
         errdefer child.close(io);
+        try waitForAdapterRetainTestBarrier(
+            allocator,
+            io,
+            environ,
+            component,
+            .after_open,
+        );
         if (!identity.matches(try child.stat(io)) or
             !identity.matches(try parent.statFile(
                 io,
                 component,
                 .{ .follow_symlinks = false },
-            )))
+            )) or
+            !deviceIdentityMatches(
+                device,
+                try linuxDeviceForHandle(child.handle),
+            ) or
+            !deviceIdentityMatches(
+                device,
+                try linuxDeviceAt(parent, component),
+            ))
         {
             return error.InputChanged;
         }
         directories.append(allocator, .{
             .name = try allocator.dupe(u8, component),
             .identity = identity,
+            .device = device,
             .directory = child,
         }) catch @panic("out of memory");
     }
@@ -6223,28 +6259,97 @@ fn retainAbsoluteInputFile(
         .{ .follow_symlinks = false },
     );
     if (stat.kind != .file) return error.UnsupportedInputEntry;
-    const entry_identity = EntryIdentity.fromStat(stat);
+    const entry_identity = SourceIdentity.fromStat(stat);
+    const entry_device = try linuxDeviceAt(parent, basename);
+    try waitForAdapterRetainTestBarrier(
+        allocator,
+        io,
+        environ,
+        basename,
+        .before_open,
+    );
     var file = try parent.openFile(io, basename, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
     });
     errdefer file.close(io);
-    const file_identity = SourceIdentity.fromStat(try file.stat(io));
-    if (!file_identity.matches(try parent.statFile(
+    try waitForAdapterRetainTestBarrier(
+        allocator,
         io,
+        environ,
         basename,
-        .{ .follow_symlinks = false },
-    ))) return error.InputChanged;
+        .after_open,
+    );
+    const file_identity = SourceIdentity.fromStat(try file.stat(io));
+    const file_device = try linuxDeviceForHandle(file.handle);
+    if (!entry_identity.matches(try file.stat(io)) or
+        !file_identity.matches(try parent.statFile(
+            io,
+            basename,
+            .{ .follow_symlinks = false },
+        )) or
+        !deviceIdentityMatches(entry_device, file_device) or
+        !deviceIdentityMatches(
+            entry_device,
+            try linuxDeviceAt(parent, basename),
+        ))
+    {
+        return error.InputChanged;
+    }
     return .{
         .root = root,
         .root_identity = root_identity,
+        .root_device = root_device,
         .directories = directories.toOwnedSlice(allocator) catch
             @panic("out of memory"),
         .basename = try allocator.dupe(u8, basename),
         .entry_identity = entry_identity,
+        .entry_device = entry_device,
         .file = file,
         .file_identity = file_identity,
+        .file_device = file_device,
+    };
+}
+
+fn snapshotAdapterInput(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    transaction: *Transaction,
+) !Snapshot {
+    var retained = retainAbsoluteInputFile(
+        allocator,
+        io,
+        source_path,
+        transaction.environ,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.InputChanged,
+    };
+    defer retained.deinit(allocator, io);
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        "adapter",
+    );
+    return snapshotRetainedInputFile(
+        allocator,
+        io,
+        &retained,
+        destination_path,
+        transaction,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.InputChanged,
     };
 }
 
@@ -7496,6 +7601,45 @@ fn waitForCommitTestBarrier(
 }
 
 const SpawnBarrierPoint = enum { before, after };
+const AdapterRetainBarrierPoint = enum { before_open, after_open };
+
+fn waitForAdapterRetainTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    component: []const u8,
+    point: AdapterRetainBarrierPoint,
+) !void {
+    const selected = environ.get(
+        "STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_COMPONENT",
+    ) orelse return;
+    if (!std.mem.eql(u8, selected, component)) return;
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const suffix = @tagName(point);
+    const ready = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.ready",
+        .{ base, suffix },
+    );
+    const release = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.release",
+        .{ base, suffix },
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
 
 fn waitForAdapterSnapshotTestBarrier(
     allocator: Allocator,
