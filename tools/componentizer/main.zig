@@ -55,6 +55,88 @@ const SnapshotSymlinkPolicy = enum {
     dereference_files,
 };
 
+const AnchoredTargetDirectory = struct {
+    name: []const u8,
+    identity: SourceIdentity,
+    directory: Dir,
+};
+
+const DereferencedTarget = struct {
+    link_path: []const u8,
+    link_target: []const u8,
+    link_identity: SourceIdentity,
+    root: Dir,
+    root_identity: SourceIdentity,
+    directories: []const AnchoredTargetDirectory,
+    basename: []const u8,
+    entry_identity: SourceIdentity,
+    file: File,
+    file_identity: SourceIdentity,
+    guard_root: []const u8,
+    guard_index: usize,
+
+    fn verify(
+        self: *DereferencedTarget,
+        allocator: Allocator,
+        io: Io,
+        monitor: *MutationMonitor,
+        protections: []ProtectedTree,
+    ) !void {
+        monitor.check(protections, null, null) catch
+            return error.InputChanged;
+        const current = buildTreeManifest(
+            allocator,
+            io,
+            .cwd(),
+            self.guard_root,
+        ) catch return error.InputChanged;
+        const protected = &protections[self.guard_index];
+        if (!protected.manifest.matches(current) and
+            !(protected.namespace_changed and
+                protected.manifest.matchesAfterRootRename(current)))
+        {
+            return error.InputChanged;
+        }
+        monitor.check(protections, null, null) catch
+            return error.InputChanged;
+        if (!self.root_identity.entry.matches(try self.root.stat(io))) {
+            return error.InputChanged;
+        }
+        var parent = self.root;
+        for (self.directories) |anchored| {
+            if (!anchored.identity.entry.matches(try parent.statFile(
+                io,
+                anchored.name,
+                .{ .follow_symlinks = false },
+            )) or
+                !anchored.identity.entry.matches(try anchored.directory.stat(io)))
+            {
+                return error.InputChanged;
+            }
+            parent = anchored.directory;
+        }
+        if (!self.entry_identity.entry.matches(try parent.statFile(
+            io,
+            self.basename,
+            .{ .follow_symlinks = false },
+        )) or
+            !self.file_identity.matchesRetained(try self.file.stat(io)))
+        {
+            return error.InputChanged;
+        }
+    }
+    fn deinit(self: *DereferencedTarget, allocator: Allocator, io: Io) void {
+        self.file.close(io);
+        var index = self.directories.len;
+        while (index > 0) {
+            index -= 1;
+            self.directories[index].directory.close(io);
+        }
+        allocator.free(self.directories);
+        self.root.close(io);
+    }
+};
+
 const Snapshot = struct {
     path: []const u8,
     storage_path: []const u8,
@@ -2953,19 +3035,52 @@ fn buildRuntime(
         transaction,
     );
     const zig = zig_install.executable;
-    const configured_adapter = if (config.preview2_adapter) |path|
-        try snapshotFile(
+    const adapter_source: ?[]const u8 = if (config.preview2_adapter) |path|
+        try absolutePath(allocator, cwd, path)
+    else blk: {
+        const sibling = try std.fs.path.join(
+            allocator,
+            &.{ executable_dir, "preview1-adapter.wasm" },
+        );
+        break :blk if (pathExists(io, sibling)) sibling else null;
+    };
+    const adapter_destination = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "runtime-adapter-input.wasm" },
+    );
+    const adapter_input = if (adapter_source) |path| blk: {
+        var adapter_guard = try SourceManifestGuard.init(
             allocator,
             io,
-            try absolutePath(allocator, cwd, path),
-            try std.fs.path.join(
-                allocator,
-                &.{ transaction_dir, "preview2-adapter.wasm" },
-            ),
+            path,
+        );
+        defer adapter_guard.deinit(allocator);
+        try waitForCaptureTestBarrier(
+            allocator,
+            io,
+            transaction.environ,
+            "adapter",
+        );
+        const snapshot = try snapshotFile(
+            allocator,
+            io,
+            path,
+            adapter_destination,
             transaction,
-        )
-    else
-        null;
+        );
+        try adapter_guard.verify(allocator, io);
+        break :blk snapshot;
+    } else try snapshotFileAt(
+        allocator,
+        io,
+        transaction.storage,
+        if (config.use_debug_build)
+            "build-root/host-apis/wasi-0.2.0/preview1-adapter-debug/wasi_snapshot_preview1.wasm"
+        else
+            "build-root/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm",
+        adapter_destination,
+        transaction,
+    );
 
     const key = try runtimeKey(
         allocator,
@@ -3093,6 +3208,11 @@ fn buildRuntime(
         "--prefix",
         prefix_child_path,
         if (config.use_debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseSmall",
+        try std.fmt.allocPrint(
+            allocator,
+            "-Dpreview1-adapter={s}",
+            .{adapter_input.path},
+        ),
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
         argv.appendSlice(allocator, &.{
@@ -3218,37 +3338,24 @@ fn buildRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
     );
-    const adapter = if (configured_adapter) |snapshot|
-        snapshot
-    else if (try statEntry(runtime_bin, io, "preview1-adapter.wasm") != null)
-        try snapshotFileAt(
+    if (try statEntry(runtime_bin, io, "preview1-adapter.wasm") == null) {
+        return error.MissingBuildArtifact;
+    }
+    const generated_adapter = try snapshotFileAt(
+        allocator,
+        io,
+        runtime_bin,
+        "preview1-adapter.wasm",
+        try std.fs.path.join(
             allocator,
-            io,
-            runtime_bin,
-            "preview1-adapter.wasm",
-            try std.fs.path.join(
-                allocator,
-                &.{ transaction_dir, "preview2-adapter.wasm" },
-            ),
-            transaction,
-        )
-    else
-        try snapshotFile(
-            allocator,
-            io,
-            try siblingOrName(
-                allocator,
-                io,
-                executable_dir,
-                "preview1-adapter.wasm",
-                "preview1-adapter.wasm",
-            ),
-            try std.fs.path.join(
-                allocator,
-                &.{ transaction_dir, "preview2-adapter.wasm" },
-            ),
-            transaction,
-        );
+            &.{ transaction_dir, "generated-preview1-adapter.wasm" },
+        ),
+        transaction,
+    );
+    if (!std.mem.eql(u8, generated_adapter.digest, adapter_input.digest)) {
+        return error.InputChanged;
+    }
+    const adapter = adapter_input;
     const bindings = if (needs_bindings) blk: {
         break :blk (try snapshotFileAt(
             allocator,
@@ -3539,11 +3646,31 @@ fn snapshotDirectoryTree(
     symlink_policy: SnapshotSymlinkPolicy,
     transaction: *Transaction,
 ) ![]const u8 {
-    var source_guard: ?SourceManifestGuard = if (included_paths.len == 0)
-        try SourceManifestGuard.init(allocator, io, source_path)
-    else
-        null;
-    defer if (source_guard) |*guard| guard.deinit(allocator);
+    var source_guards: std.ArrayList(SourceManifestGuard) = .empty;
+    defer {
+        for (source_guards.items) |*guard| guard.deinit(allocator);
+        source_guards.deinit(allocator);
+    }
+    if (included_paths.len == 0) {
+        source_guards.append(
+            allocator,
+            try SourceManifestGuard.init(allocator, io, source_path),
+        ) catch @panic("out of memory");
+    } else {
+        for (included_paths) |included| {
+            source_guards.append(
+                allocator,
+                try SourceManifestGuard.init(
+                    allocator,
+                    io,
+                    try std.fs.path.join(
+                        allocator,
+                        &.{ source_path, included },
+                    ),
+                ),
+            ) catch @panic("out of memory");
+        }
+    }
     var source = try Dir.openDirAbsolute(
         io,
         source_path,
@@ -3557,6 +3684,42 @@ fn snapshotDirectoryTree(
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer destination.close(io);
+    var dereferenced_targets: std.ArrayList(DereferencedTarget) = .empty;
+    defer {
+        for (dereferenced_targets.items) |*target| {
+            target.deinit(allocator, io);
+        }
+        dereferenced_targets.deinit(allocator);
+    }
+    var target_monitor = try MutationMonitor.init();
+    defer target_monitor.deinit(allocator);
+    var target_protections: std.ArrayList(ProtectedTree) = .empty;
+    defer target_protections.deinit(allocator);
+    if (symlink_policy == .dereference_files) {
+        try anchorDereferencedTargets(
+            allocator,
+            io,
+            source,
+            source_path,
+            source_path,
+            "",
+            included_paths,
+            excluded_paths,
+            transaction,
+            source_identity,
+            &dereferenced_targets,
+            &target_monitor,
+            &target_protections,
+        );
+        if (dereferenced_targets.items.len != 0) {
+            try waitForCaptureTestBarrier(
+                allocator,
+                io,
+                transaction.environ,
+                "build-root-targets",
+            );
+        }
+    }
     const destination_relative = try std.fs.path.relative(
         allocator,
         transaction.storage_path,
@@ -3579,6 +3742,9 @@ fn snapshotDirectoryTree(
         included_paths,
         excluded_paths,
         symlink_policy,
+        dereferenced_targets.items,
+        &target_monitor,
+        target_protections.items,
         transaction,
         &hasher,
     );
@@ -3591,7 +3757,9 @@ fn snapshotDirectoryTree(
     {
         return error.InputChanged;
     }
-    if (source_guard) |*guard| try guard.verify(allocator, io);
+    for (source_guards.items) |*guard| {
+        try guard.verify(allocator, io);
+    }
     try sealSnapshotDirectory(io, destination);
     _ = try transaction.protectStoragePath(
         allocator,
@@ -4563,6 +4731,12 @@ const SourceIdentity = struct {
             self.mtime.nanoseconds == stat.mtime.nanoseconds and
             self.ctime.nanoseconds == stat.ctime.nanoseconds;
     }
+
+    fn matchesRetained(self: SourceIdentity, stat: File.Stat) bool {
+        return self.entry.matches(stat) and
+            self.size == stat.size and
+            self.mtime.nanoseconds == stat.mtime.nanoseconds;
+    }
 };
 
 fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -4971,6 +5145,9 @@ fn snapshotInputTree(
         &.{},
         excluded_paths,
         .preserve_internal,
+        &.{},
+        null,
+        &.{},
         transaction,
         &tree_hasher,
     );
@@ -5108,6 +5285,304 @@ fn validateTreeSymlink(relative: []const u8, target: []const u8) !void {
     }
 }
 
+fn anchorDereferencedTarget(
+    allocator: Allocator,
+    io: Io,
+    source_root_path: []const u8,
+    source_parent_path: []const u8,
+    source_parent: Dir,
+    link_name: []const u8,
+    link_path: []const u8,
+    link_identity: SourceIdentity,
+    root_identity: SourceIdentity,
+) !DereferencedTarget {
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const link_len = try source_parent.readLink(
+        io,
+        link_name,
+        &link_buffer,
+    );
+    if (!link_identity.matches(try source_parent.statFile(
+        io,
+        link_name,
+        .{ .follow_symlinks = false },
+    ))) return error.InputChanged;
+    const link_target = link_buffer[0..link_len];
+    const target_absolute = try std.fs.path.resolve(
+        allocator,
+        if (std.fs.path.isAbsolute(link_target))
+            &.{link_target}
+        else
+            &.{ source_parent_path, link_target },
+    );
+    if (!pathContains(source_root_path, target_absolute) or
+        std.mem.eql(u8, source_root_path, target_absolute))
+    {
+        return error.UnsupportedInputEntry;
+    }
+    const target_relative = target_absolute[source_root_path.len + 1 ..];
+    try validateArgument(target_relative);
+
+    var root = try Dir.openDirAbsolute(
+        io,
+        source_root_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    errdefer root.close(io);
+    if (!root_identity.matches(try root.stat(io))) {
+        return error.InputChanged;
+    }
+    var directories: std.ArrayList(AnchoredTargetDirectory) = .empty;
+    errdefer {
+        var index = directories.items.len;
+        while (index > 0) {
+            index -= 1;
+            directories.items[index].directory.close(io);
+        }
+        directories.deinit(allocator);
+    }
+    if (std.fs.path.dirname(target_relative)) |parent_path| {
+        var components = std.mem.splitScalar(
+            u8,
+            parent_path,
+            std.fs.path.sep,
+        );
+        while (components.next()) |component| {
+            if (component.len == 0 or
+                std.mem.eql(u8, component, ".") or
+                std.mem.eql(u8, component, ".."))
+            {
+                return error.UnsupportedInputEntry;
+            }
+            const parent = if (directories.items.len == 0)
+                root
+            else
+                directories.items[directories.items.len - 1].directory;
+            const stat = try parent.statFile(
+                io,
+                component,
+                .{ .follow_symlinks = false },
+            );
+            if (stat.kind != .directory) {
+                return error.UnsupportedInputEntry;
+            }
+            const identity = SourceIdentity.fromStat(stat);
+            const child = try parent.openDir(
+                io,
+                component,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            errdefer child.close(io);
+            if (!identity.matches(try child.stat(io)) or
+                !identity.matches(try parent.statFile(
+                    io,
+                    component,
+                    .{ .follow_symlinks = false },
+                )))
+            {
+                return error.InputChanged;
+            }
+            directories.append(allocator, .{
+                .name = try allocator.dupe(u8, component),
+                .identity = identity,
+                .directory = child,
+            }) catch @panic("out of memory");
+        }
+    }
+    const basename = std.fs.path.basename(target_relative);
+    const parent = if (directories.items.len == 0)
+        root
+    else
+        directories.items[directories.items.len - 1].directory;
+    const target_stat = try parent.statFile(
+        io,
+        basename,
+        .{ .follow_symlinks = false },
+    );
+    if (target_stat.kind != .file) return error.UnsupportedInputEntry;
+    const entry_identity = SourceIdentity.fromStat(target_stat);
+    var file = try parent.openFile(io, basename, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const file_identity = SourceIdentity.fromStat(try file.stat(io));
+    if (!entry_identity.matches(try file.stat(io)) or
+        !entry_identity.matches(try parent.statFile(
+            io,
+            basename,
+            .{ .follow_symlinks = false },
+        )))
+    {
+        return error.InputChanged;
+    }
+    return .{
+        .link_path = try allocator.dupe(u8, link_path),
+        .link_target = try allocator.dupe(u8, link_target),
+        .link_identity = link_identity,
+        .root = root,
+        .root_identity = root_identity,
+        .directories = directories.toOwnedSlice(allocator) catch
+            @panic("out of memory"),
+        .basename = try allocator.dupe(u8, basename),
+        .entry_identity = entry_identity,
+        .file = file,
+        .file_identity = file_identity,
+        .guard_root = try allocator.dupe(u8, target_absolute),
+        .guard_index = 0,
+    };
+}
+
+fn anchorDereferencedTargets(
+    allocator: Allocator,
+    io: Io,
+    source: Dir,
+    source_root_path: []const u8,
+    source_path: []const u8,
+    relative: []const u8,
+    included_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
+    transaction: *Transaction,
+    root_identity: SourceIdentity,
+    targets: *std.ArrayList(DereferencedTarget),
+    target_monitor: *MutationMonitor,
+    target_protections: *std.ArrayList(ProtectedTree),
+) !void {
+    var iterator = source.iterate();
+    while (try iterator.next(io)) |entry| {
+        try validatePathUtf8(entry.name);
+        const child_source_path = try std.fs.path.join(
+            allocator,
+            &.{ source_path, entry.name },
+        );
+        const stat = try source.statFile(
+            io,
+            entry.name,
+            .{ .follow_symlinks = false },
+        );
+        if (transaction.isRootEntry(child_source_path, stat)) continue;
+        const child_relative = if (relative.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ relative, entry.name },
+            );
+        if (!treePathSelected(child_relative, included_paths)) continue;
+        var excluded = false;
+        for (excluded_paths) |candidate| {
+            if (candidate.matches(child_source_path, stat)) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+        const identity = SourceIdentity.fromStat(stat);
+        switch (stat.kind) {
+            .directory => {
+                var child = try source.openDir(
+                    io,
+                    entry.name,
+                    .{ .iterate = true, .follow_symlinks = false },
+                );
+                defer child.close(io);
+                if (!identity.matches(try child.stat(io))) {
+                    return error.InputChanged;
+                }
+                try anchorDereferencedTargets(
+                    allocator,
+                    io,
+                    child,
+                    source_root_path,
+                    child_source_path,
+                    child_relative,
+                    included_paths,
+                    excluded_paths,
+                    transaction,
+                    root_identity,
+                    targets,
+                    target_monitor,
+                    target_protections,
+                );
+                if (!identity.matches(try child.stat(io)) or
+                    !identity.matches(try source.statFile(
+                        io,
+                        entry.name,
+                        .{ .follow_symlinks = false },
+                    )))
+                {
+                    return error.InputChanged;
+                }
+            },
+            .sym_link => {
+                var target = try anchorDereferencedTarget(
+                    allocator,
+                    io,
+                    source_root_path,
+                    source_path,
+                    source,
+                    entry.name,
+                    child_relative,
+                    identity,
+                    root_identity,
+                );
+                errdefer target.deinit(allocator, io);
+                const guard_index = target_protections.items.len;
+                const manifest = try buildTreeManifest(
+                    allocator,
+                    io,
+                    .cwd(),
+                    target.guard_root,
+                );
+                target_protections.append(allocator, .{
+                    .location = .storage,
+                    .path = target.guard_root,
+                    .manifest = manifest,
+                }) catch @panic("out of memory");
+                try target_monitor.add(
+                    allocator,
+                    target.guard_root,
+                    guard_index,
+                    true,
+                );
+                try target_monitor.check(
+                    target_protections.items,
+                    null,
+                    null,
+                );
+                const confirmed = try buildTreeManifest(
+                    allocator,
+                    io,
+                    .cwd(),
+                    target.guard_root,
+                );
+                if (!manifest.matches(confirmed)) return error.InputChanged;
+                try target_monitor.check(
+                    target_protections.items,
+                    null,
+                    null,
+                );
+                target.guard_index = guard_index;
+                targets.append(allocator, target) catch @panic("out of memory");
+            },
+            .file => {},
+            else => return error.UnsupportedInputEntry,
+        }
+    }
+}
+
+fn findDereferencedTarget(
+    targets: []DereferencedTarget,
+    link_path: []const u8,
+) ?*DereferencedTarget {
+    for (targets) |*target| {
+        if (std.mem.eql(u8, target.link_path, link_path)) return target;
+    }
+    return null;
+}
+
 fn copyInputDirectory(
     allocator: Allocator,
     io: Io,
@@ -5120,6 +5595,9 @@ fn copyInputDirectory(
     included_paths: []const []const u8,
     excluded_paths: []const InputExclusion,
     symlink_policy: SnapshotSymlinkPolicy,
+    dereferenced_targets: []DereferencedTarget,
+    target_monitor: ?*MutationMonitor,
+    target_protections: []ProtectedTree,
     transaction: *Transaction,
     tree_hasher: *std.crypto.hash.sha2.Sha256,
 ) !?[]const u8 {
@@ -5285,6 +5763,9 @@ fn copyInputDirectory(
                     included_paths,
                     excluded_paths,
                     symlink_policy,
+                    dereferenced_targets,
+                    target_monitor,
+                    target_protections,
                     transaction,
                     tree_hasher,
                 );
@@ -5304,27 +5785,45 @@ fn copyInputDirectory(
             },
             .sym_link => {
                 if (symlink_policy == .dereference_files) {
-                    var source_file = try source.openFile(io, entry.name, .{
-                        .mode = .read_only,
-                        .allow_directory = false,
-                        .follow_symlinks = true,
-                    });
-                    defer source_file.close(io);
-                    const target_stat = try source_file.stat(io);
-                    if (target_stat.kind != .file) {
-                        return error.UnsupportedInputEntry;
-                    }
-                    const target_identity = SourceIdentity.fromStat(target_stat);
+                    const target = findDereferencedTarget(
+                        dereferenced_targets,
+                        child_relative,
+                    ) orelse return error.InputChanged;
+                    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                    const link_len = try source.readLink(
+                        io,
+                        entry.name,
+                        &link_buffer,
+                    );
                     if (!entry.identity.matches(try source.statFile(
                         io,
                         entry.name,
                         .{ .follow_symlinks = false },
-                    ))) return error.InputChanged;
+                    )) or
+                        !target.link_identity.matches(try source.statFile(
+                            io,
+                            entry.name,
+                            .{ .follow_symlinks = false },
+                        )) or
+                        !std.mem.eql(
+                            u8,
+                            target.link_target,
+                            link_buffer[0..link_len],
+                        ))
+                    {
+                        return error.InputChanged;
+                    }
+                    try target.verify(
+                        allocator,
+                        io,
+                        target_monitor orelse return error.InputChanged,
+                        target_protections,
+                    );
                     hashTreeEntryHeader(
                         tree_hasher,
                         'f',
                         child_relative,
-                        target_identity.size,
+                        target.file_identity.size,
                     );
                     var destination_file = try destination.createFile(
                         io,
@@ -5339,7 +5838,7 @@ fn copyInputDirectory(
                     );
                     var buffer: [64 * 1024]u8 = undefined;
                     while (true) {
-                        const count = source_file.readStreaming(
+                        const count = target.file.readStreaming(
                             io,
                             &.{&buffer},
                         ) catch |err| switch (err) {
@@ -5354,18 +5853,22 @@ fn copyInputDirectory(
                         );
                     }
                     tree_hasher.update(&.{0xff});
-                    if (!target_identity.matches(try source_file.stat(io)) or
-                        !entry.identity.matches(try source.statFile(
-                            io,
-                            entry.name,
-                            .{ .follow_symlinks = false },
-                        )))
-                    {
+                    try target.verify(
+                        allocator,
+                        io,
+                        target_monitor orelse return error.InputChanged,
+                        target_protections,
+                    );
+                    if (!entry.identity.matches(try source.statFile(
+                        io,
+                        entry.name,
+                        .{ .follow_symlinks = false },
+                    ))) {
                         return error.InputChanged;
                     }
                     try destination_file.setPermissions(
                         io,
-                        target_stat.permissions,
+                        (try target.file.stat(io)).permissions,
                     );
                     try destination_file.sync(io);
                     continue;

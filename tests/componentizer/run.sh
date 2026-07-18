@@ -71,10 +71,13 @@ remove_tree() {
 }
 cleanup_scratch
 mkdir -p "$TOOLS" "$WORK/wit package" "$FAKE_BUILD_ROOT/runtime" \
-  "$FAKE_BUILD_ROOT/tools/componentizer"
+  "$FAKE_BUILD_ROOT/tools/componentizer" \
+  "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release"
 printf 'captured-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
 touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
   "$FAKE_BUILD_ROOT/tools/componentizer/main.zig"
+printf 'adapter-bytes\n' > \
+  "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
@@ -372,6 +375,22 @@ for ((i = 1; i <= $#; i++)); do
     prefix="${!j}"
   fi
 done
+if [ -n "${FAKE_ASSERT_RETAINED_ADAPTER:-}" ]; then
+  retained_adapter=""
+  for arg in "$@"; do
+    case "$arg" in
+      -Dpreview1-adapter=*)
+        retained_adapter="${arg#-Dpreview1-adapter=}"
+        ;;
+    esac
+  done
+  test -n "$retained_adapter"
+  test "$(cat "$retained_adapter")" = "$FAKE_ASSERT_RETAINED_ADAPTER"
+fi
+if [ -n "${FAKE_ASSERT_DEREFERENCED_TARGET:-}" ]; then
+  test "$(cat deps/sm-obj-zig/dist/include/js/Guarded.h)" = \
+    "$FAKE_ASSERT_DEREFERENCED_TARGET"
+fi
 if [ "${FAKE_FAIL_STAGE:-}" = "zig build" ]; then
   if [ -n "${FAKE_ECHO_RUNTIME_PATHS:-}" ]; then
     printf 'runtime stdout executable=%s argv=%s\n' "$0" "$*"
@@ -414,7 +433,9 @@ printf 'local-cache-write\n' > "$ZIG_LOCAL_CACHE_DIR/fake-zig-local"
 printf 'global-cache-write\n' > "$ZIG_GLOBAL_CACHE_DIR/fake-zig-global"
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
-cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
+if [ -z "${FAKE_OMIT_GENERATED_ADAPTER:-}" ]; then
+  cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
+fi
 mkdir -p "$prefix/bin/runtime-build-tools"
 cp "$FAKE_WASIP3_BINDGEN" "$prefix/bin/runtime-build-tools/wasip3-bindgen"
 cp "$FAKE_WASM_OPT" "$prefix/bin/runtime-build-tools/wasm-opt"
@@ -2377,6 +2398,7 @@ build_with_selected_zig() {
     --wizer-bin "$TOOLS/fake wizer" \
     --wabt-bin "$TOOLS/fake wabt" \
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --preview2-adapter "$ADAPTER" \
     "$@" \
     --out "$output" \
     "$BUILD_SOURCE"
@@ -2434,6 +2456,174 @@ digests = [
     for path in sys.argv[1:]
 ]
 assert digests[0] != digests[1], digests
+PY
+
+SELECTIVE_ROOT="$SCRATCH/selective symlink build root"
+SELECTIVE_TARGET="$SELECTIVE_ROOT/deps/spidermonkey-source/js/public/Guarded.h"
+SELECTIVE_LINK="$SELECTIVE_ROOT/deps/sm-obj-zig/dist/include/js/Guarded.h"
+SELECTIVE_BARRIER="$SCRATCH/selective-target"
+SELECTIVE_OUTPUT="$WORK/selective target.wasm"
+mkdir -p "$SELECTIVE_ROOT/runtime" \
+  "$SELECTIVE_ROOT/tools/componentizer" \
+  "$(dirname "$SELECTIVE_TARGET")" \
+  "$(dirname "$SELECTIVE_LINK")"
+printf 'captured-build-root\n' > "$SELECTIVE_ROOT/build.zig"
+touch "$SELECTIVE_ROOT/build.zig.zon" "$SELECTIVE_ROOT/runtime/js.cpp" \
+  "$SELECTIVE_ROOT/tools/componentizer/main.zig"
+cat > "$SELECTIVE_ROOT/tools/componentizer/runtime-build-inputs.txt" <<'EOF'
+build.zig
+build.zig.zon
+runtime
+tools/componentizer/main.zig
+deps/sm-obj-zig/dist/include
+EOF
+printf 'original-target\n' > "$SELECTIVE_TARGET"
+ln -s "$SELECTIVE_TARGET" "$SELECTIVE_LINK"
+FAKE_ASSERT_DEREFERENCED_TARGET=original-target \
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$SELECTIVE_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=build-root-targets \
+"$COMPONENTIZER" \
+  --build-root "$SELECTIVE_ROOT" \
+  --cache-dir "$CACHE" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preview2-adapter "$ADAPTER" \
+  --out "$SELECTIVE_OUTPUT" \
+  "$BUILD_SOURCE" >/dev/null &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SELECTIVE_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "dereferenced build target capture"
+mv "$SELECTIVE_TARGET" "$SELECTIVE_TARGET.saved"
+printf 'substituted-target\n' > "$SELECTIVE_TARGET"
+rm "$SELECTIVE_TARGET"
+mv "$SELECTIVE_TARGET.saved" "$SELECTIVE_TARGET"
+: > "$SELECTIVE_BARRIER.release"
+wait "$SNAPSHOT_TEST_PID"
+SNAPSHOT_TEST_PID=""
+cmp "$ENGINE" "$SELECTIVE_OUTPUT"
+
+SELECTIVE_MUTATION_BARRIER="$SCRATCH/selective-target-mutation"
+SELECTIVE_MUTATION_ERROR="$SCRATCH/selective-target-mutation.jsonl"
+SELECTIVE_MUTATION_OUTPUT="$WORK/selective target mutation.wasm"
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$SELECTIVE_MUTATION_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=build-root-targets \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$SELECTIVE_ROOT" \
+  --cache-dir "$CACHE" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preview2-adapter "$ADAPTER" \
+  --out "$SELECTIVE_MUTATION_OUTPUT" \
+  "$BUILD_SOURCE" 2> "$SELECTIVE_MUTATION_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SELECTIVE_MUTATION_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "dereferenced build target mutation"
+printf 'mutated-target\n' > "$SELECTIVE_TARGET"
+: > "$SELECTIVE_MUTATION_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: in-place selective target mutation was captured" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$SELECTIVE_MUTATION_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test ! -e "$SELECTIVE_MUTATION_OUTPUT"
+printf 'original-target\n' > "$SELECTIVE_TARGET"
+
+OUTSIDE_TARGET="$SCRATCH/outside selective target.h"
+SELECTIVE_ESCAPE_ERROR="$SCRATCH/selective-escape.jsonl"
+printf 'outside-target\n' > "$OUTSIDE_TARGET"
+rm "$SELECTIVE_LINK"
+ln -s "$OUTSIDE_TARGET" "$SELECTIVE_LINK"
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$SELECTIVE_ROOT" \
+  --cache-dir "$WORK/selective escape cache" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preview2-adapter "$ADAPTER" \
+  --out "$WORK/selective escape.wasm" \
+  "$BUILD_SOURCE" 2> "$SELECTIVE_ESCAPE_ERROR"
+then
+  echo "FAIL: escaping selective target was captured" >&2
+  exit 1
+fi
+python3 - "$SELECTIVE_ESCAPE_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "UnsupportedInputEntry", diagnostic
+PY
+
+MISSING_GENERATED_ADAPTER_ERROR="$SCRATCH/missing-generated-adapter.jsonl"
+if FAKE_OMIT_GENERATED_ADAPTER=1 \
+  build_with_fake_zig "$WORK/missing generated adapter.wasm" \
+    --json-diagnostics 2> "$MISSING_GENERATED_ADAPTER_ERROR"
+then
+  echo "FAIL: missing generated adapter was accepted" >&2
+  exit 1
+fi
+test ! -e "$WORK/missing generated adapter.wasm"
+
+FALLBACK_TOOL_DIR="$SCRATCH/fallback adapter tool"
+FALLBACK_COMPONENTIZER="$FALLBACK_TOOL_DIR/starling-componentize"
+FALLBACK_ADAPTER="$FALLBACK_TOOL_DIR/preview1-adapter.wasm"
+FALLBACK_BARRIER="$SCRATCH/fallback-adapter"
+FALLBACK_ERROR="$SCRATCH/fallback-adapter.jsonl"
+mkdir -p "$FALLBACK_TOOL_DIR"
+cp "$COMPONENTIZER" "$FALLBACK_COMPONENTIZER"
+cp "$ADAPTER" "$FALLBACK_ADAPTER"
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$FALLBACK_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=adapter \
+"$FALLBACK_COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$FAKE_BUILD_ROOT" \
+  --cache-dir "$WORK/fallback cache" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --out "$WORK/fallback mutation.wasm" \
+  "$BUILD_SOURCE" 2> "$FALLBACK_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$FALLBACK_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "fallback adapter capture"
+printf 'mutated-fallback-adapter\n' > "$FALLBACK_ADAPTER"
+: > "$FALLBACK_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: fallback adapter capture mutation was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$FALLBACK_ERROR" <<'PY'
+import json, sys
+diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
 PY
 
 INVALID_ZIG_OUTPUT="$WORK/invalid Zig version.wasm"
@@ -2641,7 +2831,7 @@ wait "$pid2"
 unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
-test "${#prefixes[@]}" -eq 16
+test "${#prefixes[@]}" -eq 18
 for prefix in "${prefixes[@]}"; do
   case "$prefix" in
     *".starling-componentize-"*/data/runtime-prefix) ;;
@@ -2651,7 +2841,7 @@ for prefix in "${prefixes[@]}"; do
       ;;
   esac
 done
-test "$(printf '%s\n' "${prefixes[@]}" | sort -u | wc -l)" -eq 16
+test "$(printf '%s\n' "${prefixes[@]}" | sort -u | wc -l)" -eq 18
 test "$(find "$CACHE/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
   -ge 1
 cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
@@ -2699,6 +2889,7 @@ default_cache_run() {
     --wizer-bin "$TOOLS/fake wizer" \
     --wabt-bin "$TOOLS/fake wabt" \
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --preview2-adapter "$ADAPTER" \
     --metadata-out "$WORK/default cache $suffix.json" \
     --out "$WORK/default cache $suffix.wasm" \
     "$DEFAULT_SOURCE"

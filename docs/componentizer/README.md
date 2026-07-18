@@ -193,6 +193,20 @@ as their working directory. The versioned
 to the exact runtime-build closure; roots without the inventory are captured
 in full, excluding only identity-checked transaction/cache entries. Wizer
 preopens are complete retained snapshots mapped to their original guest paths.
+Every selected inventory root has a manifest guard. File symlinks in that
+closure are resolved before copying: the root, every target ancestor, and the
+target file are opened no-follow and retained, and the target bytes are
+independently manifest-guarded. A selected link's direct target is thereby
+promoted into the captured closure; targets outside the canonical build root
+or reached through another link are rejected. The snapshot reads the retained
+file handle,
+so a replace/restore race cannot inject target bytes even when the target lies
+outside the listed subtree (as with generated SpiderMonkey include links).
+Escaping or multiply symlinked targets fail closed.
+The explicit adapter, executable sibling fallback, or retained build-root
+adapter is likewise captured during `inputs`. Nested Zig receives that snapshot
+through `-Dpreview1-adapter`; a missing or byte-different installed adapter is
+rejected instead of triggering a post-build fallback.
 On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and

@@ -246,6 +246,7 @@ pub fn build(b: *std.Build) void {
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
     const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
     const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
+    const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
     const component_world = b.option([]const u8, "component-world", "World to generate JavaScript-backed exports for");
     if ((component_wit == null) != (component_world == null)) {
@@ -569,8 +570,11 @@ pub fn build(b: *std.Build) void {
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
     // Install the preview1 adapter and a generated componentize.sh next to
     // starling-raw.wasm so the runtime can be turned into a component.
-    const adapter = b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" });
-    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(adapter), "preview1-adapter.wasm").step);
+    const adapter = if (preview1_adapter) |path|
+        inputPath(b, path)
+    else
+        b.path(b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
+    b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
     if (component_wit) |wit_dir| {
         const install_wit = b.addInstallDirectory(.{
             .source_dir = inputPath(b, wit_dir),
