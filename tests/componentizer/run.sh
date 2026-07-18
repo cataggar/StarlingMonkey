@@ -2506,6 +2506,57 @@ wait "$SNAPSHOT_TEST_PID"
 SNAPSHOT_TEST_PID=""
 cmp "$ENGINE" "$SELECTIVE_OUTPUT"
 
+SELECTIVE_LINK_RACE_BARRIER="$SCRATCH/selective-link-read"
+SELECTIVE_LINK_RACE_ERROR="$SCRATCH/selective-link-read.jsonl"
+SELECTIVE_LINK_RACE_OUTPUT="$WORK/selective link read race.wasm"
+SELECTIVE_ATTACKER_TARGET="$SELECTIVE_ROOT/deps/spidermonkey-source/js/public/Attacker.h"
+SELECTIVE_LINK_SAVED="$SELECTIVE_LINK.saved"
+printf 'attacker-target\n' > "$SELECTIVE_ATTACKER_TARGET"
+STARLING_COMPONENTIZER_TEST_SYMLINK_READ_BARRIER="$SELECTIVE_LINK_RACE_BARRIER" \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$SELECTIVE_ROOT" \
+  --cache-dir "$CACHE" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preview2-adapter "$ADAPTER" \
+  --out "$SELECTIVE_LINK_RACE_OUTPUT" \
+  "$BUILD_SOURCE" 2> "$SELECTIVE_LINK_RACE_ERROR" &
+SNAPSHOT_TEST_PID=$!
+for link_read in first second; do
+  wait_for_marker \
+    "$SELECTIVE_LINK_RACE_BARRIER.${link_read}_before.ready" \
+    "$SNAPSHOT_TEST_PID" "$link_read symlink read before"
+  mv "$SELECTIVE_LINK" "$SELECTIVE_LINK_SAVED"
+  ln -s "$SELECTIVE_ATTACKER_TARGET" "$SELECTIVE_LINK"
+  : > "$SELECTIVE_LINK_RACE_BARRIER.${link_read}_before.release"
+  wait_for_marker \
+    "$SELECTIVE_LINK_RACE_BARRIER.${link_read}_after.ready" \
+    "$SNAPSHOT_TEST_PID" "$link_read symlink read after"
+  rm "$SELECTIVE_LINK"
+  mv "$SELECTIVE_LINK_SAVED" "$SELECTIVE_LINK"
+  : > "$SELECTIVE_LINK_RACE_BARRIER.${link_read}_after.release"
+done
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: restored symlink substitution was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$SELECTIVE_LINK_RACE_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test ! -e "$SELECTIVE_LINK_RACE_OUTPUT"
+
 SELECTIVE_MUTATION_BARRIER="$SCRATCH/selective-target-mutation"
 SELECTIVE_MUTATION_ERROR="$SCRATCH/selective-target-mutation.jsonl"
 SELECTIVE_MUTATION_OUTPUT="$WORK/selective target mutation.wasm"
@@ -2625,6 +2676,58 @@ assert diagnostic["code"] == "SMC1001", diagnostic
 assert diagnostic["phase"] == "inputs", diagnostic
 assert diagnostic["cause"] == "InputChanged", diagnostic
 PY
+
+FALLBACK_RENAME_BARRIER="$SCRATCH/fallback-adapter-rename"
+FALLBACK_RENAME_ERROR="$SCRATCH/fallback-adapter-rename.jsonl"
+FALLBACK_RENAME_OUTPUT="$WORK/fallback rename preserved.wasm"
+FALLBACK_RENAME_METADATA="$WORK/fallback rename preserved.json"
+FALLBACK_RENAME_DEBUG="$WORK/fallback rename preserved.debug"
+FALLBACK_ADAPTER_SAVED="$SCRATCH/fallback-adapter-saved.wasm"
+cp "$ADAPTER" "$FALLBACK_ADAPTER"
+printf 'preserved-fallback-output\n' > "$FALLBACK_RENAME_OUTPUT"
+printf 'preserved-fallback-metadata\n' > "$FALLBACK_RENAME_METADATA"
+mkdir "$FALLBACK_RENAME_DEBUG"
+printf 'preserved-fallback-debug\n' > "$FALLBACK_RENAME_DEBUG/unrelated.txt"
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$FALLBACK_RENAME_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=adapter \
+"$FALLBACK_COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$FAKE_BUILD_ROOT" \
+  --cache-dir "$WORK/fallback rename cache" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$FALLBACK_RENAME_METADATA" \
+  --debug-dir "$FALLBACK_RENAME_DEBUG" \
+  --out "$FALLBACK_RENAME_OUTPUT" \
+  "$BUILD_SOURCE" 2> "$FALLBACK_RENAME_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$FALLBACK_RENAME_BARRIER.ready" "$SNAPSHOT_TEST_PID" \
+  "fallback adapter rename-away"
+mv "$FALLBACK_ADAPTER" "$FALLBACK_ADAPTER_SAVED"
+: > "$FALLBACK_RENAME_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: renamed-away fallback adapter was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$FALLBACK_RENAME_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test "$(cat "$FALLBACK_RENAME_OUTPUT")" = "preserved-fallback-output"
+test "$(cat "$FALLBACK_RENAME_METADATA")" = "preserved-fallback-metadata"
+test "$(cat "$FALLBACK_RENAME_DEBUG/unrelated.txt")" = \
+  "preserved-fallback-debug"
+mv "$FALLBACK_ADAPTER_SAVED" "$FALLBACK_ADAPTER"
 
 INVALID_ZIG_OUTPUT="$WORK/invalid Zig version.wasm"
 INVALID_ZIG_ERROR="$SCRATCH/invalid-zig-version.jsonl"

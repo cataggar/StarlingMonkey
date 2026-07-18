@@ -65,6 +65,7 @@ const DereferencedTarget = struct {
     link_path: []const u8,
     link_target: []const u8,
     link_identity: SourceIdentity,
+    link_handle: File,
     root: Dir,
     root_identity: SourceIdentity,
     directories: []const AnchoredTargetDirectory,
@@ -126,6 +127,7 @@ const DereferencedTarget = struct {
         }
     }
     fn deinit(self: *DereferencedTarget, allocator: Allocator, io: Io) void {
+        self.link_handle.close(io);
         self.file.close(io);
         var index = self.directories.len;
         while (index > 0) {
@@ -135,6 +137,13 @@ const DereferencedTarget = struct {
         allocator.free(self.directories);
         self.root.close(io);
     }
+};
+
+const SymlinkReadBarrierPoint = enum {
+    first_before,
+    first_after,
+    second_before,
+    second_after,
 };
 
 const Snapshot = struct {
@@ -3061,13 +3070,19 @@ fn buildRuntime(
             transaction.environ,
             "adapter",
         );
-        const snapshot = try snapshotFile(
+        const snapshot = snapshotFile(
             allocator,
             io,
             path,
             adapter_destination,
             transaction,
-        );
+        ) catch |err| switch (err) {
+            error.SystemResources,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            => return err,
+            else => return error.InputChanged,
+        };
         try adapter_guard.verify(allocator, io);
         break :blk snapshot;
     } else try snapshotFileAt(
@@ -5285,6 +5300,68 @@ fn validateTreeSymlink(relative: []const u8, target: []const u8) !void {
     }
 }
 
+fn retainSymlinkNoFollow(
+    io: Io,
+    parent: Dir,
+    name: []const u8,
+    expected: SourceIdentity,
+) !File {
+    if (builtin.os.tag != .linux) return error.UnsupportedInputEntry;
+    const handle = std.posix.openat(parent.handle, name, .{
+        .PATH = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.SymLinkLoop,
+        => return error.InputChanged,
+        else => return err,
+    };
+    var link = File{
+        .handle = handle,
+        .flags = .{ .nonblocking = false },
+    };
+    errdefer link.close(io);
+    if (!expected.matches(try link.stat(io))) return error.InputChanged;
+    return link;
+}
+
+fn readBoundSymlink(
+    io: Io,
+    expected: SourceIdentity,
+    retained: File,
+    buffer: []u8,
+) !usize {
+    if (builtin.os.tag != .linux) return error.InputChanged;
+    if (!expected.matchesRetained(try retained.stat(io))) {
+        return error.InputChanged;
+    }
+    const linux = std.os.linux;
+    while (true) {
+        const result = linux.readlinkat(
+            retained.handle,
+            "",
+            buffer.ptr,
+            buffer.len,
+        );
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (!expected.matchesRetained(try retained.stat(io))) {
+                    return error.InputChanged;
+                }
+                if (result == buffer.len) return error.NameTooLong;
+                return @intCast(result);
+            },
+            .INTR => continue,
+            .NOENT, .NOTDIR, .INVAL => return error.InputChanged,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOMEM => return error.SystemResources,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
 fn anchorDereferencedTarget(
     allocator: Allocator,
     io: Io,
@@ -5295,18 +5372,34 @@ fn anchorDereferencedTarget(
     link_path: []const u8,
     link_identity: SourceIdentity,
     root_identity: SourceIdentity,
+    environ: *std.process.Environ.Map,
 ) !DereferencedTarget {
-    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const link_len = try source_parent.readLink(
+    const link_handle = try retainSymlinkNoFollow(
         io,
+        source_parent,
         link_name,
+        link_identity,
+    );
+    errdefer link_handle.close(io);
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try waitForSymlinkReadTestBarrier(
+        allocator,
+        io,
+        environ,
+        .first_before,
+    );
+    const link_len = try readBoundSymlink(
+        io,
+        link_identity,
+        link_handle,
         &link_buffer,
     );
-    if (!link_identity.matches(try source_parent.statFile(
+    try waitForSymlinkReadTestBarrier(
+        allocator,
         io,
-        link_name,
-        .{ .follow_symlinks = false },
-    ))) return error.InputChanged;
+        environ,
+        .first_after,
+    );
     const link_target = link_buffer[0..link_len];
     const target_absolute = try std.fs.path.resolve(
         allocator,
@@ -5421,6 +5514,7 @@ fn anchorDereferencedTarget(
         .link_path = try allocator.dupe(u8, link_path),
         .link_target = try allocator.dupe(u8, link_target),
         .link_identity = link_identity,
+        .link_handle = link_handle,
         .root = root,
         .root_identity = root_identity,
         .directories = directories.toOwnedSlice(allocator) catch
@@ -5506,8 +5600,8 @@ fn anchorDereferencedTargets(
                     target_monitor,
                     target_protections,
                 );
-                if (!identity.matches(try child.stat(io)) or
-                    !identity.matches(try source.statFile(
+                if (!identity.entry.matches(try child.stat(io)) or
+                    !identity.entry.matches(try source.statFile(
                         io,
                         entry.name,
                         .{ .follow_symlinks = false },
@@ -5527,6 +5621,7 @@ fn anchorDereferencedTargets(
                     child_relative,
                     identity,
                     root_identity,
+                    transaction.environ,
                 );
                 errdefer target.deinit(allocator, io);
                 const guard_index = target_protections.items.len;
@@ -5790,10 +5885,23 @@ fn copyInputDirectory(
                         child_relative,
                     ) orelse return error.InputChanged;
                     var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                    const link_len = try source.readLink(
+                    try waitForSymlinkReadTestBarrier(
+                        allocator,
                         io,
-                        entry.name,
+                        transaction.environ,
+                        .second_before,
+                    );
+                    const link_len = try readBoundSymlink(
+                        io,
+                        entry.identity,
+                        target.link_handle,
                         &link_buffer,
+                    );
+                    try waitForSymlinkReadTestBarrier(
+                        allocator,
+                        io,
+                        transaction.environ,
+                        .second_after,
                     );
                     if (!entry.identity.matches(try source.statFile(
                         io,
@@ -7125,6 +7233,39 @@ fn waitForCommitTestBarrier(
 }
 
 const SpawnBarrierPoint = enum { before, after };
+
+fn waitForSymlinkReadTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    point: SymlinkReadBarrierPoint,
+) !void {
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_SYMLINK_READ_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const suffix = @tagName(point);
+    const ready = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.ready",
+        .{ base, suffix },
+    );
+    const release = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.release",
+        .{ base, suffix },
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
 
 fn waitForCaptureTestBarrier(
     allocator: Allocator,

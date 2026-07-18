@@ -199,14 +199,18 @@ target file are opened no-follow and retained, and the target bytes are
 independently manifest-guarded. A selected link's direct target is thereby
 promoted into the captured closure; targets outside the canonical build root
 or reached through another link are rejected. The snapshot reads the retained
-file handle,
+file handle. On Linux, both link-text reads use the same retained
+`O_PATH|O_NOFOLLOW` symlink descriptor; hosts without an equivalent retained
+no-follow symlink handle reject dereferenced build symlinks,
 so a replace/restore race cannot inject target bytes even when the target lies
 outside the listed subtree (as with generated SpiderMonkey include links).
 Escaping or multiply symlinked targets fail closed.
 The explicit adapter, executable sibling fallback, or retained build-root
 adapter is likewise captured during `inputs`. Nested Zig receives that snapshot
 through `-Dpreview1-adapter`; a missing or byte-different installed adapter is
-rejected instead of triggering a post-build fallback.
+rejected instead of triggering a post-build fallback. Once adapter guarding
+begins, disappearance or canonical-identity failure is normalized to
+`InputChanged` in the `inputs` phase.
 On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
