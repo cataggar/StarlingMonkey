@@ -2637,6 +2637,36 @@ then
 fi
 test ! -e "$WORK/missing generated adapter.wasm"
 
+EXPLICIT_ADAPTER_LINK="$SCRATCH/explicit adapter symlink.wasm"
+EXPLICIT_ADAPTER_LINK_ERROR="$SCRATCH/explicit-adapter-symlink.jsonl"
+ln -s "$ADAPTER" "$EXPLICIT_ADAPTER_LINK"
+if "$COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$FAKE_BUILD_ROOT" \
+  --cache-dir "$WORK/explicit adapter symlink cache" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --preview2-adapter "$EXPLICIT_ADAPTER_LINK" \
+  --out "$WORK/explicit adapter symlink.wasm" \
+  "$BUILD_SOURCE" 2> "$EXPLICIT_ADAPTER_LINK_ERROR"
+then
+  echo "FAIL: explicit adapter symlink was accepted" >&2
+  exit 1
+fi
+python3 - "$EXPLICIT_ADAPTER_LINK_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+
 FALLBACK_TOOL_DIR="$SCRATCH/fallback adapter tool"
 FALLBACK_COMPONENTIZER="$FALLBACK_TOOL_DIR/starling-componentize"
 FALLBACK_ADAPTER="$FALLBACK_TOOL_DIR/preview1-adapter.wasm"
@@ -2728,6 +2758,67 @@ test "$(cat "$FALLBACK_RENAME_METADATA")" = "preserved-fallback-metadata"
 test "$(cat "$FALLBACK_RENAME_DEBUG/unrelated.txt")" = \
   "preserved-fallback-debug"
 mv "$FALLBACK_ADAPTER_SAVED" "$FALLBACK_ADAPTER"
+
+FALLBACK_SYMLINK_CAPTURE_BARRIER="$SCRATCH/fallback-adapter-symlink-capture"
+FALLBACK_SYMLINK_SNAPSHOT_BARRIER="$SCRATCH/fallback-adapter-symlink-snapshot"
+FALLBACK_SYMLINK_ERROR="$SCRATCH/fallback-adapter-symlink.jsonl"
+FALLBACK_SYMLINK_OUTPUT="$WORK/fallback symlink preserved.wasm"
+FALLBACK_SYMLINK_METADATA="$WORK/fallback symlink preserved.json"
+FALLBACK_SYMLINK_DEBUG="$WORK/fallback symlink preserved.debug"
+FALLBACK_SYMLINK_SAVED="$SCRATCH/fallback-adapter-symlink-saved.wasm"
+FALLBACK_SYMLINK_MISSING="$SCRATCH/missing substituted adapter.wasm"
+cp "$ADAPTER" "$FALLBACK_ADAPTER"
+printf 'preserved-symlink-output\n' > "$FALLBACK_SYMLINK_OUTPUT"
+printf 'preserved-symlink-metadata\n' > "$FALLBACK_SYMLINK_METADATA"
+mkdir "$FALLBACK_SYMLINK_DEBUG"
+printf 'preserved-symlink-debug\n' > "$FALLBACK_SYMLINK_DEBUG/unrelated.txt"
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$FALLBACK_SYMLINK_CAPTURE_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=adapter \
+STARLING_COMPONENTIZER_TEST_ADAPTER_SNAPSHOT_BARRIER="$FALLBACK_SYMLINK_SNAPSHOT_BARRIER" \
+"$FALLBACK_COMPONENTIZER" \
+  --json-diagnostics \
+  --build-root "$FAKE_BUILD_ROOT" \
+  --cache-dir "$WORK/fallback symlink cache" \
+  --zig-bin "$TOOLS/fake zig" \
+  --wit "$WIT" \
+  --world-name exports \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wabt-bin "$TOOLS/fake wabt" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$FALLBACK_SYMLINK_METADATA" \
+  --debug-dir "$FALLBACK_SYMLINK_DEBUG" \
+  --out "$FALLBACK_SYMLINK_OUTPUT" \
+  "$BUILD_SOURCE" 2> "$FALLBACK_SYMLINK_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$FALLBACK_SYMLINK_CAPTURE_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "fallback adapter symlink substitution"
+mv "$FALLBACK_ADAPTER" "$FALLBACK_SYMLINK_SAVED"
+ln -s "$FALLBACK_SYMLINK_MISSING" "$FALLBACK_ADAPTER"
+: > "$FALLBACK_SYMLINK_CAPTURE_BARRIER.release"
+wait_for_marker "$FALLBACK_SYMLINK_SNAPSHOT_BARRIER.ready" \
+  "$SNAPSHOT_TEST_PID" "retained fallback adapter snapshot"
+rm "$FALLBACK_ADAPTER"
+mv "$FALLBACK_SYMLINK_SAVED" "$FALLBACK_ADAPTER"
+: > "$FALLBACK_SYMLINK_SNAPSHOT_BARRIER.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: restored fallback adapter symlink substitution was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$FALLBACK_SYMLINK_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test ! -e "$FALLBACK_SYMLINK_MISSING"
+test "$(cat "$FALLBACK_SYMLINK_OUTPUT")" = "preserved-symlink-output"
+test "$(cat "$FALLBACK_SYMLINK_METADATA")" = "preserved-symlink-metadata"
+test "$(cat "$FALLBACK_SYMLINK_DEBUG/unrelated.txt")" = \
+  "preserved-symlink-debug"
 
 INVALID_ZIG_OUTPUT="$WORK/invalid Zig version.wasm"
 INVALID_ZIG_ERROR="$SCRATCH/invalid-zig-version.jsonl"

@@ -206,11 +206,15 @@ so a replace/restore race cannot inject target bytes even when the target lies
 outside the listed subtree (as with generated SpiderMonkey include links).
 Escaping or multiply symlinked targets fail closed.
 The explicit adapter, executable sibling fallback, or retained build-root
-adapter is likewise captured during `inputs`. Nested Zig receives that snapshot
-through `-Dpreview1-adapter`; a missing or byte-different installed adapter is
-rejected instead of triggering a post-build fallback. Once adapter guarding
-begins, disappearance or canonical-identity failure is normalized to
-`InputChanged` in the `inputs` phase.
+adapter is likewise captured during `inputs`. Explicit and sibling adapters
+are opened through a retained no-follow root/ancestor chain before guarding,
+and bytes are copied only from the retained file descriptor. Symlinks in that
+path are rejected, so a restored symlink substitution cannot redirect the
+snapshot. Nested Zig receives that snapshot through `-Dpreview1-adapter`; a
+missing or byte-different installed adapter is rejected instead of triggering
+a post-build fallback. Once adapter guarding begins, disappearance or
+canonical-identity failure is normalized to `InputChanged` in the `inputs`
+phase.
 On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and

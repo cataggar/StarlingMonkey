@@ -61,6 +61,55 @@ const AnchoredTargetDirectory = struct {
     directory: Dir,
 };
 
+const RetainedInputFile = struct {
+    root: Dir,
+    root_identity: EntryIdentity,
+    directories: []const AnchoredTargetDirectory,
+    basename: []const u8,
+    entry_identity: EntryIdentity,
+    file: File,
+    file_identity: SourceIdentity,
+
+    fn verify(self: *const RetainedInputFile, io: Io) !void {
+        if (!self.root_identity.matches(try self.root.stat(io))) {
+            return error.InputChanged;
+        }
+        var parent = self.root;
+        for (self.directories) |anchored| {
+            if (!anchored.identity.entry.matches(try parent.statFile(
+                io,
+                anchored.name,
+                .{ .follow_symlinks = false },
+            )) or
+                !anchored.identity.entry.matches(try anchored.directory.stat(io)))
+            {
+                return error.InputChanged;
+            }
+            parent = anchored.directory;
+        }
+        if (!self.entry_identity.matches(try parent.statFile(
+            io,
+            self.basename,
+            .{ .follow_symlinks = false },
+        )) or
+            !self.file_identity.matchesRetained(try self.file.stat(io)))
+        {
+            return error.InputChanged;
+        }
+    }
+
+    fn deinit(self: *RetainedInputFile, allocator: Allocator, io: Io) void {
+        self.file.close(io);
+        var index = self.directories.len;
+        while (index > 0) {
+            index -= 1;
+            self.directories[index].directory.close(io);
+        }
+        allocator.free(self.directories);
+        self.root.close(io);
+    }
+};
+
 const DereferencedTarget = struct {
     link_path: []const u8,
     link_target: []const u8,
@@ -3064,16 +3113,29 @@ fn buildRuntime(
             path,
         );
         defer adapter_guard.deinit(allocator);
+        var retained_adapter = retainAbsoluteInputFile(
+            allocator,
+            io,
+            path,
+        ) catch |err| switch (err) {
+            error.SystemResources,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            => return err,
+            else => return error.InputChanged,
+        };
+        defer retained_adapter.deinit(allocator, io);
+        try adapter_guard.verify(allocator, io);
         try waitForCaptureTestBarrier(
             allocator,
             io,
             transaction.environ,
             "adapter",
         );
-        const snapshot = snapshotFile(
+        const snapshot = snapshotRetainedInputFile(
             allocator,
             io,
-            path,
+            &retained_adapter,
             adapter_destination,
             transaction,
         ) catch |err| switch (err) {
@@ -6081,6 +6143,111 @@ fn isRelativeDescendant(path: []const u8, parent: []const u8) bool {
         path[parent.len] == '/';
 }
 
+fn retainAbsoluteInputFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) !RetainedInputFile {
+    if (std.fs.path.sep != '/' or
+        !std.fs.path.isAbsolute(path) or
+        std.mem.eql(u8, path, "/"))
+    {
+        return error.UnsupportedInputEntry;
+    }
+    var root = try Dir.openDirAbsolute(
+        io,
+        "/",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    errdefer root.close(io);
+    const root_identity = EntryIdentity.fromStat(try root.stat(io));
+    var directories: std.ArrayList(AnchoredTargetDirectory) = .empty;
+    errdefer {
+        var index = directories.items.len;
+        while (index > 0) {
+            index -= 1;
+            directories.items[index].directory.close(io);
+        }
+        directories.deinit(allocator);
+    }
+    const parent_path = std.fs.path.dirname(path) orelse
+        return error.UnsupportedInputEntry;
+    var components = std.mem.splitScalar(u8, parent_path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0) continue;
+        if (std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.UnsupportedInputEntry;
+        }
+        const parent = if (directories.items.len == 0)
+            root
+        else
+            directories.items[directories.items.len - 1].directory;
+        const stat = try parent.statFile(
+            io,
+            component,
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind != .directory) return error.UnsupportedInputEntry;
+        const identity = SourceIdentity.fromStat(stat);
+        const child = try parent.openDir(
+            io,
+            component,
+            .{ .iterate = true, .follow_symlinks = false },
+        );
+        errdefer child.close(io);
+        if (!identity.matches(try child.stat(io)) or
+            !identity.matches(try parent.statFile(
+                io,
+                component,
+                .{ .follow_symlinks = false },
+            )))
+        {
+            return error.InputChanged;
+        }
+        directories.append(allocator, .{
+            .name = try allocator.dupe(u8, component),
+            .identity = identity,
+            .directory = child,
+        }) catch @panic("out of memory");
+    }
+    const basename = std.fs.path.basename(path);
+    const parent = if (directories.items.len == 0)
+        root
+    else
+        directories.items[directories.items.len - 1].directory;
+    const stat = try parent.statFile(
+        io,
+        basename,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .file) return error.UnsupportedInputEntry;
+    const entry_identity = EntryIdentity.fromStat(stat);
+    var file = try parent.openFile(io, basename, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const file_identity = SourceIdentity.fromStat(try file.stat(io));
+    if (!file_identity.matches(try parent.statFile(
+        io,
+        basename,
+        .{ .follow_symlinks = false },
+    ))) return error.InputChanged;
+    return .{
+        .root = root,
+        .root_identity = root_identity,
+        .directories = directories.toOwnedSlice(allocator) catch
+            @panic("out of memory"),
+        .basename = try allocator.dupe(u8, basename),
+        .entry_identity = entry_identity,
+        .file = file,
+        .file_identity = file_identity,
+    };
+}
+
 fn snapshotFile(
     allocator: Allocator,
     io: Io,
@@ -6215,6 +6382,102 @@ fn snapshotFileAt(
     if (!source_identity.matches(try source_check.stat(io))) {
         return error.InputChanged;
     }
+    try destination.setPermissions(
+        io,
+        .fromMode(
+            source_stat.permissions.toMode() &
+                ~@as(std.posix.mode_t, 0o222),
+        ),
+    );
+    try destination.sync(io);
+    destination.close(io);
+    destination_open = false;
+    const storage_relative = try std.fs.path.relative(
+        allocator,
+        transaction.storage_path,
+        null,
+        transaction.storage_path,
+        destination_path,
+    );
+    const child_path = try transaction.retainStorageFile(
+        allocator,
+        io,
+        storage_relative,
+        false,
+    );
+    var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest_bytes);
+    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        storage_relative,
+    );
+    const manifest = transaction.protected.items[protection].manifest;
+    if (manifest.entries.len != 1 or
+        !std.mem.eql(
+            u8,
+            &manifest.entries[0].content_digest,
+            &digest_bytes,
+        ))
+    {
+        return error.TransactionChanged;
+    }
+    try transaction.verifyIntegrity(allocator, io);
+    return .{
+        .path = child_path,
+        .storage_path = destination_path,
+        .digest = try allocator.dupe(u8, &digest_hex),
+        .protection = protection,
+    };
+}
+
+fn snapshotRetainedInputFile(
+    allocator: Allocator,
+    io: Io,
+    source: *RetainedInputFile,
+    destination_path: []const u8,
+    transaction: *Transaction,
+) !Snapshot {
+    try transaction.verifyIntegrity(allocator, io);
+    const source_stat = try source.file.stat(io);
+
+    var destination = try Dir.createFileAbsolute(
+        io,
+        destination_path,
+        .{ .exclusive = true },
+    );
+    const destination_identity = EntryIdentity.fromStat(try destination.stat(io));
+    try transaction.recordStorageAbsolute(allocator, io, destination_path);
+    errdefer removeExactEntry(
+        io,
+        transaction.storage,
+        std.fs.path.basename(destination_path),
+        destination_identity,
+    ) catch {};
+    var destination_open = true;
+    defer if (destination_open) destination.close(io);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = source.file.readStreaming(
+            io,
+            &.{&buffer},
+        ) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (count == 0) continue;
+        hasher.update(buffer[0..count]);
+        try destination.writeStreamingAll(io, buffer[0..count]);
+    }
+    try waitForAdapterSnapshotTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+    );
+    try source.verify(io);
     try destination.setPermissions(
         io,
         .fromMode(
@@ -7233,6 +7496,29 @@ fn waitForCommitTestBarrier(
 }
 
 const SpawnBarrierPoint = enum { before, after };
+
+fn waitForAdapterSnapshotTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+) !void {
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_ADAPTER_SNAPSHOT_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const ready = try std.fmt.allocPrint(allocator, "{s}.ready", .{base});
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{base});
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
 
 fn waitForSymlinkReadTestBarrier(
     allocator: Allocator,
