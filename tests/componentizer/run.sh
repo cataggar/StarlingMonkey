@@ -1526,49 +1526,115 @@ mkdir "$PUBLICATION_A" "$PUBLICATION_B"
 ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
 printf 'unrelated-a\n' > "$PUBLICATION_A/unrelated"
 printf 'unrelated-b\n' > "$PUBLICATION_B/unrelated"
-RETARGET_HUMAN_LOG="$SCRATCH/retarget-human.log"
-FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
-FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
-"$COMPONENTIZER" \
-  --engine "$ENGINE" \
-  --preview2-adapter "$ADAPTER" \
-  --wizer-bin "$TOOLS/fake wizer" \
-  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
-  --out "$PUBLICATION_LINK/retarget-safe.wasm" \
-  "$SOURCE" 2> "$RETARGET_HUMAN_LOG"
-test "$(readlink "$PUBLICATION_LINK")" = "$PUBLICATION_B"
-cmp "$ENGINE" "$PUBLICATION_A/retarget-safe.wasm"
-test ! -e "$PUBLICATION_B/retarget-safe.wasm"
-grep -Fq "into $PUBLICATION_A/retarget-safe.wasm" "$RETARGET_HUMAN_LOG"
-if grep -Fq "into $PUBLICATION_LINK/retarget-safe.wasm" \
-  "$RETARGET_HUMAN_LOG"; then
-  echo "FAIL: human success reported retargetable lexical output" >&2
-  exit 1
-fi
-test "$(cat "$PUBLICATION_A/unrelated")" = "unrelated-a"
-test "$(cat "$PUBLICATION_B/unrelated")" = "unrelated-b"
-
-rm "$PUBLICATION_LINK"
-ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
-RETARGET_JSON_LOG="$SCRATCH/retarget-json.log"
-FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
-FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
+PUBLICATION_SAVED="$SCRATCH/publication-link-original"
+PUBLICATION_RESTORED_OUTPUT="$PUBLICATION_A/restored-safe.wasm"
+PUBLICATION_RESTORED_METADATA="$PUBLICATION_A/restored-safe.json"
+PUBLICATION_RESTORED_DEBUG="$PUBLICATION_A/restored-safe.debug"
+PUBLICATION_ATTACKER_OUTPUT="$PUBLICATION_B/restored-safe.wasm"
+PUBLICATION_ATTACKER_METADATA="$PUBLICATION_B/restored-safe.json"
+PUBLICATION_ATTACKER_DEBUG="$PUBLICATION_B/restored-safe.debug"
+PUBLICATION_RESTORED_LOG="$SCRATCH/publication-restored.jsonl"
+PUBLICATION_RESTORED_BARRIER="$BARRIERS/publication-restored"
+printf 'old-output\n' > "$PUBLICATION_RESTORED_OUTPUT"
+printf 'old-metadata\n' > "$PUBLICATION_RESTORED_METADATA"
+mkdir "$PUBLICATION_RESTORED_DEBUG" "$PUBLICATION_ATTACKER_DEBUG"
+printf 'old-debug\n' > "$PUBLICATION_RESTORED_DEBUG/unrelated.txt"
+printf 'attacker-output\n' > "$PUBLICATION_ATTACKER_OUTPUT"
+printf 'attacker-metadata\n' > "$PUBLICATION_ATTACKER_METADATA"
+printf 'attacker-debug\n' > "$PUBLICATION_ATTACKER_DEBUG/unrelated.txt"
+STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_BARRIER="$PUBLICATION_RESTORED_BARRIER" \
+STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_STAGE=output-parent \
 "$COMPONENTIZER" \
   --json-diagnostics \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
   --wizer-bin "$TOOLS/fake wizer" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
-  --out "$PUBLICATION_LINK/retarget-json.wasm" \
-  "$SOURCE" 2> "$RETARGET_JSON_LOG"
-cmp "$ENGINE" "$PUBLICATION_A/retarget-json.wasm"
+  --metadata-out "$PUBLICATION_LINK/restored-safe.json" \
+  --debug-dir "$PUBLICATION_LINK/restored-safe.debug" \
+  --out "$PUBLICATION_LINK/restored-safe.wasm" \
+  "$SOURCE" 2> "$PUBLICATION_RESTORED_LOG" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$PUBLICATION_RESTORED_BARRIER.before_read.ready" \
+  "$SNAPSHOT_TEST_PID" "publication selection before read"
+mv "$PUBLICATION_LINK" "$PUBLICATION_SAVED"
+ln -s "$PUBLICATION_B" "$PUBLICATION_LINK"
+: > "$PUBLICATION_RESTORED_BARRIER.before_read.release"
+wait_for_marker "$PUBLICATION_RESTORED_BARRIER.after_read.ready" \
+  "$SNAPSHOT_TEST_PID" "publication selection after read"
+rm "$PUBLICATION_LINK"
+mv "$PUBLICATION_SAVED" "$PUBLICATION_LINK"
+: > "$PUBLICATION_RESTORED_BARRIER.after_read.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: restored publication substitution was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+test "$(cat "$PUBLICATION_RESTORED_OUTPUT")" = "old-output"
+test "$(cat "$PUBLICATION_RESTORED_METADATA")" = "old-metadata"
+test "$(cat "$PUBLICATION_RESTORED_DEBUG/unrelated.txt")" = "old-debug"
+test ! -e "$PUBLICATION_RESTORED_DEBUG/commands.txt"
+test "$(cat "$PUBLICATION_ATTACKER_OUTPUT")" = "attacker-output"
+test "$(cat "$PUBLICATION_ATTACKER_METADATA")" = "attacker-metadata"
+test "$(cat "$PUBLICATION_ATTACKER_DEBUG/unrelated.txt")" = "attacker-debug"
+test ! -e "$PUBLICATION_ATTACKER_DEBUG/commands.txt"
+python3 - "$PUBLICATION_RESTORED_LOG" "$PUBLICATION_RESTORED_OUTPUT" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "PublicationDirectoryChanged", diagnostic
+PY
+
+RETARGET_HUMAN_LOG="$SCRATCH/retarget-human.log"
+if FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
+  FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
+  "$COMPONENTIZER" \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$PUBLICATION_LINK/retarget-safe.wasm" \
+    "$SOURCE" 2> "$RETARGET_HUMAN_LOG"
+then
+  echo "FAIL: unrestored publication retarget succeeded" >&2
+  exit 1
+fi
+test "$(readlink "$PUBLICATION_LINK")" = "$PUBLICATION_B"
+test ! -e "$PUBLICATION_A/retarget-safe.wasm"
+test ! -e "$PUBLICATION_B/retarget-safe.wasm"
+grep -Fq "error[SMC7001] publish:" "$RETARGET_HUMAN_LOG"
+grep -Fq "(PublicationDirectoryChanged)" "$RETARGET_HUMAN_LOG"
+test "$(cat "$PUBLICATION_A/unrelated")" = "unrelated-a"
+test "$(cat "$PUBLICATION_B/unrelated")" = "unrelated-b"
+
+rm "$PUBLICATION_LINK"
+ln -s "$PUBLICATION_A" "$PUBLICATION_LINK"
+RETARGET_JSON_LOG="$SCRATCH/retarget-json.log"
+if FAKE_RETARGET_PARENT_LINK="$PUBLICATION_LINK" \
+  FAKE_RETARGET_PARENT_TARGET="$PUBLICATION_B" \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$ENGINE" \
+    --preview2-adapter "$ADAPTER" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$PUBLICATION_LINK/retarget-json.wasm" \
+    "$SOURCE" 2> "$RETARGET_JSON_LOG"
+then
+  echo "FAIL: unrestored JSON publication retarget succeeded" >&2
+  exit 1
+fi
+test ! -e "$PUBLICATION_A/retarget-json.wasm"
 test ! -e "$PUBLICATION_B/retarget-json.wasm"
-python3 - "$RETARGET_JSON_LOG" \
-  "$PUBLICATION_A/retarget-json.wasm" <<'PY'
+python3 - "$RETARGET_JSON_LOG" <<'PY'
 import json, sys
 diagnostic = json.load(open(sys.argv[1], encoding="utf-8"))
-assert diagnostic["code"] == "SMC0000", diagnostic
-assert diagnostic["output"] == sys.argv[2], diagnostic
+assert diagnostic["code"] == "SMC7001", diagnostic
+assert diagnostic["phase"] == "publish", diagnostic
+assert diagnostic["cause"] == "PublicationDirectoryChanged", diagnostic
 PY
 if find "$PUBLICATION_A" "$PUBLICATION_B" \
   -name '.*.starling-componentize-*' | grep -q .; then
@@ -2410,6 +2476,92 @@ build_with_fake_zig() {
   shift
   build_with_selected_zig "$TOOLS/fake zig" "$output" "$@"
 }
+
+run_retained_cache_selection_race() {
+  local kind="$1"
+  local root="$SCRATCH/explicit cache $kind selection"
+  local link="$root/cache link"
+  local saved="$root/original link"
+  local original_cache attacker_cache configured_cache
+  mkdir "$root"
+  if [ "$kind" = symlink ]; then
+    original_cache="$root/original cache"
+    attacker_cache="$root/attacker cache"
+    mkdir "$original_cache" "$attacker_cache"
+    ln -s "$original_cache" "$link"
+    configured_cache="$link"
+  elif [ "$kind" = ancestor ]; then
+    local original_parent="$root/original parent"
+    local attacker_parent="$root/attacker parent"
+    original_cache="$original_parent/cache"
+    attacker_cache="$attacker_parent/cache"
+    mkdir -p "$original_cache" "$attacker_cache"
+    ln -s "$original_parent" "$link"
+    configured_cache="$link/cache"
+  else
+    echo "FAIL: unknown explicit cache race $kind" >&2
+    exit 1
+  fi
+  printf 'attacker-cache\n' > "$attacker_cache/sentinel"
+  local barrier="$BARRIERS/explicit-cache-$kind"
+  local error="$SCRATCH/explicit-cache-$kind.jsonl"
+  local output="$WORK/explicit cache $kind.wasm"
+  printf 'preserved-cache-%s-output\n' "$kind" > "$output"
+  STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_BARRIER="$barrier" \
+  STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_STAGE=cache \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --build-root "$FAKE_BUILD_ROOT" \
+    --cache-dir "$configured_cache" \
+    --zig-bin "$TOOLS/fake zig" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --preview2-adapter "$ADAPTER" \
+    --out "$output" \
+    "$BUILD_SOURCE" 2> "$error" &
+  SNAPSHOT_TEST_PID=$!
+  wait_for_marker "$barrier.before_read.ready" "$SNAPSHOT_TEST_PID" \
+    "explicit cache $kind selection before read"
+  mv "$link" "$saved"
+  if [ "$kind" = symlink ]; then
+    ln -s "$attacker_cache" "$link"
+  else
+    ln -s "$(dirname "$attacker_cache")" "$link"
+  fi
+  : > "$barrier.before_read.release"
+  wait_for_marker "$barrier.after_read.ready" "$SNAPSHOT_TEST_PID" \
+    "explicit cache $kind selection after read"
+  rm "$link"
+  mv "$saved" "$link"
+  : > "$barrier.after_read.release"
+  if wait "$SNAPSHOT_TEST_PID"; then
+    echo "FAIL: restored explicit cache $kind substitution was accepted" >&2
+    exit 1
+  fi
+  SNAPSHOT_TEST_PID=""
+  test "$(cat "$output")" = "preserved-cache-$kind-output"
+  test -z "$(find "$original_cache" -mindepth 1 -print -quit)"
+  test "$(cat "$attacker_cache/sentinel")" = "attacker-cache"
+  if find "$attacker_cache" -mindepth 1 ! -name sentinel | grep -q .; then
+    echo "FAIL: explicit cache $kind race wrote through attacker path" >&2
+    exit 1
+  fi
+  python3 - "$error" "$output" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "CacheDirectoryChanged", diagnostic
+PY
+}
+
+run_retained_cache_selection_race symlink
+run_retained_cache_selection_race ancestor
 
 run_retained_input_symlink_race() {
   local stage="$1"

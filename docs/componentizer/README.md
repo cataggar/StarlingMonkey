@@ -18,10 +18,19 @@ command string):
 
 Any failure before the durable publication commit leaves existing component
 and metadata outputs unchanged and never publishes a partial debug directory.
-The temporary transaction directory is
-created beside the output through a held handle to its canonical parent.
+The output parent is selected without pathname canonicalization: `/`, every
+existing ancestor, each no-follow symlink inode and descriptor-bound link
+text, and the final directory remain retained. Missing directory components
+are created one at a time through the retained parent handle and immediately
+reopened no-follow. The resulting anchor is transferred into the transaction,
+which creates its temporary directory beside the output through that held
+handle.
 Backup, publication, rollback, and cleanup stay relative to that handle and
-check recorded no-follow identities. Persistent per-destination advisory locks,
+check the complete retained chain and recorded no-follow identities.
+Metadata and debug parents are independently descriptor-resolved and must
+identify that same retained directory. A substituted output, metadata, or
+debug ancestor can therefore fail closed but can never redirect publication
+or rollback. Persistent per-destination advisory locks,
 opened no-follow beneath the held parent and inherited by no child tool,
 serialize overlapping bundles. Immediately before the explicit commit point,
 the parent, locks, recovery anchors,
@@ -34,6 +43,13 @@ transaction is retained for recovery instead of attempting a post-commit
 rollback. Optional metadata and debug destinations must use that same parent
 so publication and
 rollback cannot cross filesystems.
+
+An explicit `--cache-dir` uses the same descriptor-rooted resolver. Missing
+cache components and every cache child are created relative to retained
+directory handles; native children receive only stable handle paths. Cache
+verification checks the retained ancestor/symlink/final chain and each
+descriptor-relative child identity, so a symlink or ancestor
+replace/resolve/restore race performs no writes through the substituted cache.
 
 ## Building
 

@@ -186,6 +186,84 @@ const RetainedInputPath = struct {
         return if (parent) |index| self.nodes[index].directory.? else self.root;
     }
 
+    fn verifyMutableDirectory(self: *const RetainedInputPath, io: Io) !void {
+        if (!self.root_identity.entry.matches(try self.root.stat(io)) or
+            !deviceIdentityMatches(
+                self.root_device,
+                try linuxDeviceForHandle(self.root.handle),
+            ))
+        {
+            return error.InputChanged;
+        }
+        for (self.nodes) |node| {
+            const parent = self.parentDirectory(node.parent);
+            const namespace_stat = try parent.statFile(
+                io,
+                node.name,
+                .{ .follow_symlinks = false },
+            );
+            if (!node.identity.entry.matches(namespace_stat) or
+                !deviceIdentityMatches(
+                    node.device,
+                    try linuxDeviceAt(parent, node.name),
+                ))
+            {
+                return error.InputChanged;
+            }
+            if (node.directory) |directory| {
+                if (!node.identity.entry.matches(try directory.stat(io)) or
+                    !deviceIdentityMatches(
+                        node.device,
+                        try linuxDeviceForHandle(directory.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            } else if (node.symlink) |link| {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const length = try readBoundSymlink(
+                    io,
+                    node.identity,
+                    link,
+                    &buffer,
+                );
+                if (!std.mem.eql(u8, node.link_target.?, buffer[0..length]) or
+                    !deviceIdentityMatches(
+                        node.device,
+                        try linuxDeviceForHandle(link.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            } else unreachable;
+        }
+        const directory = switch (self.entry) {
+            .directory => |value| value,
+            .file => return error.InputChanged,
+        };
+        const parent = self.parentDirectory(self.parent);
+        const namespace_stat = try parent.statFile(
+            io,
+            self.basename,
+            .{ .follow_symlinks = false },
+        );
+        const retained_stat = try directory.stat(io);
+        if (!self.entry_identity.entry.matches(namespace_stat) or
+            !self.retained_identity.entry.matches(retained_stat) or
+            !self.entry_identity.entry.matches(retained_stat) or
+            !deviceIdentityMatches(
+                self.entry_device,
+                try linuxDeviceAt(parent, self.basename),
+            ) or
+            !deviceIdentityMatches(
+                self.retained_device,
+                try linuxDeviceForHandle(directory.handle),
+            ))
+        {
+            return error.InputChanged;
+        }
+    }
+
     fn refreshRetainedDirectoryBaseline(
         self: *RetainedInputPath,
         io: Io,
@@ -889,21 +967,23 @@ const EffectiveCache = struct {
     path: []const u8,
     identity: EntryIdentity,
     directory: Dir,
+    anchor: ?RetainedInputPath = null,
 
     fn verifyCanonical(self: *const EffectiveCache, io: Io) !void {
         if (!self.identity.matches(try self.directory.stat(io))) {
             return error.CacheDirectoryChanged;
         }
-        const canonical = Dir.cwd().statFile(
-            io,
-            self.path,
-            .{ .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.CacheDirectoryChanged,
-            else => return err,
-        };
-        if (!self.identity.matches(canonical)) {
-            return error.CacheDirectoryChanged;
+        if (self.anchor) |*anchor| {
+            anchor.verifyMutableDirectory(io) catch
+                return error.CacheDirectoryChanged;
+        }
+    }
+
+    fn deinit(self: *EffectiveCache, allocator: Allocator, io: Io) void {
+        if (self.anchor) |*anchor| {
+            anchor.deinit(allocator, io);
+        } else {
+            self.directory.close(io);
         }
     }
 };
@@ -954,6 +1034,7 @@ const Transaction = struct {
     storage_path: []const u8,
     publication_path: []const u8,
     publication: Dir,
+    publication_anchor: RetainedInputPath,
     root: Dir,
     storage: Dir,
     publication_identity: EntryIdentity,
@@ -969,12 +1050,18 @@ const Transaction = struct {
     fn create(
         allocator: Allocator,
         io: Io,
-        publication: Dir,
-        publication_path: []const u8,
+        publication_anchor: RetainedInputPath,
         name: []const u8,
         owner: []const u8,
         environ: *std.process.Environ.Map,
     ) !Transaction {
+        const publication = switch (publication_anchor.entry) {
+            .directory => |directory| directory,
+            .file => return error.PublicationDirectoryChanged,
+        };
+        publication_anchor.verifyMutableDirectory(io) catch
+            return error.PublicationDirectoryChanged;
+        const publication_path = publication_anchor.resolved_path;
         const publication_identity = EntryIdentity.fromStat(
             try publication.stat(io),
         );
@@ -1021,6 +1108,7 @@ const Transaction = struct {
             ),
             .publication_path = publication_path,
             .publication = publication,
+            .publication_anchor = publication_anchor,
             .root = root,
             .storage = storage,
             .publication_identity = publication_identity,
@@ -1042,7 +1130,7 @@ const Transaction = struct {
         for (self.child_anchors.items) |anchor| anchor.handle.close(io);
         self.storage.close(io);
         self.root.close(io);
-        self.publication.close(io);
+        self.publication_anchor.deinit(allocator, io);
         self.child_anchors.deinit(allocator);
         self.owned.deinit(allocator);
         self.mutation_monitor.deinit(allocator);
@@ -1518,17 +1606,8 @@ const Transaction = struct {
         if (!self.publication_identity.matches(try self.publication.stat(io))) {
             return error.PublicationDirectoryChanged;
         }
-        const canonical = Dir.cwd().statFile(
-            io,
-            self.publication_path,
-            .{ .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.PublicationDirectoryChanged,
-            else => return err,
-        };
-        if (!self.publication_identity.matches(canonical)) {
+        self.publication_anchor.verifyMutableDirectory(io) catch
             return error.PublicationDirectoryChanged;
-        }
     }
 
     fn ownedIdentity(
@@ -2217,18 +2296,26 @@ fn execute(
         try defaultOutputPath(allocator, cwd, source_argument);
     try validateArgument(output);
     const output_parent = std.fs.path.dirname(output) orelse return error.InvalidPath;
-    const publication_parent = try resolveOrCreateDirectory(
+    var publication_anchor = retainOrCreateAbsoluteDirectory(
         allocator,
         io,
         output_parent,
-    );
-    var publication_directory = try Dir.openDirAbsolute(
-        io,
-        publication_parent,
-        .{ .iterate = true, .follow_symlinks = false },
-    );
+        environ,
+        "output-parent",
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.PublicationDirectoryChanged,
+    };
     var publication_transferred = false;
-    defer if (!publication_transferred) publication_directory.close(io);
+    defer if (!publication_transferred) publication_anchor.deinit(allocator, io);
+    const publication_parent = publication_anchor.resolved_path;
+    const publication_directory = switch (publication_anchor.entry) {
+        .directory => |directory| directory,
+        .file => return error.PublicationDirectoryChanged,
+    };
     const output_name = std.fs.path.basename(output);
     const resolved_output = try std.fs.path.join(
         allocator,
@@ -2251,8 +2338,26 @@ fn execute(
         const destination = try absolutePath(allocator, cwd, path);
         const parent = std.fs.path.dirname(destination) orelse
             return error.InvalidMetadataDestination;
-        const resolved_parent = try resolveOrCreateDirectory(allocator, io, parent);
-        if (!std.mem.eql(u8, resolved_parent, publication_parent)) {
+        var parent_anchor = retainOrCreateAbsoluteDirectory(
+            allocator,
+            io,
+            parent,
+            environ,
+            "metadata-parent",
+        ) catch return error.InvalidMetadataDestination;
+        defer parent_anchor.deinit(allocator, io);
+        try publication_anchor.verifyMutableDirectory(io);
+        const parent_directory = switch (parent_anchor.entry) {
+            .directory => |directory| directory,
+            .file => return error.InvalidMetadataDestination,
+        };
+        const parent_stat = try parent_directory.stat(io);
+        if (!publication_anchor.retained_identity.entry.matches(parent_stat) or
+            !deviceIdentityMatches(
+                publication_anchor.retained_device,
+                try linuxDeviceForHandle(parent_directory.handle),
+            ))
+        {
             return error.InvalidMetadataDestination;
         }
         const resolved = try std.fs.path.join(
@@ -2282,8 +2387,26 @@ fn execute(
             try std.fmt.allocPrint(allocator, "{s}.debug", .{output});
         const parent = std.fs.path.dirname(destination) orelse
             return error.DebugOutputCollision;
-        const resolved_parent = try resolveOrCreateDirectory(allocator, io, parent);
-        if (!std.mem.eql(u8, resolved_parent, publication_parent)) {
+        var parent_anchor = retainOrCreateAbsoluteDirectory(
+            allocator,
+            io,
+            parent,
+            environ,
+            "debug-parent",
+        ) catch return error.DebugOutputCollision;
+        defer parent_anchor.deinit(allocator, io);
+        try publication_anchor.verifyMutableDirectory(io);
+        const parent_directory = switch (parent_anchor.entry) {
+            .directory => |directory| directory,
+            .file => return error.DebugOutputCollision,
+        };
+        const parent_stat = try parent_directory.stat(io);
+        if (!publication_anchor.retained_identity.entry.matches(parent_stat) or
+            !deviceIdentityMatches(
+                publication_anchor.retained_device,
+                try linuxDeviceForHandle(parent_directory.handle),
+            ))
+        {
             return error.DebugOutputCollision;
         }
         const resolved = try std.fs.path.join(
@@ -2321,12 +2444,12 @@ fn execute(
             allocator,
             io,
             cwd,
-            build_root,
             configured,
+            environ,
         )
     else
         null;
-    defer if (effective_cache) |cache| cache.directory.close(io);
+    defer if (effective_cache) |*cache| cache.deinit(allocator, io);
     var retained_build_root: ?RetainedInputPath = if (build_root) |path|
         retainAbsoluteInputDirectory(
             allocator,
@@ -2396,11 +2519,11 @@ fn execute(
         .{ std.fs.path.basename(output), &random_hex },
     );
     diagnostic.begin(.inputs);
+    try publication_anchor.verifyMutableDirectory(io);
     var transaction = try Transaction.create(
         allocator,
         io,
-        publication_directory,
-        publication_parent,
+        publication_anchor,
         transaction_name,
         &random_hex,
         environ,
@@ -6376,6 +6499,7 @@ fn retainAbsoluteInputFile(
         environ,
         stage,
         .file,
+        false,
     );
 }
 
@@ -6393,6 +6517,25 @@ fn retainAbsoluteInputDirectory(
         environ,
         stage,
         .directory,
+        false,
+    );
+}
+
+fn retainOrCreateAbsoluteDirectory(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+) !RetainedInputPath {
+    return retainAbsoluteInputPath(
+        allocator,
+        io,
+        path,
+        environ,
+        stage,
+        .directory,
+        true,
     );
 }
 
@@ -6403,6 +6546,7 @@ fn retainAbsoluteInputPath(
     environ: *std.process.Environ.Map,
     stage: []const u8,
     expected_kind: RetainedInputKind,
+    create_missing_directories: bool,
 ) !RetainedInputPath {
     if (std.fs.path.sep != '/' or
         !std.fs.path.isAbsolute(path) or
@@ -6416,7 +6560,7 @@ fn retainAbsoluteInputPath(
         .{ .iterate = true, .follow_symlinks = false },
     );
     errdefer root.close(io);
-    const root_identity = SourceIdentity.fromStat(try root.stat(io));
+    var root_identity = SourceIdentity.fromStat(try root.stat(io));
     const root_device = try linuxDeviceForHandle(root.handle);
     var nodes: std.ArrayList(RetainedInputPathNode) = .empty;
     errdefer {
@@ -6453,11 +6597,32 @@ fn retainAbsoluteInputPath(
         var parent_node: ?usize = null;
         var parent_absolute: []const u8 = "/";
         for (components.items, 0..) |component, component_index| {
-            const stat = try parent.statFile(
+            const stat = parent.statFile(
                 io,
                 component,
                 .{ .follow_symlinks = false },
-            );
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (!create_missing_directories or
+                        expected_kind != .directory)
+                    {
+                        return err;
+                    }
+                    return createRetainedDirectoryTail(
+                        allocator,
+                        io,
+                        root,
+                        &root_identity,
+                        root_device,
+                        &nodes,
+                        parent_node,
+                        parent,
+                        components.items[component_index..],
+                        current_path,
+                    );
+                },
+                else => return err,
+            };
             const identity = SourceIdentity.fromStat(stat);
             const device = try linuxDeviceAt(parent, component);
 
@@ -6583,12 +6748,23 @@ fn retainAbsoluteInputPath(
                     .file => |file| try linuxDeviceForHandle(file.handle),
                     .directory => |directory| try linuxDeviceForHandle(directory.handle),
                 };
-                if (!identity.matches(retained_stat) or
-                    !retained_identity.matches(try parent.statFile(
-                        io,
-                        component,
-                        .{ .follow_symlinks = false },
-                    )) or
+                const namespace_stat = try parent.statFile(
+                    io,
+                    component,
+                    .{ .follow_symlinks = false },
+                );
+                const retained_matches = if (create_missing_directories and
+                    expected_kind == .directory)
+                    identity.entry.matches(retained_stat)
+                else
+                    identity.matches(retained_stat);
+                const namespace_matches = if (create_missing_directories and
+                    expected_kind == .directory)
+                    retained_identity.entry.matches(namespace_stat)
+                else
+                    retained_identity.matches(namespace_stat);
+                if (!retained_matches or
+                    !namespace_matches or
                     !deviceIdentityMatches(device, retained_device) or
                     !deviceIdentityMatches(
                         device,
@@ -6637,12 +6813,22 @@ fn retainAbsoluteInputPath(
                 component,
                 .after_open,
             );
-            if (!identity.matches(try child.stat(io)) or
-                !identity.matches(try parent.statFile(
-                    io,
-                    component,
-                    .{ .follow_symlinks = false },
-                )) or
+            const child_stat = try child.stat(io);
+            const namespace_stat = try parent.statFile(
+                io,
+                component,
+                .{ .follow_symlinks = false },
+            );
+            const child_matches = if (create_missing_directories)
+                identity.entry.matches(child_stat)
+            else
+                identity.matches(child_stat);
+            const namespace_matches = if (create_missing_directories)
+                identity.entry.matches(namespace_stat)
+            else
+                identity.matches(namespace_stat);
+            if (!child_matches or
+                !namespace_matches or
                 !deviceIdentityMatches(
                     device,
                     try linuxDeviceForHandle(child.handle),
@@ -6670,6 +6856,145 @@ fn retainAbsoluteInputPath(
         }
         unreachable;
     }
+}
+
+fn refreshRetainedCreatedParent(
+    io: Io,
+    root: Dir,
+    root_identity: *SourceIdentity,
+    root_device: DeviceIdentity,
+    nodes: *std.ArrayList(RetainedInputPathNode),
+    parent_node: ?usize,
+) !void {
+    if (parent_node) |index| {
+        const node = &nodes.items[index];
+        const directory = node.directory orelse return error.InputChanged;
+        const namespace_parent = if (node.parent) |parent_index|
+            nodes.items[parent_index].directory.?
+        else
+            root;
+        const namespace_stat = try namespace_parent.statFile(
+            io,
+            node.name,
+            .{ .follow_symlinks = false },
+        );
+        const retained_stat = try directory.stat(io);
+        if (!node.identity.entry.matches(namespace_stat) or
+            !node.identity.entry.matches(retained_stat) or
+            !deviceIdentityMatches(
+                node.device,
+                try linuxDeviceAt(namespace_parent, node.name),
+            ) or
+            !deviceIdentityMatches(
+                node.device,
+                try linuxDeviceForHandle(directory.handle),
+            ))
+        {
+            return error.InputChanged;
+        }
+        node.identity = SourceIdentity.fromStat(retained_stat);
+        node.device = try linuxDeviceForHandle(directory.handle);
+        return;
+    }
+    const stat = try root.stat(io);
+    if (!root_identity.entry.matches(stat) or
+        !deviceIdentityMatches(
+            root_device,
+            try linuxDeviceForHandle(root.handle),
+        ))
+    {
+        return error.InputChanged;
+    }
+    root_identity.* = SourceIdentity.fromStat(stat);
+}
+
+fn createRetainedDirectoryTail(
+    allocator: Allocator,
+    io: Io,
+    root: Dir,
+    root_identity: *SourceIdentity,
+    root_device: DeviceIdentity,
+    nodes: *std.ArrayList(RetainedInputPathNode),
+    initial_parent_node: ?usize,
+    initial_parent: Dir,
+    components: []const []const u8,
+    resolved_path: []const u8,
+) !RetainedInputPath {
+    var parent_node = initial_parent_node;
+    var parent = initial_parent;
+    for (components, 0..) |component, index| {
+        parent.createDir(io, component, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.InputChanged,
+            else => return err,
+        };
+        try refreshRetainedCreatedParent(
+            io,
+            root,
+            root_identity,
+            root_device,
+            nodes,
+            parent_node,
+        );
+        const stat = try parent.statFile(
+            io,
+            component,
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind != .directory) return error.InputChanged;
+        const identity = SourceIdentity.fromStat(stat);
+        const device = try linuxDeviceAt(parent, component);
+        const child = try parent.openDir(
+            io,
+            component,
+            .{ .iterate = true, .follow_symlinks = false },
+        );
+        errdefer child.close(io);
+        const retained_stat = try child.stat(io);
+        if (!identity.entry.matches(retained_stat) or
+            !identity.entry.matches(try parent.statFile(
+                io,
+                component,
+                .{ .follow_symlinks = false },
+            )) or
+            !deviceIdentityMatches(
+                device,
+                try linuxDeviceForHandle(child.handle),
+            ) or
+            !deviceIdentityMatches(
+                device,
+                try linuxDeviceAt(parent, component),
+            ))
+        {
+            return error.InputChanged;
+        }
+        if (index + 1 == components.len) {
+            return .{
+                .root = root,
+                .root_identity = root_identity.*,
+                .root_device = root_device,
+                .nodes = nodes.toOwnedSlice(allocator) catch
+                    @panic("out of memory"),
+                .parent = parent_node,
+                .basename = try allocator.dupe(u8, component),
+                .entry_identity = identity,
+                .entry_device = device,
+                .entry = .{ .directory = child },
+                .retained_identity = SourceIdentity.fromStat(retained_stat),
+                .retained_device = try linuxDeviceForHandle(child.handle),
+                .resolved_path = try allocator.dupe(u8, resolved_path),
+            };
+        }
+        nodes.append(allocator, .{
+            .parent = parent_node,
+            .name = try allocator.dupe(u8, component),
+            .identity = identity,
+            .device = device,
+            .directory = child,
+        }) catch @panic("out of memory");
+        parent_node = nodes.items.len - 1;
+        parent = child;
+    }
+    unreachable;
 }
 
 fn captureInputFile(
@@ -9475,20 +9800,6 @@ fn copyDebugFile(
     try Dir.cwd().copyFile(source, debug_dir, basename, io, .{});
 }
 
-fn resolveOrCreateDirectory(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
-) ![]const u8 {
-    return Dir.realPathFileAbsoluteAlloc(io, path, allocator) catch |err| switch (err) {
-        error.FileNotFound => {
-            try Dir.cwd().createDirPath(io, path);
-            return Dir.realPathFileAbsoluteAlloc(io, path, allocator);
-        },
-        else => return err,
-    };
-}
-
 fn resolveDefaultCacheAtBuildRoot(
     allocator: Allocator,
     io: Io,
@@ -9517,6 +9828,7 @@ fn resolveDefaultCacheAtBuildRoot(
         .path = cache.path,
         .identity = cache.identity,
         .directory = cache.directory,
+        .anchor = null,
     };
 }
 
@@ -9524,37 +9836,37 @@ fn resolveEffectiveCache(
     allocator: Allocator,
     io: Io,
     cwd: []const u8,
-    build_root: ?[]const u8,
-    configured: ?[]const u8,
+    configured: []const u8,
+    environ: *std.process.Environ.Map,
 ) !EffectiveCache {
-    const requested = if (configured) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try std.fs.path.join(
-            allocator,
-            &.{ build_root.?, ".zig-cache", "starling-componentizer" },
-        );
-    try Dir.cwd().createDirPath(io, requested);
-    const resolved = try Dir.realPathFileAbsoluteAlloc(io, requested, allocator);
-    var directory = try Dir.openDirAbsolute(
+    const requested = try absolutePath(allocator, cwd, configured);
+    var anchor = retainOrCreateAbsoluteDirectory(
+        allocator,
         io,
-        resolved,
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    errdefer directory.close(io);
+        requested,
+        environ,
+        "cache",
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.CacheDirectoryChanged,
+    };
+    errdefer anchor.deinit(allocator, io);
+    try anchor.verifyMutableDirectory(io);
+    const directory = switch (anchor.entry) {
+        .directory => |value| value,
+        .file => return error.CacheDirectoryChanged,
+    };
     const stat = try directory.stat(io);
-    if (stat.kind != .directory) return error.InvalidPath;
-    const canonical = try Dir.cwd().statFile(
-        io,
-        resolved,
-        .{ .follow_symlinks = false },
-    );
+    if (stat.kind != .directory) return error.CacheDirectoryChanged;
     const identity = EntryIdentity.fromStat(stat);
-    if (!identity.matches(canonical)) return error.CacheDirectoryChanged;
     return .{
-        .path = resolved,
+        .path = anchor.resolved_path,
         .identity = identity,
         .directory = directory,
+        .anchor = anchor,
     };
 }
 
