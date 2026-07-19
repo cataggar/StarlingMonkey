@@ -8,7 +8,7 @@ fi
 
 COMPONENTIZER="$(realpath "$1")"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRATCH="$ROOT/tests/componentizer/.scratch"
+SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
 TOOLS="$SCRATCH/fake tools"
 WORK="$SCRATCH/work with spaces"
 FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
@@ -71,6 +71,7 @@ remove_tree() {
 }
 cleanup_scratch
 mkdir -p "$TOOLS" "$WORK/wit package" "$FAKE_BUILD_ROOT/runtime" \
+  "$SCRATCH/cache parent" \
   "$FAKE_BUILD_ROOT/tools/componentizer" \
   "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release"
 printf 'captured-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
@@ -2377,7 +2378,7 @@ PY
 )"
 test "$PREOPEN_FIRST_DIGEST" != "$PREOPEN_SECOND_DIGEST"
 
-CACHE="$WORK/runtime cache"
+CACHE="$SCRATCH/cache parent/runtime cache"
 BUILD_OUTPUT_1="$WORK/built output 1.wasm"
 BUILD_OUTPUT_2="$WORK/built output 2.wasm"
 BUILD_OUTPUT_3="$WORK/built output 3.wasm"
@@ -2407,6 +2408,115 @@ build_with_fake_zig() {
   shift
   build_with_selected_zig "$TOOLS/fake zig" "$output" "$@"
 }
+
+run_retained_input_symlink_race() {
+  local stage="$1"
+  local link_dir="$SCRATCH/$stage retained input"
+  local link="$link_dir/input link"
+  local saved="$link_dir/original link"
+  local attacker="$link_dir/attacker input"
+  local marker="$link_dir/attacker-executed"
+  local barrier="$SCRATCH/$stage-input-symlink"
+  local error="$SCRATCH/$stage-input-symlink.jsonl"
+  local output="$WORK/$stage input preserved.wasm"
+  local metadata="$WORK/$stage input preserved.json"
+  local debug="$WORK/$stage input preserved.debug"
+  local original
+  case "$stage" in
+    engine) original="$ENGINE" ;;
+    wizer) original="$TOOLS/fake wizer" ;;
+    wasm-tools) original="$TOOLS/fake wasm-tools" ;;
+    wabt) original="$TOOLS/fake wabt" ;;
+    zig) original="$TOOLS/fake zig" ;;
+    *) echo "FAIL: unknown retained input stage $stage" >&2; exit 1 ;;
+  esac
+  mkdir "$link_dir" "$debug"
+  ln -s "$original" "$link"
+  if [ "$stage" = engine ]; then
+    printf 'substituted-engine\n' > "$attacker"
+  else
+    cat > "$attacker" <<EOF
+#!/usr/bin/env bash
+printf 'executed\n' > "$marker"
+exit 99
+EOF
+    chmod +x "$attacker"
+  fi
+  printf '%s-output\n' "$stage" > "$output"
+  printf '%s-metadata\n' "$stage" > "$metadata"
+  printf '%s-debug\n' "$stage" > "$debug/unrelated.txt"
+
+  local engine="$ENGINE"
+  local wizer="$TOOLS/fake wizer"
+  local wasm_tools="$TOOLS/fake wasm-tools"
+  local wabt="$TOOLS/fake wabt"
+  [ "$stage" = engine ] && engine="$link"
+  [ "$stage" = wizer ] && wizer="$link"
+  [ "$stage" = wasm-tools ] && wasm_tools="$link"
+  [ "$stage" = wabt ] && wabt="$link"
+  local command=(
+    "$COMPONENTIZER"
+    --json-diagnostics
+    --wit "$WIT"
+    --world-name exports
+    --wizer-bin "$wizer"
+    --wabt-bin "$wabt"
+    --wasm-tools-bin "$wasm_tools"
+    --preview2-adapter "$ADAPTER"
+    --metadata-out "$metadata"
+    --debug-dir "$debug"
+    --out "$output"
+  )
+  if [ "$stage" = zig ]; then
+    command+=(
+      --build-root "$FAKE_BUILD_ROOT"
+      --cache-dir "$WORK/$stage retained input cache"
+      --zig-bin "$link"
+      "$BUILD_SOURCE"
+    )
+  else
+    command+=(--engine "$engine" "$SOURCE")
+  fi
+
+  STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_BARRIER="$barrier" \
+  STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_STAGE="$stage" \
+    "${command[@]}" 2> "$error" &
+  SNAPSHOT_TEST_PID=$!
+  wait_for_marker "$barrier.before_read.ready" "$SNAPSHOT_TEST_PID" \
+    "$stage retained symlink before read"
+  mv "$link" "$saved"
+  ln -s "$attacker" "$link"
+  : > "$barrier.before_read.release"
+  wait_for_marker "$barrier.after_read.ready" "$SNAPSHOT_TEST_PID" \
+    "$stage retained symlink after read"
+  rm "$link"
+  mv "$saved" "$link"
+  : > "$barrier.after_read.release"
+  if wait "$SNAPSHOT_TEST_PID"; then
+    echo "FAIL: restored $stage symlink substitution was accepted" >&2
+    exit 1
+  fi
+  SNAPSHOT_TEST_PID=""
+  python3 - "$error" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+  test ! -e "$marker"
+  test "$(cat "$output")" = "$stage-output"
+  test "$(cat "$metadata")" = "$stage-metadata"
+  test "$(cat "$debug/unrelated.txt")" = "$stage-debug"
+}
+
+run_retained_input_symlink_race engine
+run_retained_input_symlink_race wizer
+run_retained_input_symlink_race wasm-tools
+run_retained_input_symlink_race wabt
+run_retained_input_symlink_race zig
 
 BUILD_ROOT_SNAPSHOT_OUTPUT="$WORK/build root snapshot.wasm"
 BUILD_ROOT_SNAPSHOT_METADATA="$WORK/build root snapshot.json"
@@ -2637,10 +2747,10 @@ fi
 test ! -e "$WORK/missing generated adapter.wasm"
 
 EXPLICIT_ADAPTER_LINK="$SCRATCH/explicit adapter symlink.wasm"
-EXPLICIT_ADAPTER_LINK_ERROR="$SCRATCH/explicit-adapter-symlink.jsonl"
 ln -s "$ADAPTER" "$EXPLICIT_ADAPTER_LINK"
-if "$COMPONENTIZER" \
-  --json-diagnostics \
+FAKE_ZIG_PREFIX_LOG="$SCRATCH/explicit-adapter-zig-prefix.log" \
+FAKE_ZIG_ENV_LOG="$SCRATCH/explicit-adapter-zig-env.log" \
+  "$COMPONENTIZER" \
   --build-root "$FAKE_BUILD_ROOT" \
   --cache-dir "$WORK/explicit adapter symlink cache" \
   --zig-bin "$TOOLS/fake zig" \
@@ -2651,20 +2761,8 @@ if "$COMPONENTIZER" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --preview2-adapter "$EXPLICIT_ADAPTER_LINK" \
   --out "$WORK/explicit adapter symlink.wasm" \
-  "$BUILD_SOURCE" 2> "$EXPLICIT_ADAPTER_LINK_ERROR"
-then
-  echo "FAIL: explicit adapter symlink was accepted" >&2
-  exit 1
-fi
-python3 - "$EXPLICIT_ADAPTER_LINK_ERROR" <<'PY'
-import json, sys
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-assert len(lines) == 1, lines
-diagnostic = json.loads(lines[0])
-assert diagnostic["code"] == "SMC1001", diagnostic
-assert diagnostic["phase"] == "inputs", diagnostic
-assert diagnostic["cause"] == "InputChanged", diagnostic
-PY
+  "$BUILD_SOURCE"
+test -s "$WORK/explicit adapter symlink.wasm"
 
 run_adapter_ancestor_alternation_test() {
   local flow="$1"

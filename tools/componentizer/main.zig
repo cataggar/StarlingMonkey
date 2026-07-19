@@ -62,17 +62,29 @@ const AnchoredTargetDirectory = struct {
     directory: Dir,
 };
 
+const RetainedInputPathNode = struct {
+    parent: ?usize,
+    name: []const u8,
+    identity: SourceIdentity,
+    device: DeviceIdentity,
+    directory: ?Dir = null,
+    symlink: ?File = null,
+    link_target: ?[]const u8 = null,
+};
+
 const RetainedInputFile = struct {
     root: Dir,
     root_identity: SourceIdentity,
     root_device: DeviceIdentity,
-    directories: []const AnchoredTargetDirectory,
+    nodes: []const RetainedInputPathNode,
+    parent: ?usize,
     basename: []const u8,
     entry_identity: SourceIdentity,
     entry_device: DeviceIdentity,
     file: File,
     file_identity: SourceIdentity,
     file_device: DeviceIdentity,
+    resolved_path: []const u8,
 
     fn verify(self: *const RetainedInputFile, io: Io) !void {
         if (!self.root_identity.matches(try self.root.stat(io)) or
@@ -83,27 +95,52 @@ const RetainedInputFile = struct {
         {
             return error.InputChanged;
         }
-        var parent = self.root;
-        for (self.directories) |anchored| {
-            if (!anchored.identity.matches(try parent.statFile(
+        for (self.nodes) |node| {
+            const parent = self.parentDirectory(node.parent);
+            if (!node.identity.matches(try parent.statFile(
                 io,
-                anchored.name,
+                node.name,
                 .{ .follow_symlinks = false },
             )) or
-                !anchored.identity.matches(try anchored.directory.stat(io)) or
                 !deviceIdentityMatches(
-                    anchored.device,
-                    try linuxDeviceAt(parent, anchored.name),
-                ) or
-                !deviceIdentityMatches(
-                    anchored.device,
-                    try linuxDeviceForHandle(anchored.directory.handle),
+                    node.device,
+                    try linuxDeviceAt(parent, node.name),
                 ))
             {
                 return error.InputChanged;
             }
-            parent = anchored.directory;
+            if (node.directory) |directory| {
+                if (!node.identity.matches(try directory.stat(io)) or
+                    !deviceIdentityMatches(
+                        node.device,
+                        try linuxDeviceForHandle(directory.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            } else if (node.symlink) |link| {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const length = try readBoundSymlink(
+                    io,
+                    node.identity,
+                    link,
+                    &buffer,
+                );
+                if (!std.mem.eql(
+                    u8,
+                    node.link_target.?,
+                    buffer[0..length],
+                ) or
+                    !deviceIdentityMatches(
+                        node.device,
+                        try linuxDeviceForHandle(link.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            } else unreachable;
         }
+        const parent = self.parentDirectory(self.parent);
         if (!self.entry_identity.matches(try parent.statFile(
             io,
             self.basename,
@@ -123,18 +160,31 @@ const RetainedInputFile = struct {
         }
     }
 
+    fn parentDirectory(self: *const RetainedInputFile, parent: ?usize) Dir {
+        return if (parent) |index| self.nodes[index].directory.? else self.root;
+    }
+
     fn deinit(self: *RetainedInputFile, allocator: Allocator, io: Io) void {
         self.file.close(io);
-        var index = self.directories.len;
+        var index = self.nodes.len;
         while (index > 0) {
             index -= 1;
-            self.directories[index].directory.close(io);
-            allocator.free(self.directories[index].name);
+            const node = self.nodes[index];
+            if (node.directory) |directory| directory.close(io);
+            if (node.symlink) |link| link.close(io);
+            if (node.link_target) |target| allocator.free(target);
+            allocator.free(node.name);
         }
-        allocator.free(self.directories);
+        allocator.free(self.nodes);
         allocator.free(self.basename);
+        allocator.free(self.resolved_path);
         self.root.close(io);
     }
+};
+
+const CapturedInputFile = struct {
+    snapshot: Snapshot,
+    resolved_path: []const u8,
 };
 
 const DereferencedTarget = struct {
@@ -2952,13 +3002,14 @@ fn externalRuntime(
         return error.IncompatibleEngineOptions;
     }
     const engine_source = try absolutePath(allocator, cwd, engine_override);
-    const engine = try snapshotFile(
+    const engine = (try captureInputFile(
         allocator,
         io,
         engine_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
-    );
+        "engine",
+    )).snapshot;
     const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
     else
@@ -2973,13 +3024,14 @@ fn externalRuntime(
                 "preview1-adapter.wasm",
             ),
         );
-    const adapter = try snapshotAdapterInput(
+    const adapter = (try captureInputFile(
         allocator,
         io,
         adapter_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
         transaction,
-    );
+        "adapter",
+    )).snapshot;
     const component_wit_source = if (config.component_wit orelse config.wit) |path|
         try absolutePath(allocator, cwd, path)
     else
@@ -3144,13 +3196,14 @@ fn buildRuntime(
         &.{ transaction_dir, "runtime-adapter-input.wasm" },
     );
     const adapter_input = if (adapter_source) |path|
-        try snapshotAdapterInput(
+        (try captureInputFile(
             allocator,
             io,
             path,
             adapter_destination,
             transaction,
-        )
+            "adapter",
+        )).snapshot
     else
         try snapshotFileAt(
             allocator,
@@ -3494,27 +3547,22 @@ fn snapshotZigInstallation(
     transaction: *Transaction,
 ) !ZigSnapshot {
     const zig_absolute = try absolutePath(allocator, resolution_cwd, zig_path);
-    const zig_source = try Dir.realPathFileAbsoluteAlloc(
-        io,
-        zig_absolute,
-        allocator,
-    );
-    const zig_identity = try sourceFileIdentity(io, zig_source);
-
     try transaction.ensureStorageDirPath(allocator, io, "zig-install/bin");
     try transaction.ensureStorageDirPath(allocator, io, "zig-install/lib");
     const executable_path = try std.fs.path.join(
         allocator,
         &.{ transaction.storage_path, "zig-install", "bin", "zig" },
     );
-    const executable = try snapshotFileExpected(
+    const captured_zig = try captureInputFile(
         allocator,
         io,
-        zig_source,
+        zig_absolute,
         executable_path,
         transaction,
-        zig_identity,
+        "zig",
     );
+    const executable = captured_zig.snapshot;
+    const zig_source = captured_zig.resolved_path;
     try requirePinnedZigVersion(
         allocator,
         io,
@@ -4046,30 +4094,33 @@ fn resolveTools(
     else
         try siblingOrName(allocator, io, executable_dir, "wabt", "wabt");
     const wizer = WizerTool{
-        .executable = try snapshotFile(
+        .executable = (try captureInputFile(
             allocator,
             io,
             try resolveExecutable(allocator, io, environ, wizer_executable),
             try std.fs.path.join(allocator, &.{ transaction_dir, "wizer" }),
             transaction,
-        ),
+            "wizer",
+        )).snapshot,
         .wasmtime_subcommand = wizer_is_wasmtime,
     };
-    const wasm_tools = try snapshotFile(
+    const wasm_tools = (try captureInputFile(
         allocator,
         io,
         try resolveExecutable(allocator, io, environ, wasm_tools_source),
         try std.fs.path.join(allocator, &.{ transaction_dir, "wasm-tools" }),
         transaction,
-    );
+        "wasm-tools",
+    )).snapshot;
     const wabt = if (wabt_source) |path|
-        try snapshotFile(
+        (try captureInputFile(
             allocator,
             io,
             try resolveExecutable(allocator, io, environ, path),
             try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
             transaction,
-        )
+            "wabt",
+        )).snapshot
     else
         null;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
@@ -6157,6 +6208,7 @@ fn retainAbsoluteInputFile(
     io: Io,
     path: []const u8,
     environ: *std.process.Environ.Map,
+    stage: []const u8,
 ) !RetainedInputFile {
     if (std.fs.path.sep != '/' or
         !std.fs.path.isAbsolute(path) or
@@ -6172,158 +6224,255 @@ fn retainAbsoluteInputFile(
     errdefer root.close(io);
     const root_identity = SourceIdentity.fromStat(try root.stat(io));
     const root_device = try linuxDeviceForHandle(root.handle);
-    var directories: std.ArrayList(AnchoredTargetDirectory) = .empty;
+    var nodes: std.ArrayList(RetainedInputPathNode) = .empty;
     errdefer {
-        var index = directories.items.len;
+        var index = nodes.items.len;
         while (index > 0) {
             index -= 1;
-            directories.items[index].directory.close(io);
-            allocator.free(directories.items[index].name);
+            const node = nodes.items[index];
+            if (node.directory) |directory| directory.close(io);
+            if (node.symlink) |link| link.close(io);
+            if (node.link_target) |target| allocator.free(target);
+            allocator.free(node.name);
         }
-        directories.deinit(allocator);
+        nodes.deinit(allocator);
     }
-    const parent_path = std.fs.path.dirname(path) orelse
-        return error.UnsupportedInputEntry;
-    var components = std.mem.splitScalar(u8, parent_path[1..], '/');
-    while (components.next()) |component| {
-        if (component.len == 0) continue;
-        if (std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
-        {
-            return error.UnsupportedInputEntry;
+    var current_path = try allocator.dupe(u8, path);
+    var symlink_count: usize = 0;
+    resolve: while (true) {
+        var components: std.ArrayList([]const u8) = .empty;
+        defer components.deinit(allocator);
+        var split = std.mem.splitScalar(u8, current_path[1..], '/');
+        while (split.next()) |component| {
+            if (component.len == 0 or
+                std.mem.eql(u8, component, ".") or
+                std.mem.eql(u8, component, ".."))
+            {
+                return error.UnsupportedInputEntry;
+            }
+            components.append(allocator, component) catch
+                @panic("out of memory");
         }
-        const parent = if (directories.items.len == 0)
-            root
-        else
-            directories.items[directories.items.len - 1].directory;
-        const stat = try parent.statFile(
-            io,
-            component,
-            .{ .follow_symlinks = false },
-        );
-        if (stat.kind != .directory) return error.UnsupportedInputEntry;
-        const identity = SourceIdentity.fromStat(stat);
-        const device = try linuxDeviceAt(parent, component);
-        try waitForAdapterRetainTestBarrier(
-            allocator,
-            io,
-            environ,
-            component,
-            .before_open,
-        );
-        const child = try parent.openDir(
-            io,
-            component,
-            .{ .iterate = true, .follow_symlinks = false },
-        );
-        errdefer child.close(io);
-        try waitForAdapterRetainTestBarrier(
-            allocator,
-            io,
-            environ,
-            component,
-            .after_open,
-        );
-        if (!identity.matches(try child.stat(io)) or
-            !identity.matches(try parent.statFile(
+        if (components.items.len == 0) return error.UnsupportedInputEntry;
+
+        var parent = root;
+        var parent_node: ?usize = null;
+        var parent_absolute: []const u8 = "/";
+        for (components.items, 0..) |component, component_index| {
+            const stat = try parent.statFile(
                 io,
                 component,
                 .{ .follow_symlinks = false },
-            )) or
-            !deviceIdentityMatches(
-                device,
-                try linuxDeviceForHandle(child.handle),
-            ) or
-            !deviceIdentityMatches(
-                device,
-                try linuxDeviceAt(parent, component),
-            ))
-        {
-            return error.InputChanged;
+            );
+            const identity = SourceIdentity.fromStat(stat);
+            const device = try linuxDeviceAt(parent, component);
+
+            if (stat.kind == .sym_link) {
+                if (symlink_count == 40) return error.UnsupportedInputEntry;
+                symlink_count += 1;
+                const link = try retainSymlinkNoFollow(
+                    io,
+                    parent,
+                    component,
+                    identity,
+                );
+                errdefer link.close(io);
+                try waitForInputSymlinkTestBarrier(
+                    allocator,
+                    io,
+                    environ,
+                    stage,
+                    .before_read,
+                );
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const link_length = try readBoundSymlink(
+                    io,
+                    identity,
+                    link,
+                    &buffer,
+                );
+                try waitForInputSymlinkTestBarrier(
+                    allocator,
+                    io,
+                    environ,
+                    stage,
+                    .after_read,
+                );
+                if (!identity.matches(try parent.statFile(
+                    io,
+                    component,
+                    .{ .follow_symlinks = false },
+                )) or
+                    !deviceIdentityMatches(
+                        device,
+                        try linuxDeviceAt(parent, component),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+                const link_target = try allocator.dupe(
+                    u8,
+                    buffer[0..link_length],
+                );
+                nodes.append(allocator, .{
+                    .parent = parent_node,
+                    .name = try allocator.dupe(u8, component),
+                    .identity = identity,
+                    .device = device,
+                    .symlink = link,
+                    .link_target = link_target,
+                }) catch @panic("out of memory");
+                const target_absolute = try std.fs.path.resolve(
+                    allocator,
+                    if (std.fs.path.isAbsolute(link_target))
+                        &.{link_target}
+                    else
+                        &.{ parent_absolute, link_target },
+                );
+                if (component_index + 1 == components.items.len) {
+                    current_path = target_absolute;
+                } else {
+                    const remaining = try std.fs.path.join(
+                        allocator,
+                        components.items[component_index + 1 ..],
+                    );
+                    current_path = try std.fs.path.resolve(
+                        allocator,
+                        &.{ target_absolute, remaining },
+                    );
+                }
+                continue :resolve;
+            }
+
+            if (component_index + 1 == components.items.len) {
+                if (stat.kind != .file) return error.UnsupportedInputEntry;
+                try waitForAdapterRetainTestBarrier(
+                    allocator,
+                    io,
+                    environ,
+                    component,
+                    .before_open,
+                );
+                var file = try parent.openFile(io, component, .{
+                    .mode = .read_only,
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                });
+                errdefer file.close(io);
+                try waitForAdapterRetainTestBarrier(
+                    allocator,
+                    io,
+                    environ,
+                    component,
+                    .after_open,
+                );
+                const file_identity = SourceIdentity.fromStat(
+                    try file.stat(io),
+                );
+                const file_device = try linuxDeviceForHandle(file.handle);
+                if (!identity.matches(try file.stat(io)) or
+                    !file_identity.matches(try parent.statFile(
+                        io,
+                        component,
+                        .{ .follow_symlinks = false },
+                    )) or
+                    !deviceIdentityMatches(device, file_device) or
+                    !deviceIdentityMatches(
+                        device,
+                        try linuxDeviceAt(parent, component),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+                return .{
+                    .root = root,
+                    .root_identity = root_identity,
+                    .root_device = root_device,
+                    .nodes = nodes.toOwnedSlice(allocator) catch
+                        @panic("out of memory"),
+                    .parent = parent_node,
+                    .basename = try allocator.dupe(u8, component),
+                    .entry_identity = identity,
+                    .entry_device = device,
+                    .file = file,
+                    .file_identity = file_identity,
+                    .file_device = file_device,
+                    .resolved_path = try allocator.dupe(u8, current_path),
+                };
+            }
+
+            if (stat.kind != .directory) {
+                return error.UnsupportedInputEntry;
+            }
+            try waitForAdapterRetainTestBarrier(
+                allocator,
+                io,
+                environ,
+                component,
+                .before_open,
+            );
+            const child = try parent.openDir(
+                io,
+                component,
+                .{ .iterate = true, .follow_symlinks = false },
+            );
+            errdefer child.close(io);
+            try waitForAdapterRetainTestBarrier(
+                allocator,
+                io,
+                environ,
+                component,
+                .after_open,
+            );
+            if (!identity.matches(try child.stat(io)) or
+                !identity.matches(try parent.statFile(
+                    io,
+                    component,
+                    .{ .follow_symlinks = false },
+                )) or
+                !deviceIdentityMatches(
+                    device,
+                    try linuxDeviceForHandle(child.handle),
+                ) or
+                !deviceIdentityMatches(
+                    device,
+                    try linuxDeviceAt(parent, component),
+                ))
+            {
+                return error.InputChanged;
+            }
+            nodes.append(allocator, .{
+                .parent = parent_node,
+                .name = try allocator.dupe(u8, component),
+                .identity = identity,
+                .device = device,
+                .directory = child,
+            }) catch @panic("out of memory");
+            parent_node = nodes.items.len - 1;
+            parent = child;
+            parent_absolute = try std.fs.path.join(
+                allocator,
+                &.{ parent_absolute, component },
+            );
         }
-        directories.append(allocator, .{
-            .name = try allocator.dupe(u8, component),
-            .identity = identity,
-            .device = device,
-            .directory = child,
-        }) catch @panic("out of memory");
+        unreachable;
     }
-    const basename = std.fs.path.basename(path);
-    const parent = if (directories.items.len == 0)
-        root
-    else
-        directories.items[directories.items.len - 1].directory;
-    const stat = try parent.statFile(
-        io,
-        basename,
-        .{ .follow_symlinks = false },
-    );
-    if (stat.kind != .file) return error.UnsupportedInputEntry;
-    const entry_identity = SourceIdentity.fromStat(stat);
-    const entry_device = try linuxDeviceAt(parent, basename);
-    try waitForAdapterRetainTestBarrier(
-        allocator,
-        io,
-        environ,
-        basename,
-        .before_open,
-    );
-    var file = try parent.openFile(io, basename, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
-    errdefer file.close(io);
-    try waitForAdapterRetainTestBarrier(
-        allocator,
-        io,
-        environ,
-        basename,
-        .after_open,
-    );
-    const file_identity = SourceIdentity.fromStat(try file.stat(io));
-    const file_device = try linuxDeviceForHandle(file.handle);
-    if (!entry_identity.matches(try file.stat(io)) or
-        !file_identity.matches(try parent.statFile(
-            io,
-            basename,
-            .{ .follow_symlinks = false },
-        )) or
-        !deviceIdentityMatches(entry_device, file_device) or
-        !deviceIdentityMatches(
-            entry_device,
-            try linuxDeviceAt(parent, basename),
-        ))
-    {
-        return error.InputChanged;
-    }
-    return .{
-        .root = root,
-        .root_identity = root_identity,
-        .root_device = root_device,
-        .directories = directories.toOwnedSlice(allocator) catch
-            @panic("out of memory"),
-        .basename = try allocator.dupe(u8, basename),
-        .entry_identity = entry_identity,
-        .entry_device = entry_device,
-        .file = file,
-        .file_identity = file_identity,
-        .file_device = file_device,
-    };
 }
 
-fn snapshotAdapterInput(
+fn captureInputFile(
     allocator: Allocator,
     io: Io,
     source_path: []const u8,
     destination_path: []const u8,
     transaction: *Transaction,
-) !Snapshot {
+    stage: []const u8,
+) !CapturedInputFile {
     var retained = retainAbsoluteInputFile(
         allocator,
         io,
         source_path,
         transaction.environ,
+        stage,
     ) catch |err| switch (err) {
         error.SystemResources,
         error.ProcessFdQuotaExceeded,
@@ -6336,14 +6485,15 @@ fn snapshotAdapterInput(
         allocator,
         io,
         transaction.environ,
-        "adapter",
+        stage,
     );
-    return snapshotRetainedInputFile(
+    const snapshot = snapshotRetainedInputFile(
         allocator,
         io,
         &retained,
         destination_path,
         transaction,
+        stage,
     ) catch |err| switch (err) {
         error.SystemResources,
         error.ProcessFdQuotaExceeded,
@@ -6351,33 +6501,10 @@ fn snapshotAdapterInput(
         => return err,
         else => return error.InputChanged,
     };
-}
-
-fn snapshotFile(
-    allocator: Allocator,
-    io: Io,
-    source_path: []const u8,
-    destination_path: []const u8,
-    transaction: *Transaction,
-) !Snapshot {
-    const canonical = try Dir.realPathFileAbsoluteAlloc(
-        io,
-        source_path,
-        allocator,
-    );
-    const source_stat = try Dir.cwd().statFile(
-        io,
-        canonical,
-        .{ .follow_symlinks = false },
-    );
-    return snapshotFileExpected(
-        allocator,
-        io,
-        canonical,
-        destination_path,
-        transaction,
-        SourceIdentity.fromStat(source_stat),
-    );
+    return .{
+        .snapshot = snapshot,
+        .resolved_path = try allocator.dupe(u8, retained.resolved_path),
+    };
 }
 
 fn openFileNoFollowPath(
@@ -6543,6 +6670,7 @@ fn snapshotRetainedInputFile(
     source: *RetainedInputFile,
     destination_path: []const u8,
     transaction: *Transaction,
+    stage: []const u8,
 ) !Snapshot {
     try transaction.verifyIntegrity(allocator, io);
     const source_stat = try source.file.stat(io);
@@ -6577,10 +6705,11 @@ fn snapshotRetainedInputFile(
         hasher.update(buffer[0..count]);
         try destination.writeStreamingAll(io, buffer[0..count]);
     }
-    try waitForAdapterSnapshotTestBarrier(
+    try waitForInputSnapshotTestBarrier(
         allocator,
         io,
         transaction.environ,
+        stage,
     );
     try source.verify(io);
     try destination.setPermissions(
@@ -6659,117 +6788,6 @@ fn createChildOutput(
             &.{ transaction.storage_path, relative },
         ),
         .relative = try allocator.dupe(u8, relative),
-    };
-}
-
-fn snapshotFileExpected(
-    allocator: Allocator,
-    io: Io,
-    source_path: []const u8,
-    destination_path: []const u8,
-    transaction: *Transaction,
-    expected_identity: SourceIdentity,
-) !Snapshot {
-    var source_guard = try SourceManifestGuard.init(
-        allocator,
-        io,
-        source_path,
-    );
-    defer source_guard.deinit(allocator);
-    var source = try Dir.openFileAbsolute(
-        io,
-        source_path,
-        .{},
-    );
-    defer source.close(io);
-    const source_stat = try source.stat(io);
-    if (source_stat.kind != .file) return error.MissingBuildArtifact;
-    const source_identity = SourceIdentity.fromStat(source_stat);
-    if (!expected_identity.matches(source_stat)) return error.InputChanged;
-
-    var destination = try Dir.createFileAbsolute(
-        io,
-        destination_path,
-        .{ .exclusive = true },
-    );
-    const destination_identity = EntryIdentity.fromStat(try destination.stat(io));
-    try transaction.recordStorageAbsolute(allocator, io, destination_path);
-    errdefer removeExactEntry(
-        io,
-        transaction.storage,
-        std.fs.path.basename(destination_path),
-        destination_identity,
-    ) catch {};
-    var destination_open = true;
-    defer if (destination_open) destination.close(io);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const count = source.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (count == 0) continue;
-        hasher.update(buffer[0..count]);
-        try destination.writeStreamingAll(io, buffer[0..count]);
-    }
-    if (!source_identity.matches(try source.stat(io)) or
-        !source_identity.matches(try Dir.cwd().statFile(
-            io,
-            source_path,
-            .{ .follow_symlinks = true },
-        )))
-    {
-        return error.InputChanged;
-    }
-    try source_guard.verify(allocator, io);
-    try destination.setPermissions(
-        io,
-        .fromMode(
-            source_stat.permissions.toMode() &
-                ~@as(std.posix.mode_t, 0o222),
-        ),
-    );
-    try destination.sync(io);
-    destination.close(io);
-    destination_open = false;
-    const storage_relative = try std.fs.path.relative(
-        allocator,
-        transaction.storage_path,
-        null,
-        transaction.storage_path,
-        destination_path,
-    );
-    const child_path = try transaction.retainStorageFile(
-        allocator,
-        io,
-        storage_relative,
-        false,
-    );
-    var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest_bytes);
-    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
-    const protection = try transaction.protectStoragePath(
-        allocator,
-        io,
-        storage_relative,
-    );
-    const manifest = transaction.protected.items[protection].manifest;
-    if (manifest.entries.len != 1 or
-        !std.mem.eql(
-            u8,
-            &manifest.entries[0].content_digest,
-            &digest_bytes,
-        ))
-    {
-        return error.TransactionChanged;
-    }
-    return .{
-        .path = child_path,
-        .storage_path = destination_path,
-        .digest = try allocator.dupe(u8, &digest_hex),
-        .protection = protection,
     };
 }
 
@@ -7602,6 +7620,45 @@ fn waitForCommitTestBarrier(
 
 const SpawnBarrierPoint = enum { before, after };
 const AdapterRetainBarrierPoint = enum { before_open, after_open };
+const InputSymlinkBarrierPoint = enum { before_read, after_read };
+
+fn waitForInputSymlinkTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+    point: InputSymlinkBarrierPoint,
+) !void {
+    const selected = environ.get(
+        "STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_STAGE",
+    ) orelse return;
+    if (!std.mem.eql(u8, selected, stage)) return;
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const suffix = @tagName(point);
+    const ready = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.ready",
+        .{ base, suffix },
+    );
+    const release = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.release",
+        .{ base, suffix },
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
 
 fn waitForAdapterRetainTestBarrier(
     allocator: Allocator,
@@ -7648,6 +7705,41 @@ fn waitForAdapterSnapshotTestBarrier(
 ) !void {
     const base = environ.get(
         "STARLING_COMPONENTIZER_TEST_ADAPTER_SNAPSHOT_BARRIER",
+    ) orelse return;
+    try validateArgument(base);
+    const ready = try std.fmt.allocPrint(allocator, "{s}.ready", .{base});
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{base});
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
+
+fn waitForInputSnapshotTestBarrier(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+) !void {
+    if (std.mem.eql(u8, stage, "adapter")) {
+        try waitForAdapterSnapshotTestBarrier(
+            allocator,
+            io,
+            environ,
+        );
+    }
+    const selected = environ.get(
+        "STARLING_COMPONENTIZER_TEST_INPUT_SNAPSHOT_STAGE",
+    ) orelse return;
+    if (!std.mem.eql(u8, selected, stage)) return;
+    const base = environ.get(
+        "STARLING_COMPONENTIZER_TEST_INPUT_SNAPSHOT_BARRIER",
     ) orelse return;
     try validateArgument(base);
     const ready = try std.fmt.allocPrint(allocator, "{s}.ready", .{base});

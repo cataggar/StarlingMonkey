@@ -205,19 +205,21 @@ no-follow symlink handle reject dereferenced build symlinks,
 so a replace/restore race cannot inject target bytes even when the target lies
 outside the listed subtree (as with generated SpiderMonkey include links).
 Escaping or multiply symlinked targets fail closed.
-The explicit adapter, executable sibling fallback, or retained build-root
-adapter is likewise captured during `inputs`. External-engine and native-build
-explicit/fallback adapters use one capture transaction: it records each
-no-follow root, ancestor, and file identity while retaining that exact handle
-chain, rejects any mismatch before reading, copies only from the retained file,
-and verifies the same baseline afterward. It never independently re-resolves
-the pathname for a second baseline. Symlinks in that path are rejected, so a
-restored symlink substitution or alternating ancestor namespace cannot redirect
-the snapshot. Nested Zig receives that snapshot through `-Dpreview1-adapter`; a
-missing or byte-different installed adapter is rejected instead of triggering
-a post-build fallback. Once adapter guarding begins, disappearance or
-canonical-identity failure is normalized to `InputChanged` in the `inputs`
-phase.
+External engines, adapters (explicit, executable-sibling fallback, or retained
+build-root), Wizer/Wasmtime, wasm-tools, WABT, and Zig use one input-file
+capture primitive during `inputs`. It records each no-follow root, ancestor,
+symlink, and file identity while retaining that exact handle chain, binds link
+text to the retained no-follow symlink inode, rejects any mismatch before
+reading, copies only from the retained file, and verifies the same baseline
+afterward. It never independently re-resolves the pathname for a second
+baseline. Linux therefore supports safely retained symlinked executables and
+adapters; hosts without an equivalent no-follow symlink descriptor reject
+them. Restored link or ancestor substitution and alternating namespace states
+cannot redirect any child-consumed snapshot. Nested Zig receives the retained
+adapter snapshot through `-Dpreview1-adapter`; a missing or byte-different
+installed adapter is rejected instead of triggering a post-build fallback.
+Once capture begins, disappearance or canonical-identity failure is normalized
+to `InputChanged` in the `inputs` phase.
 On
 Linux, no-follow file and directory handles remain open and children receive
 intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
