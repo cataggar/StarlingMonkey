@@ -51,6 +51,7 @@ const BuildSelections = struct {
 };
 
 const SnapshotSymlinkPolicy = enum {
+    reject,
     preserve_internal,
     dereference_files,
 };
@@ -72,7 +73,13 @@ const RetainedInputPathNode = struct {
     link_target: ?[]const u8 = null,
 };
 
-const RetainedInputFile = struct {
+const RetainedInputKind = enum { file, directory };
+const RetainedInputHandle = union(RetainedInputKind) {
+    file: File,
+    directory: Dir,
+};
+
+const RetainedInputPath = struct {
     root: Dir,
     root_identity: SourceIdentity,
     root_device: DeviceIdentity,
@@ -81,12 +88,12 @@ const RetainedInputFile = struct {
     basename: []const u8,
     entry_identity: SourceIdentity,
     entry_device: DeviceIdentity,
-    file: File,
-    file_identity: SourceIdentity,
-    file_device: DeviceIdentity,
+    entry: RetainedInputHandle,
+    retained_identity: SourceIdentity,
+    retained_device: DeviceIdentity,
     resolved_path: []const u8,
 
-    fn verify(self: *const RetainedInputFile, io: Io) !void {
+    fn verify(self: *const RetainedInputPath, io: Io) !void {
         if (!self.root_identity.matches(try self.root.stat(io)) or
             !deviceIdentityMatches(
                 self.root_device,
@@ -145,27 +152,72 @@ const RetainedInputFile = struct {
             io,
             self.basename,
             .{ .follow_symlinks = false },
-        )) or
-            !self.file_identity.matchesRetained(try self.file.stat(io)) or
-            !deviceIdentityMatches(
-                self.entry_device,
-                try linuxDeviceAt(parent, self.basename),
-            ) or
-            !deviceIdentityMatches(
-                self.file_device,
-                try linuxDeviceForHandle(self.file.handle),
-            ))
-        {
+        )) or !deviceIdentityMatches(
+            self.entry_device,
+            try linuxDeviceAt(parent, self.basename),
+        )) {
             return error.InputChanged;
+        }
+        switch (self.entry) {
+            .file => |file| {
+                if (!self.retained_identity.matchesRetained(try file.stat(io)) or
+                    !deviceIdentityMatches(
+                        self.retained_device,
+                        try linuxDeviceForHandle(file.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            },
+            .directory => |directory| {
+                if (!self.retained_identity.matches(try directory.stat(io)) or
+                    !deviceIdentityMatches(
+                        self.retained_device,
+                        try linuxDeviceForHandle(directory.handle),
+                    ))
+                {
+                    return error.InputChanged;
+                }
+            },
         }
     }
 
-    fn parentDirectory(self: *const RetainedInputFile, parent: ?usize) Dir {
+    fn parentDirectory(self: *const RetainedInputPath, parent: ?usize) Dir {
         return if (parent) |index| self.nodes[index].directory.? else self.root;
     }
 
-    fn deinit(self: *RetainedInputFile, allocator: Allocator, io: Io) void {
-        self.file.close(io);
+    fn refreshRetainedDirectoryBaseline(
+        self: *RetainedInputPath,
+        io: Io,
+    ) !void {
+        const directory = switch (self.entry) {
+            .directory => |value| value,
+            .file => return error.InputChanged,
+        };
+        const parent = self.parentDirectory(self.parent);
+        const namespace_stat = try parent.statFile(
+            io,
+            self.basename,
+            .{ .follow_symlinks = false },
+        );
+        const retained_stat = try directory.stat(io);
+        if (!self.entry_identity.entry.matches(namespace_stat) or
+            !self.retained_identity.entry.matches(retained_stat) or
+            !self.entry_identity.entry.matches(retained_stat))
+        {
+            return error.InputChanged;
+        }
+        self.entry_identity = SourceIdentity.fromStat(namespace_stat);
+        self.retained_identity = SourceIdentity.fromStat(retained_stat);
+        self.entry_device = try linuxDeviceAt(parent, self.basename);
+        self.retained_device = try linuxDeviceForHandle(directory.handle);
+    }
+
+    fn deinit(self: *RetainedInputPath, allocator: Allocator, io: Io) void {
+        switch (self.entry) {
+            .file => |file| file.close(io),
+            .directory => |directory| directory.close(io),
+        }
         var index = self.nodes.len;
         while (index > 0) {
             index -= 1;
@@ -2152,15 +2204,10 @@ fn execute(
     try validateConfiguredPaths(config);
     const cwd = try std.process.currentPathAlloc(io, allocator);
     const source_argument = try absolutePath(allocator, cwd, config.source);
-    const source = try resolveExistingFile(allocator, io, cwd, config.source);
-    const source_identity = try sourceFileIdentity(io, source);
-    try validateArgument(source);
-    const initializer = if (config.initializer_script_path) |path| blk: {
-        const resolved = try resolveExistingFile(allocator, io, cwd, path);
-        break :blk resolved;
-    } else null;
-    const initializer_identity = if (initializer) |path|
-        try sourceFileIdentity(io, path)
+    const source_path = source_argument;
+    try validateArgument(source_path);
+    const initializer_path = if (config.initializer_script_path) |path|
+        try absolutePath(allocator, cwd, path)
     else
         null;
 
@@ -2193,8 +2240,9 @@ fn execute(
         output_name,
         error.InvalidPath,
     );
-    if (std.mem.eql(u8, source, resolved_output) or
-        (initializer != null and std.mem.eql(u8, initializer.?, resolved_output)))
+    if (std.mem.eql(u8, source_path, resolved_output) or
+        (initializer_path != null and
+            std.mem.eql(u8, initializer_path.?, resolved_output)))
     {
         return error.InputOutputCollision;
     }
@@ -2218,8 +2266,9 @@ fn execute(
             error.InvalidMetadataDestination,
         );
         if (std.mem.eql(u8, resolved, resolved_output) or
-            std.mem.eql(u8, resolved, source) or
-            (initializer != null and std.mem.eql(u8, resolved, initializer.?)))
+            std.mem.eql(u8, resolved, source_path) or
+            (initializer_path != null and
+                std.mem.eql(u8, resolved, initializer_path.?)))
         {
             return error.InvalidMetadataDestination;
         }
@@ -2249,8 +2298,9 @@ fn execute(
             if (kind != .directory) return error.DebugOutputCollision;
         }
         if (pathContains(resolved, resolved_output) or
-            pathContains(resolved, source) or
-            (initializer != null and pathContains(resolved, initializer.?)) or
+            pathContains(resolved, source_path) or
+            (initializer_path != null and
+                pathContains(resolved, initializer_path.?)) or
             (metadata_output != null and pathContains(resolved, metadata_output.?)))
         {
             return error.DebugOutputCollision;
@@ -2266,19 +2316,54 @@ fn execute(
         try resolveAndValidateRoot(allocator, io, cwd, root)
     else
         null;
-    var effective_cache: ?EffectiveCache =
-        if (config.cache_dir != null or config.engine == null)
-            try resolveEffectiveCache(
-                allocator,
-                io,
-                cwd,
-                build_root,
-                config.cache_dir,
-            )
-        else
-            null;
+    var effective_cache: ?EffectiveCache = if (config.cache_dir) |configured|
+        try resolveEffectiveCache(
+            allocator,
+            io,
+            cwd,
+            build_root,
+            configured,
+        )
+    else
+        null;
     defer if (effective_cache) |cache| cache.directory.close(io);
-
+    var retained_build_root: ?RetainedInputPath = if (build_root) |path|
+        retainAbsoluteInputDirectory(
+            allocator,
+            io,
+            path,
+            environ,
+            "build-root",
+        ) catch |err| switch (err) {
+            error.SystemResources,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            => return err,
+            error.InputChanged => return err,
+            else => return error.InvalidBuildRoot,
+        }
+    else
+        null;
+    defer if (retained_build_root) |*root| root.deinit(allocator, io);
+    if (retained_build_root) |*root| {
+        const directory = switch (root.entry) {
+            .directory => |value| value,
+            .file => return error.InvalidBuildRoot,
+        };
+        try root.verify(io);
+        if (!isBuildRootAt(io, directory)) return error.InvalidBuildRoot;
+    }
+    if (effective_cache == null and config.engine == null) {
+        effective_cache = try resolveDefaultCacheAtBuildRoot(
+            allocator,
+            io,
+            &retained_build_root.?,
+        );
+    }
+    if (config.cache_dir == null) if (retained_build_root) |*root| {
+        try root.refreshRetainedDirectoryBaseline(io);
+        try root.verify(io);
+    };
     var publication_destinations: [3][]const u8 = undefined;
     var publication_destination_count: usize = 0;
     publication_destinations[publication_destination_count] = output_name;
@@ -2328,6 +2413,63 @@ fn execute(
         io,
         transaction_safe_to_remove,
     );
+    var retained_source = retainAbsoluteInputFile(
+        allocator,
+        io,
+        source_path,
+        environ,
+        "source",
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.InputChanged,
+    };
+    defer retained_source.deinit(allocator, io);
+    const source = retained_source.resolved_path;
+    var retained_initializer: ?RetainedInputPath = if (initializer_path) |path|
+        retainAbsoluteInputFile(
+            allocator,
+            io,
+            path,
+            environ,
+            "initializer",
+        ) catch |err| switch (err) {
+            error.SystemResources,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            => return err,
+            else => return error.InputChanged,
+        }
+    else
+        null;
+    defer if (retained_initializer) |*initializer_value| {
+        initializer_value.deinit(allocator, io);
+    };
+    const initializer = if (retained_initializer) |*value|
+        value.resolved_path
+    else
+        null;
+    if (std.mem.eql(u8, source, resolved_output) or
+        (initializer != null and std.mem.eql(u8, initializer.?, resolved_output)))
+    {
+        return error.InputOutputCollision;
+    }
+    if (metadata_output) |path| {
+        if (std.mem.eql(u8, path, source) or
+            (initializer != null and std.mem.eql(u8, path, initializer.?)))
+        {
+            return error.InvalidMetadataDestination;
+        }
+    }
+    if (debug_dir) |path| {
+        if (pathContains(path, source) or
+            (initializer != null and pathContains(path, initializer.?)))
+        {
+            return error.DebugOutputCollision;
+        }
+    }
     var input_exclusions: std.ArrayList(InputExclusion) = .empty;
     const source_parent = std.fs.path.dirname(source).?;
     const initializer_parent = if (initializer) |path|
@@ -2375,10 +2517,8 @@ fn execute(
     const input_snapshots = try snapshotInputs(
         allocator,
         io,
-        source,
-        source_identity,
-        initializer,
-        initializer_identity,
+        &retained_source,
+        if (retained_initializer) |*value| value else null,
         input_exclusions.items,
         &transaction,
     );
@@ -2415,6 +2555,7 @@ fn execute(
                 &.{},
                 input_exclusions.items,
                 .preserve_internal,
+                "preopen",
                 &transaction,
             ),
         ) catch @panic("out of memory");
@@ -2437,6 +2578,7 @@ fn execute(
             environ,
             cwd,
             build_root.?,
+            &retained_build_root.?,
             executable_dir,
             config,
             &effective_cache.?,
@@ -3085,6 +3227,7 @@ fn buildRuntime(
     environ: *std.process.Environ.Map,
     cwd: []const u8,
     build_root: []const u8,
+    retained_build_root: *RetainedInputPath,
     executable_dir: []const u8,
     config: *const cli.Config,
     cache: *const EffectiveCache,
@@ -3094,24 +3237,24 @@ fn buildRuntime(
     const transaction_dir = transaction.storage_path;
     try cache.verifyCanonical(io);
 
-    const canonical_build_root = try canonicalDirectoryPath(
-        allocator,
-        io,
-        build_root,
-    );
+    const build_root_dir = switch (retained_build_root.entry) {
+        .directory => |directory| directory,
+        .file => return error.InvalidBuildRoot,
+    };
+    if (!isBuildRootAt(io, build_root_dir)) return error.InvalidBuildRoot;
     const build_selections = try runtimeBuildSelections(
         allocator,
         io,
-        canonical_build_root,
+        build_root_dir,
     );
     const build_exclusions = [_]InputExclusion{.{
         .path = cache.path,
         .identity = cache.identity,
     }};
-    const build_snapshot = try snapshotRetainedDirectory(
+    const build_snapshot = try snapshotRetainedDirectoryFromHandle(
         allocator,
         io,
-        canonical_build_root,
+        retained_build_root,
         "build-root",
         build_root,
         "starling-componentizer-runtime-build-root-v1",
@@ -3563,14 +3706,6 @@ fn snapshotZigInstallation(
     );
     const executable = captured_zig.snapshot;
     const zig_source = captured_zig.resolved_path;
-    try requirePinnedZigVersion(
-        allocator,
-        io,
-        executable.path,
-        environ,
-        child_cwd,
-        transaction,
-    );
     const lib_source = try discoverZigLibDir(
         allocator,
         io,
@@ -3581,30 +3716,31 @@ fn snapshotZigInstallation(
         child_cwd,
         transaction,
     );
-    const lib_destination = try std.fs.path.join(
-        allocator,
-        &.{ transaction.storage_path, "zig-install", "lib" },
-    );
-    const lib_digest = try snapshotDirectoryTree(
+    const lib_snapshot = try snapshotRetainedDirectory(
         allocator,
         io,
         lib_source,
-        lib_destination,
+        "zig-install/lib",
+        lib_source,
         "starling-componentizer-zig-lib-tree-v1",
         &.{},
         &.{},
         .preserve_internal,
+        "zig-lib",
         transaction,
     );
-    const lib_child_path = try transaction.retainStorageDirectory(
+    try requirePinnedZigVersion(
         allocator,
         io,
-        "zig-install/lib",
+        executable.path,
+        environ,
+        child_cwd,
+        transaction,
     );
     return .{
         .executable = executable,
-        .lib_dir = lib_child_path,
-        .lib_digest = lib_digest,
+        .lib_dir = lib_snapshot.absolute,
+        .lib_digest = lib_snapshot.digest,
     };
 }
 
@@ -3716,14 +3852,7 @@ fn discoverZigLibDir(
         ) catch return error.MissingBuildArtifact;
         break :blk try absolutePath(allocator, resolution_cwd, parsed);
     };
-    const canonical = try Dir.realPathFileAbsoluteAlloc(io, discovered, allocator);
-    const stat = try Dir.cwd().statFile(
-        io,
-        canonical,
-        .{ .follow_symlinks = false },
-    );
-    if (stat.kind != .directory) return error.MissingBuildArtifact;
-    return canonical;
+    return discovered;
 }
 
 fn inferZigLibDir(
@@ -3755,12 +3884,7 @@ fn inferZigLibDir(
             else => return err,
         };
         if (stat.kind != .directory) continue;
-        const canonical: []const u8 = try Dir.realPathFileAbsoluteAlloc(
-            io,
-            candidate,
-            allocator,
-        );
-        return canonical;
+        return candidate;
     }
     return null;
 }
@@ -3768,7 +3892,7 @@ fn inferZigLibDir(
 fn snapshotDirectoryTree(
     allocator: Allocator,
     io: Io,
-    source_path: []const u8,
+    retained_source: *RetainedInputPath,
     destination_path: []const u8,
     digest_domain: []const u8,
     included_paths: []const []const u8,
@@ -3776,37 +3900,12 @@ fn snapshotDirectoryTree(
     symlink_policy: SnapshotSymlinkPolicy,
     transaction: *Transaction,
 ) ![]const u8 {
-    var source_guards: std.ArrayList(SourceManifestGuard) = .empty;
-    defer {
-        for (source_guards.items) |*guard| guard.deinit(allocator);
-        source_guards.deinit(allocator);
-    }
-    if (included_paths.len == 0) {
-        source_guards.append(
-            allocator,
-            try SourceManifestGuard.init(allocator, io, source_path),
-        ) catch @panic("out of memory");
-    } else {
-        for (included_paths) |included| {
-            source_guards.append(
-                allocator,
-                try SourceManifestGuard.init(
-                    allocator,
-                    io,
-                    try std.fs.path.join(
-                        allocator,
-                        &.{ source_path, included },
-                    ),
-                ),
-            ) catch @panic("out of memory");
-        }
-    }
-    var source = try Dir.openDirAbsolute(
-        io,
-        source_path,
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer source.close(io);
+    const source_path = retained_source.resolved_path;
+    const source = switch (retained_source.entry) {
+        .directory => |directory| directory,
+        .file => return error.InvalidPath,
+    };
+    try retained_source.verify(io);
     const source_identity = SourceIdentity.fromStat(try source.stat(io));
     var destination = try Dir.openDirAbsolute(
         io,
@@ -3878,18 +3977,8 @@ fn snapshotDirectoryTree(
         transaction,
         &hasher,
     );
-    if (!source_identity.matches(try source.stat(io)) or
-        !source_identity.matches(try Dir.cwd().statFile(
-            io,
-            source_path,
-            .{ .follow_symlinks = false },
-        )))
-    {
-        return error.InputChanged;
-    }
-    for (source_guards.items) |*guard| {
-        try guard.verify(allocator, io);
-    }
+    if (!source_identity.matches(try source.stat(io))) return error.InputChanged;
+    try retained_source.verify(io);
     try sealSnapshotDirectory(io, destination);
     _ = try transaction.protectStoragePath(
         allocator,
@@ -3902,25 +3991,6 @@ fn snapshotDirectoryTree(
     return allocator.dupe(u8, &encoded);
 }
 
-fn canonicalDirectoryPath(
-    allocator: Allocator,
-    io: Io,
-    source_path: []const u8,
-) ![]const u8 {
-    const canonical = try Dir.realPathFileAbsoluteAlloc(
-        io,
-        source_path,
-        allocator,
-    );
-    const stat = try Dir.cwd().statFile(
-        io,
-        canonical,
-        .{ .follow_symlinks = false },
-    );
-    if (stat.kind != .directory) return error.InvalidPath;
-    return canonical;
-}
-
 fn snapshotRetainedDirectory(
     allocator: Allocator,
     io: Io,
@@ -3931,25 +4001,72 @@ fn snapshotRetainedDirectory(
     included_paths: []const []const u8,
     excluded_paths: []const InputExclusion,
     symlink_policy: SnapshotSymlinkPolicy,
+    stage: []const u8,
     transaction: *Transaction,
 ) !RetainedDirectory {
-    const canonical = try canonicalDirectoryPath(allocator, io, source_path);
-    try transaction.ensureStorageDirPath(allocator, io, storage_relative);
-    const destination = try std.fs.path.join(
-        allocator,
-        &.{ transaction.storage_path, storage_relative },
-    );
-    const digest = try snapshotDirectoryTree(
+    var retained_source = retainAbsoluteInputDirectory(
         allocator,
         io,
-        canonical,
-        destination,
+        source_path,
+        transaction.environ,
+        stage,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.InputChanged,
+    };
+    defer retained_source.deinit(allocator, io);
+    return snapshotRetainedDirectoryFromHandle(
+        allocator,
+        io,
+        &retained_source,
+        storage_relative,
+        guest,
         digest_domain,
         included_paths,
         excluded_paths,
         symlink_policy,
         transaction,
     );
+}
+
+fn snapshotRetainedDirectoryFromHandle(
+    allocator: Allocator,
+    io: Io,
+    retained_source: *RetainedInputPath,
+    storage_relative: []const u8,
+    guest: []const u8,
+    digest_domain: []const u8,
+    included_paths: []const []const u8,
+    excluded_paths: []const InputExclusion,
+    symlink_policy: SnapshotSymlinkPolicy,
+    transaction: *Transaction,
+) !RetainedDirectory {
+    try transaction.ensureStorageDirPath(allocator, io, storage_relative);
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, storage_relative },
+    );
+    const digest = snapshotDirectoryTree(
+        allocator,
+        io,
+        retained_source,
+        destination,
+        digest_domain,
+        included_paths,
+        excluded_paths,
+        symlink_policy,
+        transaction,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.UnsupportedInputEntry,
+        => return err,
+        else => return error.InputChanged,
+    };
     for (included_paths) |included| {
         const retained_path = try std.fs.path.join(
             allocator,
@@ -3975,15 +4092,11 @@ fn snapshotRetainedDirectory(
 fn runtimeBuildSelections(
     allocator: Allocator,
     io: Io,
-    build_root: []const u8,
+    build_root: Dir,
 ) !BuildSelections {
-    const manifest_path = try std.fs.path.join(
-        allocator,
-        &.{ build_root, runtime_build_manifest },
-    );
-    const source = Dir.cwd().readFileAlloc(
+    const source = build_root.readFileAlloc(
         io,
-        manifest_path,
+        runtime_build_manifest,
         allocator,
         .limited(1024 * 1024),
     ) catch |err| switch (err) {
@@ -4149,9 +4262,8 @@ fn resolveAndValidateRoot(
     cwd: []const u8,
     path: []const u8,
 ) ![]const u8 {
-    const root = try absolutePath(allocator, cwd, path);
-    if (!isBuildRoot(allocator, io, root)) return error.InvalidBuildRoot;
-    return root;
+    _ = io;
+    return absolutePath(allocator, cwd, path);
 }
 
 fn findBuildRoot(
@@ -4185,6 +4297,24 @@ fn isBuildRoot(allocator: Allocator, io: Io, candidate: []const u8) bool {
         pathExists(io, componentizer);
 }
 
+fn isBuildRootAt(io: Io, candidate: Dir) bool {
+    const required = [_][]const u8{
+        "build.zig",
+        "build.zig.zon",
+        "runtime/js.cpp",
+        "tools/componentizer/main.zig",
+    };
+    for (required) |path| {
+        const stat = candidate.statFile(
+            io,
+            path,
+            .{ .follow_symlinks = false },
+        ) catch return false;
+        if (stat.kind != .file) return false;
+    }
+    return true;
+}
+
 fn stageWit(
     allocator: Allocator,
     io: Io,
@@ -4192,32 +4322,74 @@ fn stageWit(
     stage_path: []const u8,
     transaction: *Transaction,
 ) !StagedWit {
-    var root_guard = try SourceManifestGuard.init(
+    var retained_source = retainAbsoluteInputDirectory(
         allocator,
         io,
         source_path,
-    );
-    defer root_guard.deinit(allocator);
-    const canonical_source = try canonicalDirectoryPath(
+        transaction.environ,
+        "wit",
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        else => return error.InputChanged,
+    };
+    defer retained_source.deinit(allocator, io);
+    const retained_directory = switch (retained_source.entry) {
+        .directory => |directory| directory,
+        .file => return error.UnsupportedWitEntry,
+    };
+    const source_manifest = try buildTreeManifest(
         allocator,
         io,
-        source_path,
+        retained_directory,
+        ".",
     );
-    var source_guard = try SourceManifestGuard.init(
+    const stage_relative = std.fs.path.basename(stage_path);
+    const capture_relative = try std.fmt.allocPrint(
         allocator,
-        io,
-        canonical_source,
+        "{s}-source",
+        .{stage_relative},
     );
-    defer source_guard.deinit(allocator);
     try waitForCaptureTestBarrier(
         allocator,
         io,
         transaction.environ,
         "wit",
     );
-    var source_dir = try Dir.openDirAbsolute(
+    try retained_source.verify(io);
+    _ = snapshotRetainedDirectoryFromHandle(
+        allocator,
         io,
-        canonical_source,
+        &retained_source,
+        capture_relative,
+        source_path,
+        "starling-componentizer-wit-source-tree-v1",
+        &.{},
+        &.{},
+        .reject,
+        transaction,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return err,
+        error.UnsupportedInputEntry => return error.UnsupportedWitEntry,
+        else => return error.InputChanged,
+    };
+    const confirmed_manifest = try buildTreeManifest(
+        allocator,
+        io,
+        retained_directory,
+        ".",
+    );
+    if (!source_manifest.matches(confirmed_manifest)) {
+        return error.InputChanged;
+    }
+    var source_dir = try transaction.storage.openDir(
+        io,
+        capture_relative,
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer source_dir.close(io);
@@ -4262,7 +4434,6 @@ fn stageWit(
     hasher.final(&digest_bytes);
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     const digest = try allocator.dupe(u8, &digest_hex);
-    const stage_relative = std.fs.path.basename(stage_path);
     try transaction.ensureStorageDirPath(allocator, io, stage_relative);
     for (files.items, contents.items) |relative, data| {
         const destination = try std.fs.path.join(allocator, &.{ stage_path, relative });
@@ -4293,16 +4464,7 @@ fn stageWit(
         io,
         stage_relative,
     );
-    try source_guard.verify(allocator, io);
-    try root_guard.verify(allocator, io);
-    const confirmed_canonical = try canonicalDirectoryPath(
-        allocator,
-        io,
-        source_path,
-    );
-    if (!std.mem.eql(u8, canonical_source, confirmed_canonical)) {
-        return error.InputChanged;
-    }
+    try retained_source.verify(io);
     return .{
         .absolute = try transaction.retainStorageDirectory(
             allocator,
@@ -4647,25 +4809,18 @@ fn readBuildToolManifest(
 fn snapshotInputs(
     allocator: Allocator,
     io: Io,
-    source: []const u8,
-    source_identity: SourceIdentity,
-    initializer: ?[]const u8,
-    initializer_identity: ?SourceIdentity,
+    retained_source: *RetainedInputPath,
+    retained_initializer: ?*RetainedInputPath,
     excluded_paths: []const InputExclusion,
     transaction: *Transaction,
 ) !struct { source: InputSnapshot, initializer: ?InputSnapshot } {
-    if (!source_identity.matches(try Dir.cwd().statFile(
-        io,
-        source,
-        .{ .follow_symlinks = false },
-    ))) return error.InputChanged;
-    if (initializer) |path| {
-        if (!initializer_identity.?.matches(try Dir.cwd().statFile(
-            io,
-            path,
-            .{ .follow_symlinks = false },
-        ))) return error.InputChanged;
-    }
+    try retained_source.verify(io);
+    if (retained_initializer) |value| try value.verify(io);
+    const source = retained_source.resolved_path;
+    const initializer = if (retained_initializer) |value|
+        value.resolved_path
+    else
+        null;
     const source_parent = std.fs.path.dirname(source) orelse return error.InvalidPath;
     const initializer_parent = if (initializer) |path|
         std.fs.path.dirname(path) orelse return error.InvalidPath
@@ -4700,9 +4855,20 @@ fn snapshotInputs(
         allocator,
         &.{ transaction.storage_path, source_tree_name },
     );
+    const source_tree_input = if (shared_root) |root|
+        if (std.mem.eql(u8, root, source_parent))
+            retained_source
+        else
+            retained_initializer.?
+    else
+        retained_source;
+    const source_tree_directory = source_tree_input.parentDirectory(
+        source_tree_input.parent,
+    );
     const source_file = try snapshotInputTree(
         allocator,
         io,
+        source_tree_directory,
         shared_root orelse source_parent,
         source_host,
         try std.fs.path.relative(
@@ -4763,6 +4929,9 @@ fn snapshotInputs(
             try snapshotInputTree(
                 allocator,
                 io,
+                retained_initializer.?.parentDirectory(
+                    retained_initializer.?.parent,
+                ),
                 initializer_parent.?,
                 host,
                 entry,
@@ -4825,18 +4994,8 @@ fn snapshotInputs(
         };
     } else null;
 
-    if (!source_identity.matches(try Dir.cwd().statFile(
-        io,
-        source,
-        .{ .follow_symlinks = false },
-    ))) return error.InputChanged;
-    if (initializer) |path| {
-        if (!initializer_identity.?.matches(try Dir.cwd().statFile(
-            io,
-            path,
-            .{ .follow_symlinks = false },
-        ))) return error.InputChanged;
-    }
+    try retained_source.verify(io);
+    if (retained_initializer) |value| try value.verify(io);
     return .{
         .source = source_snapshot,
         .initializer = initializer_snapshot,
@@ -5228,31 +5387,16 @@ fn buildTreeManifest(
     };
 }
 
-fn sourceFileIdentity(io: Io, path: []const u8) !SourceIdentity {
-    const stat = try Dir.cwd().statFile(
-        io,
-        path,
-        .{ .follow_symlinks = false },
-    );
-    if (stat.kind != .file) return error.MissingBuildArtifact;
-    return SourceIdentity.fromStat(stat);
-}
-
 fn snapshotInputTree(
     allocator: Allocator,
     io: Io,
+    source_dir: Dir,
     source_path: []const u8,
     destination_path: []const u8,
     entry_name: []const u8,
     excluded_paths: []const InputExclusion,
     transaction: *Transaction,
 ) !TreeSnapshot {
-    var source_dir = try Dir.openDirAbsolute(
-        io,
-        source_path,
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer source_dir.close(io);
     const source_identity = SourceIdentity.fromStat(try source_dir.stat(io));
     var destination_dir = try Dir.openDirAbsolute(
         io,
@@ -6001,6 +6145,9 @@ fn copyInputDirectory(
                 );
             },
             .sym_link => {
+                if (symlink_policy == .reject) {
+                    return error.UnsupportedInputEntry;
+                }
                 if (symlink_policy == .dereference_files) {
                     const target = findDereferencedTarget(
                         dereferenced_targets,
@@ -6103,8 +6250,20 @@ fn copyInputDirectory(
                     try destination_file.sync(io);
                     continue;
                 }
+                const retained_link = try retainSymlinkNoFollow(
+                    io,
+                    source,
+                    entry.name,
+                    entry.identity,
+                );
+                defer retained_link.close(io);
                 var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                const link_len = try source.readLink(io, entry.name, &link_buffer);
+                const link_len = try readBoundSymlink(
+                    io,
+                    entry.identity,
+                    retained_link,
+                    &link_buffer,
+                );
                 if (!entry.identity.matches(try source.statFile(
                     io,
                     entry.name,
@@ -6209,7 +6368,42 @@ fn retainAbsoluteInputFile(
     path: []const u8,
     environ: *std.process.Environ.Map,
     stage: []const u8,
-) !RetainedInputFile {
+) !RetainedInputPath {
+    return retainAbsoluteInputPath(
+        allocator,
+        io,
+        path,
+        environ,
+        stage,
+        .file,
+    );
+}
+
+fn retainAbsoluteInputDirectory(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+) !RetainedInputPath {
+    return retainAbsoluteInputPath(
+        allocator,
+        io,
+        path,
+        environ,
+        stage,
+        .directory,
+    );
+}
+
+fn retainAbsoluteInputPath(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+    expected_kind: RetainedInputKind,
+) !RetainedInputPath {
     if (std.fs.path.sep != '/' or
         !std.fs.path.isAbsolute(path) or
         std.mem.eql(u8, path, "/"))
@@ -6345,7 +6539,11 @@ fn retainAbsoluteInputFile(
             }
 
             if (component_index + 1 == components.items.len) {
-                if (stat.kind != .file) return error.UnsupportedInputEntry;
+                if ((expected_kind == .file and stat.kind != .file) or
+                    (expected_kind == .directory and stat.kind != .directory))
+                {
+                    return error.UnsupportedInputEntry;
+                }
                 try waitForAdapterRetainTestBarrier(
                     allocator,
                     io,
@@ -6353,12 +6551,22 @@ fn retainAbsoluteInputFile(
                     component,
                     .before_open,
                 );
-                var file = try parent.openFile(io, component, .{
-                    .mode = .read_only,
-                    .allow_directory = false,
-                    .follow_symlinks = false,
-                });
-                errdefer file.close(io);
+                const retained: RetainedInputHandle = switch (expected_kind) {
+                    .file => .{ .file = try parent.openFile(io, component, .{
+                        .mode = .read_only,
+                        .allow_directory = false,
+                        .follow_symlinks = false,
+                    }) },
+                    .directory => .{ .directory = try parent.openDir(
+                        io,
+                        component,
+                        .{ .iterate = true, .follow_symlinks = false },
+                    ) },
+                };
+                errdefer switch (retained) {
+                    .file => |file| file.close(io),
+                    .directory => |directory| directory.close(io),
+                };
                 try waitForAdapterRetainTestBarrier(
                     allocator,
                     io,
@@ -6366,17 +6574,22 @@ fn retainAbsoluteInputFile(
                     component,
                     .after_open,
                 );
-                const file_identity = SourceIdentity.fromStat(
-                    try file.stat(io),
-                );
-                const file_device = try linuxDeviceForHandle(file.handle);
-                if (!identity.matches(try file.stat(io)) or
-                    !file_identity.matches(try parent.statFile(
+                const retained_stat = switch (retained) {
+                    .file => |file| try file.stat(io),
+                    .directory => |directory| try directory.stat(io),
+                };
+                const retained_identity = SourceIdentity.fromStat(retained_stat);
+                const retained_device = switch (retained) {
+                    .file => |file| try linuxDeviceForHandle(file.handle),
+                    .directory => |directory| try linuxDeviceForHandle(directory.handle),
+                };
+                if (!identity.matches(retained_stat) or
+                    !retained_identity.matches(try parent.statFile(
                         io,
                         component,
                         .{ .follow_symlinks = false },
                     )) or
-                    !deviceIdentityMatches(device, file_device) or
+                    !deviceIdentityMatches(device, retained_device) or
                     !deviceIdentityMatches(
                         device,
                         try linuxDeviceAt(parent, component),
@@ -6394,9 +6607,9 @@ fn retainAbsoluteInputFile(
                     .basename = try allocator.dupe(u8, component),
                     .entry_identity = identity,
                     .entry_device = device,
-                    .file = file,
-                    .file_identity = file_identity,
-                    .file_device = file_device,
+                    .entry = retained,
+                    .retained_identity = retained_identity,
+                    .retained_device = retained_device,
                     .resolved_path = try allocator.dupe(u8, current_path),
                 };
             }
@@ -6667,13 +6880,17 @@ fn snapshotFileAt(
 fn snapshotRetainedInputFile(
     allocator: Allocator,
     io: Io,
-    source: *RetainedInputFile,
+    source: *RetainedInputPath,
     destination_path: []const u8,
     transaction: *Transaction,
     stage: []const u8,
 ) !Snapshot {
     try transaction.verifyIntegrity(allocator, io);
-    const source_stat = try source.file.stat(io);
+    const source_file = switch (source.entry) {
+        .file => |file| file,
+        .directory => return error.InvalidPath,
+    };
+    const source_stat = try source_file.stat(io);
 
     var destination = try Dir.createFileAbsolute(
         io,
@@ -6694,7 +6911,7 @@ fn snapshotRetainedInputFile(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     while (true) {
-        const count = source.file.readStreaming(
+        const count = source_file.readStreaming(
             io,
             &.{&buffer},
         ) catch |err| switch (err) {
@@ -9249,17 +9466,6 @@ fn requireDestinationFileOrMissingAt(
     if (stat.kind != .file) return invalid_error;
 }
 
-fn resolveExistingFile(
-    allocator: Allocator,
-    io: Io,
-    cwd: []const u8,
-    path: []const u8,
-) ![]const u8 {
-    const absolute = try absolutePath(allocator, cwd, path);
-    try requireFile(io, absolute);
-    return Dir.realPathFileAbsoluteAlloc(io, absolute, allocator);
-}
-
 fn copyDebugFile(
     io: Io,
     source: []const u8,
@@ -9280,6 +9486,37 @@ fn resolveOrCreateDirectory(
             return Dir.realPathFileAbsoluteAlloc(io, path, allocator);
         },
         else => return err,
+    };
+}
+
+fn resolveDefaultCacheAtBuildRoot(
+    allocator: Allocator,
+    io: Io,
+    retained_root: *RetainedInputPath,
+) !EffectiveCache {
+    const root = switch (retained_root.entry) {
+        .directory => |directory| directory,
+        .file => return error.InvalidBuildRoot,
+    };
+    var zig_cache = try ensureCacheDirectory(
+        allocator,
+        io,
+        root,
+        retained_root.resolved_path,
+        ".zig-cache",
+    );
+    defer zig_cache.directory.close(io);
+    const cache = try ensureCacheDirectory(
+        allocator,
+        io,
+        zig_cache.directory,
+        zig_cache.path,
+        "starling-componentizer",
+    );
+    return .{
+        .path = cache.path,
+        .identity = cache.identity,
+        .directory = cache.directory,
     };
 }
 

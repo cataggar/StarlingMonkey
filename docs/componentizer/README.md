@@ -184,15 +184,27 @@ are deterministic even if an underlying snapshot tool emits byte-distinct
 components. Files, complete JavaScript source-directory trees, WIT trees, and
 executables are copied to immutable per-run snapshots in controlled transaction
 storage before use; hashes are computed while creating those snapshots.
-Symlinked WIT roots are resolved to a no-follow canonical directory anchor and
-copied descriptor-relative while both identities and the complete target
-manifest are checked. Internal escaping, absolute, dangling, or non-regular
-WIT entries are rejected. Native builds run with a retained build-root snapshot
-as their working directory. The versioned
+Source and initializer files, their selected source-tree roots, WIT roots,
+native build roots, Wizer preopens, and Zig library roots use the same
+descriptor-rooted resolver as executable inputs. The resolver retains `/`,
+every no-follow ancestor, each symlink inode and its descriptor-bound link
+text, and the selected file or directory before any content becomes a
+baseline. Tree copying starts from that exact retained directory handle rather
+than reopening a canonical pathname. Restored root or ancestor substitution,
+including alternating namespace states between selection and copying, fails
+with `InputChanged` during `inputs`.
+
+WIT roots are copied descriptor-relative to an immutable intermediate snapshot
+while both the retained path chain and complete original tree manifest are
+checked. Internal symlinks, escaping, absolute, dangling, or non-regular WIT
+entries are rejected. Native builds run with a retained build-root snapshot as
+their working directory. The versioned
 `tools/componentizer/runtime-build-inputs.txt` inventory limits that snapshot
 to the exact runtime-build closure; roots without the inventory are captured
 in full, excluding only identity-checked transaction/cache entries. Wizer
-preopens are complete retained snapshots mapped to their original guest paths.
+preopens are complete descriptor-rooted snapshots mapped to their original
+guest paths. Zig version execution occurs only after its executable and
+selected library tree have both been retained and snapshotted.
 Every selected inventory root has a manifest guard. File symlinks in that
 closure are resolved before copying: the root, every target ancestor, and the
 target file are opened no-follow and retained, and the target bytes are

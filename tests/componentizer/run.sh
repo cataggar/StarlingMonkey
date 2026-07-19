@@ -9,6 +9,7 @@ fi
 COMPONENTIZER="$(realpath "$1")"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="$ROOT/.zig-cache/componentizer-test-scratch"
+BARRIERS="$SCRATCH/test barriers"
 TOOLS="$SCRATCH/fake tools"
 WORK="$SCRATCH/work with spaces"
 FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
@@ -71,6 +72,7 @@ remove_tree() {
 }
 cleanup_scratch
 mkdir -p "$TOOLS" "$WORK/wit package" "$FAKE_BUILD_ROOT/runtime" \
+  "$BARRIERS" \
   "$SCRATCH/cache parent" \
   "$FAKE_BUILD_ROOT/tools/componentizer" \
   "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release"
@@ -1761,7 +1763,7 @@ for commit_artifact in component metadata debug; do
     commit_metadata="$WORK/commit $commit_slug.json"
     commit_debug="$WORK/commit $commit_slug.debug"
     commit_error="$SCRATCH/commit-$commit_slug.jsonl"
-    commit_barrier="$SCRATCH/commit-$commit_slug-barrier"
+    commit_barrier="$BARRIERS/commit-$commit_slug-barrier"
     commit_saved="$SCRATCH/commit-$commit_slug-published"
     printf 'old-component-%s\n' "$commit_slug" > "$commit_output"
     printf 'old-metadata-%s\n' "$commit_slug" > "$commit_metadata"
@@ -1886,7 +1888,7 @@ for mutation_artifact in component metadata debug; do
   mutation_metadata="$WORK/mutation-$mutation_artifact.json"
   mutation_debug="$WORK/mutation-$mutation_artifact.debug"
   mutation_error="$SCRATCH/mutation-$mutation_artifact.jsonl"
-  mutation_barrier="$SCRATCH/mutation-$mutation_artifact-barrier"
+  mutation_barrier="$BARRIERS/mutation-$mutation_artifact-barrier"
   printf 'old-component-%s\n' "$mutation_artifact" > "$mutation_output"
   printf 'old-metadata-%s\n' "$mutation_artifact" > "$mutation_metadata"
   mkdir "$mutation_debug"
@@ -2308,7 +2310,7 @@ PREOPEN_ROOT="$SCRATCH/preopen caller tree"
 PREOPEN_SAVED="$SCRATCH/preopen caller tree saved"
 PREOPEN_OUTPUT="$WORK/preopen snapshot.wasm"
 PREOPEN_METADATA="$WORK/preopen snapshot.json"
-PREOPEN_BARRIER="$SCRATCH/preopen-snapshot"
+PREOPEN_BARRIER="$BARRIERS/preopen-snapshot"
 PREOPEN_LOG="$SCRATCH/preopen-snapshot.log"
 mkdir "$PREOPEN_ROOT"
 printf 'captured-preopen\n' > "$PREOPEN_ROOT/marker.txt"
@@ -2416,7 +2418,7 @@ run_retained_input_symlink_race() {
   local saved="$link_dir/original link"
   local attacker="$link_dir/attacker input"
   local marker="$link_dir/attacker-executed"
-  local barrier="$SCRATCH/$stage-input-symlink"
+  local barrier="$BARRIERS/$stage-input-symlink"
   local error="$SCRATCH/$stage-input-symlink.jsonl"
   local output="$WORK/$stage input preserved.wasm"
   local metadata="$WORK/$stage input preserved.json"
@@ -2518,10 +2520,213 @@ run_retained_input_symlink_race wasm-tools
 run_retained_input_symlink_race wabt
 run_retained_input_symlink_race zig
 
+run_retained_directory_selection_race() {
+  local stage="$1"
+  local root="$SCRATCH/$stage directory selection"
+  local link="$root/input link"
+  local saved="$root/original link"
+  local attacker="$root/attacker"
+  local barrier="$BARRIERS/$stage-directory-selection"
+  local error="$SCRATCH/$stage-directory-selection.jsonl"
+  local output="$WORK/$stage directory selection.wasm"
+  local metadata="$WORK/$stage directory selection.json"
+  local debug="$WORK/$stage directory selection.debug"
+  local source="$SOURCE"
+  local initializer_args=()
+  local preopen_args=()
+  local build_root="$FAKE_BUILD_ROOT"
+  local wit="$WIT"
+  local target
+  mkdir "$root" "$debug"
+  case "$stage" in
+    source)
+      target="$root/original.js"
+      printf 'export const originalSource = true;\n' > "$target"
+      printf 'export const attackerSource = true;\n' > "$attacker"
+      source="$link"
+      ;;
+    initializer)
+      target="$root/original-initializer.js"
+      printf 'globalThis.originalInitializer = true;\n' > "$target"
+      printf 'globalThis.attackerInitializer = true;\n' > "$attacker"
+      initializer_args=(--initializer-script-path "$link")
+      ;;
+    build-root)
+      target="$FAKE_BUILD_ROOT"
+      mkdir "$attacker"
+      build_root="$link"
+      ;;
+    preopen)
+      target="$root/original-preopen"
+      mkdir "$target" "$attacker"
+      printf 'original-preopen\n' > "$target/value.txt"
+      printf 'attacker-preopen\n' > "$attacker/value.txt"
+      preopen_args=(--preopen-dir "$link")
+      ;;
+    zig-lib)
+      target="$FAKE_ZIG_LIB_DIR"
+      mkdir "$attacker"
+      printf 'attacker-zig-lib\n' > "$attacker/std.zig"
+      ;;
+    wit)
+      target="$WIT"
+      mkdir "$attacker"
+      cat > "$attacker/world.wit" <<'EOF'
+package attacker:componentizer;
+world exports {}
+EOF
+      wit="$link"
+      ;;
+    *) echo "FAIL: unknown retained directory stage $stage" >&2; exit 1 ;;
+  esac
+  ln -s "$target" "$link"
+  printf 'preserved-%s-output\n' "$stage" > "$output"
+  printf 'preserved-%s-metadata\n' "$stage" > "$metadata"
+  printf 'preserved-%s-debug\n' "$stage" > "$debug/unrelated.txt"
+  local before_wizer=0
+  if [ -e "$FAKE_WIZER_ARGS_LOG" ]; then
+    before_wizer="$(wc -l < "$FAKE_WIZER_ARGS_LOG")"
+  fi
+
+  local command=(
+    "$COMPONENTIZER"
+    --json-diagnostics
+    --wit "$wit"
+    --world-name exports
+    --wizer-bin "$TOOLS/fake wizer"
+    --wabt-bin "$TOOLS/fake wabt"
+    --wasm-tools-bin "$TOOLS/fake wasm-tools"
+    --preview2-adapter "$ADAPTER"
+    --metadata-out "$metadata"
+    --debug-dir "$debug"
+    --out "$output"
+    "${initializer_args[@]}"
+    "${preopen_args[@]}"
+  )
+  if [ "$stage" = build-root ] || [ "$stage" = zig-lib ]; then
+    command+=(
+      --build-root "$build_root"
+      --cache-dir "$CACHE"
+      --zig-bin "$TOOLS/fake zig"
+      "$source"
+    )
+  else
+    command+=(--engine "$ENGINE" "$source")
+  fi
+  local environment=(
+    env
+    "STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_BARRIER=$barrier"
+    "STARLING_COMPONENTIZER_TEST_INPUT_SYMLINK_STAGE=$stage"
+  )
+  if [ "$stage" = zig-lib ]; then
+    environment+=("ZIG_LIB_DIR=$link")
+  fi
+  "${environment[@]}" "${command[@]}" 2> "$error" &
+  SNAPSHOT_TEST_PID=$!
+  wait_for_marker "$barrier.before_read.ready" "$SNAPSHOT_TEST_PID" \
+    "$stage directory selection before read"
+  mv "$link" "$saved"
+  ln -s "$attacker" "$link"
+  : > "$barrier.before_read.release"
+  wait_for_marker "$barrier.after_read.ready" "$SNAPSHOT_TEST_PID" \
+    "$stage directory selection after read"
+  rm "$link"
+  mv "$saved" "$link"
+  : > "$barrier.after_read.release"
+  if wait "$SNAPSHOT_TEST_PID"; then
+    echo "FAIL: restored $stage directory selection was accepted" >&2
+    exit 1
+  fi
+  SNAPSHOT_TEST_PID=""
+  python3 - "$error" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+  local after_wizer=0
+  if [ -e "$FAKE_WIZER_ARGS_LOG" ]; then
+    after_wizer="$(wc -l < "$FAKE_WIZER_ARGS_LOG")"
+  fi
+  test "$before_wizer" -eq "$after_wizer"
+  test "$(cat "$output")" = "preserved-$stage-output"
+  test "$(cat "$metadata")" = "preserved-$stage-metadata"
+  test "$(cat "$debug/unrelated.txt")" = "preserved-$stage-debug"
+}
+
+run_retained_directory_selection_race source
+run_retained_directory_selection_race initializer
+run_retained_directory_selection_race build-root
+run_retained_directory_selection_race preopen
+run_retained_directory_selection_race zig-lib
+run_retained_directory_selection_race wit
+
+SOURCE_ANCESTOR_PARENT="$SCRATCH/source ancestor original"
+SOURCE_ANCESTOR_SAVED="$SCRATCH/source ancestor saved"
+SOURCE_ANCESTOR_REPLACEMENT="$SCRATCH/source ancestor replacement"
+SOURCE_ANCESTOR_DISPLACED="$SCRATCH/source ancestor displaced"
+SOURCE_ANCESTOR_FILE="$SOURCE_ANCESTOR_PARENT/main.js"
+SOURCE_ANCESTOR_BARRIER="$BARRIERS/source-ancestor-alternation"
+SOURCE_ANCESTOR_ERROR="$SCRATCH/source-ancestor-alternation.jsonl"
+SOURCE_ANCESTOR_OUTPUT="$WORK/source ancestor preserved.wasm"
+SOURCE_ANCESTOR_METADATA="$WORK/source ancestor preserved.json"
+SOURCE_ANCESTOR_DEBUG="$WORK/source ancestor preserved.debug"
+mkdir "$SOURCE_ANCESTOR_PARENT" "$SOURCE_ANCESTOR_REPLACEMENT" \
+  "$SOURCE_ANCESTOR_DEBUG"
+printf 'export const originalAncestor = true;\n' > "$SOURCE_ANCESTOR_FILE"
+printf 'export const attackerAncestor = true;\n' > \
+  "$SOURCE_ANCESTOR_REPLACEMENT/main.js"
+printf 'source-ancestor-output\n' > "$SOURCE_ANCESTOR_OUTPUT"
+printf 'source-ancestor-metadata\n' > "$SOURCE_ANCESTOR_METADATA"
+printf 'source-ancestor-debug\n' > "$SOURCE_ANCESTOR_DEBUG/unrelated.txt"
+STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_BARRIER="$SOURCE_ANCESTOR_BARRIER" \
+STARLING_COMPONENTIZER_TEST_ADAPTER_RETAIN_COMPONENT="$(basename "$SOURCE_ANCESTOR_PARENT")" \
+"$COMPONENTIZER" \
+  --json-diagnostics \
+  --engine "$ENGINE" \
+  --preview2-adapter "$ADAPTER" \
+  --wizer-bin "$TOOLS/fake wizer" \
+  --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+  --metadata-out "$SOURCE_ANCESTOR_METADATA" \
+  --debug-dir "$SOURCE_ANCESTOR_DEBUG" \
+  --out "$SOURCE_ANCESTOR_OUTPUT" \
+  "$SOURCE_ANCESTOR_FILE" 2> "$SOURCE_ANCESTOR_ERROR" &
+SNAPSHOT_TEST_PID=$!
+wait_for_marker "$SOURCE_ANCESTOR_BARRIER.before_open.ready" \
+  "$SNAPSHOT_TEST_PID" "source ancestor baseline"
+mv "$SOURCE_ANCESTOR_PARENT" "$SOURCE_ANCESTOR_SAVED"
+mv "$SOURCE_ANCESTOR_REPLACEMENT" "$SOURCE_ANCESTOR_PARENT"
+: > "$SOURCE_ANCESTOR_BARRIER.before_open.release"
+wait_for_marker "$SOURCE_ANCESTOR_BARRIER.after_open.ready" \
+  "$SNAPSHOT_TEST_PID" "source retained ancestor"
+mv "$SOURCE_ANCESTOR_PARENT" "$SOURCE_ANCESTOR_DISPLACED"
+mv "$SOURCE_ANCESTOR_SAVED" "$SOURCE_ANCESTOR_PARENT"
+: > "$SOURCE_ANCESTOR_BARRIER.after_open.release"
+if wait "$SNAPSHOT_TEST_PID"; then
+  echo "FAIL: alternating source ancestor was accepted" >&2
+  exit 1
+fi
+SNAPSHOT_TEST_PID=""
+python3 - "$SOURCE_ANCESTOR_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC1001", diagnostic
+assert diagnostic["phase"] == "inputs", diagnostic
+assert diagnostic["cause"] == "InputChanged", diagnostic
+PY
+test "$(cat "$SOURCE_ANCESTOR_OUTPUT")" = "source-ancestor-output"
+test "$(cat "$SOURCE_ANCESTOR_METADATA")" = "source-ancestor-metadata"
+test "$(cat "$SOURCE_ANCESTOR_DEBUG/unrelated.txt")" = "source-ancestor-debug"
+
 BUILD_ROOT_SNAPSHOT_OUTPUT="$WORK/build root snapshot.wasm"
 BUILD_ROOT_SNAPSHOT_METADATA="$WORK/build root snapshot.json"
 BUILD_ROOT_SNAPSHOT_METADATA_CHANGED="$WORK/build root snapshot changed.json"
-BUILD_ROOT_SNAPSHOT_BARRIER="$SCRATCH/build-root-snapshot"
+BUILD_ROOT_SNAPSHOT_BARRIER="$BARRIERS/build-root-snapshot"
 BUILD_ROOT_SAVED="$SCRATCH/fake native build root saved"
 FAKE_ASSERT_BUILD_SNAPSHOT=1 \
 FAKE_BUILD_ROOT_GUEST="$FAKE_BUILD_ROOT" \
@@ -2570,7 +2775,7 @@ PY
 SELECTIVE_ROOT="$SCRATCH/selective symlink build root"
 SELECTIVE_TARGET="$SELECTIVE_ROOT/deps/spidermonkey-source/js/public/Guarded.h"
 SELECTIVE_LINK="$SELECTIVE_ROOT/deps/sm-obj-zig/dist/include/js/Guarded.h"
-SELECTIVE_BARRIER="$SCRATCH/selective-target"
+SELECTIVE_BARRIER="$BARRIERS/selective-target"
 SELECTIVE_OUTPUT="$WORK/selective target.wasm"
 mkdir -p "$SELECTIVE_ROOT/runtime" \
   "$SELECTIVE_ROOT/tools/componentizer" \
@@ -2615,7 +2820,7 @@ wait "$SNAPSHOT_TEST_PID"
 SNAPSHOT_TEST_PID=""
 cmp "$ENGINE" "$SELECTIVE_OUTPUT"
 
-SELECTIVE_LINK_RACE_BARRIER="$SCRATCH/selective-link-read"
+SELECTIVE_LINK_RACE_BARRIER="$BARRIERS/selective-link-read"
 SELECTIVE_LINK_RACE_ERROR="$SCRATCH/selective-link-read.jsonl"
 SELECTIVE_LINK_RACE_OUTPUT="$WORK/selective link read race.wasm"
 SELECTIVE_ATTACKER_TARGET="$SELECTIVE_ROOT/deps/spidermonkey-source/js/public/Attacker.h"
@@ -2666,7 +2871,7 @@ assert diagnostic["cause"] == "InputChanged", diagnostic
 PY
 test ! -e "$SELECTIVE_LINK_RACE_OUTPUT"
 
-SELECTIVE_MUTATION_BARRIER="$SCRATCH/selective-target-mutation"
+SELECTIVE_MUTATION_BARRIER="$BARRIERS/selective-target-mutation"
 SELECTIVE_MUTATION_ERROR="$SCRATCH/selective-target-mutation.jsonl"
 SELECTIVE_MUTATION_OUTPUT="$WORK/selective target mutation.wasm"
 STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$SELECTIVE_MUTATION_BARRIER" \
@@ -2771,7 +2976,7 @@ run_adapter_ancestor_alternation_test() {
   local replacement="$SCRATCH/$flow adapter capture replacement"
   local displaced="$SCRATCH/$flow adapter capture displaced"
   local adapter="$parent/adapter input.wasm"
-  local barrier="$SCRATCH/$flow-adapter-retain"
+  local barrier="$BARRIERS/$flow-adapter-retain"
   local error="$SCRATCH/$flow-adapter-retain.jsonl"
   local output="$WORK/$flow adapter retain preserved.wasm"
   local metadata="$WORK/$flow adapter retain preserved.json"
@@ -2846,7 +3051,7 @@ run_adapter_ancestor_alternation_test build
 FALLBACK_TOOL_DIR="$SCRATCH/fallback adapter tool"
 FALLBACK_COMPONENTIZER="$FALLBACK_TOOL_DIR/starling-componentize"
 FALLBACK_ADAPTER="$FALLBACK_TOOL_DIR/preview1-adapter.wasm"
-FALLBACK_BARRIER="$SCRATCH/fallback-adapter"
+FALLBACK_BARRIER="$BARRIERS/fallback-adapter"
 FALLBACK_ERROR="$SCRATCH/fallback-adapter.jsonl"
 mkdir -p "$FALLBACK_TOOL_DIR"
 cp "$COMPONENTIZER" "$FALLBACK_COMPONENTIZER"
@@ -2883,7 +3088,7 @@ assert diagnostic["phase"] == "inputs", diagnostic
 assert diagnostic["cause"] == "InputChanged", diagnostic
 PY
 
-FALLBACK_RENAME_BARRIER="$SCRATCH/fallback-adapter-rename"
+FALLBACK_RENAME_BARRIER="$BARRIERS/fallback-adapter-rename"
 FALLBACK_RENAME_ERROR="$SCRATCH/fallback-adapter-rename.jsonl"
 FALLBACK_RENAME_OUTPUT="$WORK/fallback rename preserved.wasm"
 FALLBACK_RENAME_METADATA="$WORK/fallback rename preserved.json"
@@ -2935,8 +3140,8 @@ test "$(cat "$FALLBACK_RENAME_DEBUG/unrelated.txt")" = \
   "preserved-fallback-debug"
 mv "$FALLBACK_ADAPTER_SAVED" "$FALLBACK_ADAPTER"
 
-FALLBACK_SYMLINK_CAPTURE_BARRIER="$SCRATCH/fallback-adapter-symlink-capture"
-FALLBACK_SYMLINK_SNAPSHOT_BARRIER="$SCRATCH/fallback-adapter-symlink-snapshot"
+FALLBACK_SYMLINK_CAPTURE_BARRIER="$BARRIERS/fallback-adapter-symlink-capture"
+FALLBACK_SYMLINK_SNAPSHOT_BARRIER="$BARRIERS/fallback-adapter-symlink-snapshot"
 FALLBACK_SYMLINK_ERROR="$SCRATCH/fallback-adapter-symlink.jsonl"
 FALLBACK_SYMLINK_OUTPUT="$WORK/fallback symlink preserved.wasm"
 FALLBACK_SYMLINK_METADATA="$WORK/fallback symlink preserved.json"
@@ -3296,7 +3501,7 @@ cache_identity_race() {
   local race_target="$SCRATCH/cache identity $race_kind user target"
   local race_output="$WORK/cache identity $race_kind.wasm"
   local race_error="$SCRATCH/cache-identity-$race_kind.jsonl"
-  local race_barrier="$SCRATCH/cache-identity-$race_kind"
+  local race_barrier="$BARRIERS/cache-identity-$race_kind"
   remove_tree "$race_cache" "$race_held" "$race_target"
   FAKE_ZIG_BARRIER="$race_barrier" "$COMPONENTIZER" \
     --json-diagnostics \
@@ -3402,7 +3607,7 @@ WIT_TARGET="$SCRATCH/symlinked WIT target"
 WIT_TARGET_SAVED="$SCRATCH/symlinked WIT target saved"
 WIT_LINK="$SCRATCH/symlinked WIT root"
 WIT_SUBSTITUTION_OUTPUT="$WORK/WIT target substitution.wasm"
-WIT_SUBSTITUTION_BARRIER="$SCRATCH/WIT-target-substitution"
+WIT_SUBSTITUTION_BARRIER="$BARRIERS/WIT-target-substitution"
 mkdir "$WIT_TARGET"
 cat > "$WIT_TARGET/world.wit" <<'EOF'
 package test:componentizer;
@@ -3443,7 +3648,7 @@ mv "$WIT_TARGET_SAVED" "$WIT_TARGET"
 
 WIT_RACE_OUTPUT="$WORK/WIT capture race.wasm"
 WIT_RACE_ERROR="$SCRATCH/WIT-capture-race.jsonl"
-WIT_RACE_BARRIER="$SCRATCH/WIT-capture-race"
+WIT_RACE_BARRIER="$BARRIERS/WIT-capture-race"
 printf 'old-WIT-race-output\n' > "$WIT_RACE_OUTPUT"
 STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$WIT_RACE_BARRIER" \
 STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=wit \
@@ -3521,7 +3726,7 @@ done
 
 SNAPSHOT_MUTATION_OUTPUT="$WORK/snapshot-mutation.wasm"
 SNAPSHOT_MUTATION_ERROR="$SCRATCH/snapshot-mutation.jsonl"
-SNAPSHOT_MUTATION_BARRIER="$SCRATCH/snapshot-mutation"
+SNAPSHOT_MUTATION_BARRIER="$BARRIERS/snapshot-mutation"
 printf 'old-snapshot-mutation-output\n' > "$SNAPSHOT_MUTATION_OUTPUT"
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_MUTATION_BARRIER" \
 STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
@@ -3561,7 +3766,7 @@ test "$(cat "$SNAPSHOT_MUTATION_OUTPUT")" = \
 
 SNAPSHOT_UNRESTORED_OUTPUT="$WORK/snapshot-unrestored.wasm"
 SNAPSHOT_UNRESTORED_ERROR="$SCRATCH/snapshot-unrestored.jsonl"
-SNAPSHOT_UNRESTORED_BARRIER="$SCRATCH/snapshot-unrestored"
+SNAPSHOT_UNRESTORED_BARRIER="$BARRIERS/snapshot-unrestored"
 SNAPSHOT_UNRESTORED_ORIGINAL="$SCRATCH/snapshot-unrestored-engine"
 printf 'old-snapshot-unrestored-output\n' > "$SNAPSHOT_UNRESTORED_OUTPUT"
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_UNRESTORED_BARRIER" \
@@ -3609,7 +3814,7 @@ rm -f "$SNAPSHOT_UNRESTORED_ORIGINAL"
 
 SNAPSHOT_WIZER_OUTPUT="$WORK/snapshot-wizer.wasm"
 SNAPSHOT_WIZER_METADATA="$WORK/snapshot-wizer.json"
-SNAPSHOT_WIZER_BARRIER="$SCRATCH/snapshot-wizer"
+SNAPSHOT_WIZER_BARRIER="$BARRIERS/snapshot-wizer"
 SNAPSHOT_WIZER_EXTERNAL="$SCRATCH/snapshot-wizer-external"
 printf 'external-output\n' > "$SNAPSHOT_WIZER_EXTERNAL"
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_WIZER_BARRIER" \
@@ -3673,7 +3878,7 @@ PY
 
 SNAPSHOT_WASM_OUTPUT="$WORK/snapshot-wasm-tools.wasm"
 SNAPSHOT_WASM_METADATA="$WORK/snapshot-wasm-tools.json"
-SNAPSHOT_WASM_BARRIER="$SCRATCH/snapshot-wasm-tools"
+SNAPSHOT_WASM_BARRIER="$BARRIERS/snapshot-wasm-tools"
 SNAPSHOT_WASM_EXTERNAL="$SCRATCH/snapshot-wasm-tools-external"
 printf 'external-output\n' > "$SNAPSHOT_WASM_EXTERNAL"
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$SNAPSHOT_WASM_BARRIER" \
@@ -3730,7 +3935,7 @@ PY
 
 SNAPSHOT_WIT_OUTPUT="$WORK/snapshot-wit.wasm"
 SNAPSHOT_WIT_DEBUG="$WORK/snapshot-wit.debug"
-SNAPSHOT_WIT_BARRIER="$SCRATCH/snapshot-wit"
+SNAPSHOT_WIT_BARRIER="$BARRIERS/snapshot-wit"
 SNAPSHOT_WIT_EXTERNAL="$SCRATCH/snapshot-wit-external"
 SNAPSHOT_WIT_LOG="$SCRATCH/snapshot-wit.log"
 printf 'external-output\n' > "$SNAPSHOT_WIT_EXTERNAL"
@@ -3804,7 +4009,7 @@ PY
 SNAPSHOT_ZIG_CACHE="$SCRATCH/snapshot-zig-cache"
 SNAPSHOT_ZIG_OUTPUT="$WORK/snapshot-zig.wasm"
 SNAPSHOT_ZIG_METADATA="$WORK/snapshot-zig.json"
-SNAPSHOT_ZIG_BARRIER="$SCRATCH/snapshot-zig"
+SNAPSHOT_ZIG_BARRIER="$BARRIERS/snapshot-zig"
 SNAPSHOT_ZIG_EXTERNAL="$SCRATCH/snapshot-zig-external"
 mkdir "$SNAPSHOT_ZIG_EXTERNAL"
 printf 'external-prefix\n' > "$SNAPSHOT_ZIG_EXTERNAL/sentinel"
