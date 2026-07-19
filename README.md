@@ -108,8 +108,9 @@ zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 The Zig build also installs `starling-componentize`, a host-native, Node-free
 CLI that drives the monolithic Zig/Wizer/WABT pipeline without shell command
 construction. It supports per-run WIT/world selection, content-addressed
-cached relinking, feature and tool overrides, runtime arguments, debug
-intermediates, and atomic output replacement:
+cached relinking, feature and tool overrides, stable human/JSON diagnostics,
+deterministic imports/provenance metadata, explicit debug binding dumps, and
+transactional output replacement:
 
 ```console
 zig-out/bin/starling-componentize \
@@ -117,6 +118,7 @@ zig-out/bin/starling-componentize \
   --world-name js-exports \
   --component-wit host-apis/wasi-0.2.10/wit \
   --component-world-name js-dispatch \
+  --metadata-out app.metadata.json \
   --out app.wasm \
   app.js
 ```

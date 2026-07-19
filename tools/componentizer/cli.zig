@@ -1,4 +1,5 @@
 const std = @import("std");
+const diagnostics = @import("diagnostics.zig");
 
 pub const version = "0.3.0";
 
@@ -32,6 +33,9 @@ pub const usage =
     \\      --weval-bin <file>             Reserve a Weval override for --aot
     \\      --build-root <dir>             Override StarlingMonkey source-root discovery
     \\      --cache-dir <dir>              Override the monolithic runtime cache
+    \\      --metadata-out <file>          Write deterministic imports/provenance JSON
+    \\      --diagnostic-format <format>   Diagnostic stream: human (default) or json
+    \\      --json-diagnostics             Alias for --diagnostic-format json
     \\      --use-debug-build              Build a Debug runtime instead of ReleaseSmall
     \\      --debug-bindings               Preserve generated bindings and intermediates
     \\      --debug-dir <dir>              Directory for debug intermediates
@@ -84,7 +88,9 @@ pub const Config = struct {
     weval_bin: ?[]const u8 = null,
     build_root: ?[]const u8 = null,
     cache_dir: ?[]const u8 = null,
+    metadata_out: ?[]const u8 = null,
     debug_dir: ?[]const u8 = null,
+    diagnostic_format: diagnostics.Format = .human,
     use_debug_build: bool = false,
     debug_bindings: bool = false,
     enable_wizer_logging: bool = false,
@@ -102,6 +108,7 @@ pub const Config = struct {
 pub const ParseError = error{
     ConflictingFeatures,
     InvalidHeapLimit,
+    InvalidDiagnosticFormat,
     MissingSource,
     MissingValue,
     MissingWitWorld,
@@ -112,7 +119,7 @@ pub const ParseError = error{
     UnsupportedAot,
 };
 
-const feature_names = [_][]const u8{
+pub const feature_names = [_][]const u8{
     "stdio",
     "random",
     "clocks",
@@ -173,6 +180,26 @@ fn nextValue(args: []const []const u8, index: *usize) ParseError![]const u8 {
     index.* += 1;
     if (index.* >= args.len) return error.MissingValue;
     return args[index.*];
+}
+
+fn parseDiagnosticFormat(value: []const u8) ParseError!diagnostics.Format {
+    if (std.mem.eql(u8, value, "human")) return .human;
+    if (std.mem.eql(u8, value, "json")) return .json;
+    return error.InvalidDiagnosticFormat;
+}
+
+pub fn detectDiagnosticFormat(args: []const []const u8) diagnostics.Format {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--json-diagnostics")) return .json;
+        if (std.mem.eql(u8, args[i], "--diagnostic-format") and i + 1 < args.len) {
+            if (std.mem.eql(u8, args[i + 1], "json")) return .json;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--diagnostic-format=json")) {
+            return .json;
+        }
+    }
+    return .human;
 }
 
 pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!Action {
@@ -251,6 +278,16 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
             config.build_root = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
             config.cache_dir = try nextValue(args, &i);
+        } else if (std.mem.eql(u8, arg, "--metadata-out")) {
+            config.metadata_out = try nextValue(args, &i);
+        } else if (std.mem.eql(u8, arg, "--diagnostic-format")) {
+            config.diagnostic_format = try parseDiagnosticFormat(try nextValue(args, &i));
+        } else if (std.mem.startsWith(u8, arg, "--diagnostic-format=")) {
+            config.diagnostic_format = try parseDiagnosticFormat(
+                arg["--diagnostic-format=".len..],
+            );
+        } else if (std.mem.eql(u8, arg, "--json-diagnostics")) {
+            config.diagnostic_format = .json;
         } else if (std.mem.eql(u8, arg, "--use-debug-build")) {
             config.use_debug_build = true;
         } else if (std.mem.eql(u8, arg, "--debug-bindings")) {
@@ -321,6 +358,10 @@ test "parses the native componentizer surface" {
         "--js-heap-limit-mib",
         "256",
         "--debug-bindings",
+        "--metadata-out",
+        "metadata.json",
+        "--diagnostic-format",
+        "json",
         "--out",
         "out file.wasm",
         "source file.js",
@@ -337,6 +378,8 @@ test "parses the native componentizer surface" {
     try std.testing.expectEqualStrings("random", config.disable_features[1]);
     try std.testing.expectEqual(@as(u32, 256), config.js_heap_limit_mib.?);
     try std.testing.expect(config.debug_bindings);
+    try std.testing.expectEqual(diagnostics.Format.json, config.diagnostic_format);
+    try std.testing.expectEqualStrings("metadata.json", config.metadata_out.?);
 }
 
 test "rejects conflicting feature selections" {
@@ -387,4 +430,29 @@ test "rejects AOT until the dedicated AOT phase lands" {
         "source.js",
     };
     try std.testing.expectError(error.UnsupportedAot, parse(std.testing.allocator, &args));
+}
+
+test "detects JSON diagnostics before full argument parsing" {
+    const args = [_][]const u8{
+        "starling-componentize",
+        "--not-a-real-option",
+        "--diagnostic-format=json",
+    };
+    try std.testing.expectEqual(
+        diagnostics.Format.json,
+        detectDiagnosticFormat(&args),
+    );
+}
+
+test "rejects unknown diagnostic formats" {
+    const args = [_][]const u8{
+        "starling-componentize",
+        "--diagnostic-format",
+        "xml",
+        "source.js",
+    };
+    try std.testing.expectError(
+        error.InvalidDiagnosticFormat,
+        parse(std.testing.allocator, &args),
+    );
 }

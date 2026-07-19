@@ -1,0 +1,19 @@
+# Exact repository-relative closure exposed to the nested runtime build.
+build.zig
+build.zig.zon
+componentize.sh.in
+builtins
+runtime
+tools
+host-apis
+crates
+include
+deps/include
+deps/openssl-zig/include
+deps/openssl-zig/libx32/libcrypto.a
+deps/sm-obj-zig/dist/include
+deps/sm-obj-zig/dist/libspidermonkey.a
+deps/sm-obj-zig/js/src/js-confdefs.h
+target/wasm32-wasip1/release/librust_staticlib.a
+zig-pkg
+LICENSE

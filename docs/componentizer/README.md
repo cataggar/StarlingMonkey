@@ -11,12 +11,45 @@ command string):
 2. Pre-initialize the JavaScript module with Wizer.
 3. Strip and embed the selected component world with WABT.
 4. Adapt the reactor into a component.
-5. Validate the candidate with `wasm-tools`.
-6. `fsync` and atomically rename the candidate over the requested output.
+5. Add standard `language=JavaScript` and
+   `processed-by=starling-componentize` producers metadata.
+6. Validate the completed candidate with `wasm-tools`.
+7. `fsync` and transactionally publish the requested outputs.
 
-Any failure before the final rename leaves an existing output unchanged. The
-temporary transaction directory is created beside the output so publication
-cannot cross filesystems.
+Any failure before the durable publication commit leaves existing component
+and metadata outputs unchanged and never publishes a partial debug directory.
+The output parent is selected without pathname canonicalization: `/`, every
+existing ancestor, each no-follow symlink inode and descriptor-bound link
+text, and the final directory remain retained. Missing directory components
+are created one at a time through the retained parent handle and immediately
+reopened no-follow. The resulting anchor is transferred into the transaction,
+which creates its temporary directory beside the output through that held
+handle.
+Backup, publication, rollback, and cleanup stay relative to that handle and
+check the complete retained chain and recorded no-follow identities.
+Metadata and debug parents are independently descriptor-resolved and must
+identify that same retained directory. A substituted output, metadata, or
+debug ancestor can therefore fail closed but can never redirect publication
+or rollback. Persistent per-destination advisory locks,
+opened no-follow beneath the held parent and inherited by no child tool,
+serialize overlapping bundles. Immediately before the explicit commit point,
+the parent, locks, recovery anchors,
+component, metadata, and optional debug directory must retain their exact
+identities. A mismatch rolls back only exact owned entries and retains
+recoverable transaction state rather than touching a replacement. No error is
+reported after commit. Backup cleanup then removes only pre-recorded entries;
+if that cleanup cannot finish, publication remains successful and the
+transaction is retained for recovery instead of attempting a post-commit
+rollback. Optional metadata and debug destinations must use that same parent
+so publication and
+rollback cannot cross filesystems.
+
+An explicit `--cache-dir` uses the same descriptor-rooted resolver. Missing
+cache components and every cache child are created relative to retained
+directory handles; native children receive only stable handle paths. Cache
+verification checks the retained ancestor/symlink/final chain and each
+descriptor-relative child identity, so a symlink or ancestor
+replace/resolve/restore race performs no writes through the substituted cache.
 
 ## Building
 
@@ -64,10 +97,197 @@ monolithic relink a fast cache hit. JavaScript source is deliberately excluded
 from the runtime key. Per-input and per-runtime advisory locks make concurrent
 uses of one cache safe, and the runtime lock remains held until componentization
 has finished consuming the cached engine, adapter, and generated bindings.
+The effective default or explicit componentizer cache is canonicalized before
+source snapshotting and retained through an opened directory handle. Runtime,
+lock, and Zig local/global-cache directories are created and checked no-follow
+relative to held ancestors. Zig receives private handle-backed paths for the
+runtime prefix and both caches; canonical cache paths remain in diagnostics.
+The private prefix and its `bin` directory are held independently, while every
+consumed runtime artifact is opened no-follow relative to the held `bin`.
+Cache `bin` and artifact symlinks are rejected before and after the build, so
+root or descendant replacement cannot redirect writes or reads into a
+replacement. Only the exact effective-cache
+directory identity is excluded if it is nested inside a snapshotted source
+tree.
 
 Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
 and feature selection. Build-changing feature/debug options are rejected with
-that override.
+that override. Public imports metadata for a WIT-selected run requires the
+generated bindings retained by the native runtime build, so `--metadata-out`
+with both `--engine` and `--wit` is rejected rather than reporting an
+incomplete imports list.
+
+## Diagnostics
+
+Human errors use stable codes and name the failing pipeline phase, for example:
+
+```text
+error[SMC4101] embed: wabt component embed did not complete successfully (CommandFailed)
+```
+
+Codes are assigned by phase: `SMC0001` arguments, `SMC1001` inputs,
+`SMC2001` runtime build, `SMC3001` initialization/export preflight,
+`SMC4001` strip, `SMC4101` embed, `SMC4201` adapt, `SMC4301` metadata,
+`SMC5001` validation, `SMC6001` debug preparation, and `SMC7001`
+publication. Messages include a phase-specific recovery hint and captured tool
+details where available.
+
+Pass `--diagnostic-format json` (or `--json-diagnostics`) for deterministic
+JSON Lines on stderr. Each object uses schema
+`starling-componentize-diagnostic/v1` and contains `severity`, `code`, `phase`,
+`message`, `cause`, `detail`, and `hint`, plus typed `command`, `exit_code`,
+and `signal` process fields; a successful run emits `SMC0000`. Child output is
+captured in this mode, so the diagnostic stream is not mixed with ad hoc
+subprocess text. Capture is bounded per stream; failed commands retain at most
+16 KiB of final stderr and include an explicit truncation marker. Human mode
+streams ordinary child stdout and stderr while retaining the same bounded
+failure tail. Runtime-build output and verbose arguments are bounded, buffered,
+and redact transaction snapshot paths before display; canonical build and cache
+paths remain visible.
+Filesystem paths must be valid UTF-8. Invalid source, initializer, output, WIT,
+tool, or traversed tree paths fail during input diagnostics with
+`InvalidUtf8Path`, ensuring every public diagnostic path remains a JSON string.
+Component, metadata, and debug destination validation is also input preflight
+and therefore reports `SMC1001`/`inputs`; the later metadata and debug phase
+codes describe generation, not destination parsing. Engine, adapter, WIT,
+tool, Zig executable/library, build-root, and preopen capture also remain in
+the input phase. Only execution of the retained native build enters
+`runtime_build`.
+
+## Imports and provenance metadata
+
+`--metadata-out <file>` writes componentizer-owned
+`starling-componentize-metadata/v2` JSON next to the component; debug import
+output remains `starling-componentize-imports/v1`. Schema meanings and
+required fields are stable within each version. Its `imports` array uses
+ComponentizeJS 0.21's public
+`[[specifier, binding], ...]` convention, including default-import records for
+world-level functions. The typed `bindings` array adds function arity,
+canonical dispatch keys, resource classes, and constructor/method/static
+operations without requiring consumers to parse runtime TSV or stderr.
+`imports_complete` distinguishes a verified empty list from debug metadata
+produced with an external engine whose generated bindings are unavailable.
+External engines also report `features` and `features_sha256` as `null`:
+feature-selection options are rejected for those engines, so their actual
+compiled feature state cannot be asserted authoritatively.
+
+The `provenance` object records the selected dispatch and component worlds,
+content hashes of both complete WIT layouts, the resolved feature booleans,
+SHA-256 hashes of every invoked tool (including nested runtime-build tools
+such as `wasip3-bindgen` and `wasm-opt`), source/initializer/runtime-argument
+hashes, engine/adapter hashes, and the exact published component hash. The
+optional `build_root_sha256` and ordered `preopen_trees` fields record
+domain-separated digests of the exact directory snapshots visible to native
+Zig and Wizer. Their order follows the CLI preopen order; they do not expose
+host paths.
+The
+`zig` tool record carries both the executable `sha256` and a domain-separated
+`lib_tree_sha256` over the complete snapshotted Zig library tree; both fields
+participate unambiguously in `tools_sha256`. Other tool records set
+`lib_tree_sha256` to `null`.
+Native components also expose `zig-sha256` and `zig-lib-sha256` entries in
+their standard WebAssembly `processed-by` producers section, beside the
+`starling-componentize` version.
+`source_sha256` and `initializer_sha256` remain hashes of the exact entry
+files. The `source_tree` and optional `initializer_tree` records add the
+normalized relative entry path and a domain-separated digest of every staged
+directory, regular file, file byte, and symlink target. An initializer record
+states whether it shares the source tree, including nested overlap, so one
+snapshot is not ambiguously represented as two independent inputs.
+Canonical aggregate hashes cover worlds, features, and tools. It contains no
+timestamps, random transaction names, or host paths, so its provenance fields
+are deterministic even if an underlying snapshot tool emits byte-distinct
+components. Files, complete JavaScript source-directory trees, WIT trees, and
+executables are copied to immutable per-run snapshots in controlled transaction
+storage before use; hashes are computed while creating those snapshots.
+Source and initializer files, their selected source-tree roots, WIT roots,
+native build roots, Wizer preopens, and Zig library roots use the same
+descriptor-rooted resolver as executable inputs. The resolver retains `/`,
+every no-follow ancestor, each symlink inode and its descriptor-bound link
+text, and the selected file or directory before any content becomes a
+baseline. Tree copying starts from that exact retained directory handle rather
+than reopening a canonical pathname. Restored root or ancestor substitution,
+including alternating namespace states between selection and copying, fails
+with `InputChanged` during `inputs`.
+
+WIT roots are copied descriptor-relative to an immutable intermediate snapshot
+while both the retained path chain and complete original tree manifest are
+checked. Internal symlinks, escaping, absolute, dangling, or non-regular WIT
+entries are rejected. Native builds run with a retained build-root snapshot as
+their working directory. The versioned
+`tools/componentizer/runtime-build-inputs.txt` inventory limits that snapshot
+to the exact runtime-build closure; roots without the inventory are captured
+in full, excluding only identity-checked transaction/cache entries. Wizer
+preopens are complete descriptor-rooted snapshots mapped to their original
+guest paths. Zig version execution occurs only after its executable and
+selected library tree have both been retained and snapshotted.
+Every selected inventory root has a manifest guard. File symlinks in that
+closure are resolved before copying: the root, every target ancestor, and the
+target file are opened no-follow and retained, and the target bytes are
+independently manifest-guarded. A selected link's direct target is thereby
+promoted into the captured closure; targets outside the canonical build root
+or reached through another link are rejected. The snapshot reads the retained
+file handle. On Linux, both link-text reads use the same retained
+`O_PATH|O_NOFOLLOW` symlink descriptor; hosts without an equivalent retained
+no-follow symlink handle reject dereferenced build symlinks,
+so a replace/restore race cannot inject target bytes even when the target lies
+outside the listed subtree (as with generated SpiderMonkey include links).
+Escaping or multiply symlinked targets fail closed.
+External engines, adapters (explicit, executable-sibling fallback, or retained
+build-root), Wizer/Wasmtime, wasm-tools, WABT, and Zig use one input-file
+capture primitive during `inputs`. It records each no-follow root, ancestor,
+symlink, and file identity while retaining that exact handle chain, binds link
+text to the retained no-follow symlink inode, rejects any mismatch before
+reading, copies only from the retained file, and verifies the same baseline
+afterward. It never independently re-resolves the pathname for a second
+baseline. Linux therefore supports safely retained symlinked executables and
+adapters; hosts without an equivalent no-follow symlink descriptor reject
+them. Restored link or ancestor substitution and alternating namespace states
+cannot redirect any child-consumed snapshot. Nested Zig receives the retained
+adapter snapshot through `-Dpreview1-adapter`; a missing or byte-different
+installed adapter is rejected instead of triggering a post-build fallback.
+Once capture begins, disappearance or canonical-identity failure is normalized
+to `InputChanged` in the `inputs` phase.
+On
+Linux, no-follow file and directory handles remain open and children receive
+intentional `/proc/self/fd` paths for executables, preopens, engines, WIT, and
+pre-created output files. Supported BSD-family hosts use inherited `/dev/fd`
+handles; hosts without a retained-handle path fail closed. Handles are
+identity-checked immediately around each spawn; publication and cache lock
+descriptors remain close-on-exec. Thus a snapshot name can be replaced and
+restored without the substituted bytes ever being executed, consumed, or
+written. Namespace substitutions that are restored may complete. An
+unrestored identity or manifest change, in-place mutation of a retained
+object, or monitor overflow fails the active phase with `TransactionChanged`
+and publishes nothing. Existing component, metadata, and debug outputs are
+restored by identity-checked rollback. This retains
+relative sibling and nested-module visibility even for read-only source trees.
+Source-tree traversal order, permissions, timestamps, and absolute root
+location do not affect tree hashes. Relative symlinks that remain within the
+staged tree are preserved and hashed by target; absolute or escaping symlinks
+are rejected so a child cannot consume mutable files outside its snapshot.
+The current transaction directory and, when nested, the exact effective cache
+directory are excluded after no-follow identity verification. Component,
+metadata, publication-lock, and generated debug entries are excluded only by
+their exact normalized path and current no-follow identity (or exact name while
+not yet created). Their parent directories and unrelated debug contents remain
+hashed and staged, so modules beside or inside destination directories keep
+working. Unrelated names that resemble transaction, output, or cache names
+remain ordinary hashed and staged source entries.
+Root ctime relaxation is permitted only after Linux inotify positively
+observes a root rename. Hosts without that observation compare strict identity
+and manifests and fail closed; transaction-owned publication moves remain
+explicitly identity-checked before and after rename.
+Source and initializer snapshots are mapped to their original logical paths for
+Wizer, and the runtime-argument hash covers the exact stable byte stream
+supplied to Wizer.
+Native bindgen registers every nested `.wit` file as a content-hashed build
+input for both relative and absolute WIT roots, in sorted order. Rewriting a WIT
+file at the same path therefore invalidates bindgen without relying on a
+directory timestamp; spaces and checkout-root relocation do not affect the
+generated bindings.
+The component itself also receives standard WebAssembly producers metadata
+compatible with `wasm-tools metadata show`.
 
 ## Runtime and tool options
 
@@ -91,13 +311,31 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--preview2-adapter`. `--wasmtime-bin` selects Wasmtime's `wizer` subcommand;
 `--wizer-bin` selects a standalone Wizer and uses its native
 `--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
+For runtime builds, a valid `ZIG_LIB_DIR` takes precedence; standard archive
+and installed layouts are resolved next, with stable `zig env` execution as a
+fallback. The executable and complete library tree are copied together into
+transaction storage, and the build runs only that executable with
+`ZIG_LIB_DIR` fixed to the immutable copy. This
+supports archive layouts, installed `bin/zig` plus `lib/zig` layouts, symlinked
+executables, and paths containing spaces without consulting the original
+installation after snapshot validation.
+Every top-level and nested build requires exactly Zig
+`0.17.0-dev.902+7255f3e72`; `--zig-bin` and `ZIG` overrides are queried from
+their retained executable and rejected during input preflight when the version
+differs. The broader `build.zig.zon` minimum remains only a package parser
+floor.
 
-`--debug-bindings` preserves runtime arguments, generated bindings (when the
-CLI builds the runtime), and each pipeline intermediate in `<output>.debug`.
-`--debug-dir` chooses another directory. Debug files are replaced by name but
-the CLI never recursively deletes a user-provided directory. A debug directory
-that contains the requested component output is rejected so debug publication
-cannot violate output atomicity.
+`--debug-bindings` explicitly requests runtime arguments, generated bindings
+(when the CLI builds the runtime), imports/provenance JSON, a path-sanitized
+command log, and each pipeline intermediate in `<output>.debug`. `--debug-dir`
+chooses another directory and also enables the dump. The destination cannot
+contain an input or output. Routine reruns transactionally replace only the
+known generated files while preserving unrelated files, symlinks, and
+directory trees; a directory at a generated filename is rejected rather than
+removed recursively. Before publication, the complete old debug directory is
+retained as the rollback anchor while unrelated entries are identity-checked
+and copied into the staged merge. The complete merged directory is published
+only after validation, with rollback on any publication failure.
 
 The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
 them explicitly. Weval execution and cache controls belong to the separate
