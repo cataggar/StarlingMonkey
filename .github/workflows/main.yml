@@ -102,9 +102,19 @@ jobs:
     - name: Set up cacheable SpiderMonkey artifacts
       if: steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit != 'true'
       run: |
+        legacy_dist=cmake-build-${{ matrix.build }}/spidermonkey-obj/dist
+        zig_dist=deps/sm-obj-zig/dist
+        if [[ -f "$legacy_dist/libspidermonkey.a" ]]; then
+          sm_dist="$legacy_dist"
+        elif [[ -f "$zig_dist/libspidermonkey.a" ]]; then
+          sm_dist="$zig_dist"
+        else
+          echo "SpiderMonkey distribution was not produced" >&2
+          exit 1
+        fi
         mkdir -p spidermonkey-dist-${{ matrix.build }}
-        cp -a cmake-build-${{ matrix.build }}/spidermonkey-obj/dist/libspidermonkey.a spidermonkey-dist-${{ matrix.build }}/
-        cp -aL cmake-build-${{ matrix.build }}/spidermonkey-obj/dist/include spidermonkey-dist-${{ matrix.build }}/
+        cp -a "$sm_dist/libspidermonkey.a" spidermonkey-dist-${{ matrix.build }}/
+        cp -aL "$sm_dist/include" spidermonkey-dist-${{ matrix.build }}/
         tree spidermonkey-dist-${{ matrix.build }}
 
       # Upload tarball as an artifact of the github action run, so the output
@@ -140,6 +150,9 @@ jobs:
 
     - name: Install Rust WASI target
       run: rustup target add wasm32-wasip1
+
+    - name: Install cbindgen
+      run: cargo install cbindgen --locked --version 0.29.3
 
     - name: Build Zig runtime dependencies
       run: ./deps/build-deps.sh --all
