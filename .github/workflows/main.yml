@@ -42,6 +42,7 @@ jobs:
 
     - name: Check if SpiderMonkey Release Exists
       id: check-sm-release
+      if: github.base_ref != 'zig17'
       run: |
         SM_TAG="libspidermonkey_$(awk '/^set\(SM_TAG/ {gsub(/set\(SM_TAG |\)/, ""); print}' cmake/spidermonkey.cmake)"
         echo "SM_TAG=${SM_TAG}" >> "$GITHUB_OUTPUT"
@@ -56,7 +57,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
 
     - name: Cache SpiderMonkey tarball
-      if: steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false'
+      if: github.base_ref != 'zig17' && steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false'
       uses: actions/cache@v4
       id: sm-cache
       with:
@@ -65,7 +66,7 @@ jobs:
         key: spidermonkey-cache-${{ matrix.build }}-${{ hashFiles('cmake/spidermonkey.cmake') }}
 
     - name: Set env var to use cached SpiderMonkey tarball
-      if: steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit == 'true'
+      if: github.base_ref != 'zig17' && steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit == 'true'
       run: |
         tree spidermonkey-dist-${{ matrix.build }}
         echo "SPIDERMONKEY_BINARIES=$(pwd)/spidermonkey-dist-${{ matrix.build }}" >> $GITHUB_ENV
@@ -100,28 +101,19 @@ jobs:
         CTEST_OUTPUT_ON_FAILURE=1 ctest --test-dir cmake-build-${{ matrix.build }} -j$(nproc) --verbose
 
     - name: Set up cacheable SpiderMonkey artifacts
-      if: steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit != 'true'
+      if: github.base_ref != 'zig17' && steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit != 'true'
       run: |
-        legacy_dist=cmake-build-${{ matrix.build }}/spidermonkey-obj/dist
-        zig_dist=deps/sm-obj-zig/dist
-        if [[ -f "$legacy_dist/libspidermonkey.a" ]]; then
-          sm_dist="$legacy_dist"
-        elif [[ -f "$zig_dist/libspidermonkey.a" ]]; then
-          sm_dist="$zig_dist"
-        else
-          echo "SpiderMonkey distribution was not produced" >&2
-          exit 1
-        fi
         mkdir -p spidermonkey-dist-${{ matrix.build }}
-        cp -a "$sm_dist/libspidermonkey.a" spidermonkey-dist-${{ matrix.build }}/
-        cp -aL "$sm_dist/include" spidermonkey-dist-${{ matrix.build }}/
+        cp -a cmake-build-${{ matrix.build }}/spidermonkey-obj/dist/libspidermonkey.a spidermonkey-dist-${{ matrix.build }}/
+        cp -aL cmake-build-${{ matrix.build }}/spidermonkey-obj/dist/include spidermonkey-dist-${{ matrix.build }}/
         tree spidermonkey-dist-${{ matrix.build }}
 
       # Upload tarball as an artifact of the github action run, so the output
       # can be inspected for pull requests.
     - name: Upload SpiderMonkey tarball
       uses: actions/upload-artifact@v4
-      if: (github.event_name != 'push' || (github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v')))
+      if: github.base_ref != 'zig17'
+        && (github.event_name != 'push' || (github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v')))
         && steps.check-sm-release.outputs.SM_TAG_EXISTS == 'false' && steps.sm-cache.outputs.cache-hit != 'true'
       with:
         name: spidermonkey-${{ matrix.build }}
