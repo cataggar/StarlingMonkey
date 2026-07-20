@@ -220,6 +220,7 @@ generated_destination_componentize() {
     --component-world-name js-dispatch \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
+    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     --debug-dir "$GENERATED_DEBUG" \
@@ -267,6 +268,7 @@ PY
   --component-world-name js-dispatch \
   --wasmtime-bin "$WASMTIME" \
   --wabt-bin "$WABT" \
+  --wac-bin "$WAC" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --preview2-adapter "$ADAPTER" \
   --metadata-out "$CACHED_METADATA" \
@@ -294,9 +296,12 @@ surface_case() {
   local native_wit="$WORK/$name native.wit"
   local shell_wit="$WORK/$name shell.wit"
   local engine_wit="$WORK/$name external engine.wit"
+  local runtime_prefix="$case_cache/release"
   local -a feature_args=()
+  local -a build_feature_args=()
   if [ -n "$disabled" ]; then
     feature_args+=(--disable "$disabled")
+    build_feature_args+=("-Ddisable-features=$disabled")
   fi
 
   WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
@@ -316,10 +321,18 @@ surface_case() {
     --out "$native_output" \
     "$ROOT/tests/fixtures/js-dispatch.js"
 
-  local runtime_bin
-  runtime_bin="$(find "$case_cache/runtimes" -mindepth 3 -maxdepth 3 \
-    -type f -name componentize.sh -printf '%T@ %h\n' |
-    sort -nr | head -1 | cut -d' ' -f2-)"
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$ZIG" build \
+    --prefix "$runtime_prefix" \
+    -Doptimize=ReleaseSmall \
+    "-Dhost-api=$HOST_API" \
+    -Dhost-api-world=bindings \
+    "-Dpreview1-adapter=$ADAPTER" \
+    "-Dcomponent-wit=$ROOT/host-apis/$HOST_API/wit" \
+    -Dcomponent-world=js-dispatch \
+    "-Ddispatch-wit=$ROOT/host-apis/$HOST_API/wit/deps/starling-js" \
+    -Ddispatch-world=js-exports \
+    "${build_feature_args[@]}"
+  local runtime_bin="$runtime_prefix/bin"
   "$runtime_bin/componentize.sh" \
     "$ROOT/tests/fixtures/js-dispatch.js" \
     -o "$shell_output"

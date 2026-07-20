@@ -2250,6 +2250,64 @@ const Tools = struct {
     wasm_tools: Snapshot,
 };
 
+const FeatureSurfaceCommandContext = struct {
+    diagnostic: *diagnostics.Context,
+    transaction: *Transaction,
+    transaction_storage: []const u8,
+};
+
+fn runFeatureSurfaceCommand(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    argv: []const []const u8,
+    cwd: []const u8,
+    verbose: bool,
+    command_log: ?*std.ArrayList(u8),
+) !void {
+    const context: *FeatureSurfaceCommandContext = @ptrCast(@alignCast(context_ptr));
+    context.diagnostic.begin(.adapt);
+    runCommand(
+        allocator,
+        io,
+        stage,
+        argv,
+        cwd,
+        null,
+        null,
+        verbose,
+        command_log orelse @panic("missing feature-surface command log"),
+        context.diagnostic,
+        context.transaction_storage,
+        context.transaction,
+    ) catch |err| {
+        try recordFeatureSurfaceWork(allocator, io, context.transaction);
+        return err;
+    };
+    try recordFeatureSurfaceWork(allocator, io, context.transaction);
+}
+
+fn recordFeatureSurfaceWork(
+    allocator: Allocator,
+    io: Io,
+    transaction: *Transaction,
+) !void {
+    var work = try transaction.storage.openDir(
+        io,
+        "feature-surface",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer work.close(io);
+    try recordDebugBackupTree(
+        allocator,
+        io,
+        transaction,
+        work,
+        "feature-surface",
+    );
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -2664,6 +2722,12 @@ fn execute(
         publication_parent,
     );
 
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        environ,
+        "source",
+    );
     const input_snapshots = try snapshotInputs(
         allocator,
         io,
@@ -2856,6 +2920,7 @@ fn execute(
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
     const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
+        const use_wabt = tools.wabt != null and runtime.zig == null;
         var stripped_output = try createChildOutput(
             allocator,
             io,
@@ -2866,14 +2931,13 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wasm-tools strip",
-            &.{
-                tools.wasm_tools.path,
-                "strip",
-                "--all",
-                "-o",
-                stripped_output.path,
-                initialized.path,
+            if (use_wabt) "wabt module strip" else "wasm-tools strip",
+            if (use_wabt) &.{
+                tools.wabt.?.path,    "module",         "strip", "-o",
+                stripped_output.path, initialized.path,
+            } else &.{
+                tools.wasm_tools.path, "strip",          "--all", "-o",
+                stripped_output.path,  initialized.path,
             },
             cwd,
             null,
@@ -2900,16 +2964,17 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wasm-tools component embed",
-            &.{
-                tools.wasm_tools.path,
-                "component",
-                "embed",
-                component_wit,
-                "--world",
-                runtime.component_world.?,
-                "-o",
-                embedded_output.path,
+            if (use_wabt)
+                "wabt component embed"
+            else
+                "wasm-tools component embed",
+            if (use_wabt) &.{
+                tools.wabt.?.path,         "component", "embed",              "--world",
+                runtime.component_world.?, "-o",        embedded_output.path, component_wit,
+                stripped_output.path,
+            } else &.{
+                tools.wasm_tools.path, "component",               "embed", component_wit,
+                "--world",             runtime.component_world.?, "-o",    embedded_output.path,
                 stripped_output.path,
             },
             cwd,
@@ -2942,16 +3007,16 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wasm-tools component new",
-            &.{
-                tools.wasm_tools.path,
-                "component",
-                "new",
-                "--adapt",
-                adapter_arg,
-                "-o",
-                candidate_output.path,
-                embedded_output.path,
+            if (use_wabt)
+                "wabt component new"
+            else
+                "wasm-tools component new",
+            if (use_wabt) &.{
+                tools.wabt.?.path, "component",           "new",                "--adapt", adapter_arg,
+                "-o",              candidate_output.path, embedded_output.path,
+            } else &.{
+                tools.wasm_tools.path, "component", "new",                 "--adapt",
+                adapter_arg,           "-o",        candidate_output.path, embedded_output.path,
             },
             cwd,
             null,
@@ -3018,13 +3083,28 @@ fn execute(
         &transaction,
         "surfaced.wasm",
     );
+    const surface_work_dir = try std.fs.path.join(
+        allocator,
+        &.{ transaction_storage, "feature-surface" },
+    );
+    try transaction.createStorageDir(
+        allocator,
+        io,
+        "feature-surface",
+        .fromMode(0o700),
+    );
+    var surface_command_context = FeatureSurfaceCommandContext{
+        .diagnostic = diagnostic,
+        .transaction = &transaction,
+        .transaction_storage = transaction_storage,
+    };
     try feature_surface.apply(allocator, io, .{
         .wac = tools.wac.path,
         .wasm_tools = tools.wasm_tools.path,
         .platform_wit = runtime.platform_wit,
         .component = candidate.path,
         .output = surfaced.path,
-        .work_dir = transaction_storage,
+        .work_dir = surface_work_dir,
         .target_wit = runtime.surface_target_wit,
         .target_world = runtime.surface_target_world,
         .features = runtime.features,
@@ -3033,7 +3113,29 @@ fn execute(
         .cwd = cwd,
         .verbose = config.verbose,
         .command_log = &command_log,
+        .command_runner = .{
+            .context = &surface_command_context,
+            .run = runFeatureSurfaceCommand,
+        },
     });
+    var surface_work = try transaction.storage.openDir(
+        io,
+        "feature-surface",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer surface_work.close(io);
+    try recordDebugBackupTree(
+        allocator,
+        io,
+        &transaction,
+        surface_work,
+        "feature-surface",
+    );
+    _ = try transaction.sealStorageTree(
+        allocator,
+        io,
+        "feature-surface",
+    );
     try transaction.sealChildOutput(
         allocator,
         io,
@@ -3249,7 +3351,7 @@ fn execute(
         try transaction.recordStoragePath(allocator, io, "debug/component.wasm");
         const provider_wit = try std.fs.path.join(
             allocator,
-            &.{ transaction_storage, "feature-0-provider-wit", "component.wit" },
+            &.{ surface_work_dir, "feature-0-provider-wit", "component.wit" },
         );
         if (pathExists(io, provider_wit)) {
             try copyDebugFile(io, provider_wit, debug_dir_handle, "feature-provider.wit");
@@ -3261,7 +3363,7 @@ fn execute(
         }
         const provider_component = try std.fs.path.join(
             allocator,
-            &.{ transaction_storage, "feature-provider-a.wasm" },
+            &.{ surface_work_dir, "feature-provider-a.wasm" },
         );
         if (pathExists(io, provider_component)) {
             try copyDebugFile(io, provider_component, debug_dir_handle, "feature-provider.wasm");
@@ -3358,15 +3460,16 @@ fn externalRuntime(
         return error.IncompatibleEngineOptions;
     }
     const engine_source = try absolutePath(allocator, cwd, engine_override);
-    const engine = (try captureInputFile(
+    const captured_engine = try captureInputFile(
         allocator,
         io,
         engine_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
         "engine",
-    )).snapshot;
-    const engine_dir = std.fs.path.dirname(engine_source) orelse
+    );
+    const engine = captured_engine.snapshot;
+    const engine_dir = std.fs.path.dirname(captured_engine.resolved_path) orelse
         return error.InvalidPath;
     const manifest_source = try std.fs.path.join(
         allocator,
@@ -3388,11 +3491,19 @@ fn externalRuntime(
     );
     const adapter_source = if (config.preview2_adapter) |path|
         try absolutePath(allocator, cwd, path)
-    else
-        try std.fs.path.join(
+    else blk: {
+        const bundled = try std.fs.path.join(
             allocator,
             &.{ engine_dir, "preview1-adapter.wasm" },
         );
+        break :blk if (pathExists(io, bundled))
+            bundled
+        else
+            try std.fs.path.join(
+                allocator,
+                &.{ executable_dir, "preview1-adapter.wasm" },
+            );
+    };
     const adapter = (try captureInputFile(
         allocator,
         io,
@@ -3424,7 +3535,7 @@ fn externalRuntime(
         null;
     const component_wit =
         if (dispatch_wit_source != null and
-            std.mem.eql(u8, component_wit_source, dispatch_wit_source.?))
+        std.mem.eql(u8, component_wit_source, dispatch_wit_source.?))
             dispatch_wit.?
         else
             try stageWit(
@@ -3445,7 +3556,7 @@ fn externalRuntime(
         if (std.mem.eql(u8, surface_target_wit_source, component_wit_source))
             component_wit
         else if (dispatch_wit_source != null and
-            std.mem.eql(u8, surface_target_wit_source, dispatch_wit_source.?))
+        std.mem.eql(u8, surface_target_wit_source, dispatch_wit_source.?))
             dispatch_wit.?
         else
             try stageWit(
@@ -3466,7 +3577,6 @@ fn externalRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
         transaction,
     );
-    _ = executable_dir;
     return .{
         .engine = engine,
         .adapter = adapter,
@@ -3641,8 +3751,8 @@ const ParsedEngineProvenance = struct {
     surface_world: []const u8,
 };
 
-fn parseEngineProvenance(metadata: []const u8) !ParsedEngineProvenance {
-    var lines = std.mem.splitScalar(u8, metadata, '\n');
+fn parseEngineProvenance(provenance_metadata: []const u8) !ParsedEngineProvenance {
+    var lines = std.mem.splitScalar(u8, provenance_metadata, '\n');
     if (!std.mem.eql(u8, lines.next() orelse return error.InvalidMetadata, "schema=1")) {
         return error.InvalidMetadata;
     }
@@ -3877,23 +3987,48 @@ fn buildRuntime(
             allocator,
             io,
             transaction.storage,
-            if (config.use_debug_build)
-                "build-root/host-apis/wasi-0.2.0/preview1-adapter-debug/wasi_snapshot_preview1.wasm"
-            else
-                "build-root/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm",
+            try std.fs.path.join(
+                allocator,
+                &.{
+                    "build-root",
+                    try selectedHostApiPath(allocator),
+                    if (config.use_debug_build)
+                        "preview1-adapter-debug/wasi_snapshot_preview1.wasm"
+                    else
+                        "preview1-adapter-release/wasi_snapshot_preview1.wasm",
+                },
+            ),
             adapter_destination,
             transaction,
         );
 
+    const needs_bindings = (config.debug_bindings or config.metadata_out != null) and
+        dispatch_wit != null;
     const key = try runtimeKey(
         allocator,
         config,
         if (dispatch_wit) |wit| wit.digest else null,
         if (component_wit) |wit| wit.digest else null,
         build_options.host_api_world,
+        adapter_input.digest,
+        needs_bindings,
         build_snapshot.digest,
         zig_install,
     );
+    var locks = try ensureCacheDirectory(
+        allocator,
+        io,
+        cache.directory,
+        cache.path,
+        "locks",
+    );
+    defer locks.close(io);
+    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{key});
+    const cache_lock = try acquireCacheLock(io, locks.directory, lock_name);
+    const lock_file = cache_lock.file;
+    errdefer lock_file.close(io);
+    errdefer lock_file.unlock(io);
+
     var runtimes = try ensureCacheDirectory(
         allocator,
         io,
@@ -3919,19 +4054,6 @@ fn buildRuntime(
     );
     defer cache_bin.close(io);
     try verifyNoSymlinkTree(io, cache_bin.directory);
-    var locks = try ensureCacheDirectory(
-        allocator,
-        io,
-        cache.directory,
-        cache.path,
-        "locks",
-    );
-    defer locks.close(io);
-    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{key});
-    const cache_lock = try acquireCacheLock(io, locks.directory, lock_name);
-    const lock_file = cache_lock.file;
-    errdefer lock_file.close(io);
-    errdefer lock_file.unlock(io);
 
     var zig_global = try ensureCacheDirectory(
         allocator,
@@ -4054,8 +4176,6 @@ fn buildRuntime(
             ),
         ) catch @panic("out of memory");
     }
-    const needs_bindings = (config.debug_bindings or config.metadata_out != null) and
-        dispatch_wit != null;
     if (needs_bindings) {
         argv.append(allocator, "-Dcomponentizer-debug-bindings=true") catch
             @panic("out of memory");
@@ -4197,40 +4317,50 @@ fn buildRuntime(
     try verifyNoSymlinkTree(io, cache_bin.directory);
 
     const features = resolveFeatures(config);
-    const platform_wit = try std.fs.path.join(
+    const platform_wit = try stageRuntimeWit(
         allocator,
-        &.{ prefix, "bin", "feature-wit" },
+        io,
+        runtime_bin,
+        "feature-wit",
+        try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-feature-wit" }),
+        transaction,
     );
-    const runtime_component_wit = if (component_wit) |wit|
-        wit.absolute
-    else
-        try std.fs.path.join(
+    const runtime_component_wit = if (component_wit) |wit| wit else blk: {
+        break :blk try stageRuntimeWit(
             allocator,
-            &.{ prefix, "bin", "component-wit" },
+            io,
+            runtime_bin,
+            "component-wit",
+            try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-component-wit" }),
+            transaction,
         );
+    };
     const runtime_component_world = config.component_world_name orelse
         config.world_name orelse
         build_options.host_api_world;
-    const surface_target_wit = if (dispatch_wit) |wit|
-        wit.absolute
-    else
-        try std.fs.path.join(
+    const surface_target_wit = if (dispatch_wit) |wit| wit else blk: {
+        break :blk try stageRuntimeWit(
             allocator,
-            &.{ prefix, "bin", "surface-wit" },
+            io,
+            runtime_bin,
+            "surface-wit",
+            try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-surface-wit" }),
+            transaction,
         );
+    };
     const surface_target_world = config.world_name orelse "caller";
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = runtime_component_wit,
+        .component_wit = runtime_component_wit.absolute,
         .component_world = runtime_component_world,
-        .surface_target_wit = surface_target_wit,
+        .surface_target_wit = surface_target_wit.absolute,
         .surface_target_world = surface_target_world,
-        .platform_wit = platform_wit,
+        .platform_wit = platform_wit.absolute,
         .features = features,
         .bindings = bindings,
         .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
-        .component_wit_digest = if (component_wit) |wit| wit.digest else null,
+        .component_wit_digest = runtime_component_wit.digest,
         .features_known = true,
         .zig = zig_install,
         .build_tools = build_tools,
@@ -4690,11 +4820,40 @@ fn runtimeBuildSelections(
         selections.append(allocator, try allocator.dupe(u8, line)) catch
             @panic("out of memory");
     }
+    const host_api_path = try selectedHostApiPath(allocator);
+    for (selections.items) |existing| {
+        if (std.mem.eql(u8, existing, host_api_path)) break;
+    } else {
+        selections.append(allocator, host_api_path) catch
+            @panic("out of memory");
+    }
     return .{
         .paths = selections.toOwnedSlice(allocator) catch
             @panic("out of memory"),
         .manifest_digest = try metadata.sha256Bytes(allocator, source),
     };
+}
+
+fn selectedHostApiPath(allocator: Allocator) ![]const u8 {
+    const selection = build_options.host_api;
+    if (std.fs.path.isAbsolute(selection) or
+        std.mem.indexOfScalar(u8, selection, '\\') != null)
+    {
+        return error.InvalidBuildRoot;
+    }
+    var components = std.mem.splitScalar(u8, selection, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.InvalidBuildRoot;
+        }
+    }
+    if (std.mem.indexOfScalar(u8, selection, '/') != null) {
+        return allocator.dupe(u8, selection);
+    }
+    return std.fs.path.join(allocator, &.{ "host-apis", selection });
 }
 
 fn copyEnvironment(
@@ -4966,6 +5125,25 @@ fn stageWit(
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer source_dir.close(io);
+    const staged = try stageWitDirectory(
+        allocator,
+        io,
+        source_dir,
+        stage_path,
+        transaction,
+    );
+    try retained_source.verify(io);
+    return staged;
+}
+
+fn stageWitDirectory(
+    allocator: Allocator,
+    io: Io,
+    source_dir: Dir,
+    stage_path: []const u8,
+    transaction: *Transaction,
+) !StagedWit {
+    const stage_relative = std.fs.path.basename(stage_path);
     var walker = try source_dir.walk(allocator);
     defer walker.deinit();
     var files: std.ArrayList([]const u8) = .empty;
@@ -5037,7 +5215,6 @@ fn stageWit(
         io,
         stage_relative,
     );
-    try retained_source.verify(io);
     return .{
         .absolute = try transaction.retainStorageDirectory(
             allocator,
@@ -5048,23 +5225,54 @@ fn stageWit(
     };
 }
 
+fn stageRuntimeWit(
+    allocator: Allocator,
+    io: Io,
+    runtime_bin: Dir,
+    source_path: []const u8,
+    stage_path: []const u8,
+    transaction: *Transaction,
+) !StagedWit {
+    var source = try runtime_bin.openDir(
+        io,
+        source_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    return stageWitDirectory(
+        allocator,
+        io,
+        source,
+        stage_path,
+        transaction,
+    );
+}
+
 fn runtimeKey(
     allocator: Allocator,
     config: *const cli.Config,
     dispatch_digest: ?[]const u8,
     component_digest: ?[]const u8,
     host_api_world: []const u8,
+    adapter_digest: []const u8,
+    needs_bindings: bool,
     build_root_digest: []const u8,
     zig: ZigSnapshot,
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hasher, "schema", "2");
+    hashField(&hasher, "schema", "3");
     hashField(&hasher, "version", build_options.version);
     hashField(&hasher, "host-api", build_options.host_api);
     hashField(&hasher, "host-api-world", host_api_world);
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
+    hashField(&hasher, "preview1-adapter", adapter_digest);
+    hashField(
+        &hasher,
+        "componentizer-debug-bindings",
+        if (needs_bindings) "true" else "false",
+    );
     hashField(&hasher, "build-root", build_root_digest);
     hashField(&hasher, "zig", zig.executable.digest);
     hashField(&hasher, "zig-lib", zig.lib_digest);
@@ -8960,7 +9168,11 @@ const debug_generated_names = [_][]const u8{
     "initialized.wasm",
     "stripped.wasm",
     "embedded.wasm",
+    "component-before-feature-surface.wasm",
+    "surfaced.wasm",
     "component.wasm",
+    "feature-provider.wit",
+    "feature-provider.wasm",
     "component-bindings.zig",
     "commands.txt",
     "metadata.json",

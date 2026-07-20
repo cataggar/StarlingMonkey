@@ -14,6 +14,7 @@ BARRIERS="$SCRATCH/test barriers"
 TOOLS="$SCRATCH/fake tools"
 WORK="$SCRATCH/work with spaces"
 FAKE_BUILD_ROOT="$SCRATCH/fake native build root"
+FAKE_HOST_API_DIR="$FAKE_BUILD_ROOT/host-apis/$EXPECTED_HOST_API"
 SOURCE_RACER_PID=""
 SOURCE_COMPONENTIZER_PID=""
 SNAPSHOT_TEST_PID=""
@@ -76,12 +77,12 @@ mkdir -p "$TOOLS" "$WORK/wit package" "$FAKE_BUILD_ROOT/runtime" \
   "$BARRIERS" \
   "$SCRATCH/cache parent" \
   "$FAKE_BUILD_ROOT/tools/componentizer" \
-  "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release"
+  "$FAKE_HOST_API_DIR/preview1-adapter-release"
 printf 'captured-build-root\n' > "$FAKE_BUILD_ROOT/build.zig"
 touch "$FAKE_BUILD_ROOT/build.zig.zon" "$FAKE_BUILD_ROOT/runtime/js.cpp" \
   "$FAKE_BUILD_ROOT/tools/componentizer/main.zig"
 printf 'adapter-bytes\n' > \
-  "$FAKE_BUILD_ROOT/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"
+  "$FAKE_HOST_API_DIR/preview1-adapter-release/wasi_snapshot_preview1.wasm"
 trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
@@ -99,7 +100,13 @@ cat > "$WIT/world.wit" <<'EOF'
 package test:componentizer;
 world exports {}
 EOF
-mkdir -p "$WORK/feature-wit"
+mkdir -p "$WORK/feature-wit" "$WORK/component-wit" "$WORK/surface-wit"
+printf 'package test:feature; world feature {}\n' \
+  > "$WORK/feature-wit/feature.wit"
+printf 'package test:component; world bindings {}\n' \
+  > "$WORK/component-wit/component.wit"
+printf 'package test:surface; world caller {}\n' \
+  > "$WORK/surface-wit/caller.wit"
 cat > "$WORK/features.json" <<EOF
 {
   "host-api": "$(basename "$EXPECTED_HOST_API")",
@@ -503,7 +510,15 @@ cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 if [ -z "${FAKE_OMIT_GENERATED_ADAPTER:-}" ]; then
   cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
 fi
-mkdir -p "$prefix/bin/feature-wit"
+mkdir -p "$prefix/bin/feature-wit" \
+  "$prefix/bin/component-wit" \
+  "$prefix/bin/surface-wit"
+printf 'package test:feature; world feature {}\n' \
+  > "$prefix/bin/feature-wit/feature.wit"
+printf 'package test:component; world bindings {}\n' \
+  > "$prefix/bin/component-wit/component.wit"
+printf 'package test:surface; world caller {}\n' \
+  > "$prefix/bin/surface-wit/caller.wit"
 mkdir -p "$prefix/bin/runtime-build-tools"
 cp "$FAKE_WASIP3_BINDGEN" "$prefix/bin/runtime-build-tools/wasip3-bindgen"
 cp "$FAKE_WASM_OPT" "$prefix/bin/runtime-build-tools/wasm-opt"
@@ -524,6 +539,21 @@ done
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasip3-bindgen"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasm-opt"
+cat > "$TOOLS/fake wac" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+consumer=""
+for ((i = 1; i <= $#; i++)); do
+  if [ "${!i}" = "-o" ]; then
+    consumer_index=$((i - 1))
+    output_index=$((i + 1))
+    consumer="${!consumer_index}"
+    out="${!output_index}"
+  fi
+done
+cp "$consumer" "$out"
+EOF
 chmod +x "$TOOLS"/*
 
 export FAKE_RUNTIME_ARGS_LOG="$SCRATCH/runtime args.log"
@@ -537,6 +567,7 @@ export FAKE_WASIP3_BINDGEN="$TOOLS/fake wasip3-bindgen"
 export FAKE_WASM_OPT="$TOOLS/fake wasm-opt"
 export FAKE_ZIG_LIB_DIR="$SCRATCH/fake zig direct/lib"
 export FAKE_ZIG_ARGS_LOG="$SCRATCH/zig args.log"
+export WAC_BIN="$TOOLS/fake wac"
 export STARLINGMONKEY_CONFIG="--ambient-config-must-not-reach-wizer"
 mkdir -p "$FAKE_ZIG_LIB_DIR"
 printf 'immutable-zig-lib\n' > "$FAKE_ZIG_LIB_DIR/marker"
@@ -588,8 +619,11 @@ imports = json.load(open(sys.argv[1], encoding="utf-8"))
 metadata = json.load(open(sys.argv[2], encoding="utf-8"))
 assert imports["complete"] is False
 assert imports["imports"] == []
-assert metadata["provenance"]["features"] is None
-assert metadata["provenance"]["features_sha256"] is None
+assert [feature["name"] for feature in metadata["provenance"]["features"]] == [
+    "stdio", "random", "clocks", "http", "fetch-event",
+]
+assert all(feature["enabled"] for feature in metadata["provenance"]["features"])
+assert len(metadata["provenance"]["features_sha256"]) == 64
 runtime_args = open(sys.argv[3], "rb").read()
 assert metadata["provenance"]["inputs"]["runtime_arguments_sha256"] == \
     hashlib.sha256(runtime_args).hexdigest()
@@ -680,6 +714,8 @@ make_engine_bundle() {
   local name="$1" tuple="$2"
   local bundle="$WORK/$name engine bundle"
   mkdir -p "$bundle/feature-wit"
+  printf 'package test:feature; world feature {}\n' \
+    > "$bundle/feature-wit/feature.wit"
   python3 "$ROOT/tools/embed-engine-provenance.py" \
     "$ENGINE_BASE" "$bundle/starling-raw.wasm" \
     "$(basename "$EXPECTED_HOST_API")" "$tuple" bindings caller
@@ -1133,12 +1169,15 @@ test ! -e "$WORK/unreadable source.wasm"
 RACED_SOURCE="$WORK/raced source.js"
 RACED_ORIGINAL="$SCRATCH/raced source original.js"
 RACED_ERROR="$SCRATCH/raced-source.jsonl"
+RACED_BARRIER="$BARRIERS/raced-source-capture"
 python3 - "$RACED_SOURCE" <<'PY'
 import sys
 with open(sys.argv[1], "w", encoding="utf-8") as source:
     source.write("// immutable input race padding\n" * 500000)
     source.write("export const raced = true;\n")
 PY
+STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$RACED_BARRIER" \
+STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=source \
 "$COMPONENTIZER" \
   --json-diagnostics \
   --engine "$ENGINE" \
@@ -1148,16 +1187,15 @@ PY
   --out "$WORK/raced source.wasm" \
   "$RACED_SOURCE" >/dev/null 2> "$RACED_ERROR" &
 SOURCE_COMPONENTIZER_PID=$!
-python3 - "$WORK" "$RACED_SOURCE" "$RACED_ORIGINAL" \
-  "$SOURCE_COMPONENTIZER_PID" <<'PY' &
+python3 - "$RACED_SOURCE" "$RACED_ORIGINAL" \
+  "$SOURCE_COMPONENTIZER_PID" "$RACED_BARRIER" <<'PY' &
 import os, sys, time
-work, source, original, componentizer = sys.argv[1:]
+source, original, componentizer, barrier = sys.argv[1:]
 componentizer = int(componentizer)
-prefix = ".raced source.wasm.starling-componentize-"
 deadline = time.monotonic() + 30
-while not any(name.startswith(prefix) for name in os.listdir(work)):
+while not os.path.exists(barrier + ".ready"):
     if time.monotonic() >= deadline:
-        raise SystemExit("timed out waiting for raced-source transaction")
+        raise SystemExit("timed out waiting for raced-source capture")
     try:
         os.kill(componentizer, 0)
     except ProcessLookupError:
@@ -1166,6 +1204,7 @@ while not any(name.startswith(prefix) for name in os.listdir(work)):
 os.rename(source, original)
 with open(source, "w", encoding="utf-8") as replacement:
     replacement.write("export const replacement = true;\n")
+open(barrier + ".release", "w", encoding="utf-8").close()
 PY
 SOURCE_RACER_PID=$!
 source_race_deadline=$((SECONDS + 35))
@@ -2314,14 +2353,29 @@ done
 CONCURRENT_BUNDLE_OUTPUT="$WORK/concurrent bundle.wasm"
 CONCURRENT_BUNDLE_METADATA="$WORK/concurrent bundle.json"
 CONCURRENT_BUNDLE_DEBUG="$WORK/concurrent bundle.debug"
-CONCURRENT_BUNDLE_ENGINE_A="$SCRATCH/concurrent-engine-a.wasm"
-CONCURRENT_BUNDLE_ENGINE_B="$SCRATCH/concurrent-engine-b.wasm"
+CONCURRENT_BUNDLE_ENGINE_A_DIR="$SCRATCH/concurrent-engine-a"
+CONCURRENT_BUNDLE_ENGINE_B_DIR="$SCRATCH/concurrent-engine-b"
+CONCURRENT_BUNDLE_ENGINE_A="$CONCURRENT_BUNDLE_ENGINE_A_DIR/starling-raw.wasm"
+CONCURRENT_BUNDLE_ENGINE_B="$CONCURRENT_BUNDLE_ENGINE_B_DIR/starling-raw.wasm"
 CONCURRENT_BUNDLE_LOG_A="$SCRATCH/concurrent-bundle-a.jsonl"
 CONCURRENT_BUNDLE_LOG_B="$SCRATCH/concurrent-bundle-b.jsonl"
 CONCURRENT_BUNDLE_BARRIER_A="$SCRATCH/concurrent-bundle-a-lock"
 CONCURRENT_BUNDLE_BARRIER_B="$SCRATCH/concurrent-bundle-b-lock"
-printf 'concurrent-engine-a\n' > "$CONCURRENT_BUNDLE_ENGINE_A"
-printf 'concurrent-engine-b\n' > "$CONCURRENT_BUNDLE_ENGINE_B"
+for engine_dir in \
+  "$CONCURRENT_BUNDLE_ENGINE_A_DIR" "$CONCURRENT_BUNDLE_ENGINE_B_DIR"; do
+  mkdir -p "$engine_dir"
+  cp -a "$WORK/component-wit" "$WORK/surface-wit" "$WORK/feature-wit" \
+    "$engine_dir/"
+  cp "$WORK/features.json" "$engine_dir/features.json"
+done
+printf '\0asm\1\0\0\0\0\6\4seedA' > "$SCRATCH/concurrent-engine-a-base.wasm"
+printf '\0asm\1\0\0\0\0\6\4seedB' > "$SCRATCH/concurrent-engine-b-base.wasm"
+python3 "$ROOT/tools/embed-engine-provenance.py" \
+  "$SCRATCH/concurrent-engine-a-base.wasm" "$CONCURRENT_BUNDLE_ENGINE_A" \
+  "$(basename "$EXPECTED_HOST_API")" 11111 bindings caller
+python3 "$ROOT/tools/embed-engine-provenance.py" \
+  "$SCRATCH/concurrent-engine-b-base.wasm" "$CONCURRENT_BUNDLE_ENGINE_B" \
+  "$(basename "$EXPECTED_HOST_API")" 11111 bindings caller
 STARLING_COMPONENTIZER_TEST_LOCK_BARRIER="$CONCURRENT_BUNDLE_BARRIER_A" \
 STARLING_COMPONENTIZER_TEST_LOCK_BARRIER_MODE=after \
 "$COMPONENTIZER" \
@@ -3098,6 +3152,7 @@ SELECTIVE_BARRIER="$BARRIERS/selective-target"
 SELECTIVE_OUTPUT="$WORK/selective target.wasm"
 mkdir -p "$SELECTIVE_ROOT/runtime" \
   "$SELECTIVE_ROOT/tools/componentizer" \
+  "$SELECTIVE_ROOT/host-apis/$EXPECTED_HOST_API" \
   "$(dirname "$SELECTIVE_TARGET")" \
   "$(dirname "$SELECTIVE_LINK")"
 printf 'captured-build-root\n' > "$SELECTIVE_ROOT/build.zig"
@@ -3749,8 +3804,14 @@ while IFS='|' read -r local_cache global_cache zig_lib; do
       ;;
   esac
 done < "$FAKE_ZIG_ENV_LOG"
-test "$(grep -c -- "-Dhost-api=$EXPECTED_HOST_API" "$FAKE_ZIG_ARGS_LOG")" -eq 5
-test "$(grep -c -- '-Dhost-api-world=bindings' "$FAKE_ZIG_ARGS_LOG")" -eq 5
+host_api_arg_count="$(
+  grep -c -- "-Dhost-api=$EXPECTED_HOST_API" "$FAKE_ZIG_ARGS_LOG"
+)"
+host_world_arg_count="$(
+  grep -c -- '-Dhost-api-world=bindings' "$FAKE_ZIG_ARGS_LOG"
+)"
+test "$host_api_arg_count" -ge 5
+test "$host_world_arg_count" -eq "$host_api_arg_count"
 cmp "$ENGINE" "$BUILD_OUTPUT_1"
 cmp "$ENGINE" "$BUILD_OUTPUT_2"
 cmp "$ENGINE" "$BUILD_OUTPUT_3"

@@ -40,6 +40,21 @@ pub const Options = struct {
     cwd: []const u8,
     verbose: bool = false,
     command_log: ?*std.ArrayList(u8) = null,
+    command_runner: ?CommandRunner = null,
+};
+
+pub const CommandRunner = struct {
+    context: *anyopaque,
+    run: *const fn (
+        context: *anyopaque,
+        allocator: Allocator,
+        io: Io,
+        stage: []const u8,
+        argv: []const []const u8,
+        cwd: []const u8,
+        verbose: bool,
+        command_log: ?*std.ArrayList(u8),
+    ) anyerror!void,
 };
 
 pub fn apply(
@@ -624,13 +639,23 @@ fn readFile(allocator: Allocator, io: Io, absolute: []const u8) ![]const u8 {
 }
 
 fn copyFile(io: Io, source: []const u8, destination: []const u8) !void {
-    const parent = std.fs.path.dirname(destination) orelse ".";
-    var dir = if (std.fs.path.isAbsolute(parent))
-        try Dir.openDirAbsolute(io, parent, .{})
-    else
-        try Dir.cwd().openDir(io, parent, .{});
-    defer dir.close(io);
-    try Dir.cwd().copyFile(source, dir, std.fs.path.basename(destination), io, .{});
+    var source_file = try Dir.openFileAbsolute(io, source, .{});
+    defer source_file.close(io);
+    var destination_file = try Dir.createFileAbsolute(io, destination, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer destination_file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = source_file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (count != 0) {
+            try destination_file.writeStreamingAll(io, buffer[0..count]);
+        }
+    }
 }
 
 fn runCommand(
@@ -640,6 +665,18 @@ fn runCommand(
     stage: []const u8,
     argv: []const []const u8,
 ) !void {
+    if (options.command_runner) |runner| {
+        return runner.run(
+            runner.context,
+            allocator,
+            io,
+            stage,
+            argv,
+            options.cwd,
+            options.verbose,
+            options.command_log,
+        );
+    }
     if (options.command_log) |log| {
         log.appendSlice(allocator, stage) catch @panic("out of memory");
         log.append(allocator, '\n') catch @panic("out of memory");

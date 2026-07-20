@@ -61,16 +61,13 @@ WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
 NATIVE_WIT="$BUILD_ROOT/native custom component.wit"
 "$ZIG_PREFIX/bin/wasm-tools" component wit "$NATIVE_COMPONENT" -o "$NATIVE_WIT"
 
-mapfile -t NATIVE_MANIFESTS < <(
-  find "$NATIVE_CACHE/runtimes" -mindepth 3 -maxdepth 3 \
-    -type f -name features.json
-)
-test "${#NATIVE_MANIFESTS[@]}" -eq 1
-NATIVE_RUNTIME="$(dirname "${NATIVE_MANIFESTS[0]}")"
-grep -q '"host-api": "custom runtime api"' "$NATIVE_RUNTIME/features.json"
+test "$(find "$NATIVE_CACHE/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
+  -eq 1
+RELEASE_RUNTIME="$ZIG_PREFIX/bin"
+grep -q '"host-api": "custom runtime api"' "$RELEASE_RUNTIME/features.json"
 grep -q '"component-world": "custom-bindings"' \
-  "$NATIVE_RUNTIME/features.json"
-python3 - "$NATIVE_RUNTIME/starling-raw.wasm" <<'PY'
+  "$RELEASE_RUNTIME/features.json"
+python3 - "$RELEASE_RUNTIME/starling-raw.wasm" <<'PY'
 import pathlib
 import sys
 
@@ -82,7 +79,7 @@ PY
 EXTERNAL_COMPONENT="$BUILD_ROOT/native external custom component.wasm"
 WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   "$ZIG_PREFIX/bin/starling-componentize" \
-  --engine "$NATIVE_RUNTIME/starling-raw.wasm" \
+  --engine "$RELEASE_RUNTIME/starling-raw.wasm" \
   --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
   --wac-bin "$ZIG_PREFIX/bin/wac" \
   --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \

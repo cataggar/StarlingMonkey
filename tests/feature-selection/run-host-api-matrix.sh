@@ -84,23 +84,10 @@ for version in "${VERSIONS[@]}"; do
         --disable stdio,random,clocks,http,fetch-event \
         --out "$native_component" \
         "$FIXTURE"
-      nested_runtime=""
-      for manifest in "$native_cache"/runtimes/*/bin/features.json; do
-        if grep -q "\"host-api\": \"wasi-$version\"" "$manifest"; then
-          nested_runtime="$(dirname "$manifest")"
-          break
-        fi
-      done
-      test -n "$nested_runtime"
-      grep -q "\"host-api\": \"wasi-$version\"" "$nested_runtime/features.json"
-      check_wit_versions "$version" "$nested_runtime/feature-wit"
-      check_wit_versions "$version" "$nested_runtime/component-wit"
+      # Native runtimes stay transaction-private; the cache records identity
+      # keys while the resulting component proves the selected surface.
       test "$(find "$native_cache/runtimes" -mindepth 1 -maxdepth 1 -type d | wc -l)" \
         -eq "$version_index"
-      nested_adapter_version="$("$runtime/wasm-tools" component wit \
-        "$nested_runtime/preview1-adapter.wasm" |
-        sed -n 's/.*import wasi:cli\/environment@\([^;]*\);.*/\1/p' | head -1)"
-      test "$nested_adapter_version" = "$version"
       check_component "$version" "$runtime" "$native_component"
       external_component="$prefix/pure-external-engine.wasm"
       WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
