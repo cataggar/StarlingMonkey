@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, zig17]
     paths-ignore:
       - '*.md'
       - 'docs/**'

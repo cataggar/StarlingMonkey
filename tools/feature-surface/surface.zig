@@ -41,6 +41,7 @@ pub const Options = struct {
     verbose: bool = false,
     command_log: ?*std.ArrayList(u8) = null,
     command_runner: ?CommandRunner = null,
+    generated_inputs: ?GeneratedInputs = null,
 };
 
 pub const CommandRunner = struct {
@@ -54,6 +55,29 @@ pub const CommandRunner = struct {
         cwd: []const u8,
         verbose: bool,
         command_log: ?*std.ArrayList(u8),
+    ) anyerror!void,
+};
+
+pub const GeneratedInputs = struct {
+    context: *anyopaque,
+    retain_file: *const fn (
+        context: *anyopaque,
+        allocator: Allocator,
+        io: Io,
+        stage: []const u8,
+        path: []const u8,
+    ) anyerror![]const u8,
+    snapshot_tree: *const fn (
+        context: *anyopaque,
+        allocator: Allocator,
+        io: Io,
+        stage: []const u8,
+        path: []const u8,
+    ) anyerror![]const u8,
+    verify: *const fn (
+        context: *anyopaque,
+        allocator: Allocator,
+        io: Io,
     ) anyerror!void,
 };
 
@@ -116,8 +140,16 @@ pub fn apply(
                 target_surface,
             },
         );
-        const target_text = try readFile(allocator, io, target_surface);
+        const retained_target_surface = try retainGeneratedFile(
+            allocator,
+            io,
+            options,
+            "feature-target-surface",
+            target_surface,
+        );
+        const target_text = try readFile(allocator, io, retained_target_surface);
         target_imports = try collectWasiImports(allocator, target_text);
+        try verifyGeneratedInputs(allocator, io, options);
     }
 
     const platform_dir = try passPath(allocator, options.work_dir, 0, "platform-wit");
@@ -136,10 +168,22 @@ pub fn apply(
             platform_dir,
         },
     );
-    const platform_root = try generatedRootWit(allocator, io, platform_dir);
+    const retained_platform_dir = try snapshotGeneratedTree(
+        allocator,
+        io,
+        options,
+        "feature-platform-wit",
+        platform_dir,
+    );
+    const platform_root = try generatedRootWit(
+        allocator,
+        io,
+        retained_platform_dir,
+    );
     const platform_text = try readFile(allocator, io, platform_root);
     try validateGeneratedRootWit(platform_text);
     const platform_imports = try collectWasiImports(allocator, platform_text);
+    try verifyGeneratedInputs(allocator, io, options);
     var actual_imports: []const []const u8 = &.{};
     if (options.inspect_candidate) {
         const candidate_surface = try passPath(
@@ -161,8 +205,20 @@ pub fn apply(
                 candidate_surface,
             },
         );
-        const candidate_text = try readFile(allocator, io, candidate_surface);
+        const retained_candidate_surface = try retainGeneratedFile(
+            allocator,
+            io,
+            options,
+            "feature-candidate-surface",
+            candidate_surface,
+        );
+        const candidate_text = try readFile(
+            allocator,
+            io,
+            retained_candidate_surface,
+        );
         actual_imports = try collectComponentImports(allocator, candidate_text);
+        try verifyGeneratedInputs(allocator, io, options);
     } else {
         var assumed: std.ArrayList([]const u8) = .empty;
         assumed.appendSlice(allocator, platform_imports) catch @panic("out of memory");
@@ -267,8 +323,28 @@ fn buildProvider(
             provider_dir,
         },
     );
-    const provider_wit = try generatedRootWit(allocator, io, provider_dir);
-    const provider_base_text = try readFile(allocator, io, provider_wit);
+    const retained_provider_dir = try snapshotGeneratedTree(
+        allocator,
+        io,
+        options,
+        "feature-provider-wit",
+        provider_dir,
+    );
+    const retained_provider_wit = try generatedRootWit(
+        allocator,
+        io,
+        retained_provider_dir,
+    );
+    const provider_wit = try path(
+        allocator,
+        provider_dir,
+        std.fs.path.basename(retained_provider_wit),
+    );
+    const provider_base_text = try readFile(
+        allocator,
+        io,
+        retained_provider_wit,
+    );
     try validateGeneratedRootWit(provider_base_text);
     const provider_text = try renderProviderWit(
         allocator,
@@ -281,13 +357,24 @@ fn buildProvider(
         // Duration is a u64 alias. Inlining it prevents preserved HTTP and
         // internalized socket interfaces from reintroducing monotonic-clock.
         for ([_][]const u8{ "http.wit", "sockets.wit" }) |basename| {
+            const retained_dependency = try path(
+                allocator,
+                retained_provider_dir,
+                "deps",
+            );
             const dependency = try path(allocator, provider_dir, "deps");
             const wit = try path(allocator, dependency, basename);
-            const text = try readFile(allocator, io, wit);
+            const retained_wit = try path(
+                allocator,
+                retained_dependency,
+                basename,
+            );
+            const text = try readFile(allocator, io, retained_wit);
             const inlined = try inlineMonotonicDuration(allocator, text);
             try Dir.cwd().writeFile(io, .{ .sub_path = wit, .data = inlined });
         }
     }
+    try verifyGeneratedInputs(allocator, io, options);
 
     const provider_core = try passPath(allocator, options.work_dir, depth, "provider-core.wasm");
     const provider_component = try providerComponentPath(allocator, options.work_dir, depth);
@@ -338,8 +425,20 @@ fn buildProvider(
             provider_surface,
         },
     );
-    const provider_surface_text = try readFile(allocator, io, provider_surface);
+    const retained_provider_surface = try retainGeneratedFile(
+        allocator,
+        io,
+        options,
+        "feature-provider-surface",
+        provider_surface,
+    );
+    const provider_surface_text = try readFile(
+        allocator,
+        io,
+        retained_provider_surface,
+    );
     const provider_imports = try collectWasiImports(allocator, provider_surface_text);
+    try verifyGeneratedInputs(allocator, io, options);
     var residuals: std.ArrayList([]const u8) = .empty;
     for (provider_imports) |name| {
         if (shouldProvide(
@@ -636,6 +735,53 @@ fn readFile(allocator: Allocator, io: Io, absolute: []const u8) ![]const u8 {
     var dir = try Dir.openDirAbsolute(io, parent, .{});
     defer dir.close(io);
     return dir.readFileAlloc(io, std.fs.path.basename(absolute), allocator, .unlimited);
+}
+
+fn retainGeneratedFile(
+    allocator: Allocator,
+    io: Io,
+    options: Options,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const generated_inputs = options.generated_inputs orelse return absolute;
+    return generated_inputs.retain_file(
+        generated_inputs.context,
+        allocator,
+        io,
+        stage,
+        absolute,
+    );
+}
+
+fn snapshotGeneratedTree(
+    allocator: Allocator,
+    io: Io,
+    options: Options,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const generated_inputs = options.generated_inputs orelse return absolute;
+    return generated_inputs.snapshot_tree(
+        generated_inputs.context,
+        allocator,
+        io,
+        stage,
+        absolute,
+    );
+}
+
+fn verifyGeneratedInputs(
+    allocator: Allocator,
+    io: Io,
+    options: Options,
+) !void {
+    const generated_inputs = options.generated_inputs orelse return;
+    try generated_inputs.verify(
+        generated_inputs.context,
+        allocator,
+        io,
+    );
 }
 
 fn copyFile(io: Io, source: []const u8, destination: []const u8) !void {

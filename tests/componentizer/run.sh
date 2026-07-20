@@ -758,6 +758,70 @@ componentize_external_engine \
 componentize_external_engine \
   "$MIXED_ENGINE_DIR/starling-raw.wasm" "$WORK/mixed engine output.wasm"
 
+for feature_mutation in inplace replace-restore; do
+  FEATURE_RACE_OUTPUT="$WORK/feature input $feature_mutation.wasm"
+  FEATURE_RACE_ERROR="$SCRATCH/feature-input-$feature_mutation.jsonl"
+  FEATURE_RACE_BARRIER="$BARRIERS/feature-input-$feature_mutation"
+  printf 'old-feature-output-%s\n' "$feature_mutation" > \
+    "$FEATURE_RACE_OUTPUT"
+  STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$FEATURE_RACE_BARRIER" \
+  STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=feature-target-surface \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$FEATURE_RACE_OUTPUT" \
+    "$SOURCE" >/dev/null 2>"$FEATURE_RACE_ERROR" &
+  feature_race_pid=$!
+  wait_for_marker "$FEATURE_RACE_BARRIER.ready" "$feature_race_pid" \
+    "$feature_mutation generated feature input race"
+  feature_transaction="$(find "$WORK" -maxdepth 1 -type d \
+    -name ".feature input $feature_mutation.wasm.starling-componentize-*" \
+    -print -quit)"
+  test -n "$feature_transaction"
+  feature_target="$feature_transaction/data/feature-surface-input-0"
+  test -f "$feature_target"
+  if [ "$feature_mutation" = inplace ]; then
+    chmod u+w "$feature_target"
+    printf 'package raced:surface; world raced {}\n' > "$feature_target"
+  else
+    feature_saved="$SCRATCH/feature-target-saved.wit"
+    mv "$feature_target" "$feature_saved"
+    printf 'package raced:surface; world raced {}\n' > "$feature_target"
+    rm "$feature_target"
+    mv "$feature_saved" "$feature_target"
+  fi
+  : > "$FEATURE_RACE_BARRIER.release"
+  if wait "$feature_race_pid"; then
+    echo "FAIL: $feature_mutation generated feature input race succeeded" >&2
+    exit 1
+  fi
+  python3 - "$FEATURE_RACE_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC4201", diagnostic
+assert diagnostic["phase"] == "adapt", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+  test "$(cat "$FEATURE_RACE_OUTPUT")" = \
+    "old-feature-output-$feature_mutation"
+  if find "$WORK" -maxdepth 1 -type d \
+    -name ".feature input $feature_mutation.wasm.starling-componentize-*" \
+    | grep -q .; then
+    echo "FAIL: $feature_mutation feature race retained a transaction" >&2
+    exit 1
+  fi
+  rm -f "$FEATURE_RACE_OUTPUT" "$FEATURE_RACE_ERROR" \
+    "$FEATURE_RACE_BARRIER.ready" "$FEATURE_RACE_BARRIER.release"
+done
+
 MISSING_ENGINE_DIR="$WORK/missing provenance engine bundle"
 mkdir -p "$MISSING_ENGINE_DIR/feature-wit"
 printf '\0asm\1\0\0\0' > "$MISSING_ENGINE_DIR/starling-raw.wasm"

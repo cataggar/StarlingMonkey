@@ -656,6 +656,7 @@ const ProtectedTree = struct {
     path: []const u8,
     manifest: TreeManifest,
     active: bool = true,
+    strict: bool = false,
     namespace_changed: bool = false,
     attribute_changed: bool = false,
 };
@@ -1811,6 +1812,11 @@ const Transaction = struct {
     ) !void {
         for (self.protected.items) |*protected| {
             if (!protected.active) continue;
+            if (protected.strict and
+                (protected.namespace_changed or protected.attribute_changed))
+            {
+                return error.TransactionChanged;
+            }
             const current = buildTreeManifest(
                 allocator,
                 io,
@@ -2254,6 +2260,7 @@ const FeatureSurfaceCommandContext = struct {
     diagnostic: *diagnostics.Context,
     transaction: *Transaction,
     transaction_storage: []const u8,
+    snapshot_index: usize = 0,
 };
 
 fn runFeatureSurfaceCommand(
@@ -2286,6 +2293,179 @@ fn runFeatureSurfaceCommand(
         return err;
     };
     try recordFeatureSurfaceWork(allocator, io, context.transaction);
+}
+
+fn featureSurfaceStorageRelative(
+    allocator: Allocator,
+    transaction: *const Transaction,
+    absolute: []const u8,
+) ![]const u8 {
+    const relative = try std.fs.path.relative(
+        allocator,
+        transaction.storage_path,
+        null,
+        transaction.storage_path,
+        absolute,
+    );
+    if (std.fs.path.isAbsolute(relative) or
+        std.mem.eql(u8, relative, "..") or
+        std.mem.startsWith(u8, relative, "../"))
+    {
+        return error.TransactionChanged;
+    }
+    return relative;
+}
+
+fn retainFeatureSurfaceFile(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    const relative = try featureSurfaceStorageRelative(
+        allocator,
+        context.transaction,
+        absolute,
+    );
+    const destination_relative = try std.fmt.allocPrint(
+        allocator,
+        "feature-surface-input-{d}",
+        .{context.snapshot_index},
+    );
+    context.snapshot_index += 1;
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ context.transaction.storage_path, destination_relative },
+    );
+    const snapshot = snapshotFileAt(
+        allocator,
+        io,
+        context.transaction.storage,
+        relative,
+        destination,
+        context.transaction,
+    ) catch |err| switch (err) {
+        error.InputChanged => return error.TransactionChanged,
+        else => return err,
+    };
+    context.transaction.protected.items[snapshot.protection].strict = true;
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        context.transaction.environ,
+        stage,
+    );
+    try verifyFeatureSurfaceContext(context, allocator, io);
+    return snapshot.path;
+}
+
+fn snapshotFeatureSurfaceTree(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    const transaction = context.transaction;
+    const source_relative = try featureSurfaceStorageRelative(
+        allocator,
+        transaction,
+        absolute,
+    );
+    try transaction.verifyIntegrity(allocator, io);
+    var source = try transaction.storage.openDir(
+        io,
+        source_relative,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    const source_identity = SourceIdentity.fromStat(try source.stat(io));
+
+    const destination_relative = try std.fmt.allocPrint(
+        allocator,
+        "feature-surface-input-{d}",
+        .{context.snapshot_index},
+    );
+    context.snapshot_index += 1;
+    try transaction.ensureStorageDirPath(
+        allocator,
+        io,
+        destination_relative,
+    );
+    var destination = try transaction.storage.openDir(
+        io,
+        destination_relative,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer destination.close(io);
+    var tree_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    _ = copyInputDirectory(
+        allocator,
+        io,
+        source,
+        destination,
+        source_relative,
+        "",
+        destination_relative,
+        "",
+        &.{},
+        &.{},
+        .reject,
+        &.{},
+        null,
+        &.{},
+        transaction,
+        &tree_hasher,
+    ) catch |err| switch (err) {
+        error.InputChanged => return error.TransactionChanged,
+        else => return err,
+    };
+    if (!source_identity.matches(try source.stat(io))) {
+        return error.TransactionChanged;
+    }
+    try sealSnapshotDirectory(io, destination);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        destination_relative,
+    );
+    transaction.protected.items[protection].strict = true;
+    const retained = try transaction.retainStorageDirectory(
+        allocator,
+        io,
+        destination_relative,
+    );
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        stage,
+    );
+    try verifyFeatureSurfaceContext(context, allocator, io);
+    return retained;
+}
+
+fn verifyFeatureSurfaceContext(
+    context: *FeatureSurfaceCommandContext,
+    allocator: Allocator,
+    io: Io,
+) !void {
+    try context.transaction.verifyIntegrity(allocator, io);
+}
+
+fn verifyFeatureSurfaceInputs(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+) !void {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    try verifyFeatureSurfaceContext(context, allocator, io);
 }
 
 fn recordFeatureSurfaceWork(
@@ -3116,6 +3296,12 @@ fn execute(
         .command_runner = .{
             .context = &surface_command_context,
             .run = runFeatureSurfaceCommand,
+        },
+        .generated_inputs = .{
+            .context = &surface_command_context,
+            .retain_file = retainFeatureSurfaceFile,
+            .snapshot_tree = snapshotFeatureSurfaceTree,
+            .verify = verifyFeatureSurfaceInputs,
         },
     });
     var surface_work = try transaction.storage.openDir(
@@ -10891,6 +11077,8 @@ test "runtime cache key excludes JavaScript source" {
         "a",
         "b",
         "bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
@@ -10902,6 +11090,8 @@ test "runtime cache key excludes JavaScript source" {
         "a",
         "b",
         "bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
@@ -11012,6 +11202,8 @@ test "runtime cache key includes the authoritative host API world" {
         null,
         null,
         "bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
@@ -11022,6 +11214,8 @@ test "runtime cache key includes the authoritative host API world" {
         null,
         null,
         "custom-bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
