@@ -2963,6 +2963,7 @@ fn execute(
             config,
             engine_override,
             &transaction,
+            diagnostic,
         )
     else
         try buildRuntime(
@@ -3440,7 +3441,6 @@ fn execute(
         const document = try buildMetadataDocument(
             allocator,
             io,
-            config,
             source_snapshot,
             initializer_snapshot,
             runtime_args,
@@ -3635,6 +3635,7 @@ fn externalRuntime(
     config: *const cli.Config,
     engine_override: []const u8,
     transaction: *Transaction,
+    diagnostic: *diagnostics.Context,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     if (config.disable_features.len != 0 or
@@ -3659,32 +3660,47 @@ fn externalRuntime(
         allocator,
         &.{ engine_dir, "features.json" },
     );
-    const manifest = (try captureInputFile(
+    const manifest = (captureInputFile(
         allocator,
         io,
         manifest_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "features.json" }),
         transaction,
         "engine provenance",
-    )).snapshot;
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling features.json",
+            .{},
+        );
+        return err;
+    }).snapshot;
     const provenance = try loadEngineProvenance(
         allocator,
         io,
         engine.path,
         manifest.path,
+        diagnostic,
     );
     const adapter_source = try std.fs.path.join(
         allocator,
         &.{ engine_dir, "preview1-adapter.wasm" },
     );
-    const adapter = (try captureInputFile(
+    const adapter = (captureInputFile(
         allocator,
         io,
         adapter_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
         transaction,
         "adapter",
-    )).snapshot;
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling preview1-adapter.wasm",
+            .{},
+        );
+        return err;
+    }).snapshot;
     if (config.preview2_adapter) |path| {
         const override = (try captureInputFile(
             allocator,
@@ -3695,41 +3711,62 @@ fn externalRuntime(
             "adapter override",
         )).snapshot;
         if (!std.mem.eql(u8, adapter.digest, override.digest)) {
-            std.debug.print(
-                "error: --preview2-adapter does not match the --engine sibling adapter\n",
+            setExternalPackageDetail(
+                diagnostic,
+                "--preview2-adapter does not match the external engine package adapter",
                 .{},
             );
             return error.IncompatibleEngineOptions;
         }
     }
-    const component_wit = try stageWit(
+    const component_wit = stageWit(
         allocator,
         io,
         try std.fs.path.join(allocator, &.{ engine_dir, "component-wit" }),
         try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
         transaction,
-    );
-    const surface_target_wit = try stageWit(
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling component-wit",
+            .{},
+        );
+        return err;
+    };
+    const surface_target_wit = stageWit(
         allocator,
         io,
         try std.fs.path.join(allocator, &.{ engine_dir, "surface-wit" }),
         try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
         transaction,
-    );
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling surface-wit",
+            .{},
+        );
+        return err;
+    };
     const platform_wit_source = try std.fs.path.join(
         allocator,
         &.{ engine_dir, "feature-wit" },
     );
-    const platform_wit = try stageWit(
+    const platform_wit = stageWit(
         allocator,
         io,
         platform_wit_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
         transaction,
-    );
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling feature-wit",
+            .{},
+        );
+        return err;
+    };
     var selected_component_wit = component_wit;
     var selected_surface_target_wit = surface_target_wit;
-    var dispatch_wit_digest: ?[]const u8 = null;
     if (config.component_wit) |path| {
         const override = try stageWit(
             allocator,
@@ -3739,8 +3776,9 @@ fn externalRuntime(
             transaction,
         );
         if (!std.mem.eql(u8, component_wit.digest, override.digest)) {
-            std.debug.print(
-                "error: --component-wit does not match the --engine sibling component-wit\n",
+            setExternalPackageDetail(
+                diagnostic,
+                "--component-wit does not match the external engine package component-wit",
                 .{},
             );
             return error.IncompatibleEngineOptions;
@@ -3755,34 +3793,31 @@ fn externalRuntime(
             try std.fs.path.join(allocator, &.{ transaction_dir, "wit-override" }),
             transaction,
         );
-        if (!std.mem.eql(u8, component_wit.digest, override.digest) or
-            !std.mem.eql(u8, surface_target_wit.digest, override.digest))
-        {
-            std.debug.print(
-                "error: --wit does not match the --engine sibling component-wit and surface-wit\n",
+        if (!std.mem.eql(u8, surface_target_wit.digest, override.digest)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--wit does not match the external engine package surface-wit",
                 .{},
             );
             return error.IncompatibleEngineOptions;
         }
-        dispatch_wit_digest = override.digest;
-        selected_component_wit = override;
         selected_surface_target_wit = override;
     }
     if (config.component_world_name) |world| {
         if (!std.mem.eql(u8, world, provenance.component_world)) {
-            std.debug.print(
-                "error: --component-world-name does not match --engine provenance\n",
+            setExternalPackageDetail(
+                diagnostic,
+                "--component-world-name does not match external engine provenance",
                 .{},
             );
             return error.IncompatibleEngineOptions;
         }
     }
     if (config.world_name) |world| {
-        if (!std.mem.eql(u8, world, provenance.surface_world) or
-            !std.mem.eql(u8, world, provenance.component_world))
-        {
-            std.debug.print(
-                "error: --world-name does not match --engine component and surface provenance\n",
+        if (!std.mem.eql(u8, world, provenance.surface_world)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--world-name does not match external engine surface provenance",
                 .{},
             );
             return error.IncompatibleEngineOptions;
@@ -3798,7 +3833,7 @@ fn externalRuntime(
         .platform_wit = platform_wit.absolute,
         .features = provenance.features,
         .bindings = null,
-        .dispatch_wit_digest = dispatch_wit_digest,
+        .dispatch_wit_digest = selected_surface_target_wit.digest,
         .component_wit_digest = selected_component_wit.digest,
         .features_known = true,
         .zig = null,
@@ -3813,25 +3848,29 @@ fn loadEngineProvenance(
     io: Io,
     engine: []const u8,
     manifest_path: []const u8,
+    diagnostic: *diagnostics.Context,
 ) !EngineProvenance {
     const module = try readAbsoluteFile(allocator, io, engine);
     const section = findEngineProvenanceSection(module) catch |err| {
-        std.debug.print(
-            "error: --engine '{s}' has invalid embedded feature/host provenance ({t})\n",
-            .{ engine, err },
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine has invalid embedded feature/host provenance ({t})",
+            .{err},
         );
         return error.InvalidEngineProvenance;
     } orelse {
-        std.debug.print(
-            "error: --engine '{s}' is missing embedded feature/host provenance\n",
-            .{engine},
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine is missing embedded feature/host provenance",
+            .{},
         );
         return error.MissingEngineProvenance;
     };
     const parsed = parseEngineProvenance(section.metadata) catch |err| {
-        std.debug.print(
-            "error: --engine '{s}' has malformed embedded feature/host provenance ({t})\n",
-            .{ engine, err },
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine has malformed embedded feature/host provenance ({t})",
+            .{err},
         );
         return error.InvalidEngineProvenance;
     };
@@ -3842,9 +3881,10 @@ fn loadEngineProvenance(
     hasher.final(&digest);
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, parsed.sha256, &digest_hex)) {
-        std.debug.print(
-            "error: --engine '{s}' provenance digest does not match the engine bytes\n",
-            .{engine},
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine provenance digest does not match the engine bytes",
+            .{},
         );
         return error.EngineProvenanceMismatch;
     }
@@ -3854,9 +3894,10 @@ fn loadEngineProvenance(
         io,
         manifest_path,
     ) catch {
-        std.debug.print(
-            "error: --engine '{s}' requires sibling features.json provenance\n",
-            .{engine},
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine requires sibling features.json provenance",
+            .{},
         );
         return error.MissingEngineProvenance;
     };
@@ -3866,9 +3907,10 @@ fn loadEngineProvenance(
         manifest_text,
         .{ .ignore_unknown_fields = true },
     ) catch |err| {
-        std.debug.print(
-            "error: --engine sibling provenance '{s}' is invalid JSON ({t})\n",
-            .{ manifest_path, err },
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine sibling features.json is invalid JSON ({t})",
+            .{err},
         );
         return error.InvalidEngineProvenance;
     };
@@ -3888,9 +3930,10 @@ fn loadEngineProvenance(
         !std.mem.eql(u8, parsed.surface_world, manifest.@"surface-world") or
         !featuresEqual(parsed.features, manifest_features))
     {
-        std.debug.print(
-            "error: --engine '{s}' embedded provenance does not match sibling features.json\n",
-            .{engine},
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine embedded provenance does not match sibling features.json",
+            .{},
         );
         return error.EngineProvenanceMismatch;
     }
@@ -3900,6 +3943,18 @@ fn loadEngineProvenance(
         .component_world = parsed.component_world,
         .surface_world = parsed.surface_world,
     };
+}
+
+fn setExternalPackageDetail(
+    diagnostic: *diagnostics.Context,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    diagnostic.detail = std.fmt.allocPrint(
+        diagnostic.allocator,
+        format,
+        args,
+    ) catch "external engine package validation failed";
 }
 
 const EngineProvenanceSection = struct {
@@ -4568,7 +4623,7 @@ fn buildRuntime(
         .platform_wit = platform_wit.absolute,
         .features = features,
         .bindings = bindings,
-        .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
+        .dispatch_wit_digest = surface_target_wit.digest,
         .component_wit_digest = runtime_component_wit.digest,
         .features_known = true,
         .zig = zig_install,
@@ -5509,7 +5564,6 @@ fn hashField(
 fn buildMetadataDocument(
     allocator: Allocator,
     io: Io,
-    config: *const cli.Config,
     source: InputSnapshot,
     initializer: ?InputSnapshot,
     runtime_args: []const u8,
@@ -5522,14 +5576,14 @@ fn buildMetadataDocument(
     var features: std.ArrayList(metadata.Feature) = .empty;
     var feature_fields: std.ArrayList([2][]const u8) = .empty;
     if (runtime.features_known) {
-        for (cli.feature_names) |name| {
-            var enabled = true;
-            for (config.disable_features) |disabled| {
-                if (std.mem.eql(u8, name, disabled)) enabled = false;
-            }
-            for (config.enable_features) |explicitly_enabled| {
-                if (std.mem.eql(u8, name, explicitly_enabled)) enabled = true;
-            }
+        const enabled_features = [_]bool{
+            runtime.features.stdio,
+            runtime.features.random,
+            runtime.features.clocks,
+            runtime.features.http,
+            runtime.features.fetch_event,
+        };
+        for (cli.feature_names, enabled_features) |name, enabled| {
             features.append(allocator, .{ .name = name, .enabled = enabled }) catch
                 @panic("out of memory");
             feature_fields.append(
@@ -5548,11 +5602,11 @@ fn buildMetadataDocument(
         null;
 
     const dispatch_world = metadata.World{
-        .name = config.world_name,
+        .name = runtime.surface_target_world,
         .wit_sha256 = runtime.dispatch_wit_digest,
     };
     const component_world = metadata.World{
-        .name = config.component_world_name orelse config.world_name,
+        .name = runtime.component_world,
         .wit_sha256 = runtime.component_wit_digest,
     };
     const world_fields = [_][2][]const u8{

@@ -112,6 +112,13 @@ pub fn apply(
                 target_core,
             },
         );
+        const retained_target_core = try retainGeneratedFile(
+            allocator,
+            io,
+            options,
+            "feature-target-core",
+            target_core,
+        );
         try runCommand(
             allocator,
             io,
@@ -121,11 +128,19 @@ pub fn apply(
                 options.wasm_tools,
                 "component",
                 "new",
-                target_core,
+                retained_target_core,
                 "-o",
                 target_component,
             },
         );
+        const retained_target_component = try retainGeneratedFile(
+            allocator,
+            io,
+            options,
+            "feature-target-component",
+            target_component,
+        );
+        try verifyGeneratedInputs(allocator, io, options);
         try runCommand(
             allocator,
             io,
@@ -135,7 +150,7 @@ pub fn apply(
                 options.wasm_tools,
                 "component",
                 "wit",
-                target_component,
+                retained_target_component,
                 "-o",
                 target_surface,
             },
@@ -147,6 +162,7 @@ pub fn apply(
             "feature-target-surface",
             target_surface,
         );
+        try verifyGeneratedInputs(allocator, io, options);
         const target_text = try readFile(allocator, io, retained_target_surface);
         target_imports = try collectWasiImports(allocator, target_text);
         try verifyGeneratedInputs(allocator, io, options);
@@ -402,6 +418,13 @@ fn buildProvider(
             provider_core,
         },
     );
+    const retained_provider_core = try retainGeneratedFile(
+        allocator,
+        io,
+        options,
+        "feature-provider-core",
+        provider_core,
+    );
     try verifyGeneratedInputs(allocator, io, options);
     try runCommand(
         allocator,
@@ -412,11 +435,19 @@ fn buildProvider(
             options.wasm_tools,
             "component",
             "new",
-            provider_core,
+            retained_provider_core,
             "-o",
             provider_component,
         },
     );
+    const retained_provider_component = try retainGeneratedFile(
+        allocator,
+        io,
+        options,
+        "feature-provider-component",
+        provider_component,
+    );
+    try verifyGeneratedInputs(allocator, io, options);
 
     const provider_surface = try passPath(allocator, options.work_dir, depth, "provider-surface.wit");
     try runCommand(
@@ -428,7 +459,7 @@ fn buildProvider(
             options.wasm_tools,
             "component",
             "wit",
-            provider_component,
+            retained_provider_component,
             "-o",
             provider_surface,
         },
@@ -440,6 +471,7 @@ fn buildProvider(
         "feature-provider-surface",
         provider_surface,
     );
+    try verifyGeneratedInputs(allocator, io, options);
     const provider_surface_text = try readFile(
         allocator,
         io,
@@ -461,7 +493,7 @@ fn buildProvider(
             residuals.append(allocator, name) catch @panic("out of memory");
         }
     }
-    definitions.append(allocator, provider_component) catch @panic("out of memory");
+    definitions.append(allocator, retained_provider_component) catch @panic("out of memory");
     if (residuals.items.len == 0) return;
     try buildProvider(
         allocator,
