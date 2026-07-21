@@ -140,6 +140,14 @@ jobs:
       with:
         version: 0.17.0-dev.902+7255f3e72
 
+    - name: Retain Zig for the production matrix
+      run: |
+        zig_dir="$(dirname "$(command -v zig)")"
+        mkdir -p "$GITHUB_WORKSPACE/.ci-tools"
+        cp -a "$zig_dir" "$GITHUB_WORKSPACE/.ci-tools/zig"
+        echo "$GITHUB_WORKSPACE/.ci-tools/zig" >> "$GITHUB_PATH"
+        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" version
+
     - name: Validate release workflow recipes
       run: python3 tests/workflows/check-just-recipes.py .github/workflows/release-please.yml justfile
 
