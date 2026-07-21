@@ -86,15 +86,17 @@ printf 'adapter-bytes\n' > \
 trap cleanup_scratch EXIT
 
 SOURCE="$WORK/source module.js"
-ENGINE="$WORK/fake engine.wasm"
+ENGINE_BUNDLE="$WORK/default engine bundle"
+ENGINE="$ENGINE_BUNDLE/fake engine.wasm"
 ENGINE_BASE="$WORK/fake engine base.wasm"
-ADAPTER="$WORK/fake adapter.wasm"
+ADAPTER="$ENGINE_BUNDLE/preview1-adapter.wasm"
 WIT="$WORK/wit package"
+mkdir -p "$ENGINE_BUNDLE"
 printf 'export const api = {};\n' > "$SOURCE"
 printf '\0asm\1\0\0\0\0\6\4seedA' > "$ENGINE_BASE"
 python3 "$ROOT/tools/embed-engine-provenance.py" \
   "$ENGINE_BASE" "$ENGINE" "$(basename "$EXPECTED_HOST_API")" 11111 \
-  bindings caller
+  exports exports
 printf 'adapter-bytes\n' > "$ADAPTER"
 cat > "$WIT/world.wit" <<'EOF'
 package test:componentizer;
@@ -103,15 +105,13 @@ EOF
 mkdir -p "$WORK/feature-wit" "$WORK/component-wit" "$WORK/surface-wit"
 printf 'package test:feature; world feature {}\n' \
   > "$WORK/feature-wit/feature.wit"
-printf 'package test:component; world bindings {}\n' \
-  > "$WORK/component-wit/component.wit"
-printf 'package test:surface; world caller {}\n' \
-  > "$WORK/surface-wit/caller.wit"
+cp "$WIT/world.wit" "$WORK/component-wit/world.wit"
+cp "$WIT/world.wit" "$WORK/surface-wit/world.wit"
 cat > "$WORK/features.json" <<EOF
 {
   "host-api": "$(basename "$EXPECTED_HOST_API")",
-  "component-world": "bindings",
-  "surface-world": "caller",
+  "component-world": "exports",
+  "surface-world": "exports",
   "stdio": true,
   "random": true,
   "clocks": true,
@@ -119,6 +119,9 @@ cat > "$WORK/features.json" <<EOF
   "fetch-event": true
 }
 EOF
+cp "$WORK/features.json" "$ENGINE_BUNDLE/features.json"
+cp -a "$WORK/feature-wit" "$WORK/component-wit" "$WORK/surface-wit" \
+  "$ENGINE_BUNDLE/"
 
 cat > "$TOOLS/fake wizer" <<'EOF'
 #!/usr/bin/env bash
@@ -400,6 +403,13 @@ elif [ "$1 $2" = "component wit" ]; then
   if [ -n "$out_dir" ]; then
     mkdir -p "$out_dir"
     out="$out_dir/custom-runtime.wit"
+    if [ "${FAKE_PROVIDER_WIT:-0}" = 1 ]; then
+      mkdir -p "$out_dir/deps"
+      printf 'package wasi:http; type duration = u64;\n' \
+        > "$out_dir/deps/http.wit"
+      printf 'package wasi:sockets; type duration = u64;\n' \
+        > "$out_dir/deps/sockets.wit"
+    fi
     if [ "${FAKE_AMBIGUOUS_WIT:-0}" = 1 ]; then
       cat > "$out_dir/second-root.wit" <<'WIT'
 package test:second;
@@ -407,10 +417,19 @@ world second {}
 WIT
     fi
   fi
-  cat > "$out" <<'WIT'
+  if [ "${FAKE_PROVIDER_WIT:-0}" = 1 ] && [[ "$out_dir" = *platform-wit* ]]; then
+    cat > "$out" <<'WIT'
+package test:fake;
+world fake {
+  import wasi:random/random@0.2.0;
+}
+WIT
+  else
+    cat > "$out" <<'WIT'
 package test:fake;
 world fake {}
 WIT
+  fi
 elif [ "$1 $2" = "component embed" ]; then
   input="${!#}"
   if [ -f "$input" ] && [ "$input" != "$out" ]; then
@@ -713,6 +732,9 @@ fi
 make_engine_bundle() {
   local name="$1" tuple="$2"
   local bundle="$WORK/$name engine bundle"
+  mkdir -p "$bundle"
+  cp "$ADAPTER" "$bundle/preview1-adapter.wasm"
+  cp -a "$WORK/component-wit" "$WORK/surface-wit" "$bundle/"
   mkdir -p "$bundle/feature-wit"
   printf 'package test:feature; world feature {}\n' \
     > "$bundle/feature-wit/feature.wit"
@@ -741,9 +763,6 @@ componentize_external_engine() {
   local engine="$1" output="$2"
   "$COMPONENTIZER" \
     --engine "$engine" \
-    --preview2-adapter "$ADAPTER" \
-    --wit "$WIT" \
-    --world-name exports \
     --wizer-bin "$TOOLS/fake wizer" \
     --wabt-bin "$TOOLS/fake wabt" \
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
@@ -758,6 +777,47 @@ componentize_external_engine \
 componentize_external_engine \
   "$MIXED_ENGINE_DIR/starling-raw.wasm" "$WORK/mixed engine output.wasm"
 
+for required_asset in \
+  features.json \
+  preview1-adapter.wasm \
+  component-wit \
+  surface-wit \
+  feature-wit
+do
+  incomplete_bundle="$WORK/missing ${required_asset//\\//-} engine bundle"
+  cp -a "$PURE_ENGINE_DIR" "$incomplete_bundle"
+  rm -rf "$incomplete_bundle/$required_asset"
+  if "$COMPONENTIZER" \
+      --engine "$incomplete_bundle/starling-raw.wasm" \
+      --preview2-adapter "$ADAPTER" \
+      --wit "$WIT" \
+      --world-name exports \
+      --wizer-bin "$TOOLS/fake wizer" \
+      --wabt-bin "$TOOLS/fake wabt" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --out "$WORK/missing ${required_asset//\\//-}.wasm" \
+      "$SOURCE" >/dev/null 2>&1
+  then
+    echo "FAIL: external engine missing $required_asset succeeded via overrides" >&2
+    exit 1
+  fi
+done
+
+if "$COMPONENTIZER" \
+    --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
+    --preview2-adapter "$ADAPTER" \
+    --wit "$WIT" \
+    --world-name exports \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$WORK/incompatible external overrides.wasm" \
+    "$SOURCE" >/dev/null 2>&1
+then
+  echo "FAIL: incompatible external engine package overrides succeeded" >&2
+  exit 1
+fi
+
 for feature_mutation in inplace replace-restore; do
   FEATURE_RACE_OUTPUT="$WORK/feature input $feature_mutation.wasm"
   FEATURE_RACE_ERROR="$SCRATCH/feature-input-$feature_mutation.jsonl"
@@ -769,9 +829,6 @@ for feature_mutation in inplace replace-restore; do
   "$COMPONENTIZER" \
     --json-diagnostics \
     --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
-    --preview2-adapter "$ADAPTER" \
-    --wit "$WIT" \
-    --world-name exports \
     --wizer-bin "$TOOLS/fake wizer" \
     --wabt-bin "$TOOLS/fake wabt" \
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
@@ -820,6 +877,74 @@ PY
   fi
   rm -f "$FEATURE_RACE_OUTPUT" "$FEATURE_RACE_ERROR" \
     "$FEATURE_RACE_BARRIER.ready" "$FEATURE_RACE_BARRIER.release"
+done
+
+for provider_mutation in inplace replace-restore; do
+  PROVIDER_RACE_OUTPUT="$WORK/provider input $provider_mutation.wasm"
+  PROVIDER_RACE_ERROR="$SCRATCH/provider-input-$provider_mutation.jsonl"
+  PROVIDER_RACE_BARRIER="$BARRIERS/provider-input-$provider_mutation"
+  printf 'old-provider-output-%s\n' "$provider_mutation" > \
+    "$PROVIDER_RACE_OUTPUT"
+  STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$PROVIDER_RACE_BARRIER" \
+  STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=feature-provider-wit-rendered \
+  FAKE_PROVIDER_WIT=1 \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$PROVIDER_RACE_OUTPUT" \
+    "$SOURCE" >/dev/null 2>"$PROVIDER_RACE_ERROR" &
+  provider_race_pid=$!
+  wait_for_marker "$PROVIDER_RACE_BARRIER.ready" "$provider_race_pid" \
+    "$provider_mutation generated provider WIT race"
+  provider_transaction="$(find "$WORK" -maxdepth 1 -type d \
+    -name ".provider input $provider_mutation.wasm.starling-componentize-*" \
+    -print -quit)"
+  test -n "$provider_transaction"
+  provider_tree="$(find "$provider_transaction/data" -maxdepth 1 -type d \
+    -name 'feature-surface-input-*' -print | sort -V | tail -1)"
+  test -n "$provider_tree"
+  provider_root="$(find "$provider_tree" -maxdepth 1 -type f -name '*.wit' \
+    -print -quit)"
+  test -f "$provider_root"
+  if [ "$provider_mutation" = inplace ]; then
+    chmod u+w "$provider_root"
+    printf 'package raced:provider; world raced {}\n' > "$provider_root"
+  else
+    provider_saved="$SCRATCH/provider-root-saved.wit"
+    chmod u+w "$provider_tree"
+    mv "$provider_root" "$provider_saved"
+    printf 'package raced:provider; world raced {}\n' \
+      > "$provider_root"
+    rm "$provider_root"
+    mv "$provider_saved" "$provider_root"
+  fi
+  : > "$PROVIDER_RACE_BARRIER.release"
+  if wait "$provider_race_pid"; then
+    echo "FAIL: $provider_mutation generated provider WIT race succeeded" >&2
+    exit 1
+  fi
+  python3 - "$PROVIDER_RACE_ERROR" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC4201", diagnostic
+assert diagnostic["phase"] == "adapt", diagnostic
+assert diagnostic["cause"] == "TransactionChanged", diagnostic
+PY
+  test "$(cat "$PROVIDER_RACE_OUTPUT")" = \
+    "old-provider-output-$provider_mutation"
+  if find "$WORK" -maxdepth 1 -type d \
+    -name ".provider input $provider_mutation.wasm.starling-componentize-*" \
+    | grep -q .; then
+    echo "FAIL: $provider_mutation provider race retained a transaction" >&2
+    exit 1
+  fi
+  rm -f "$PROVIDER_RACE_OUTPUT" "$PROVIDER_RACE_ERROR" \
+    "$PROVIDER_RACE_BARRIER.ready" "$PROVIDER_RACE_BARRIER.release"
 done
 
 MISSING_ENGINE_DIR="$WORK/missing provenance engine bundle"
@@ -2428,6 +2553,7 @@ CONCURRENT_BUNDLE_BARRIER_B="$SCRATCH/concurrent-bundle-b-lock"
 for engine_dir in \
   "$CONCURRENT_BUNDLE_ENGINE_A_DIR" "$CONCURRENT_BUNDLE_ENGINE_B_DIR"; do
   mkdir -p "$engine_dir"
+  cp "$ADAPTER" "$engine_dir/preview1-adapter.wasm"
   cp -a "$WORK/component-wit" "$WORK/surface-wit" "$WORK/feature-wit" \
     "$engine_dir/"
   cp "$WORK/features.json" "$engine_dir/features.json"
@@ -2436,10 +2562,10 @@ printf '\0asm\1\0\0\0\0\6\4seedA' > "$SCRATCH/concurrent-engine-a-base.wasm"
 printf '\0asm\1\0\0\0\0\6\4seedB' > "$SCRATCH/concurrent-engine-b-base.wasm"
 python3 "$ROOT/tools/embed-engine-provenance.py" \
   "$SCRATCH/concurrent-engine-a-base.wasm" "$CONCURRENT_BUNDLE_ENGINE_A" \
-  "$(basename "$EXPECTED_HOST_API")" 11111 bindings caller
+  "$(basename "$EXPECTED_HOST_API")" 11111 exports exports
 python3 "$ROOT/tools/embed-engine-provenance.py" \
   "$SCRATCH/concurrent-engine-b-base.wasm" "$CONCURRENT_BUNDLE_ENGINE_B" \
-  "$(basename "$EXPECTED_HOST_API")" 11111 bindings caller
+  "$(basename "$EXPECTED_HOST_API")" 11111 exports exports
 STARLING_COMPONENTIZER_TEST_LOCK_BARRIER="$CONCURRENT_BUNDLE_BARRIER_A" \
 STARLING_COMPONENTIZER_TEST_LOCK_BARRIER_MODE=after \
 "$COMPONENTIZER" \
@@ -3687,6 +3813,8 @@ build_with_fake_zig "$BUILD_OUTPUT_1"
 build_with_fake_zig "$BUILD_OUTPUT_2"
 printf '\n// cache invalidation\n' >> "$WIT/world.wit"
 build_with_fake_zig "$BUILD_OUTPUT_3"
+cp "$WIT/world.wit" "$ENGINE_BUNDLE/component-wit/world.wit"
+cp "$WIT/world.wit" "$ENGINE_BUNDLE/surface-wit/world.wit"
 
 METADATA_OUTPUT="$WORK/public metadata.json"
 METADATA_REFERENCE="$SCRATCH/public metadata reference.json"
@@ -4060,12 +4188,33 @@ package test:componentizer;
 world captured {}
 EOF
 ln -s "$WIT_TARGET" "$WIT_LINK"
+WIT_PACKAGE="$SCRATCH/symlinked WIT engine bundle"
+mkdir -p "$WIT_PACKAGE/feature-wit"
+ln -s "$WIT_TARGET" "$WIT_PACKAGE/component-wit"
+ln -s "$WIT_TARGET" "$WIT_PACKAGE/surface-wit"
+cp "$ADAPTER" "$WIT_PACKAGE/preview1-adapter.wasm"
+cp "$WORK/feature-wit/feature.wit" "$WIT_PACKAGE/feature-wit/"
+cat > "$WIT_PACKAGE/features.json" <<EOF
+{
+  "host-api": "$(basename "$EXPECTED_HOST_API")",
+  "component-world": "captured",
+  "surface-world": "captured",
+  "stdio": true,
+  "random": true,
+  "clocks": true,
+  "http": true,
+  "fetch-event": true
+}
+EOF
+python3 "$ROOT/tools/embed-engine-provenance.py" \
+  "$ENGINE_BASE" "$WIT_PACKAGE/starling-raw.wasm" \
+  "$(basename "$EXPECTED_HOST_API")" 11111 captured captured
 FAKE_ASSERT_WIT_SNAPSHOT=1 \
 STARLING_COMPONENTIZER_TEST_SPAWN_BARRIER="$WIT_SUBSTITUTION_BARRIER" \
 STARLING_COMPONENTIZER_TEST_SPAWN_STAGE=wizer \
 "$COMPONENTIZER" \
-  --engine "$ENGINE" \
-  --preview2-adapter "$ADAPTER" \
+  --engine "$WIT_PACKAGE/starling-raw.wasm" \
+  --preview2-adapter "$WIT_PACKAGE/preview1-adapter.wasm" \
   --wit "$WIT_LINK" \
   --world-name captured \
   --wizer-bin "$TOOLS/fake wizer" \
@@ -4088,7 +4237,7 @@ wait_for_marker "$WIT_SUBSTITUTION_BARRIER.complete" "$SNAPSHOT_TEST_PID" \
 : > "$WIT_SUBSTITUTION_BARRIER.verify"
 wait "$SNAPSHOT_TEST_PID"
 SNAPSHOT_TEST_PID=""
-cmp "$ENGINE" "$WIT_SUBSTITUTION_OUTPUT"
+cmp "$WIT_PACKAGE/starling-raw.wasm" "$WIT_SUBSTITUTION_OUTPUT"
 remove_tree "$WIT_TARGET"
 mv "$WIT_TARGET_SAVED" "$WIT_TARGET"
 
@@ -4100,8 +4249,8 @@ STARLING_COMPONENTIZER_TEST_CAPTURE_BARRIER="$WIT_RACE_BARRIER" \
 STARLING_COMPONENTIZER_TEST_CAPTURE_STAGE=wit \
 "$COMPONENTIZER" \
   --json-diagnostics \
-  --engine "$ENGINE" \
-  --preview2-adapter "$ADAPTER" \
+  --engine "$WIT_PACKAGE/starling-raw.wasm" \
+  --preview2-adapter "$WIT_PACKAGE/preview1-adapter.wasm" \
   --wit "$WIT_LINK" \
   --world-name captured \
   --wizer-bin "$TOOLS/fake wizer" \
@@ -4406,17 +4555,17 @@ snapshot_root="$(find "$WORK" -maxdepth 1 -type d \
 snapshot_storage="$snapshot_root/data"
 mkdir "$SCRATCH/snapshot-wit-saved"
 mv "$snapshot_storage/wabt" "$SCRATCH/snapshot-wit-saved/wabt"
-mv "$snapshot_storage/dispatch-wit" \
-  "$snapshot_storage/dispatch-wit.saved"
+mv "$snapshot_storage/wit-override" \
+  "$snapshot_storage/wit-override.saved"
 mv "$snapshot_storage/stripped.wasm" \
   "$SCRATCH/snapshot-wit-saved/stripped.wasm"
 mv "$snapshot_storage/embedded.wasm" \
   "$SCRATCH/snapshot-wit-saved/embedded.wasm"
 printf '#!/usr/bin/env bash\nexit 97\n' > "$snapshot_storage/wabt"
 chmod +x "$snapshot_storage/wabt"
-mkdir "$snapshot_storage/dispatch-wit"
+mkdir "$snapshot_storage/wit-override"
 printf 'package test:substituted;\nworld substituted {}\n' > \
-  "$snapshot_storage/dispatch-wit/world.wit"
+  "$snapshot_storage/wit-override/world.wit"
 printf 'substituted-stripped\n' > "$snapshot_storage/stripped.wasm"
 ln -s "$SNAPSHOT_WIT_EXTERNAL" "$snapshot_storage/embedded.wasm"
 : > "$SNAPSHOT_WIT_BARRIER.release"
@@ -4425,10 +4574,10 @@ wait_for_marker "$SNAPSHOT_WIT_BARRIER.complete" \
 test "$(cat "$SNAPSHOT_WIT_EXTERNAL")" = "external-output"
 rm -f "$snapshot_storage/wabt" "$snapshot_storage/stripped.wasm" \
   "$snapshot_storage/embedded.wasm"
-remove_tree "$snapshot_storage/dispatch-wit"
+remove_tree "$snapshot_storage/wit-override"
 mv "$SCRATCH/snapshot-wit-saved/wabt" "$snapshot_storage/wabt"
-mv "$snapshot_storage/dispatch-wit.saved" \
-  "$snapshot_storage/dispatch-wit"
+mv "$snapshot_storage/wit-override.saved" \
+  "$snapshot_storage/wit-override"
 mv "$SCRATCH/snapshot-wit-saved/stripped.wasm" \
   "$snapshot_storage/stripped.wasm"
 mv "$SCRATCH/snapshot-wit-saved/embedded.wasm" \

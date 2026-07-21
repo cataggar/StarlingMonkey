@@ -140,6 +140,9 @@ jobs:
       with:
         version: 0.17.0-dev.902+7255f3e72
 
+    - name: Validate release workflow recipes
+      run: python3 tests/workflows/check-just-recipes.py .github/workflows/release-please.yml justfile
+
     - name: Install Rust WASI target
       run: rustup target add wasm32-wasip1
 

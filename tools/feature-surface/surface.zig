@@ -375,6 +375,13 @@ fn buildProvider(
         }
     }
     try verifyGeneratedInputs(allocator, io, options);
+    const retained_rendered_provider_dir = try snapshotGeneratedTree(
+        allocator,
+        io,
+        options,
+        "feature-provider-wit-rendered",
+        provider_dir,
+    );
 
     const provider_core = try passPath(allocator, options.work_dir, depth, "provider-core.wasm");
     const provider_component = try providerComponentPath(allocator, options.work_dir, depth);
@@ -387,7 +394,7 @@ fn buildProvider(
             options.wasm_tools,
             "component",
             "embed",
-            provider_dir,
+            retained_rendered_provider_dir,
             "--world",
             "feature-provider",
             "--dummy",
@@ -395,6 +402,7 @@ fn buildProvider(
             provider_core,
         },
     );
+    try verifyGeneratedInputs(allocator, io, options);
     try runCommand(
         allocator,
         io,

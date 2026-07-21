@@ -2960,7 +2960,6 @@ fn execute(
             allocator,
             io,
             cwd,
-            executable_dir,
             config,
             engine_override,
             &transaction,
@@ -3633,7 +3632,6 @@ fn externalRuntime(
     allocator: Allocator,
     io: Io,
     cwd: []const u8,
-    executable_dir: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
     transaction: *Transaction,
@@ -3675,21 +3673,10 @@ fn externalRuntime(
         engine.path,
         manifest.path,
     );
-    const adapter_source = if (config.preview2_adapter) |path|
-        try absolutePath(allocator, cwd, path)
-    else blk: {
-        const bundled = try std.fs.path.join(
-            allocator,
-            &.{ engine_dir, "preview1-adapter.wasm" },
-        );
-        break :blk if (pathExists(io, bundled))
-            bundled
-        else
-            try std.fs.path.join(
-                allocator,
-                &.{ executable_dir, "preview1-adapter.wasm" },
-            );
-    };
+    const adapter_source = try std.fs.path.join(
+        allocator,
+        &.{ engine_dir, "preview1-adapter.wasm" },
+    );
     const adapter = (try captureInputFile(
         allocator,
         io,
@@ -3698,60 +3685,37 @@ fn externalRuntime(
         transaction,
         "adapter",
     )).snapshot;
-    const component_wit_source = if (config.component_wit orelse config.wit) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try std.fs.path.join(
-            allocator,
-            &.{ engine_dir, "component-wit" },
-        );
-    const dispatch_wit_source = if (config.wit) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        null;
-    const dispatch_wit = if (dispatch_wit_source) |path|
-        try stageWit(
+    if (config.preview2_adapter) |path| {
+        const override = (try captureInputFile(
             allocator,
             io,
-            path,
-            try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "adapter-override.wasm" }),
             transaction,
-        )
-    else
-        null;
-    const component_wit =
-        if (dispatch_wit_source != null and
-        std.mem.eql(u8, component_wit_source, dispatch_wit_source.?))
-            dispatch_wit.?
-        else
-            try stageWit(
-                allocator,
-                io,
-                component_wit_source,
-                try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
-                transaction,
+            "adapter override",
+        )).snapshot;
+        if (!std.mem.eql(u8, adapter.digest, override.digest)) {
+            std.debug.print(
+                "error: --preview2-adapter does not match the --engine sibling adapter\n",
+                .{},
             );
-    const surface_target_wit_source = if (config.wit) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try std.fs.path.join(
-            allocator,
-            &.{ engine_dir, "surface-wit" },
-        );
-    const surface_target_wit =
-        if (std.mem.eql(u8, surface_target_wit_source, component_wit_source))
-            component_wit
-        else if (dispatch_wit_source != null and
-        std.mem.eql(u8, surface_target_wit_source, dispatch_wit_source.?))
-            dispatch_wit.?
-        else
-            try stageWit(
-                allocator,
-                io,
-                surface_target_wit_source,
-                try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
-                transaction,
-            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
+    const component_wit = try stageWit(
+        allocator,
+        io,
+        try std.fs.path.join(allocator, &.{ engine_dir, "component-wit" }),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+        transaction,
+    );
+    const surface_target_wit = try stageWit(
+        allocator,
+        io,
+        try std.fs.path.join(allocator, &.{ engine_dir, "surface-wit" }),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
+        transaction,
+    );
     const platform_wit_source = try std.fs.path.join(
         allocator,
         &.{ engine_dir, "feature-wit" },
@@ -3763,20 +3727,79 @@ fn externalRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
         transaction,
     );
+    var selected_component_wit = component_wit;
+    var selected_surface_target_wit = surface_target_wit;
+    var dispatch_wit_digest: ?[]const u8 = null;
+    if (config.component_wit) |path| {
+        const override = try stageWit(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit-override" }),
+            transaction,
+        );
+        if (!std.mem.eql(u8, component_wit.digest, override.digest)) {
+            std.debug.print(
+                "error: --component-wit does not match the --engine sibling component-wit\n",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+        selected_component_wit = override;
+    }
+    if (config.wit) |path| {
+        const override = try stageWit(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "wit-override" }),
+            transaction,
+        );
+        if (!std.mem.eql(u8, component_wit.digest, override.digest) or
+            !std.mem.eql(u8, surface_target_wit.digest, override.digest))
+        {
+            std.debug.print(
+                "error: --wit does not match the --engine sibling component-wit and surface-wit\n",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+        dispatch_wit_digest = override.digest;
+        selected_component_wit = override;
+        selected_surface_target_wit = override;
+    }
+    if (config.component_world_name) |world| {
+        if (!std.mem.eql(u8, world, provenance.component_world)) {
+            std.debug.print(
+                "error: --component-world-name does not match --engine provenance\n",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
+    if (config.world_name) |world| {
+        if (!std.mem.eql(u8, world, provenance.surface_world) or
+            !std.mem.eql(u8, world, provenance.component_world))
+        {
+            std.debug.print(
+                "error: --world-name does not match --engine component and surface provenance\n",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = component_wit.absolute,
-        .component_world = config.component_world_name orelse
-            config.world_name orelse
-            provenance.component_world,
-        .surface_target_wit = surface_target_wit.absolute,
-        .surface_target_world = config.world_name orelse provenance.surface_world,
+        .component_wit = selected_component_wit.absolute,
+        .component_world = provenance.component_world,
+        .surface_target_wit = selected_surface_target_wit.absolute,
+        .surface_target_world = provenance.surface_world,
         .platform_wit = platform_wit.absolute,
         .features = provenance.features,
         .bindings = null,
-        .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
-        .component_wit_digest = component_wit.digest,
+        .dispatch_wit_digest = dispatch_wit_digest,
+        .component_wit_digest = selected_component_wit.digest,
         .features_known = true,
         .zig = null,
         .build_tools = &.{},
