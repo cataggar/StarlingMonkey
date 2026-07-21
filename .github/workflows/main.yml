@@ -146,6 +146,8 @@ jobs:
         mkdir -p "$GITHUB_WORKSPACE/.ci-tools"
         cp -a "$zig_dir" "$GITHUB_WORKSPACE/.ci-tools/zig"
         echo "$GITHUB_WORKSPACE/.ci-tools/zig" >> "$GITHUB_PATH"
+        echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache-feature-surface" >> "$GITHUB_ENV"
+        echo "ZIG_LOCAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-cache-feature-surface" >> "$GITHUB_ENV"
         "$GITHUB_WORKSPACE/.ci-tools/zig/zig" version
 
     - name: Validate release workflow recipes
@@ -162,7 +164,7 @@ jobs:
 
     - name: Run required host API production gate
       run: |
-        zig build host-api-production-matrix-test \
+        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" build host-api-production-matrix-test \
           -Doptimize=ReleaseSmall
 
   release-spidermonkey:
