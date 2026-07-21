@@ -2468,6 +2468,15 @@ fn verifyFeatureSurfaceInputs(
     try verifyFeatureSurfaceContext(context, allocator, io);
 }
 
+fn setFeatureSurfaceDiagnosticDetail(
+    context_ptr: *anyopaque,
+    detail: []const u8,
+) void {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    context.diagnostic.detail = detail;
+}
+
 fn recordFeatureSurfaceWork(
     allocator: Allocator,
     io: Io,
@@ -3302,6 +3311,7 @@ fn execute(
             .retain_file = retainFeatureSurfaceFile,
             .snapshot_tree = snapshotFeatureSurfaceTree,
             .verify = verifyFeatureSurfaceInputs,
+            .set_diagnostic_detail = setFeatureSurfaceDiagnosticDetail,
         },
     });
     var surface_work = try transaction.storage.openDir(

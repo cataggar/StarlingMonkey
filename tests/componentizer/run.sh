@@ -403,6 +403,9 @@ elif [ "$1 $2" = "component wit" ]; then
   if [ -n "$out_dir" ]; then
     mkdir -p "$out_dir"
     out="$out_dir/custom-runtime.wit"
+    if [ "${FAKE_MISSING_WIT_ROOT:-0}" = 1 ]; then
+      exit 0
+    fi
     if [ "${FAKE_PROVIDER_WIT:-0}" = 1 ]; then
       mkdir -p "$out_dir/deps"
       printf 'package wasi:http; type duration = u64;\n' \
@@ -417,7 +420,23 @@ world second {}
 WIT
     fi
   fi
-  if [ "${FAKE_PROVIDER_WIT:-0}" = 1 ] && [[ "$out_dir" = *platform-wit* ]]; then
+  if [ "${FAKE_MULTI_PROVIDER_WIT:-0}" = 1 ] && \
+     [[ "$out" = *feature-0-provider-surface.wit ]]; then
+    cat > "$out" <<'WIT'
+package test:fake;
+world fake {
+  import wasi:random/insecure@0.2.0;
+}
+WIT
+  elif [ "${FAKE_MULTI_PROVIDER_WIT:-0}" = 1 ] && \
+       [[ "$out" = *feature-1-provider-surface.wit ]]; then
+    cat > "$out" <<'WIT'
+package test:fake;
+world fake {
+  import wasi:random/insecure-seed@0.2.0;
+}
+WIT
+  elif [ "${FAKE_PROVIDER_WIT:-0}" = 1 ] && [[ "$out_dir" = *platform-wit* ]]; then
     cat > "$out" <<'WIT'
 package test:fake;
 world fake {
@@ -571,6 +590,20 @@ for ((i = 1; i <= $#; i++)); do
     out="${!output_index}"
   fi
 done
+if [ -n "${FAKE_WAC_COUNT_FILE:-}" ]; then
+  count=0
+  if [ -f "$FAKE_WAC_COUNT_FILE" ]; then
+    count="$(cat "$FAKE_WAC_COUNT_FILE")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_WAC_COUNT_FILE"
+  if [ "$count" = "${FAKE_WAC_BARRIER_CALL:-0}" ]; then
+    : > "$FAKE_WAC_BARRIER.ready"
+    while [ ! -e "$FAKE_WAC_BARRIER.release" ]; do
+      sleep 0.001
+    done
+  fi
+fi
 cp "$consumer" "$out"
 EOF
 chmod +x "$TOOLS"/*
@@ -777,18 +810,23 @@ componentize_external_engine() {
     "$SOURCE"
 }
 
-assert_external_json_diagnostic() {
-  local path="$1" cause="$2" detail="$3"
-  python3 - "$path" "$cause" "$detail" <<'PY'
+assert_json_diagnostic() {
+  local path="$1" code="$2" phase="$3" cause="$4" detail="$5"
+  python3 - "$path" "$code" "$phase" "$cause" "$detail" <<'PY'
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 assert len(lines) == 1, lines
 diagnostic = json.loads(lines[0])
-assert diagnostic["code"] == "SMC1001", diagnostic
-assert diagnostic["phase"] == "inputs", diagnostic
-assert diagnostic["cause"] == sys.argv[2], diagnostic
-assert sys.argv[3] in diagnostic["detail"], diagnostic
+assert diagnostic["code"] == sys.argv[2], diagnostic
+assert diagnostic["phase"] == sys.argv[3], diagnostic
+assert diagnostic["cause"] == sys.argv[4], diagnostic
+if sys.argv[5]:
+    assert sys.argv[5] in diagnostic["detail"], diagnostic
 PY
+}
+
+assert_external_json_diagnostic() {
+  assert_json_diagnostic "$1" SMC1001 inputs "$2" "$3"
 }
 
 PURE_ENGINE_DIR="$(make_engine_bundle pure 00000)"
@@ -1143,6 +1181,69 @@ PY
     "$PROVIDER_RACE_BARRIER.ready" "$PROVIDER_RACE_BARRIER.release"
 done
 
+for partial_index in 0 1; do
+  for partial_mutation in inplace replace-restore; do
+    partial_label="$partial_index-$partial_mutation"
+    PARTIAL_RACE_OUTPUT="$WORK/partial input $partial_label.wasm"
+    PARTIAL_RACE_ERROR="$SCRATCH/partial-input-$partial_label.jsonl"
+    PARTIAL_RACE_BARRIER="$BARRIERS/partial-input-$partial_label"
+    PARTIAL_WAC_COUNT="$SCRATCH/partial-wac-count-$partial_label"
+    printf 'old-partial-output-%s\n' "$partial_label" \
+      > "$PARTIAL_RACE_OUTPUT"
+    FAKE_PROVIDER_WIT=1 \
+    FAKE_MULTI_PROVIDER_WIT=1 \
+    FAKE_WAC_COUNT_FILE="$PARTIAL_WAC_COUNT" \
+    FAKE_WAC_BARRIER_CALL="$((partial_index + 2))" \
+    FAKE_WAC_BARRIER="$PARTIAL_RACE_BARRIER" \
+    "$COMPONENTIZER" \
+      --json-diagnostics \
+      --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
+      --wizer-bin "$TOOLS/fake wizer" \
+      --wabt-bin "$TOOLS/fake wabt" \
+      --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+      --out "$PARTIAL_RACE_OUTPUT" \
+      "$SOURCE" >/dev/null 2>"$PARTIAL_RACE_ERROR" &
+    partial_race_pid=$!
+    wait_for_marker "$PARTIAL_RACE_BARRIER.ready" "$partial_race_pid" \
+      "$partial_mutation partial $partial_index consumer race"
+    partial_transaction="$(find "$WORK" -maxdepth 1 -type d \
+      -name ".partial input $partial_label.wasm.starling-componentize-*" \
+      -print -quit)"
+    test -n "$partial_transaction"
+    partial_target="$(find "$partial_transaction/data" -maxdepth 1 \
+      -type f -name 'feature-surface-input-*' -print | sort -V | tail -1)"
+    test -f "$partial_target"
+    if [ "$partial_mutation" = inplace ]; then
+      chmod u+w "$partial_target"
+      printf 'mutated-partial-%s\n' "$partial_index" > "$partial_target"
+    else
+      partial_saved="$SCRATCH/partial-saved-$partial_label"
+      mv "$partial_target" "$partial_saved"
+      printf 'mutated-partial-%s\n' "$partial_index" > "$partial_target"
+      rm "$partial_target"
+      mv "$partial_saved" "$partial_target"
+    fi
+    : > "$PARTIAL_RACE_BARRIER.release"
+    if wait "$partial_race_pid"; then
+      echo "FAIL: $partial_mutation partial $partial_index race succeeded" >&2
+      exit 1
+    fi
+    assert_json_diagnostic "$PARTIAL_RACE_ERROR" SMC4201 adapt \
+      TransactionChanged ""
+    test "$(cat "$PARTIAL_RACE_OUTPUT")" = \
+      "old-partial-output-$partial_label"
+    if find "$WORK" -maxdepth 1 -type d \
+      -name ".partial input $partial_label.wasm.starling-componentize-*" \
+      | grep -q .; then
+      echo "FAIL: partial $partial_label race retained a transaction" >&2
+      exit 1
+    fi
+    rm -f "$PARTIAL_RACE_OUTPUT" "$PARTIAL_RACE_ERROR" \
+      "$PARTIAL_RACE_BARRIER.ready" "$PARTIAL_RACE_BARRIER.release" \
+      "$PARTIAL_WAC_COUNT"
+  done
+done
+
 MISSING_ENGINE_DIR="$WORK/missing provenance engine bundle"
 mkdir -p "$MISSING_ENGINE_DIR/feature-wit"
 printf '\0asm\1\0\0\0' > "$MISSING_ENGINE_DIR/starling-raw.wasm"
@@ -1193,14 +1294,27 @@ assert_external_json_diagnostic "$WORK/mismatched provenance.err" \
   EngineProvenanceMismatch \
   "does not match sibling features.json"
 
-if FAKE_AMBIGUOUS_WIT=1 componentize_external_engine \
+if FAKE_AMBIGUOUS_WIT=1 JSON_DIAGNOSTICS=1 componentize_external_engine \
     "$ENGINE" "$WORK/ambiguous generated WIT.wasm" \
-    >"$WORK/ambiguous WIT.out" 2>"$WORK/ambiguous WIT.err"
+    >"$WORK/ambiguous WIT.out" 2>"$WORK/ambiguous WIT.jsonl"
 then
   echo "FAIL: ambiguous generated root WIT unexpectedly succeeded" >&2
   exit 1
 fi
-grep -q 'multiple root packages' "$WORK/ambiguous WIT.err"
+assert_json_diagnostic "$WORK/ambiguous WIT.jsonl" SMC4201 adapt \
+  AmbiguousGeneratedWitRoot "generated WIT has multiple root packages"
+test ! -e "$WORK/ambiguous generated WIT.wasm"
+
+if FAKE_MISSING_WIT_ROOT=1 JSON_DIAGNOSTICS=1 componentize_external_engine \
+    "$ENGINE" "$WORK/missing generated WIT.wasm" \
+    >"$WORK/missing WIT.out" 2>"$WORK/missing WIT.jsonl"
+then
+  echo "FAIL: missing generated root WIT unexpectedly succeeded" >&2
+  exit 1
+fi
+assert_json_diagnostic "$WORK/missing WIT.jsonl" SMC4201 adapt \
+  MissingGeneratedWitRoot "generated WIT has no root package"
+test ! -e "$WORK/missing generated WIT.wasm"
 
 SOURCE_ALIAS_DIR="$SCRATCH/real sources"
 SOURCE_ALIAS="$WORK/source alias.js"

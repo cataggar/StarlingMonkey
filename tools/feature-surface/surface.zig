@@ -79,6 +79,10 @@ pub const GeneratedInputs = struct {
         allocator: Allocator,
         io: Io,
     ) anyerror!void,
+    set_diagnostic_detail: *const fn (
+        context: *anyopaque,
+        detail: []const u8,
+    ) void,
 };
 
 pub fn apply(
@@ -194,6 +198,7 @@ pub fn apply(
     const platform_root = try generatedRootWit(
         allocator,
         io,
+        options,
         retained_platform_dir,
     );
     const platform_text = try readFile(allocator, io, platform_root);
@@ -288,7 +293,8 @@ pub fn apply(
     if (providers.items.len == 0) return copyFile(io, options.component, options.output);
     var consumer = options.component;
     for (providers.items, 0..) |provider, index| {
-        const output = if (index + 1 == providers.items.len)
+        const final = index + 1 == providers.items.len;
+        const output = if (final)
             options.output
         else
             try passPath(allocator, options.work_dir, index, "partial.wasm");
@@ -307,7 +313,23 @@ pub fn apply(
                 output,
             },
         );
-        consumer = output;
+        if (final) {
+            try verifyGeneratedInputs(allocator, io, options);
+        } else {
+            const stage = try std.fmt.allocPrint(
+                allocator,
+                "feature-provider-partial-{d}",
+                .{index},
+            );
+            consumer = try retainGeneratedFile(
+                allocator,
+                io,
+                options,
+                stage,
+                output,
+            );
+            try verifyGeneratedInputs(allocator, io, options);
+        }
     }
 }
 
@@ -349,6 +371,7 @@ fn buildProvider(
     const retained_provider_wit = try generatedRootWit(
         allocator,
         io,
+        options,
         retained_provider_dir,
     );
     const provider_wit = try path(
@@ -698,6 +721,7 @@ fn path(allocator: Allocator, directory: []const u8, basename: []const u8) ![]co
 fn generatedRootWit(
     allocator: Allocator,
     io: Io,
+    options: Options,
     directory: []const u8,
 ) ![]const u8 {
     var dir = try Dir.openDirAbsolute(io, directory, .{ .iterate = true });
@@ -714,22 +738,38 @@ fn generatedRootWit(
             continue;
         }
         if (root != null) {
-            std.debug.print(
-                "error: generated WIT directory '{s}' has multiple root packages ('{s}' and '{s}')\n",
-                .{ directory, root.?, entry.path },
+            setGeneratedInputDiagnosticDetail(
+                allocator,
+                options,
+                "generated WIT has multiple root packages ('{s}' and '{s}')",
+                .{ root.?, entry.path },
             );
             return error.AmbiguousGeneratedWitRoot;
         }
         root = try allocator.dupe(u8, entry.path);
     }
     const relative = root orelse {
-        std.debug.print(
-            "error: generated WIT directory '{s}' has no root package\n",
-            .{directory},
+        setGeneratedInputDiagnosticDetail(
+            allocator,
+            options,
+            "generated WIT has no root package",
+            .{},
         );
         return error.MissingGeneratedWitRoot;
     };
     return path(allocator, directory, relative);
+}
+
+fn setGeneratedInputDiagnosticDetail(
+    allocator: Allocator,
+    options: Options,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const generated = options.generated_inputs orelse return;
+    const detail = std.fmt.allocPrint(allocator, format, args) catch
+        "generated WIT root validation failed";
+    generated.set_diagnostic_detail(generated.context, detail);
 }
 
 fn validateGeneratedRootWit(text: []const u8) !void {
