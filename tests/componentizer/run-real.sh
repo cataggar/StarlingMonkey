@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 8 ]; then
-  echo "usage: $0 <componentizer> <zig> <wac> <wasmtime> <wasm-tools> <wabt> <adapter> <host-api>" >&2
+if [ "$#" -ne 7 ]; then
+  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter> <host-api>" >&2
   exit 2
 fi
 
 COMPONENTIZER="$1"
 ZIG="$2"
-WAC="$3"
-WASMTIME="$4"
-WASM_TOOLS="$5"
-WABT="$6"
-ADAPTER="$7"
-HOST_API="$8"
+WASMTIME="$3"
+WASM_TOOLS="$4"
+WABT="$5"
+ADAPTER="$6"
+HOST_API="$7"
 HOST_VERSION="${HOST_API#wasi-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="$ROOT/tests/componentizer/.real-cache"
@@ -55,7 +54,6 @@ componentize() {
     --component-world-name "$component_world" \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
-    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     "${metadata_args[@]}" \
@@ -73,7 +71,6 @@ WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
   --component-world-name js-dispatch \
   --wasmtime-bin "$WASMTIME" \
   --wabt-bin "$WABT" \
-  --wac-bin "$WAC" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --preview2-adapter "$ADAPTER" \
   --debug-dir "$DEBUG_DIR" \
@@ -220,7 +217,6 @@ generated_destination_componentize() {
     --component-world-name js-dispatch \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
-    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     --debug-dir "$GENERATED_DEBUG" \
@@ -268,7 +264,6 @@ PY
   --component-world-name js-dispatch \
   --wasmtime-bin "$WASMTIME" \
   --wabt-bin "$WABT" \
-  --wac-bin "$WAC" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --preview2-adapter "$ADAPTER" \
   --metadata-out "$CACHED_METADATA" \
@@ -314,7 +309,6 @@ surface_case() {
     --component-world-name js-dispatch \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
-    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --preview2-adapter "$ADAPTER" \
     "${feature_args[@]}" \
@@ -339,7 +333,6 @@ surface_case() {
   WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
     --engine "$runtime_bin/starling-raw.wasm" \
     --wasmtime-bin "$WASMTIME" \
-    --wac-bin "$WAC" \
     --wasm-tools-bin "$WASM_TOOLS" \
     --out "$engine_output" \
     "$ROOT/tests/fixtures/js-dispatch.js"

@@ -79,7 +79,6 @@ for version in "${VERSIONS[@]}"; do
         --cache-dir "$native_cache" \
         --zig-bin "$ZIG" \
         --wasmtime-bin "$runtime/wasmtime" \
-        --wac-bin "$runtime/wac" \
         --wasm-tools-bin "$runtime/wasm-tools" \
         --disable stdio,random,clocks,http,fetch-event \
         --out "$native_component" \
@@ -93,7 +92,6 @@ for version in "${VERSIONS[@]}"; do
       WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
         --engine "$runtime/starling-raw.wasm" \
         --wasmtime-bin "$runtime/wasmtime" \
-        --wac-bin "$runtime/wac" \
         --wasm-tools-bin "$runtime/wasm-tools" \
         --out "$external_component" \
         "$FIXTURE"

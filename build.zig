@@ -8,9 +8,6 @@ const RuntimeBuildTool = struct {
     executable: std.Build.LazyPath,
 };
 
-const wac_url = "https://github.com/bytecodealliance/wac/releases/download/v0.10.1/wac-cli-x86_64-unknown-linux-musl";
-const wac_sha256 = "250c11762916ba733c7d22b62487580f21270ec9dde4f13460ea69d300e25406";
-
 fn dependencyExecutable(
     dependency: *std.Build.Dependency,
     name: []const u8,
@@ -180,15 +177,6 @@ pub fn build(b: *std.Build) void {
         "host-api-world",
         "Default component world in the selected host API WIT package",
     ) orelse "bindings";
-    const download_wac = b.addSystemCommand(&.{
-        "bash",
-        "tools/download-wac.sh",
-        wac_url,
-        wac_sha256,
-    });
-    const wac = download_wac.addOutputFileArg("wac");
-    b.getInstallStep().dependOn(&b.addInstallBinFile(wac, "wac").step);
-
     // Native, Node-free driver for the monolithic Zig/WABT componentization
     // pipeline. It is a host tool even though the runtime it builds targets
     // wasm32-wasi.
@@ -225,7 +213,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(feature_surface);
     const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
-    b.installArtifact(wabt);
+    const install_wabt = b.addInstallArtifact(wabt, .{});
+    b.getInstallStep().dependOn(&install_wabt.step);
+    const wabt_step = b.step("wabt", "Build and install the pinned WABT CLI");
+    wabt_step.dependOn(&install_wabt.step);
     const componentizer_step = b.step(
         "componentizer",
         "Build the native starling-componentize CLI",
@@ -281,7 +272,6 @@ pub fn build(b: *std.Build) void {
     );
     componentizer_e2e.addArtifactArg(componentizer);
     componentizer_e2e.addArg(b.graph.zig_exe);
-    componentizer_e2e.addFileArg(wac);
     if (b.lazyDependency("wasmtime", .{})) |dep| {
         componentizer_e2e.addFileArg(dep.path("wasmtime"));
     }

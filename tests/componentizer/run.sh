@@ -229,8 +229,7 @@ if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-adapter\n' > "$FAKE_REPLACE_ADAPTER"
   printf 'package test:componentizer;\nworld replaced {}\n' > \
     "$FAKE_REPLACE_WIT/world.wit"
-  for tool in "$FAKE_REPLACE_WABT" "$FAKE_REPLACE_WAC" \
-    "$FAKE_REPLACE_WASM_TOOLS"; do
+  for tool in "$FAKE_REPLACE_WABT" "$FAKE_REPLACE_WASM_TOOLS"; do
     printf '#!/usr/bin/env bash\nexit 99\n' > "$tool"
     chmod +x "$tool"
   done
@@ -274,6 +273,29 @@ if [ "$stage" = "component embed" ] &&
   wit="${!wit_index}"
   grep -Fq "world captured" "$wit/world.wit"
   ! grep -Fq "substituted" "$wit/world.wit"
+fi
+if [ "$stage" = "component compose" ]; then
+  provider_count=0
+  for arg in "$@"; do
+    if [ "$arg" = "-d" ]; then
+      provider_count=$((provider_count + 1))
+    fi
+  done
+  test "$provider_count" -ge 1
+  if [ -n "${FAKE_WABT_COMPOSE_COUNT_FILE:-}" ]; then
+    count=0
+    if [ -f "$FAKE_WABT_COMPOSE_COUNT_FILE" ]; then
+      count="$(cat "$FAKE_WABT_COMPOSE_COUNT_FILE")"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_WABT_COMPOSE_COUNT_FILE"
+    if [ "$count" = "${FAKE_WABT_COMPOSE_BARRIER_CALL:-0}" ]; then
+      : > "$FAKE_WABT_COMPOSE_BARRIER.ready"
+      while [ ! -e "$FAKE_WABT_COMPOSE_BARRIER.release" ]; do
+        sleep 0.001
+      done
+    fi
+  fi
 fi
 out=""
 for ((i = 1; i <= $#; i++)); do
@@ -390,9 +412,17 @@ elif [ "$1 $2" = "metadata add" ]; then
   done
   cp "${!#}" "$out"
 elif [ "$1" = "print" ]; then
-  cat > "$out" <<'WAT'
+  if [ "${FAKE_CANDIDATE_WASI_IMPORT:-0}" = 1 ]; then
+    cat > "$out" <<'WAT'
+(component
+  (import "wasi:random/insecure@0.2.0" (instance))
+)
+WAT
+  else
+    cat > "$out" <<'WAT'
 (component)
 WAT
+  fi
 elif [ "$1 $2" = "component wit" ]; then
   out_dir=""
   for ((i = 1; i <= $#; i++)); do
@@ -441,7 +471,7 @@ WIT
     cat > "$out" <<'WIT'
 package test:fake;
 world fake {
-  import wasi:random/random@0.2.0;
+  import wasi:random/insecure@0.2.0;
 }
 WIT
   else
@@ -578,35 +608,6 @@ done
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasip3-bindgen"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TOOLS/fake wasm-opt"
-cat > "$TOOLS/fake wac" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-out=""
-consumer=""
-for ((i = 1; i <= $#; i++)); do
-  if [ "${!i}" = "-o" ]; then
-    consumer_index=$((i - 1))
-    output_index=$((i + 1))
-    consumer="${!consumer_index}"
-    out="${!output_index}"
-  fi
-done
-if [ -n "${FAKE_WAC_COUNT_FILE:-}" ]; then
-  count=0
-  if [ -f "$FAKE_WAC_COUNT_FILE" ]; then
-    count="$(cat "$FAKE_WAC_COUNT_FILE")"
-  fi
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$FAKE_WAC_COUNT_FILE"
-  if [ "$count" = "${FAKE_WAC_BARRIER_CALL:-0}" ]; then
-    : > "$FAKE_WAC_BARRIER.ready"
-    while [ ! -e "$FAKE_WAC_BARRIER.release" ]; do
-      sleep 0.001
-    done
-  fi
-fi
-cp "$consumer" "$out"
-EOF
 chmod +x "$TOOLS"/*
 
 export FAKE_RUNTIME_ARGS_LOG="$SCRATCH/runtime args.log"
@@ -620,7 +621,7 @@ export FAKE_WASIP3_BINDGEN="$TOOLS/fake wasip3-bindgen"
 export FAKE_WASM_OPT="$TOOLS/fake wasm-opt"
 export FAKE_ZIG_LIB_DIR="$SCRATCH/fake zig direct/lib"
 export FAKE_ZIG_ARGS_LOG="$SCRATCH/zig args.log"
-export WAC_BIN="$TOOLS/fake wac"
+export WABT="$TOOLS/fake wabt"
 export STARLINGMONKEY_CONFIG="--ambient-config-must-not-reach-wizer"
 mkdir -p "$FAKE_ZIG_LIB_DIR"
 printf 'immutable-zig-lib\n' > "$FAKE_ZIG_LIB_DIR/marker"
@@ -712,14 +713,14 @@ cp "$ENGINE" "$SCRATCH/original-engine"
 cp "$ADAPTER" "$SCRATCH/original-adapter"
 cp "$WIT/world.wit" "$SCRATCH/original-world.wit"
 cp "$TOOLS/fake wabt" "$SCRATCH/original-wabt"
-cp "$TOOLS/fake wac" "$SCRATCH/original-wac"
 cp "$TOOLS/fake wasm-tools" "$SCRATCH/original-wasm-tools"
+FAKE_PROVIDER_WIT=1 \
+FAKE_CANDIDATE_WASI_IMPORT=1 \
 FAKE_REPLACE_SOURCE="$SOURCE" \
 FAKE_REPLACE_ENGINE="$ENGINE" \
 FAKE_REPLACE_ADAPTER="$ADAPTER" \
 FAKE_REPLACE_WIT="$WIT" \
 FAKE_REPLACE_WABT="$TOOLS/fake wabt" \
-FAKE_REPLACE_WAC="$TOOLS/fake wac" \
 FAKE_REPLACE_WASM_TOOLS="$TOOLS/fake wasm-tools" \
 "$COMPONENTIZER" \
   --engine "$ENGINE" \
@@ -736,8 +737,7 @@ cmp "$SCRATCH/original-engine" "$SNAPSHOT_OUTPUT"
 python3 - "$SNAPSHOT_DIR/metadata.json" \
   "$SCRATCH/original-source" "$SCRATCH/original-engine" \
   "$SCRATCH/original-adapter" "$SCRATCH/original-world.wit" \
-  "$SCRATCH/original-wabt" "$SCRATCH/original-wac" \
-  "$SCRATCH/original-wasm-tools" <<'PY'
+  "$SCRATCH/original-wabt" "$SCRATCH/original-wasm-tools" <<'PY'
 import hashlib, json, sys
 digest = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()
 metadata = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -752,15 +752,13 @@ wit.update(b"\xff")
 assert metadata["provenance"]["dispatch_world"]["wit_sha256"] == wit.hexdigest()
 tools = {tool["name"]: tool["sha256"] for tool in metadata["provenance"]["tools"]}
 assert tools["wabt"] == digest(sys.argv[6])
-assert tools["wac"] == digest(sys.argv[7])
-assert tools["wasm-tools"] == digest(sys.argv[8])
+assert tools["wasm-tools"] == digest(sys.argv[7])
 PY
 cp "$SCRATCH/original-source" "$SOURCE"
 cp "$SCRATCH/original-engine" "$ENGINE"
 cp "$SCRATCH/original-adapter" "$ADAPTER"
 cp "$SCRATCH/original-world.wit" "$WIT/world.wit"
 cp "$SCRATCH/original-wabt" "$TOOLS/fake wabt"
-cp "$SCRATCH/original-wac" "$TOOLS/fake wac"
 cp "$SCRATCH/original-wasm-tools" "$TOOLS/fake wasm-tools"
 if find "$WORK" -name '*.starling-componentize-source-*' -o \
   -name '*.starling-componentize-initializer-*' | grep -q .; then
@@ -1193,14 +1191,14 @@ for partial_index in 0 1; do
     PARTIAL_RACE_OUTPUT="$WORK/partial input $partial_label.wasm"
     PARTIAL_RACE_ERROR="$SCRATCH/partial-input-$partial_label.jsonl"
     PARTIAL_RACE_BARRIER="$BARRIERS/partial-input-$partial_label"
-    PARTIAL_WAC_COUNT="$SCRATCH/partial-wac-count-$partial_label"
+    PARTIAL_COMPOSE_COUNT="$SCRATCH/partial-compose-count-$partial_label"
     printf 'old-partial-output-%s\n' "$partial_label" \
       > "$PARTIAL_RACE_OUTPUT"
     FAKE_PROVIDER_WIT=1 \
     FAKE_MULTI_PROVIDER_WIT=1 \
-    FAKE_WAC_COUNT_FILE="$PARTIAL_WAC_COUNT" \
-    FAKE_WAC_BARRIER_CALL="$((partial_index + 2))" \
-    FAKE_WAC_BARRIER="$PARTIAL_RACE_BARRIER" \
+    FAKE_WABT_COMPOSE_COUNT_FILE="$PARTIAL_COMPOSE_COUNT" \
+    FAKE_WABT_COMPOSE_BARRIER_CALL="$((partial_index + 2))" \
+    FAKE_WABT_COMPOSE_BARRIER="$PARTIAL_RACE_BARRIER" \
     "$COMPONENTIZER" \
       --json-diagnostics \
       --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
@@ -1246,7 +1244,7 @@ for partial_index in 0 1; do
     fi
     rm -f "$PARTIAL_RACE_OUTPUT" "$PARTIAL_RACE_ERROR" \
       "$PARTIAL_RACE_BARRIER.ready" "$PARTIAL_RACE_BARRIER.release" \
-      "$PARTIAL_WAC_COUNT"
+      "$PARTIAL_COMPOSE_COUNT"
   done
 done
 
@@ -2014,6 +2012,32 @@ negative_stage "component new" wit SMC4201 adapt "wabt component new"
 negative_stage "metadata add" wit SMC4301 metadata "wasm-tools metadata add"
 negative_stage validate wit SMC5001 validate "wasm-tools validate"
 negative_stage "component new" no-wit SMC4201 adapt "wasm-tools component new"
+
+COMPOSE_DIAGNOSTIC="$SCRATCH/component-compose.diagnostic.jsonl"
+if FAKE_PROVIDER_WIT=1 FAKE_FAIL_STAGE="component compose" \
+  "$COMPONENTIZER" \
+    --json-diagnostics \
+    --engine "$PURE_ENGINE_DIR/starling-raw.wasm" \
+    --wizer-bin "$TOOLS/fake wizer" \
+    --wabt-bin "$TOOLS/fake wabt" \
+    --wasm-tools-bin "$TOOLS/fake wasm-tools" \
+    --out "$WORK/component compose failure.wasm" \
+    "$SOURCE" >/dev/null 2>"$COMPOSE_DIAGNOSTIC"
+then
+  echo "FAIL: injected WABT compose failure unexpectedly succeeded" >&2
+  exit 1
+fi
+python3 - "$COMPOSE_DIAGNOSTIC" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) == 1, lines
+diagnostic = json.loads(lines[0])
+assert diagnostic["code"] == "SMC4201", diagnostic
+assert diagnostic["phase"] == "adapt", diagnostic
+assert diagnostic["cause"] == "CommandFailed", diagnostic
+assert diagnostic["command"] == "feature surface: compose provider", diagnostic
+assert diagnostic["exit_code"] == 23, diagnostic
+PY
 
 INVALID_UTF8_ERROR="$SCRATCH/invalid-utf8-error.jsonl"
 if FAKE_FAIL_STAGE="component embed" FAKE_INVALID_STDERR=1 "$COMPONENTIZER" \
@@ -4139,6 +4163,7 @@ cp "$WIT/world.wit" "$ENGINE_BUNDLE/surface-wit/world.wit"
 METADATA_OUTPUT="$WORK/public metadata.json"
 METADATA_REFERENCE="$SCRATCH/public metadata reference.json"
 BUILD_DEBUG_DIR="$WORK/build debug bindings"
+FAKE_PROVIDER_WIT=1 FAKE_CANDIDATE_WASI_IMPORT=1 \
 build_with_fake_zig "$WORK/metadata component.wasm" \
   --metadata-out "$METADATA_OUTPUT" \
   --debug-dir "$BUILD_DEBUG_DIR"
@@ -4189,8 +4214,7 @@ assert [f["name"] for f in provenance["features"]] == [
 ]
 assert all(f["enabled"] for f in provenance["features"])
 assert [t["name"] for t in provenance["tools"]] == [
-    "zig", "wasip3-bindgen", "wasm-opt", "wizer", "wabt", "wac",
-    "wasm-tools",
+    "zig", "wasip3-bindgen", "wasm-opt", "wizer", "wabt", "wasm-tools",
 ]
 assert all(sha256.match(t["sha256"]) for t in provenance["tools"])
 assert sha256.match(provenance["tools"][0]["lib_tree_sha256"])
@@ -4212,6 +4236,7 @@ runtime_args = open(sys.argv[3], "rb").read()
 assert provenance["inputs"]["runtime_arguments_sha256"] == \
     hashlib.sha256(runtime_args).hexdigest()
 PY
+FAKE_PROVIDER_WIT=1 FAKE_CANDIDATE_WASI_IMPORT=1 \
 build_with_fake_zig "$WORK/metadata component.wasm" \
   --metadata-out "$METADATA_OUTPUT" \
   --debug-dir "$BUILD_DEBUG_DIR"

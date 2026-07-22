@@ -2251,8 +2251,7 @@ const WizerTool = struct {
 
 const Tools = struct {
     wizer: WizerTool,
-    wabt: ?Snapshot,
-    wac: Snapshot,
+    wabt: Snapshot,
     wasm_tools: Snapshot,
 };
 
@@ -2935,7 +2934,6 @@ fn execute(
         cwd,
         executable_dir,
         config,
-        config.wit != null,
         &transaction,
     );
 
@@ -3108,8 +3106,10 @@ fn execute(
 
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
+    const wabt_used_for_embedding =
+        runtime.component_wit != null and config.wit != null and runtime.zig == null;
     const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
-        const use_wabt = tools.wabt != null and runtime.zig == null;
+        const use_wabt = config.wit != null and runtime.zig == null;
         var stripped_output = try createChildOutput(
             allocator,
             io,
@@ -3122,7 +3122,7 @@ fn execute(
             io,
             if (use_wabt) "wabt module strip" else "wasm-tools strip",
             if (use_wabt) &.{
-                tools.wabt.?.path,    "module",         "strip", "-o",
+                tools.wabt.path,      "module",         "strip", "-o",
                 stripped_output.path, initialized.path,
             } else &.{
                 tools.wasm_tools.path, "strip",          "--all", "-o",
@@ -3158,7 +3158,7 @@ fn execute(
             else
                 "wasm-tools component embed",
             if (use_wabt) &.{
-                tools.wabt.?.path,         "component", "embed",              "--world",
+                tools.wabt.path,           "component", "embed",              "--world",
                 runtime.component_world.?, "-o",        embedded_output.path, component_wit,
                 stripped_output.path,
             } else &.{
@@ -3201,8 +3201,8 @@ fn execute(
             else
                 "wasm-tools component new",
             if (use_wabt) &.{
-                tools.wabt.?.path, "component",           "new",                "--adapt", adapter_arg,
-                "-o",              candidate_output.path, embedded_output.path,
+                tools.wabt.path, "component",           "new",                "--adapt", adapter_arg,
+                "-o",            candidate_output.path, embedded_output.path,
             } else &.{
                 tools.wasm_tools.path, "component", "new",                 "--adapt",
                 adapter_arg,           "-o",        candidate_output.path, embedded_output.path,
@@ -3287,8 +3287,8 @@ fn execute(
         .transaction = &transaction,
         .transaction_storage = transaction_storage,
     };
-    try feature_surface.apply(allocator, io, .{
-        .wac = tools.wac.path,
+    const wabt_used_for_surface = try feature_surface.apply(allocator, io, .{
+        .wabt = tools.wabt.path,
         .wasm_tools = tools.wasm_tools.path,
         .platform_wit = runtime.platform_wit,
         .component = candidate.path,
@@ -3456,6 +3456,7 @@ fn execute(
             runtime_args,
             runtime,
             tools,
+            wabt_used_for_embedding or wabt_used_for_surface,
             preopen_snapshots.items,
             processed.path,
             imports,
@@ -5147,7 +5148,6 @@ fn resolveTools(
     cwd: []const u8,
     executable_dir: []const u8,
     config: *const cli.Config,
-    needs_wabt: bool,
     transaction: *Transaction,
 ) !Tools {
     const transaction_dir = transaction.storage_path;
@@ -5190,15 +5190,7 @@ fn resolveTools(
             "wasm-tools",
             "wasm-tools",
         );
-    const wac_source = if (config.wac_bin) |path|
-        try absolutePath(allocator, cwd, path)
-    else if (environ.get("WAC_BIN")) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try siblingOrName(allocator, io, executable_dir, "wac", "wac");
-    const wabt_source = if (!needs_wabt)
-        null
-    else if (config.wabt_bin) |path|
+    const wabt_source = if (config.wabt_bin) |path|
         try absolutePath(allocator, cwd, path)
     else if (environ.get("WABT")) |path|
         try absolutePath(allocator, cwd, path)
@@ -5223,26 +5215,15 @@ fn resolveTools(
         transaction,
         "wasm-tools",
     )).snapshot;
-    const wac = (try captureInputFile(
+    const wabt = (try captureInputFile(
         allocator,
         io,
-        try resolveExecutable(allocator, io, environ, wac_source),
-        try std.fs.path.join(allocator, &.{ transaction_dir, "wac" }),
+        try resolveExecutable(allocator, io, environ, wabt_source),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
         transaction,
-        "wac",
+        "wabt",
     )).snapshot;
-    const wabt = if (wabt_source) |path|
-        (try captureInputFile(
-            allocator,
-            io,
-            try resolveExecutable(allocator, io, environ, path),
-            try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
-            transaction,
-            "wabt",
-        )).snapshot
-    else
-        null;
-    return .{ .wizer = wizer, .wabt = wabt, .wac = wac, .wasm_tools = wasm_tools };
+    return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
 }
 
 fn discoverBuildRoot(
@@ -5579,6 +5560,7 @@ fn buildMetadataDocument(
     runtime_args: []const u8,
     runtime: Runtime,
     tools: Tools,
+    wabt_invoked: bool,
     preopens: []const RetainedDirectory,
     component: []const u8,
     imports: metadata.Imports,
@@ -5655,22 +5637,15 @@ fn buildMetadataDocument(
         if (tools.wizer.wasmtime_subcommand) "wasmtime-wizer" else "wizer",
         tools.wizer.executable,
     );
-    if (tools.wabt) |wabt| {
+    if (wabt_invoked) {
         try appendToolSnapshot(
             allocator,
             &tool_values,
             &tool_fields,
             "wabt",
-            wabt,
+            tools.wabt,
         );
     }
-    try appendToolSnapshot(
-        allocator,
-        &tool_values,
-        &tool_fields,
-        "wac",
-        tools.wac,
-    );
     try appendToolSnapshot(
         allocator,
         &tool_values,

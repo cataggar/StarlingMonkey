@@ -4,10 +4,6 @@ find_program(BASH_PROGRAM bash)
 include("wasmtime")
 
 add_test(
-    NAME wac-platform-selection
-    COMMAND ${BASH_PROGRAM} ${CMAKE_SOURCE_DIR}/tests/cmake/run-wac-tests.sh
-)
-add_test(
     NAME componentizer-install-package
     COMMAND
         ${BASH_PROGRAM}

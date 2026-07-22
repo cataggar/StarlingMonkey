@@ -29,7 +29,6 @@ pub const usage =
     \\      --wizer-bin <file>             Override the Wizer executable
     \\      --wasmtime-bin <file>           Override Wasmtime's wizer subcommand
     \\      --wabt-bin <file>              Override the WABT executable
-    \\      --wac-bin <file>               Override the WAC component composer
     \\      --wasm-tools-bin <file>        Override the wasm-tools executable
     \\      --weval-bin <file>             Reserve a Weval override for --aot
     \\      --build-root <dir>             Override StarlingMonkey source-root discovery
@@ -85,7 +84,6 @@ pub const Config = struct {
     wizer_bin: ?[]const u8 = null,
     wasmtime_bin: ?[]const u8 = null,
     wabt_bin: ?[]const u8 = null,
-    wac_bin: ?[]const u8 = null,
     wasm_tools_bin: ?[]const u8 = null,
     weval_bin: ?[]const u8 = null,
     build_root: ?[]const u8 = null,
@@ -271,8 +269,6 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
             config.wasmtime_bin = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--wabt-bin")) {
             config.wabt_bin = try nextValue(args, &i);
-        } else if (std.mem.eql(u8, arg, "--wac-bin")) {
-            config.wac_bin = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--wasm-tools-bin")) {
             config.wasm_tools_bin = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--weval-bin")) {
@@ -359,8 +355,8 @@ test "parses the native componentizer surface" {
         "--enable-script-debugging",
         "--preopen-dir",
         "extra dir",
-        "--wac-bin",
-        "tools/wac",
+        "--wabt-bin",
+        "tools/wabt",
         "--js-heap-limit-mib",
         "256",
         "--debug-bindings",
@@ -383,7 +379,7 @@ test "parses the native componentizer surface" {
     try std.testing.expectEqual(@as(usize, 2), config.disable_features.len);
     try std.testing.expectEqualStrings("random", config.disable_features[1]);
     try std.testing.expectEqual(@as(u32, 256), config.js_heap_limit_mib.?);
-    try std.testing.expectEqualStrings("tools/wac", config.wac_bin.?);
+    try std.testing.expectEqualStrings("tools/wabt", config.wabt_bin.?);
     try std.testing.expect(config.debug_bindings);
     try std.testing.expectEqual(diagnostics.Format.json, config.diagnostic_format);
     try std.testing.expectEqualStrings("metadata.json", config.metadata_out.?);

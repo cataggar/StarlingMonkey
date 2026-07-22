@@ -26,7 +26,7 @@ pub const RuntimeConfig = enum {
 };
 
 pub const Options = struct {
-    wac: []const u8,
+    wabt: []const u8,
     wasm_tools: []const u8,
     platform_wit: []const u8,
     component: []const u8,
@@ -89,9 +89,10 @@ pub fn apply(
     allocator: Allocator,
     io: Io,
     options: Options,
-) !void {
+) !bool {
     if (options.target_wit == null and options.features.allEnabled()) {
-        return copyFile(io, options.component, options.output);
+        try copyFile(io, options.component, options.output);
+        return false;
     }
 
     var target_imports: []const []const u8 = &.{};
@@ -290,7 +291,10 @@ pub fn apply(
             &providers,
         );
     }
-    if (providers.items.len == 0) return copyFile(io, options.component, options.output);
+    if (providers.items.len == 0) {
+        try copyFile(io, options.component, options.output);
+        return false;
+    }
     var consumer = options.component;
     for (providers.items, 0..) |provider, index| {
         const final = index + 1 == providers.items.len;
@@ -304,13 +308,14 @@ pub fn apply(
             options,
             "feature surface: compose provider",
             &.{
-                options.wac,
-                "plug",
-                "--plug",
+                options.wabt,
+                "component",
+                "compose",
+                "-d",
                 provider,
-                consumer,
                 "-o",
                 output,
+                consumer,
             },
         );
         if (final) {
@@ -331,6 +336,7 @@ pub fn apply(
             try verifyGeneratedInputs(allocator, io, options);
         }
     }
+    return true;
 }
 
 fn buildProvider(

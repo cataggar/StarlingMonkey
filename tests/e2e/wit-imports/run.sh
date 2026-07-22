@@ -113,7 +113,6 @@ echo "[wit-imports e2e] componentizing through the native production CLI"
   --preview2-adapter "$BIN/preview1-adapter.wasm" \
   --wasmtime-bin "$BIN/wasmtime" \
   --wabt-bin "$BIN/wabt" \
-  --wac-bin "$BIN/wac" \
   --wasm-tools-bin "$BIN/wasm-tools" \
   --debug-dir "$NATIVE_DEBUG" \
   --out "$NATIVE_COMPONENT" \

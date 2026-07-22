@@ -11,7 +11,7 @@ fi
 wasm_tools="${WASM_TOOLS:-$script_dir/wasm-tools}"
 weval="${WEVAL:-$script_dir/weval}"
 feature_surface="${FEATURE_SURFACE:-$script_dir/starling-feature-surface}"
-wac="${WAC:-$script_dir/wac}"
+wabt="${WABT:-$script_dir/wabt}"
 external_runtime="$script_dir/@EXTERNAL_RUNTIME_FILE@"
 component_world="@COMPONENT_WORLD@"
 component_wit="$script_dir/component-wit"
@@ -193,7 +193,7 @@ if [[ -n "${FEATURE_SURFACE_BEFORE:-}" ]]; then
 fi
 
 surface_args=(
-  --wac "$wac"
+  --wabt "$wabt"
   --wasm-tools "$wasm_tools"
   --platform-wit "$script_dir/feature-wit"
   --component "$component"

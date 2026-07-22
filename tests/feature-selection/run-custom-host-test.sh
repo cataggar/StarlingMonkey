@@ -53,7 +53,6 @@ WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   --cache-dir "$NATIVE_CACHE" \
   --zig-bin "$ZIG" \
   --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
-  --wac-bin "$ZIG_PREFIX/bin/wac" \
   --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
   --out "$NATIVE_COMPONENT" \
   "$FIXTURE"
@@ -81,7 +80,6 @@ WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   "$ZIG_PREFIX/bin/starling-componentize" \
   --engine "$RELEASE_RUNTIME/starling-raw.wasm" \
   --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
-  --wac-bin "$ZIG_PREFIX/bin/wac" \
   --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
   --out "$EXTERNAL_COMPONENT" \
   "$FIXTURE"

@@ -41,7 +41,7 @@ printf 'globalThis.installMarker = 42;\n' > "$SOURCE"
 cmake --install "$BUILD_DIR" --prefix "$INSTALL_ROOT"
 for required in \
   starling-raw.wasm preview1-adapter.wasm features.json componentize.sh \
-  starling-feature-surface wasm-tools wasmtime wac
+  starling-feature-surface wasm-tools wasmtime wabt
 do
   test -s "$INSTALL_ROOT/bin/$required"
 done

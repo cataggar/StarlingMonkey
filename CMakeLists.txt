@@ -263,39 +263,6 @@ set(AOT 0)
 
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")
-set(WAC_BIN "${CMAKE_CURRENT_BINARY_DIR}/wac")
-include("wac")
-set(WAC_HOST_PROCESSOR "${CMAKE_HOST_SYSTEM_PROCESSOR}")
-if(WAC_HOST_PROCESSOR STREQUAL "")
-    cmake_host_system_information(RESULT WAC_HOST_PROCESSOR QUERY OS_PLATFORM)
-endif()
-starling_select_wac_artifact(
-    WAC_URL
-    WAC_SHA256
-    "${CMAKE_HOST_SYSTEM_NAME}"
-    "${WAC_HOST_PROCESSOR}"
-)
-message(STATUS "Using WAC artifact: ${WAC_URL}")
-execute_process(
-    COMMAND
-        bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/download-wac.sh"
-        "${WAC_URL}" "${WAC_SHA256}" "${WAC_BIN}" "${CMAKE_COMMAND}"
-    COMMAND_ERROR_IS_FATAL ANY
-)
-execute_process(
-    COMMAND "${WAC_BIN}" --version
-    OUTPUT_VARIABLE WAC_ACTUAL_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_VARIABLE WAC_VERSION_ERROR
-    RESULT_VARIABLE WAC_VERSION_RESULT
-)
-if(NOT WAC_VERSION_RESULT EQUAL 0 OR
-   NOT WAC_ACTUAL_VERSION MATCHES "${STARLING_WAC_VERSION}")
-    message(FATAL_ERROR
-        "Downloaded WAC artifact is not executable for this host: "
-        "${WAC_VERSION_ERROR}${WAC_ACTUAL_VERSION}"
-    )
-endif()
 if(DEFINED ENV{ZIG})
     set(ZIG_PROGRAM "$ENV{ZIG}")
 else()
@@ -313,6 +280,28 @@ if(NOT ZIG_VERSION STREQUAL STARLING_ZIG_VERSION)
         "StarlingMonkey requires Zig ${STARLING_ZIG_VERSION}; found ${ZIG_VERSION}"
     )
 endif()
+
+set(WABT_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/wabt-install")
+set(WABT_BIN "${WABT_PREFIX}/bin/wabt")
+set(WABT_LOCAL_CACHE "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/wabt-local")
+set(WABT_GLOBAL_CACHE "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/wabt-global")
+add_custom_command(
+    OUTPUT "${WABT_BIN}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${WABT_LOCAL_CACHE}" "${WABT_GLOBAL_CACHE}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "ZIG_LOCAL_CACHE_DIR=${WABT_LOCAL_CACHE}"
+            "ZIG_GLOBAL_CACHE_DIR=${WABT_GLOBAL_CACHE}"
+            "${ZIG_PROGRAM}" build wabt
+            --prefix "${WABT_PREFIX}"
+            -Doptimize=ReleaseSmall
+    DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/build.zig"
+            "${CMAKE_CURRENT_SOURCE_DIR}/build.zig.zon"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    VERBATIM
+)
+add_custom_target(starling-wabt-helper ALL DEPENDS "${WABT_BIN}")
 
 set(FEATURE_SURFACE_BIN "${CMAKE_CURRENT_BINARY_DIR}/starling-feature-surface")
 set(FEATURE_SURFACE_LOCAL_CACHE "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/feature-surface-local")
@@ -401,6 +390,7 @@ function(componentize OUTPUT)
             COMMAND ${RUNTIME_DIR}/componentize.sh ${SOURCES} -o ${OUTPUT}.wasm
             DEPENDS ${ARG_SOURCES} ${RUNTIME_DIR}/componentize.sh
                     starling-raw.wasm starling-feature-surface-helper
+                    starling-wabt-helper
             VERBATIM
     )
     add_custom_target(${OUTPUT} DEPENDS ${OUTPUT}.wasm)
@@ -416,7 +406,7 @@ install(
         "${FEATURE_SURFACE_BIN}"
         "${CMAKE_CURRENT_BINARY_DIR}/wasm-tools"
         "${CMAKE_CURRENT_BINARY_DIR}/wasmtime"
-        "${WAC_BIN}"
+        "${WABT_BIN}"
     DESTINATION bin
 )
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${ADAPTER_FILE}" DESTINATION bin)

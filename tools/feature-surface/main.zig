@@ -2,7 +2,7 @@ const std = @import("std");
 const surface = @import("surface.zig");
 
 const Args = struct {
-    wac: []const u8 = "",
+    wabt: []const u8 = "",
     wasm_tools: []const u8 = "",
     platform_wit: []const u8 = "",
     component: []const u8 = "",
@@ -23,8 +23,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.fatal("invalid feature-surface arguments: {t}", .{err});
     };
     const cwd = try std.process.currentPathAlloc(init.io, allocator);
-    try surface.apply(allocator, init.io, .{
-        .wac = args.wac,
+    _ = try surface.apply(allocator, init.io, .{
+        .wabt = args.wabt,
         .wasm_tools = args.wasm_tools,
         .platform_wit = args.platform_wit,
         .component = args.component,
@@ -45,8 +45,8 @@ fn parse(argv: []const []const u8) !Args {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--wac")) {
-            args.wac = try value(argv, &i);
+        if (std.mem.eql(u8, arg, "--wabt")) {
+            args.wabt = try value(argv, &i);
         } else if (std.mem.eql(u8, arg, "--wasm-tools")) {
             args.wasm_tools = try value(argv, &i);
         } else if (std.mem.eql(u8, arg, "--platform-wit")) {
@@ -79,7 +79,7 @@ fn parse(argv: []const []const u8) !Args {
             return error.UnknownArgument;
         }
     }
-    if (args.wac.len == 0 or
+    if (args.wabt.len == 0 or
         args.wasm_tools.len == 0 or
         args.platform_wit.len == 0 or
         args.component.len == 0 or
@@ -127,8 +127,8 @@ fn parseFeatures(text: []const u8) !surface.Features {
 test "parses feature tuple and target" {
     const argv = [_][]const u8{
         "starling-feature-surface",
-        "--wac",
-        "wac",
+        "--wabt",
+        "wabt",
         "--wasm-tools",
         "wasm-tools",
         "--platform-wit",
