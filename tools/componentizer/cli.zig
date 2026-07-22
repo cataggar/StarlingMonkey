@@ -112,9 +112,9 @@ pub const Config = struct {
 pub const ParseError = error{
     ConflictingFeatures,
     InvalidHeapLimit,
-    InvalidDiagnosticFormat,
     InvalidAotMinStackSize,
     IncompatibleAotOptions,
+    InvalidDiagnosticFormat,
     MissingSource,
     MissingValue,
     MissingWitWorld,
@@ -373,9 +373,9 @@ test "parses the native componentizer surface" {
         "--enable-script-debugging",
         "--preopen-dir",
         "extra dir",
+        "--legacy-wrapper-preopen",
         "--wabt-bin",
         "tools/wabt",
-        "--legacy-wrapper-preopen",
         "--js-heap-limit-mib",
         "256",
         "--debug-bindings",
@@ -400,9 +400,9 @@ test "parses the native componentizer surface" {
     try std.testing.expectEqual(@as(u32, 256), config.js_heap_limit_mib.?);
     try std.testing.expectEqualStrings("tools/wabt", config.wabt_bin.?);
     try std.testing.expect(config.debug_bindings);
+    try std.testing.expect(config.legacy_wrapper_preopen);
     try std.testing.expectEqual(diagnostics.Format.json, config.diagnostic_format);
     try std.testing.expectEqualStrings("metadata.json", config.metadata_out.?);
-    try std.testing.expect(config.legacy_wrapper_preopen);
 }
 
 test "rejects conflicting feature selections" {

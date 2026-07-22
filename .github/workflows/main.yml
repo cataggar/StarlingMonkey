@@ -40,7 +40,6 @@ jobs:
       with:
         version: 0.17.0-dev.902+7255f3e72
 
-
     - name: Check if SpiderMonkey Release Exists
       id: check-sm-release
       if: github.base_ref != 'zig17'
@@ -127,12 +126,6 @@ jobs:
       if: matrix.build == 'debug' && github.base_ref != 'zig17'
       run: just lint
 
-  feature-surface-acceptance:
-    name: Required Zig and CMake feature-surface matrices
-    runs-on: ubuntu-latest
-    env:
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-feature-surface
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-feature-surface
   test-aot:
     name: Test sealed Zig AOT
     runs-on: ubuntu-latest
@@ -151,34 +144,12 @@ jobs:
       with:
         version: 0.17.0-dev.902+7255f3e72
 
-    - name: Retain Zig for the production matrix
-      run: |
-        zig_dir="$(dirname "$(command -v zig)")"
-        mkdir -p "$GITHUB_WORKSPACE/.ci-tools"
-        cp -a "$zig_dir" "$GITHUB_WORKSPACE/.ci-tools/zig"
-        echo "$GITHUB_WORKSPACE/.ci-tools/zig" >> "$GITHUB_PATH"
-        echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache-feature-surface" >> "$GITHUB_ENV"
-        echo "ZIG_LOCAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-cache-feature-surface" >> "$GITHUB_ENV"
-        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" version
-
-    - name: Validate release workflow recipes
-      run: python3 tests/workflows/check-just-recipes.py .github/workflows/release-please.yml justfile
     - name: Install Just
       uses: taiki-e/install-action@just
 
     - name: Install Rust WASI target
       run: rustup target add wasm32-wasip1
 
-    - name: Install cbindgen
-      run: cargo install cbindgen --locked --version 0.29.3
-
-    - name: Build Zig runtime dependencies
-      run: ./deps/build-deps.sh --all
-
-    - name: Run required host API production gate
-      run: |
-        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" build host-api-production-matrix-test \
-          -Doptimize=ReleaseSmall
     - name: Build AOT dependencies
       run: ./deps/build-deps.sh --all
 
@@ -207,8 +178,49 @@ jobs:
           release-artifacts/starling-ics.wevalcache
           release-artifacts/starling-ics.wevalcache.manifest
 
+  feature-surface-acceptance:
+    name: Required Zig and CMake feature-surface matrices
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-feature-surface
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-feature-surface
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0-dev.902+7255f3e72
+
+    - name: Retain Zig for the production matrix
+      run: |
+        zig_dir="$(dirname "$(command -v zig)")"
+        mkdir -p "$GITHUB_WORKSPACE/.ci-tools"
+        cp -a "$zig_dir" "$GITHUB_WORKSPACE/.ci-tools/zig"
+        echo "$GITHUB_WORKSPACE/.ci-tools/zig" >> "$GITHUB_PATH"
+        echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache-feature-surface" >> "$GITHUB_ENV"
+        echo "ZIG_LOCAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-cache-feature-surface" >> "$GITHUB_ENV"
+        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" version
+
+    - name: Validate release workflow recipes
+      run: python3 tests/workflows/check-just-recipes.py .github/workflows/release-please.yml justfile
+
+    - name: Install Rust WASI target
+      run: rustup target add wasm32-wasip1
+
+    - name: Install cbindgen
+      run: cargo install cbindgen --locked --version 0.29.3
+
+    - name: Build Zig runtime dependencies
+      run: ./deps/build-deps.sh --all
+
+    - name: Run required host API production gate
+      run: |
+        "$GITHUB_WORKSPACE/.ci-tools/zig/zig" build host-api-production-matrix-test \
+          -Doptimize=ReleaseSmall
+
   release-spidermonkey:
-    needs: [test, feature-surface-acceptance]
+    needs: [test, test-aot, feature-surface-acceptance]
     if: needs.test.outputs.SM_TAG_EXISTS == 'false' && (github.event_name == 'push' && 
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest

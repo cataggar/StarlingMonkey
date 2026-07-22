@@ -27,11 +27,15 @@ SOURCE="$ROOT/tests/fixtures/js-dispatch.js"
 PRIMER="$ROOT/tools/componentizer/aot-cache-primer.js"
 PRIMER_BACKUP="$CACHE/aot-cache-primer.js.original"
 
-rm -rf "$CACHE"
+if [ -e "$CACHE" ]; then
+  chmod -R u+w "$CACHE" 2>/dev/null || true
+  rm -rf "$CACHE"
+fi
 mkdir -p "$WORK"
 cp -p "$PRIMER" "$PRIMER_BACKUP"
 cleanup() {
   cp -p "$PRIMER_BACKUP" "$PRIMER"
+  chmod -R u+w "$CACHE" 2>/dev/null || true
   rm -rf "$CACHE"
 }
 trap cleanup EXIT

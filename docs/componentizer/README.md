@@ -8,11 +8,9 @@ The CLI performs these stages with structured process arguments (never a shell
 command string):
 
 1. Select and cache a WIT-specific `zig build` of `starling-raw.wasm`.
-2. Pre-initialize the JavaScript module with Wizer.
-3. Strip and embed the selected component world with `wasm-tools`.
 2. Pre-initialize the JavaScript module with Wizer, or partially evaluate it
    with the explicitly selected Weval AOT pipeline.
-3. Strip and embed the selected component world with WABT.
+3. Strip and embed the selected component world with `wasm-tools`.
 4. Adapt the reactor into a component.
 5. Generate and compose feature-surface providers with pinned WABT so
    disabled/runtime-only
@@ -367,18 +365,19 @@ zig-out/bin/starling-componentize \
 ```
 
 WIT files are content-hashed and staged under the build root. Runtime prefixes
-are keyed by the componentizer's embedded host API, the two WIT closures,
-worlds, feature selection, and build mode. Every nested build receives that
-exact `-Dhost-api`; an installed componentizer cannot silently fall back to a
-different adapter/provider identity.
-are keyed by the pipeline/engine ABI, two WIT closures, worlds, resolved
-feature ABI, and build mode.
+are keyed by the pipeline/engine ABI, the componentizer's embedded host API,
+the two WIT closures and worlds, resolved feature ABI, and build mode. Every
+nested build receives that exact `-Dhost-api`; an installed componentizer
+cannot silently fall back to a different adapter/provider identity.
 The CLI still invokes `zig build` on every run so source/toolchain changes
 cannot reuse stale output; Zig's own dependency cache makes an unchanged
 monolithic relink a fast cache hit. JavaScript source is deliberately excluded
 from the runtime key. Per-input and per-runtime advisory locks make concurrent
 uses of one cache safe, and the runtime lock remains held until componentization
 has finished consuming the cached engine, adapter, and generated bindings.
+An explicit `ZIG_GLOBAL_CACHE_DIR` is preserved for nested builds; otherwise
+the CLI uses `<cache-dir>/zig-global-cache`. `ZIG_LOCAL_CACHE_DIR` is always
+removed.
 The effective default or explicit componentizer cache is canonicalized before
 source snapshotting and retained through an opened directory handle. Runtime,
 lock, and Zig local/global-cache directories are created and checked no-follow
@@ -391,9 +390,6 @@ root or descendant replacement cannot redirect writes or reads into a
 replacement. Only the exact effective-cache
 directory identity is excluded if it is nested inside a snapshotted source
 tree.
-An explicit `ZIG_GLOBAL_CACHE_DIR` is preserved for nested builds; otherwise
-the CLI uses `<cache-dir>/zig-global-cache`. `ZIG_LOCAL_CACHE_DIR` is always
-removed.
 
 `--engine` accepts only a `starling-raw.wasm` carrying StarlingMonkey's
 integrity-bound embedded engine provenance and a matching sibling
@@ -599,7 +595,13 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--wasmtime-bin`/`--wizer-bin`, `--wabt-bin`, `--wasm-tools-bin`, and
 `--preview2-adapter`. `--wasmtime-bin` selects Wasmtime's `wizer` subcommand;
 `--wizer-bin` selects a standalone Wizer and uses its native
-`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
+`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options. Executable
+overrides may be absolute paths, relative paths containing a separator, or
+bare names resolved through `PATH`. Wizer is resolved only for a non-AOT run
+that actually initializes JavaScript; AOT and non-AOT output-only runs ignore
+ambient Wizer settings. The AOT runtime-only initializer snapshots no engine,
+but resets libc environment state and finalizes the monotonic-clock offset so
+runtime `STARLINGMONKEY_CONFIG` and `-e` arguments are observed after resume.
 For runtime builds, a valid `ZIG_LIB_DIR` takes precedence; standard archive
 and installed layouts are resolved next, with stable `zig env` execution as a
 fallback. The executable and complete library tree are copied together into
@@ -613,13 +615,6 @@ Every top-level and nested build requires exactly Zig
 their retained executable and rejected during input preflight when the version
 differs. The broader `build.zig.zon` minimum remains only a package parser
 floor.
-`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options. Executable
-overrides may be absolute paths, relative paths containing a separator, or
-bare names resolved through `PATH`. Wizer is resolved only for a non-AOT run
-that actually initializes JavaScript; AOT and non-AOT output-only runs ignore
-ambient Wizer settings. The AOT runtime-only initializer snapshots no engine,
-but resets libc environment state and finalizes the monotonic-clock offset so
-runtime `STARLINGMONKEY_CONFIG` and `-e` arguments are observed after resume.
 
 `--debug-bindings` explicitly requests runtime arguments, generated bindings
 (when the CLI builds the runtime), imports/provenance JSON, a path-sanitized

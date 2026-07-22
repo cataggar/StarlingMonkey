@@ -91,5 +91,5 @@ tests/compat/runtime/invoker/target/
 # Native componentizer fake-tool orchestration scratch.
 tests/componentizer/.scratch/
 tests/componentizer/.real-cache/
-tests/runtime-eval/.scratch/
 tests/componentizer/.aot-real-cache/
+tests/runtime-eval/.scratch/

@@ -8,7 +8,6 @@ const RuntimeBuildTool = struct {
     executable: std.Build.LazyPath,
 };
 
-
 fn dependencyExecutable(
     dependency: *std.Build.Dependency,
     name: []const u8,
@@ -21,11 +20,6 @@ fn dependencyExecutable(
     @panic("dependency executable not found");
 }
 
-fn inputPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
-    return if (std.fs.path.isAbsolute(path))
-        .{ .cwd_relative = path }
-    else
-        b.path(path);
 fn addPrefixBinFile(
     b: *std.Build,
     generation: ?*std.Build.Step.WriteFile,
@@ -67,6 +61,13 @@ fn addPrefixBinDirectory(
     });
     b.getInstallStep().dependOn(&install.step);
     return &install.step;
+}
+
+fn inputPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(path))
+        .{ .cwd_relative = path }
+    else
+        b.path(path);
 }
 
 // StarlingMonkey build (Zig 0.17 port of the CMake build).
@@ -198,13 +199,20 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
         std.debug.print(
-            "error: StarlingMonkey requires Zig {s}; found {s}\n",
             "error: StarlingMonkey v0.4 requires Zig {s}; found {s}\n",
             .{ required_zig_version, builtin.zig_version_string },
         );
         @panic("unsupported Zig version");
     }
     const optimize = b.standardOptimizeOption(.{});
+    const aot_engine = b.option(
+        bool,
+        "aot-engine",
+        "Build the PBL+Weval SpiderMonkey variant and its sealed IC cache",
+    ) orelse false;
+    const aot_generation = if (aot_engine) b.addWriteFiles() else null;
+    var aot_generation_chmod: ?*std.Build.Step.Run = null;
+
     const host_api_selection = b.option(
         []const u8,
         "host-api",
@@ -220,19 +228,11 @@ pub fn build(b: *std.Build) void {
         "host-api-world",
         "Default component world in the selected host API WIT package",
     ) orelse "bindings";
-    const aot_engine = b.option(
-        bool,
-        "aot-engine",
-        "Build the PBL+Weval SpiderMonkey variant and its sealed IC cache",
-    ) orelse false;
-    const aot_generation = if (aot_engine) b.addWriteFiles() else null;
-    var aot_generation_chmod: ?*std.Build.Step.Run = null;
-
     // Native, Node-free driver for the monolithic Zig/WABT componentization
     // pipeline. It is a host tool even though the runtime it builds targets
     // wasm32-wasi.
     const componentizer_options = b.addOptions();
-    componentizer_options.addOption([]const u8, "version", "0.4.1");
+    componentizer_options.addOption([]const u8, "version", "0.3.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     componentizer_options.addOption([]const u8, "host_api", host_api_selection);
     componentizer_options.addOption([]const u8, "host_api_world", host_api_world);
@@ -253,17 +253,6 @@ pub fn build(b: *std.Build) void {
         .name = "starling-componentize",
         .root_module = componentizer_mod,
     });
-    b.installArtifact(componentizer);
-    const feature_surface_mod = b.createModule(.{
-        .root_source_file = b.path("tools/feature-surface/main.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
-    const feature_surface = b.addExecutable(.{
-        .name = "starling-feature-surface",
-        .root_module = feature_surface_mod,
-    });
-    b.installArtifact(feature_surface);
     _ = addPrefixBinFile(
         b,
         aot_generation,
@@ -286,16 +275,24 @@ pub fn build(b: *std.Build) void {
         "starling-aot-cache",
     );
     const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
-    const install_wabt = b.addInstallArtifact(wabt, .{});
-    b.getInstallStep().dependOn(&install_wabt.step);
-    const wabt_step = b.step("wabt", "Build and install the pinned WABT CLI");
-    wabt_step.dependOn(&install_wabt.step);
-    _ = addPrefixBinFile(
+    const wabt_install_step = addPrefixBinFile(
         b,
         aot_generation,
         wabt.getEmittedBin(),
         "wabt",
     );
+    const feature_surface_mod = b.createModule(.{
+        .root_source_file = b.path("tools/feature-surface/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const feature_surface = b.addExecutable(.{
+        .name = "starling-feature-surface",
+        .root_module = feature_surface_mod,
+    });
+    if (!aot_engine) b.installArtifact(feature_surface);
+    const wabt_step = b.step("wabt", "Build and install the pinned WABT CLI");
+    wabt_step.dependOn(wabt_install_step);
     const componentizer_step = b.step(
         "componentizer",
         "Build the native starling-componentize CLI",
@@ -330,8 +327,6 @@ pub fn build(b: *std.Build) void {
         "Run native componentizer unit and fake-tool orchestration tests",
     );
     componentizer_test_step.dependOn(&run_componentizer_tests.step);
-    componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
-    componentizer_test_step.dependOn(&run_feature_surface_tests.step);
     const aot_package_test_step = b.step(
         "aot-package-test",
         "Race two validated AOT bundles through release publication",
@@ -390,15 +385,26 @@ pub fn build(b: *std.Build) void {
     zig_version_test.addFileArg(b.path("scripts/require-zig-version.sh"));
     zig_version_test.addArg(b.graph.zig_exe);
     componentizer_test_step.dependOn(&zig_version_test.step);
+    componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
+    componentizer_test_step.dependOn(&run_feature_surface_tests.step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
     componentizer_orchestration.addArtifactArg(componentizer);
     componentizer_orchestration.addArg(host_api_selection);
-    componentizer_orchestration.addArtifactArg(aot_cache_tool);
-    if (b.lazyDependency("wasm-tools", .{})) |dep|
-        componentizer_orchestration.addFileArg(dep.path("wasm-tools"));
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
+    const aot_fake_orchestration = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot-fake.sh" },
+    );
+    aot_fake_orchestration.addArtifactArg(componentizer);
+    aot_fake_orchestration.addArtifactArg(aot_cache_tool);
+    if (b.lazyDependency("wasm-tools", .{})) |dep|
+        aot_fake_orchestration.addFileArg(dep.path("wasm-tools"));
+    aot_fake_orchestration.setEnvironmentVariable(
+        "STARLING_COMPONENTIZER_AOT_PIPELINE",
+        "1",
+    );
+    componentizer_test_step.dependOn(&aot_fake_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
     );
@@ -447,7 +453,11 @@ pub fn build(b: *std.Build) void {
     }
     aot_engine_test.addArtifactArg(wabt);
     aot_engine_test.addFileArg(
-        b.path("host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+        b.path(b.pathJoin(&.{
+            host_api_dir,
+            "preview1-adapter-release",
+            "wasi_snapshot_preview1.wasm",
+        })),
     );
     if (b.lazyDependency("weval", .{})) |dep| {
         aot_engine_test.addFileArg(dep.path("weval"));
@@ -459,14 +469,12 @@ pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
 
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
-    const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
-    const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
-    const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
     const requested_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds");
     const use_wasm_opt = requested_wasm_opt orelse !aot_engine;
     if (aot_engine and use_wasm_opt) {
         @panic("-Daot-engine requires -Dwasm-opt=false (the default for AOT builds)");
     }
+    const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
     const component_world = b.option([]const u8, "component-world", "World to generate JavaScript-backed exports for");
     if ((component_wit == null) != (component_world == null)) {
@@ -505,7 +513,7 @@ pub fn build(b: *std.Build) void {
             @intFromBool(features.http),
             @intFromBool(features.fetch_event),
             @tagName(optimize),
-            host_api_name,
+            host_api_identity,
             @intFromBool(enable_debugger),
         },
     );
@@ -680,11 +688,15 @@ pub fn build(b: *std.Build) void {
         addWitArg(b, bindgen, inputPath(b, wit_dir));
         bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "--js-imports", "-o" });
         generated_bindings = bindgen.addOutputFileArg("component_bindings.zig");
-        const install_bindings = b.addInstallFile(
-            generated_bindings.?,
-            "wit-bindgen/component_bindings.zig",
-        );
-        wit_bindgen_step.dependOn(&install_bindings.step);
+        if (aot_engine) {
+            wit_bindgen_step.dependOn(&bindgen.step);
+        } else {
+            const install_bindings = b.addInstallFile(
+                generated_bindings.?,
+                "wit-bindgen/component_bindings.zig",
+            );
+            wit_bindgen_step.dependOn(&install_bindings.step);
+        }
     }
 
     const link_mod = b.createModule(.{
@@ -771,30 +783,6 @@ pub fn build(b: *std.Build) void {
             raw_wasm = opt_out;
         }
     }
-    const feature_tuple = b.fmt(
-        "{d}{d}{d}{d}{d}",
-        .{
-            @intFromBool(features.stdio),
-            @intFromBool(features.random),
-            @intFromBool(features.clocks),
-            @intFromBool(features.http),
-            @intFromBool(features.fetch_event),
-        },
-    );
-    const provenance = b.addSystemCommand(&.{"python3"});
-    provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
-    provenance.addFileArg(raw_wasm);
-    const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
-    provenance.addArgs(&.{
-        host_api_identity,
-        feature_tuple,
-        component_world orelse host_api_world,
-        dispatch_world orelse "caller",
-    });
-    raw_wasm = provenanced_raw;
-
-    const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
-
     const provenance_tool = b.addExecutable(.{
         .name = "starling-engine-provenance",
         .root_module = b.createModule(.{
@@ -810,7 +798,7 @@ pub fn build(b: *std.Build) void {
     const provenance_wasm =
         add_provenance.addOutputFileArg("starling-raw.wasm");
     add_provenance.addArgs(&.{
-        host_api_name,
+        host_api_identity,
         component_world orelse "js-dispatch",
         dispatch_world orelse "js-exports",
         if (features.stdio) "true" else "false",
@@ -819,45 +807,9 @@ pub fn build(b: *std.Build) void {
         if (features.http) "true" else "false",
         if (features.fetch_event) "true" else "false",
     });
-    raw_wasm = provenance_wasm;
+    if (aot_engine) raw_wasm = provenance_wasm;
     var aot_bundle_publish: ?*std.Build.Step.Run = null;
-    if (!aot_engine)
-        _ = addPrefixBinFile(b, null, raw_wasm, "starling-raw.wasm");
 
-    var tool_manifest: std.ArrayList(u8) = .empty;
-    tool_manifest.appendSlice(
-        gpa,
-        "{\n  \"schema\": \"starling-componentize-build-tools/v1\",\n  \"tools\": [",
-    ) catch @panic("OOM");
-    for (runtime_build_tools.items, 0..) |tool, index| {
-        tool_manifest.appendSlice(
-            gpa,
-            if (index == 0) "\n" else ",\n",
-        ) catch @panic("OOM");
-        tool_manifest.appendSlice(gpa, b.fmt(
-            "    {{\"name\": \"{s}\", \"path\": \"runtime-build-tools/{s}\"}}",
-            .{ tool.name, tool.name },
-        )) catch @panic("OOM");
-        const install_tool = b.addInstallBinFile(
-            tool.executable,
-            b.fmt("runtime-build-tools/{s}", .{tool.name}),
-        );
-        b.getInstallStep().dependOn(&install_tool.step);
-    }
-    tool_manifest.appendSlice(
-        gpa,
-        if (runtime_build_tools.items.len == 0) "]\n}\n" else "\n  ]\n}\n",
-    ) catch @panic("OOM");
-    const tool_manifest_file = b.addWriteFiles().add(
-        "runtime-build-tools.json",
-        tool_manifest.items,
-    );
-    b.getInstallStep().dependOn(
-        &b.addInstallBinFile(
-            tool_manifest_file,
-            "runtime-build-tools.json",
-        ).step,
-    );
     if (aot_engine) {
         if (is_debug) @panic("-Daot-engine does not support Debug builds");
         const weval_dep = b.lazyDependency("weval", .{}) orelse
@@ -939,6 +891,66 @@ pub fn build(b: *std.Build) void {
         );
         aot_step.dependOn(&publish_bundle.step);
     }
+    if (!aot_engine) {
+        const feature_tuple = b.fmt(
+            "{d}{d}{d}{d}{d}",
+            .{
+                @intFromBool(features.stdio),
+                @intFromBool(features.random),
+                @intFromBool(features.clocks),
+                @intFromBool(features.http),
+                @intFromBool(features.fetch_event),
+            },
+        );
+        const provenance = b.addSystemCommand(&.{"python3"});
+        provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
+        provenance.addFileArg(raw_wasm);
+        const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
+        provenance.addArgs(&.{
+            host_api_identity,
+            feature_tuple,
+            component_world orelse host_api_world,
+            dispatch_world orelse "caller",
+        });
+        raw_wasm = provenanced_raw;
+        _ = addPrefixBinFile(b, null, raw_wasm, "starling-raw.wasm");
+    }
+
+    var tool_manifest: std.ArrayList(u8) = .empty;
+    tool_manifest.appendSlice(
+        gpa,
+        "{\n  \"schema\": \"starling-componentize-build-tools/v1\",\n  \"tools\": [",
+    ) catch @panic("OOM");
+    for (runtime_build_tools.items, 0..) |tool, index| {
+        tool_manifest.appendSlice(
+            gpa,
+            if (index == 0) "\n" else ",\n",
+        ) catch @panic("OOM");
+        tool_manifest.appendSlice(gpa, b.fmt(
+            "    {{\"name\": \"{s}\", \"path\": \"runtime-build-tools/{s}\"}}",
+            .{ tool.name, tool.name },
+        )) catch @panic("OOM");
+        _ = addPrefixBinFile(
+            b,
+            aot_generation,
+            tool.executable,
+            b.fmt("runtime-build-tools/{s}", .{tool.name}),
+        );
+    }
+    tool_manifest.appendSlice(
+        gpa,
+        if (runtime_build_tools.items.len == 0) "]\n}\n" else "\n  ]\n}\n",
+    ) catch @panic("OOM");
+    const tool_manifest_file = b.addWriteFiles().add(
+        "runtime-build-tools.json",
+        tool_manifest.items,
+    );
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        tool_manifest_file,
+        "runtime-build-tools.json",
+    );
 
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
     // Install the preview1 adapter and a generated componentize.sh next to
@@ -947,57 +959,34 @@ pub fn build(b: *std.Build) void {
         inputPath(b, path)
     else
         b.path(b.pathJoin(&.{ ctx.host_api_dir, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
-    b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
-    const installed_component_wit = component_wit orelse
-        b.pathJoin(&.{ ctx.host_api_dir, "wit" });
-    const install_wit = b.addInstallDirectory(.{
-        .source_dir = inputPath(b, installed_component_wit),
-        .install_dir = .bin,
-        .install_subdir = "component-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_wit.step);
-    const surface_wit = dispatch_wit orelse "tools/feature-surface";
-    const install_surface_wit = b.addInstallDirectory(.{
-        .source_dir = inputPath(b, surface_wit),
-        .install_dir = .bin,
-        .install_subdir = "surface-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_surface_wit.step);
-    const install_feature_wit = b.addInstallDirectory(.{
-        .source_dir = b.path(b.pathJoin(&.{ ctx.host_api_dir, "wit" })),
-        .install_dir = .bin,
-        .install_subdir = "feature-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_feature_wit.step);
-    const adapter = b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" });
     _ = addPrefixBinFile(
         b,
         aot_generation,
-        b.path(adapter),
+        adapter,
         "preview1-adapter.wasm",
     );
-    const default_wit = b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    const component_package_wit = component_wit orelse
+        b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    const surface_wit = dispatch_wit orelse "tools/feature-surface";
+    const feature_wit = b.pathJoin(&.{ ctx.host_api_dir, "wit" });
     for ([_]struct { source: []const u8, destination: []const u8 }{
         .{
-            .source = component_wit orelse default_wit,
+            .source = component_package_wit,
             .destination = "component-wit",
         },
         .{
-            .source = dispatch_wit orelse default_wit,
+            .source = surface_wit,
             .destination = "surface-wit",
         },
         .{
-            .source = default_wit,
+            .source = feature_wit,
             .destination = "feature-wit",
         },
     }) |wit| {
         _ = addPrefixBinDirectory(
             b,
             aot_generation,
-            b.path(wit.source),
+            inputPath(b, wit.source),
             wit.destination,
             &.{".wit"},
         );
@@ -1025,10 +1014,10 @@ pub fn build(b: *std.Build) void {
     const componentize_sh = renderComponentizeScript(
         b,
         component_world orelse host_api_world,
+        aot_engine,
         dispatch_world orelse "caller",
         features,
     );
-    const componentize_sh = renderComponentizeScript(b, component_world, aot_engine);
     const inst_componentize = addPrefixBinFile(
         b,
         aot_generation,
@@ -1511,22 +1500,21 @@ pub fn build(b: *std.Build) void {
 fn renderComponentizeScript(
     b: *std.Build,
     component_world: ?[]const u8,
+    aot_engine: bool,
     surface_target_world: []const u8,
     features: Features,
-    aot_engine: bool,
 ) std.Build.LazyPath {
     const template = @embedFile("componentize.sh.in");
     var buf = std.ArrayList(u8).empty;
     const gpa = b.allocator;
     var rest: []const u8 = template;
     const subs = [_]struct { from: []const u8, to: []const u8 }{
-        .{ .from = "@AOT@", .to = "0" },
-        .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
         .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
         .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
         .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
         .{ .from = "@AOT@", .to = if (aot_engine) "1" else "0" },
         .{ .from = "@AOT_DRIVER@", .to = "native" },
+        .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
         .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },
         .{ .from = "@FEATURE_STDIO@", .to = if (features.stdio) "1" else "0" },
