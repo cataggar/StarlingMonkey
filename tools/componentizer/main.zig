@@ -5668,6 +5668,13 @@ fn buildMetadataDocument(
         allocator,
         &tool_values,
         &tool_fields,
+        "wac",
+        tools.wac,
+    );
+    try appendToolSnapshot(
+        allocator,
+        &tool_values,
+        &tool_fields,
         "wasm-tools",
         tools.wasm_tools,
     );

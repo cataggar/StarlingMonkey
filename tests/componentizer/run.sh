@@ -229,7 +229,8 @@ if [ -n "${FAKE_REPLACE_SOURCE:-}" ]; then
   printf 'replaced-adapter\n' > "$FAKE_REPLACE_ADAPTER"
   printf 'package test:componentizer;\nworld replaced {}\n' > \
     "$FAKE_REPLACE_WIT/world.wit"
-  for tool in "$FAKE_REPLACE_WABT" "$FAKE_REPLACE_WASM_TOOLS"; do
+  for tool in "$FAKE_REPLACE_WABT" "$FAKE_REPLACE_WAC" \
+    "$FAKE_REPLACE_WASM_TOOLS"; do
     printf '#!/usr/bin/env bash\nexit 99\n' > "$tool"
     chmod +x "$tool"
   done
@@ -711,12 +712,14 @@ cp "$ENGINE" "$SCRATCH/original-engine"
 cp "$ADAPTER" "$SCRATCH/original-adapter"
 cp "$WIT/world.wit" "$SCRATCH/original-world.wit"
 cp "$TOOLS/fake wabt" "$SCRATCH/original-wabt"
+cp "$TOOLS/fake wac" "$SCRATCH/original-wac"
 cp "$TOOLS/fake wasm-tools" "$SCRATCH/original-wasm-tools"
 FAKE_REPLACE_SOURCE="$SOURCE" \
 FAKE_REPLACE_ENGINE="$ENGINE" \
 FAKE_REPLACE_ADAPTER="$ADAPTER" \
 FAKE_REPLACE_WIT="$WIT" \
 FAKE_REPLACE_WABT="$TOOLS/fake wabt" \
+FAKE_REPLACE_WAC="$TOOLS/fake wac" \
 FAKE_REPLACE_WASM_TOOLS="$TOOLS/fake wasm-tools" \
 "$COMPONENTIZER" \
   --engine "$ENGINE" \
@@ -733,7 +736,8 @@ cmp "$SCRATCH/original-engine" "$SNAPSHOT_OUTPUT"
 python3 - "$SNAPSHOT_DIR/metadata.json" \
   "$SCRATCH/original-source" "$SCRATCH/original-engine" \
   "$SCRATCH/original-adapter" "$SCRATCH/original-world.wit" \
-  "$SCRATCH/original-wabt" "$SCRATCH/original-wasm-tools" <<'PY'
+  "$SCRATCH/original-wabt" "$SCRATCH/original-wac" \
+  "$SCRATCH/original-wasm-tools" <<'PY'
 import hashlib, json, sys
 digest = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()
 metadata = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -748,13 +752,15 @@ wit.update(b"\xff")
 assert metadata["provenance"]["dispatch_world"]["wit_sha256"] == wit.hexdigest()
 tools = {tool["name"]: tool["sha256"] for tool in metadata["provenance"]["tools"]}
 assert tools["wabt"] == digest(sys.argv[6])
-assert tools["wasm-tools"] == digest(sys.argv[7])
+assert tools["wac"] == digest(sys.argv[7])
+assert tools["wasm-tools"] == digest(sys.argv[8])
 PY
 cp "$SCRATCH/original-source" "$SOURCE"
 cp "$SCRATCH/original-engine" "$ENGINE"
 cp "$SCRATCH/original-adapter" "$ADAPTER"
 cp "$SCRATCH/original-world.wit" "$WIT/world.wit"
 cp "$SCRATCH/original-wabt" "$TOOLS/fake wabt"
+cp "$SCRATCH/original-wac" "$TOOLS/fake wac"
 cp "$SCRATCH/original-wasm-tools" "$TOOLS/fake wasm-tools"
 if find "$WORK" -name '*.starling-componentize-source-*' -o \
   -name '*.starling-componentize-initializer-*' | grep -q .; then
@@ -4183,11 +4189,24 @@ assert [f["name"] for f in provenance["features"]] == [
 ]
 assert all(f["enabled"] for f in provenance["features"])
 assert [t["name"] for t in provenance["tools"]] == [
-    "zig", "wasip3-bindgen", "wasm-opt", "wizer", "wabt", "wasm-tools",
+    "zig", "wasip3-bindgen", "wasm-opt", "wizer", "wabt", "wac",
+    "wasm-tools",
 ]
 assert all(sha256.match(t["sha256"]) for t in provenance["tools"])
 assert sha256.match(provenance["tools"][0]["lib_tree_sha256"])
 assert all(t["lib_tree_sha256"] is None for t in provenance["tools"][1:])
+tool_fields = []
+for tool in provenance["tools"]:
+    tool_fields.append((tool["name"], tool["sha256"]))
+    if tool["name"] == "zig":
+        tool_fields.append(("zig-lib", tool["lib_tree_sha256"]))
+tool_hash = hashlib.sha256()
+for name, value in tool_fields:
+    tool_hash.update(name.encode())
+    tool_hash.update(b"\0")
+    tool_hash.update(value.encode())
+    tool_hash.update(b"\xff")
+assert provenance["tools_sha256"] == tool_hash.hexdigest()
 assert sha256.match(metadata["component_sha256"])
 runtime_args = open(sys.argv[3], "rb").read()
 assert provenance["inputs"]["runtime_arguments_sha256"] == \
