@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
-  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter>" >&2
+if [ "$#" -ne 7 ]; then
+  echo "usage: $0 <componentizer> <zig> <wasmtime> <wasm-tools> <wabt> <adapter> <host-api>" >&2
   exit 2
 fi
 
@@ -12,6 +12,8 @@ WASMTIME="$3"
 WASM_TOOLS="$4"
 WABT="$5"
 ADAPTER="$6"
+HOST_API="$7"
+HOST_VERSION="${HOST_API#wasi-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="$ROOT/tests/componentizer/.real-cache"
 WORK="$CACHE/work with spaces"
@@ -35,7 +37,7 @@ trap cleanup_cache EXIT
 
 componentize() {
   local source="$1" output="$2"
-  local dispatch_wit="${3:-$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js}"
+  local dispatch_wit="${3:-$ROOT/host-apis/$HOST_API/wit/deps/starling-js}"
   local component_world="${4:-js-dispatch}"
   local metadata="${5:-}"
   local metadata_args=()
@@ -48,7 +50,7 @@ componentize() {
     --zig-bin "$ZIG" \
     --wit "$dispatch_wit" \
     --world-name js-exports \
-    --component-wit "$ROOT/host-apis/wasi-0.2.10/wit" \
+    --component-wit "$ROOT/host-apis/$HOST_API/wit" \
     --component-world-name "$component_world" \
     --wasmtime-bin "$WASMTIME" \
     --wabt-bin "$WABT" \
@@ -63,9 +65,9 @@ WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
   --build-root "$ROOT" \
   --cache-dir "$CACHE/runtime cache" \
   --zig-bin "$ZIG" \
-  --wit "$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js" \
+  --wit "$ROOT/host-apis/$HOST_API/wit/deps/starling-js" \
   --world-name js-exports \
-  --component-wit "$ROOT/host-apis/wasi-0.2.10/wit" \
+  --component-wit "$ROOT/host-apis/$HOST_API/wit" \
   --component-world-name js-dispatch \
   --wasmtime-bin "$WASMTIME" \
   --wabt-bin "$WABT" \
@@ -280,12 +282,99 @@ for component_path, metadata in ((sys.argv[1], first), (sys.argv[3], second)):
 assert first == second
 PY
 
+surface_case() {
+  local name="$1" oracle_case="$2" disabled="$3"
+  local case_cache="$CACHE/surface runtime cache"
+  local native_output="$WORK/$name native.wasm"
+  local shell_output="$WORK/$name shell.wasm"
+  local engine_output="$WORK/$name external engine.wasm"
+  local native_wit="$WORK/$name native.wit"
+  local shell_wit="$WORK/$name shell.wit"
+  local engine_wit="$WORK/$name external engine.wit"
+  local runtime_prefix="$case_cache/release"
+  local -a feature_args=()
+  local -a build_feature_args=()
+  if [ -n "$disabled" ]; then
+    feature_args+=(--disable "$disabled")
+    build_feature_args+=("-Ddisable-features=$disabled")
+  fi
+
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
+    --build-root "$ROOT" \
+    --cache-dir "$case_cache" \
+    --zig-bin "$ZIG" \
+    --wit "$ROOT/host-apis/$HOST_API/wit/deps/starling-js" \
+    --world-name js-exports \
+    --component-wit "$ROOT/host-apis/$HOST_API/wit" \
+    --component-world-name js-dispatch \
+    --wasmtime-bin "$WASMTIME" \
+    --wabt-bin "$WABT" \
+    --wasm-tools-bin "$WASM_TOOLS" \
+    --preview2-adapter "$ADAPTER" \
+    "${feature_args[@]}" \
+    --out "$native_output" \
+    "$ROOT/tests/fixtures/js-dispatch.js"
+
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$ZIG" build \
+    --prefix "$runtime_prefix" \
+    -Doptimize=ReleaseSmall \
+    "-Dhost-api=$HOST_API" \
+    -Dhost-api-world=bindings \
+    "-Dpreview1-adapter=$ADAPTER" \
+    "-Dcomponent-wit=$ROOT/host-apis/$HOST_API/wit" \
+    -Dcomponent-world=js-dispatch \
+    "-Ddispatch-wit=$ROOT/host-apis/$HOST_API/wit/deps/starling-js" \
+    -Ddispatch-world=js-exports \
+    "${build_feature_args[@]}"
+  local runtime_bin="$runtime_prefix/bin"
+  "$runtime_bin/componentize.sh" \
+    "$ROOT/tests/fixtures/js-dispatch.js" \
+    -o "$shell_output"
+  WASM_TOOLS_BIN="$WASM_TOOLS" "$COMPONENTIZER" \
+    --engine "$runtime_bin/starling-raw.wasm" \
+    --wasmtime-bin "$WASMTIME" \
+    --wasm-tools-bin "$WASM_TOOLS" \
+    --out "$engine_output" \
+    "$ROOT/tests/fixtures/js-dispatch.js"
+
+  "$WASM_TOOLS" validate --features all "$native_output"
+  "$WASM_TOOLS" validate --features all "$shell_output"
+  "$WASM_TOOLS" validate --features all "$engine_output"
+  "$WASM_TOOLS" component wit "$native_output" -o "$native_wit"
+  "$WASM_TOOLS" component wit "$shell_output" -o "$shell_wit"
+  "$WASM_TOOLS" component wit "$engine_output" -o "$engine_wit"
+  python3 "$ROOT/tests/feature-selection/check-production-surface.py" \
+    "$ROOT/tests/feature-selection/reference/expected/import-surfaces.json" \
+    "$oracle_case" \
+    "starling:js/api,wasi:cli/run@$HOST_VERSION,wasi:http/incoming-handler@$HOST_VERSION" \
+    "$native_wit" "$shell_wit" "$engine_wit"
+  if [ "$name" = pure ]; then
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$native_output" -- --invalid-if-visible
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$shell_output" -- --invalid-if-visible
+    STARLINGMONKEY_CONFIG=--invalid-if-visible \
+      "$WASMTIME" run -S cli -S inherit-env "$engine_output" -- --invalid-if-visible
+  fi
+}
+
+surface_case defaults defaults ""
+surface_case pure disable-all "stdio,random,clocks,http,fetch-event"
+surface_case no-stdio disable-stdio "stdio"
+surface_case no-random disable-random "random"
+surface_case no-clocks disable-clocks "clocks"
+surface_case no-http disable-http-only "http"
+surface_case no-fetch-event disable-fetch-event-only "fetch-event"
+surface_case no-http-or-fetch-event disable-http-fetch-event "http,fetch-event"
+surface_case fetch-event-dependency-closure fetch-event-random-only "stdio,clocks,http"
+surface_case fetch-event-only fetch-event-only "stdio,random,clocks,http"
+
 # A different dispatch and component world must produce an observably
 # different relink rather than reusing or restaging the first runtime.
 componentize \
   "$ROOT/tests/componentizer/js-dispatch-v2.js" \
   "$V2_OUTPUT" \
-  "$ROOT/host-apis/wasi-0.2.10/wit/deps/starling-js-v2" \
+  "$ROOT/host-apis/$HOST_API/wit/deps/starling-js-v2" \
   js-dispatch-v2
 "$WASM_TOOLS" validate --features all "$V2_OUTPUT"
 test "$("$WASMTIME" run -S cli -S http --invoke 'subtract(7, 2)' "$V2_OUTPUT")" = 5

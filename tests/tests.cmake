@@ -2,7 +2,15 @@ enable_testing()
 
 find_program(BASH_PROGRAM bash)
 include("wasmtime")
-include("weval")
+
+add_test(
+    NAME componentizer-install-package
+    COMMAND
+        ${BASH_PROGRAM}
+        ${CMAKE_SOURCE_DIR}/tests/cmake/run-install-package-test.sh
+        ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(componentizer-install-package PROPERTIES TIMEOUT 300)
 
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(resource-registry-tests
@@ -12,6 +20,88 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_include_directories(resource-registry-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_features(resource-registry-tests PRIVATE cxx_std_23)
     add_test(NAME resource-registry COMMAND resource-registry-tests)
+
+    add_executable(task-selection-tests
+        ${CMAKE_SOURCE_DIR}/tests/task-selection.cpp
+    )
+    target_include_directories(
+        task-selection-tests PRIVATE ${CMAKE_SOURCE_DIR}/host-apis/wasi-0.2.0
+    )
+    target_compile_features(task-selection-tests PRIVATE cxx_std_23)
+    add_test(NAME task-selection COMMAND task-selection-tests)
+endif()
+
+set(FEATURE_SURFACE_TEST_SCRIPT
+    ${CMAKE_SOURCE_DIR}/tests/feature-selection/run-cmake-surface-test.sh
+)
+if(NOT HOST_API_VERSION STREQUAL "" AND NOT FEATURE_SURFACE_CASE STREQUAL "")
+    add_test(
+        NAME componentize-exact-surface
+        COMMAND
+            ${BASH_PROGRAM}
+            ${FEATURE_SURFACE_TEST_SCRIPT}
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_BINARY_DIR}/wasm-tools
+            ${CMAKE_SOURCE_DIR}/tests/feature-selection/reference/expected/import-surfaces.json
+            "${FEATURE_SURFACE_CASE}"
+            "${HOST_API_VERSION}"
+            "wasi:cli/run@${HOST_API_VERSION},wasi:http/incoming-handler@${HOST_API_VERSION}"
+    )
+    set_tests_properties(componentize-exact-surface PROPERTIES TIMEOUT 180)
+elseif(
+    NOT CUSTOM_FEATURE_SURFACE_ORACLE STREQUAL "" AND
+    NOT CUSTOM_FEATURE_SURFACE_CASE STREQUAL "" AND
+    NOT CUSTOM_HOST_API_VERSION STREQUAL "" AND
+    NOT CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS STREQUAL ""
+)
+    add_test(
+        NAME componentize-exact-surface
+        COMMAND
+            ${BASH_PROGRAM}
+            ${FEATURE_SURFACE_TEST_SCRIPT}
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_BINARY_DIR}/wasm-tools
+            "${CUSTOM_FEATURE_SURFACE_ORACLE}"
+            "${CUSTOM_FEATURE_SURFACE_CASE}"
+            "${CUSTOM_HOST_API_VERSION}"
+            "${CUSTOM_FEATURE_SURFACE_EXPECTED_EXPORTS}"
+    )
+    set_tests_properties(componentize-exact-surface PROPERTIES TIMEOUT 180)
+else()
+    if(HOST_API_VERSION STREQUAL "")
+        message(STATUS
+            "Skipping built-in exact-surface oracle for custom host API "
+            "'${HOST_API_NAME}'; componentize-production-surface still validates "
+            "the production output. Set all CUSTOM_FEATURE_SURFACE_* variables "
+            "and CUSTOM_HOST_API_VERSION to enable a custom exact oracle."
+        )
+    else()
+        message(STATUS
+            "No built-in exact-surface oracle is registered for feature tuple "
+            "${FEATURE_TUPLE}; componentize-production-surface still validates "
+            "the production output."
+        )
+    endif()
+    add_test(
+        NAME componentize-production-surface
+        COMMAND
+            ${BASH_PROGRAM}
+            ${FEATURE_SURFACE_TEST_SCRIPT}
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_BINARY_DIR}/wasm-tools
+    )
+    set_tests_properties(componentize-production-surface PROPERTIES TIMEOUT 180)
+endif()
+
+if(FEATURE_TUPLE STREQUAL "11111")
+    add_test(
+        NAME runtime-eval-cli
+        COMMAND
+            ${BASH_PROGRAM}
+            ${CMAKE_SOURCE_DIR}/tests/runtime-eval/run.sh
+            ${CMAKE_BINARY_DIR}
+    )
+    set_tests_properties(runtime-eval-cli PROPERTIES TIMEOUT 180)
 endif()
 
 function(test_e2e TEST_NAME)
@@ -46,10 +136,6 @@ function(integration_tests)
             VERBATIM
     )
     add_custom_target(integration-test-server DEPENDS test-server.wasm)
-    if(WEVAL)
-        add_dependencies(integration-test-server starling-ics.wevalcache)
-    endif()
-
     foreach(TEST_NAME ${ARGV})
         test_integration(${TEST_NAME})
     endforeach()

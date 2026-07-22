@@ -4,6 +4,7 @@
 #include "../dom-exception.h"
 #include "../event/event.h"
 #include "../timers.h"
+#include "feature-defaults.h"
 
 
 
@@ -85,6 +86,9 @@ bool AbortSignal::onabort_set(JSContext *cx, unsigned argc, JS::Value *vp) {
 
 // https://dom.spec.whatwg.org/#dom-abortsignal-timeout
 bool AbortSignal::timeout(JSContext *cx, unsigned argc, JS::Value *vp) {
+#if !STARLING_FEATURE_CLOCKS
+  return api::throw_error(cx, api::Errors::FeatureDisabled, "AbortSignal.timeout", "clocks");
+#else
   CallArgs args = JS::CallArgsFromVp(argc, vp);
   if (!args.requireAtLeast(cx, "timeout", 1)) {
     return false;
@@ -97,6 +101,7 @@ bool AbortSignal::timeout(JSContext *cx, unsigned argc, JS::Value *vp) {
 
   args.rval().setObject(*self);
   return true;
+#endif
 }
 
 // https://dom.spec.whatwg.org/#dom-abortsignal-abort
@@ -383,7 +388,7 @@ JSObject *AbortSignal::create_with_timeout(JSContext *cx, HandleValue timeout) {
   }
 
   JS::RootedObject handler(cx, JS_GetFunctionObject(on_timeout));
-  if (!timers::set_timeout(cx, handler, args, ms, &timer_id)) {
+  if (!timers::set_timeout(cx, handler, args, ms, &timer_id, "AbortSignal.timeout")) {
     return nullptr;
   }
 
@@ -514,5 +519,4 @@ bool install(api::Engine *engine) {
 JSString *AbortSignal::abort_type_atom = nullptr;
 
 } // namespace builtins::web::abort
-
 

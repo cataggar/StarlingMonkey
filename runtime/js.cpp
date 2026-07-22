@@ -26,6 +26,20 @@ api::Engine* initialize(std::vector<std::string_view> args) {
 
 static api::Engine *ENGINE = nullptr;
 
+enum class RuntimeConfigurationMode {
+  External,
+  Snapshotted,
+};
+
+// Wizer explicitly transitions the runtime to snapshotted configuration.
+// An unsnapshotted runtime remains in external mode and reads its invocation
+// arguments and environment when wasi:cli/run is called.
+static RuntimeConfigurationMode configuration_mode = RuntimeConfigurationMode::External;
+
+extern "C" bool starling_uses_snapshotted_configuration() {
+  return configuration_mode == RuntimeConfigurationMode::Snapshotted;
+}
+
 __attribute__((weak))
 int main(int argc, const char *argv[]) {
   MOZ_ASSERT_UNREACHABLE("main() should not be called");
@@ -70,6 +84,7 @@ void wizen() {
     ENGINE->abort("validating required JavaScript exports");
   }
   ENGINE->finish_pre_initialization();
+  configuration_mode = RuntimeConfigurationMode::Snapshotted;
 
   // Ensure that the monotonic clock is always increasing, even across multiple resumptions.
   __wasi_timestamp_t t = 0;
@@ -84,21 +99,29 @@ WIZER_INIT(wizen);
  * The main entry function for the runtime.
  *
  * The runtime will be initialized with a configuration derived in the following way:
- * 1. If a command line is provided, it will be parsed and used.
- * 2. Otherwise, the env var `STARLINGMONKEY_CONFIG` will be split into a command line and used.
- * 3. Otherwise, a default configuration is used. In particular, the runtime will attempt to
- *    load the file `./index.js` and run it as the top-level module script.
+ * 1. A runtime explicitly initialized by Wizer reuses its snapshotted engine.
+ * 2. Otherwise, invocation arguments override STARLINGMONKEY_CONFIG.
+ * 3. Otherwise, the default configuration loads ./index.js.
  */
 extern "C" bool exports_wasi_cli_run_run() {
-  auto arg_strings = host_api::environment_get_arguments();
-  std::vector<std::string_view> args;
-  args.reserve(arg_strings.size());
-  for (auto& arg : arg_strings) { args.push_back(arg);
-}
+  switch (configuration_mode) {
+  case RuntimeConfigurationMode::Snapshotted:
+    MOZ_RELEASE_ASSERT(ENGINE);
+    break;
+  case RuntimeConfigurationMode::External: {
+    auto arg_strings = host_api::environment_get_arguments();
+    std::vector<std::string_view> args;
+    args.reserve(arg_strings.size());
+    for (auto &arg : arg_strings) {
+      args.push_back(arg);
+    }
 
-  auto config_parser = starling::ConfigParser();
-  config_parser.apply_env()->apply_args(args);
-  ENGINE = new api::Engine(config_parser.take());
+    auto config_parser = starling::ConfigParser();
+    config_parser.apply_env()->apply_args(std::move(args));
+    ENGINE = new api::Engine(config_parser.take());
+    break;
+  }
+  }
   return starling::shutdown_resources(ENGINE);
 }
 

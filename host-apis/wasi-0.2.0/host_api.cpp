@@ -2,8 +2,11 @@
 #include "bindings/bindings.h"
 #include "handles.h"
 #include "feature-defaults.h"
+#include "task-selection.h"
 
+#if STARLING_FEATURE_CLOCKS
 static std::optional<wasi_clocks_monotonic_clock_own_pollable_t> immediately_ready;
+#endif
 
 size_t poll_handles(vector<WASIHandle<host_api::Pollable>::Borrowed> handles) {
   auto list = list_borrow_pollable_t{handles.data(), handles.size()};
@@ -32,6 +35,7 @@ size_t api::AsyncTask::select(std::vector<RefPtr<AsyncTask>> &tasks) {
 
     if (id == IMMEDIATE_TASK_HANDLE) {
       if (handles.size() > 0) {
+#if STARLING_FEATURE_CLOCKS
         if (!immediately_ready) {
           immediately_ready = wasi_clocks_monotonic_clock_subscribe_duration(0);
         }
@@ -41,6 +45,11 @@ size_t api::AsyncTask::select(std::vector<RefPtr<AsyncTask>> &tasks) {
         if (ready_index <= len - 1) {
           return ready_index;
         }
+#else
+        return oldest_ready_or_immediate(idx, [&handles](size_t ready_index) {
+          return wasi_io_poll_method_pollable_ready(handles[ready_index]);
+        });
+#endif
       }
       return idx;
     }
@@ -147,12 +156,7 @@ uint64_t MonotonicClock::now() {
 #else
   // Fixed constant (matches feature_stubs.c's preview1 clock_time_get stub):
   // disabling `clocks` yields a deterministic, non-advancing "now" rather
-  // than a trap, since `now()` also feeds internal deadline math (see
-  // docs/feature-selection/README.md "clocks" for why subscribe/unsubscribe
-  // are deliberately left real/ungated: the async task scheduler's
-  // immediate-vs-blocking fairness tie-break also goes through
-  // MonotonicClock, and trapping it would break unrelated async code, not
-  // just user-facing timers/Date).
+  // than a trap, since `now()` also feeds internal deadline math.
   return UINT64_C(1000000000);
 #endif
 }
@@ -166,23 +170,34 @@ uint64_t MonotonicClock::resolution() {
 }
 
 int32_t MonotonicClock::subscribe(const uint64_t when, const bool absolute) {
+#if STARLING_FEATURE_CLOCKS
   if (absolute) {
     return wasi_clocks_monotonic_clock_subscribe_instant(when).__handle;
   } else {
     return wasi_clocks_monotonic_clock_subscribe_duration(when).__handle;
   }
+#else
+  (void)when;
+  (void)absolute;
+  MOZ_CRASH("MonotonicClock::subscribe: clocks feature is disabled");
+#endif
 }
 
 void MonotonicClock::unsubscribe(const int32_t handle_id) {
+#if STARLING_FEATURE_CLOCKS
   wasi_io_poll_pollable_drop_own(own_pollable_t{handle_id});
+#else
+  (void)handle_id;
+#endif
 }
 
 vector<std::string> environment_get_arguments() {
   bindings_list_string_t raw_args = {};
   wasi_cli_environment_get_arguments(&raw_args);
   std::vector<std::string> args = {};
-  for (int i = 0; i < raw_args.len; i++) {
-    args.push_back(std::string(reinterpret_cast<char *>(raw_args.ptr[i].ptr), raw_args.ptr[i].len));
+  args.reserve(raw_args.len);
+  for (size_t i = 0; i < raw_args.len; i++) {
+    args.emplace_back(reinterpret_cast<char *>(raw_args.ptr[i].ptr), raw_args.ptr[i].len);
   }
   return args;
 }

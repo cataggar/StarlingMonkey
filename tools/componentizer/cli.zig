@@ -355,6 +355,8 @@ test "parses the native componentizer surface" {
         "--enable-script-debugging",
         "--preopen-dir",
         "extra dir",
+        "--wabt-bin",
+        "tools/wabt",
         "--js-heap-limit-mib",
         "256",
         "--debug-bindings",
@@ -377,6 +379,7 @@ test "parses the native componentizer surface" {
     try std.testing.expectEqual(@as(usize, 2), config.disable_features.len);
     try std.testing.expectEqualStrings("random", config.disable_features[1]);
     try std.testing.expectEqual(@as(u32, 256), config.js_heap_limit_mib.?);
+    try std.testing.expectEqualStrings("tools/wabt", config.wabt_bin.?);
     try std.testing.expect(config.debug_bindings);
     try std.testing.expectEqual(diagnostics.Format.json, config.diagnostic_format);
     try std.testing.expectEqualStrings("metadata.json", config.metadata_out.?);

@@ -2,12 +2,22 @@
 
 set -euo pipefail
 
-wizer="${WIZER:-@WASMTIME_DIR@/wasmtime wizer}"
-wasm_tools="${WASM_TOOLS:-@WASM_TOOLS_BIN@}"
-weval="${WEVAL:-@WEVAL_BIN@}"
-wabt="${WABT:-$(dirname "$0")/wabt}"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${WIZER:-}" ]]; then
+  read -r -a wizer_cmd <<< "$WIZER"
+else
+  wizer_cmd=("$script_dir/wasmtime" wizer)
+fi
+wasm_tools="${WASM_TOOLS:-$script_dir/wasm-tools}"
+weval="${WEVAL:-$script_dir/weval}"
+feature_surface="${FEATURE_SURFACE:-$script_dir/starling-feature-surface}"
+wabt="${WABT:-$script_dir/wabt}"
+external_runtime="$script_dir/@EXTERNAL_RUNTIME_FILE@"
 component_world="@COMPONENT_WORLD@"
-component_wit="@COMPONENT_WIT_DIR@"
+component_wit="$script_dir/component-wit"
+surface_target_world="@SURFACE_TARGET_WORLD@"
+surface_target_wit="$script_dir/surface-wit"
+feature_tuple="@FEATURE_STDIO@,@FEATURE_RANDOM@,@FEATURE_CLOCKS@,@FEATURE_HTTP@,@FEATURE_FETCH_EVENT@"
 aot=@AOT@
 preopen_dir="${PREOPEN_DIR:-}"
 
@@ -32,15 +42,28 @@ fi
 
 IN_FILE=""
 OUT_FILE=""
-LEGACY_SCRIPT_PARAM=""
+LEGACY_SCRIPT=0
 STARLING_ARGS=""
 VERBOSE=0
+
+append_starling_arg() {
+  local value="$1"
+  if [[ -z "$value" || "$value" == *'"'* || "$value" == *$'\n'* ||
+        "$value" == *$'\r'* || "$value" == *$'\t'* || "$value" == *\\ ]]; then
+    echo "Runtime argument cannot be represented safely: $value" >&2
+    exit 1
+  fi
+  if [[ -n "$STARLING_ARGS" ]]; then
+    STARLING_ARGS+=" "
+  fi
+  STARLING_ARGS+="\"$value\""
+}
 
 while [ $# -gt 0 ]
 do
     case "$1" in
         --legacy-script)
-            LEGACY_SCRIPT_PARAM="$1 "
+            LEGACY_SCRIPT=1
             IN_FILE="$2"
             shift 2
             ;;
@@ -49,19 +72,22 @@ do
             shift 2
             ;;
         -i|--initializer-script-path)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --strip-path-prefix)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --wpt-mode)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
-            shift 2
+            append_starling_arg "$1"
+            shift
             ;;
         --init-location)
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         --js-heap-limit-mib)
@@ -69,11 +95,12 @@ do
               echo "Missing value for --js-heap-limit-mib" >&2
               exit 1
             fi
-            STARLING_ARGS="$STARLING_ARGS $1 $2"
+            append_starling_arg "$1"
+            append_starling_arg "$2"
             shift 2
             ;;
         -v|--verbose)
-            STARLING_ARGS="$1 $STARLING_ARGS"
+            append_starling_arg "$1"
             VERBOSE=1
             shift
             ;;
@@ -105,13 +132,16 @@ fi
 
 if [[ -n "$IN_FILE" ]]; then
   if [[ -n $preopen_dir ]]; then
-    preopen_dir="--dir "$preopen_dir""
+    preopen_args=(--dir "$preopen_dir")
   else
-    preopen_dir="--dir "$(dirname "$IN_FILE")""
+    preopen_args=(--dir "$(dirname "$IN_FILE")")
   fi
   echo "Componentizing $IN_FILE into $OUT_FILE"
 
-  STARLING_ARGS="$STARLING_ARGS $LEGACY_SCRIPT_PARAM$IN_FILE"
+  if [[ $LEGACY_SCRIPT -ne 0 ]]; then
+    append_starling_arg "--legacy-script"
+  fi
+  append_starling_arg "$IN_FILE"
   if [[ $VERBOSE -ne 0 ]]; then
       echo "Componentizing with args $STARLING_ARGS"
   fi
@@ -123,35 +153,65 @@ if [[ -n "$IN_FILE" ]]; then
           echo "Using AOT compilation"
       fi
 
-      echo "$STARLING_ARGS" | WASMTIME_BACKTRACE_DETAILS=1 $weval weval -w $preopen_dir \
-           --cache-ro "$(dirname "$0")/starling-ics.wevalcache" \
+      echo "$STARLING_ARGS" | WASMTIME_BACKTRACE_DETAILS=1 "$weval" weval -w "${preopen_args[@]}" \
+           --cache-ro "$script_dir/starling-ics.wevalcache" \
            $WEVAL_VERBOSE \
            -o "$OUT_FILE" \
-           -i "$(dirname "$0")/starling-raw.wasm"
+           -i "$script_dir/starling-raw.wasm"
   else
-      echo "$STARLING_ARGS" | WASMTIME_BACKTRACE_DETAILS=1 $wizer -S cli -S inherit-env \
+      echo "$STARLING_ARGS" | WASMTIME_BACKTRACE_DETAILS=1 "${wizer_cmd[@]}" -S cli -S inherit-env \
            -W bulk-memory -W unknown-imports-trap \
-           $preopen_dir -o "$OUT_FILE" \
-           "$(dirname "$0")/starling-raw.wasm"
+           "${preopen_args[@]}" -o "$OUT_FILE" \
+           "$script_dir/starling-raw.wasm"
   fi
 else
   echo "Creating runtime-eval component $OUT_FILE"
-  cp "$(dirname "$0")/starling-raw.wasm" "$OUT_FILE"
+  cp "$external_runtime" "$OUT_FILE"
 fi
+
+stripped="${OUT_FILE}.stripped.$$"
+embedded="${OUT_FILE}.embedded.$$"
+component="${OUT_FILE}.component.$$"
+surfaced="${OUT_FILE}.surfaced.$$"
+surface_work="${OUT_FILE}.surface-work.$$"
+mkdir -p "$surface_work"
+trap 'rm -rf "$stripped" "$embedded" "$component" "$surfaced" "$surface_work"' EXIT
 
 if [[ -n "$component_world" ]]; then
-  stripped="${OUT_FILE}.stripped.$$"
-  embedded="${OUT_FILE}.embedded.$$"
-  component="${OUT_FILE}.component.$$"
-  trap 'rm -f "$stripped" "$embedded" "$component"' EXIT
-
-  "$wabt" module strip -o "$stripped" "$OUT_FILE"
-  "$wabt" component embed --world "$component_world" -o "$embedded" "$component_wit" "$stripped"
-  "$wabt" component new --adapt "wasi_snapshot_preview1=$(dirname "$0")/preview1-adapter.wasm" -o "$component" "$embedded"
-  mv "$component" "$OUT_FILE"
-
-  rm -f "$stripped" "$embedded"
-  trap - EXIT
+  "$wasm_tools" strip --all -o "$stripped" "$OUT_FILE"
+  "$wasm_tools" component embed "$component_wit" --world "$component_world" \
+    -o "$embedded" "$stripped"
+  "$wasm_tools" component new \
+    --adapt "wasi_snapshot_preview1=$script_dir/preview1-adapter.wasm" \
+    -o "$component" "$embedded"
 else
-  "$wasm_tools" component new -v --adapt "wasi_snapshot_preview1=$(dirname "$0")/preview1-adapter.wasm" --output "$OUT_FILE" "$OUT_FILE"
+  "$wasm_tools" component new -v --adapt "wasi_snapshot_preview1=$script_dir/preview1-adapter.wasm" --output "$component" "$OUT_FILE"
 fi
+
+if [[ -n "${FEATURE_SURFACE_BEFORE:-}" ]]; then
+  cp "$component" "$FEATURE_SURFACE_BEFORE"
+fi
+
+surface_args=(
+  --wabt "$wabt"
+  --wasm-tools "$wasm_tools"
+  --platform-wit "$script_dir/feature-wit"
+  --component "$component"
+  --output "$surfaced"
+  --work-dir "$surface_work"
+  --features "$feature_tuple"
+)
+if [[ -n "$IN_FILE" ]]; then
+  surface_args+=(
+    --runtime-config snapshotted
+    --target-wit "$surface_target_wit"
+    --target-world "$surface_target_world"
+  )
+else
+  surface_args+=(--runtime-config external)
+fi
+"$feature_surface" "${surface_args[@]}"
+mv "$surfaced" "$OUT_FILE"
+
+rm -rf "$stripped" "$embedded" "$component" "$surface_work"
+trap - EXIT

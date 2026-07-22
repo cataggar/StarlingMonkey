@@ -50,8 +50,8 @@ const Ctx = struct {
 // ComponentizeJS-compatible platform feature defaults/disabling for stdio,
 // random, clocks, http, and fetch-event. Mirrors the pinned ComponentizeJS
 // 0.21.0 `componentize()` API's `disableFeatures`/`enableFeatures` naming
-// (see docs/feature-selection/README.md for the full behavior matrix and
-// documented deviations), but is threaded through typed Zig build options
+// (see docs/feature-selection/README.md for the full behavior matrix), but is
+// threaded through typed Zig build options
 // (`-Dfeature-*`) rather than environment variables, since this build
 // produces the componentizer itself rather than consuming it as an npm API.
 const FeatureName = enum {
@@ -104,7 +104,7 @@ const Features = struct {
 // stricter-than-reference deviation: the pinned ComponentizeJS 0.21.0
 // splicer silently ignores unknown `disableFeatures`/`enableFeatures` entries
 // (empirically verified against the real npm package; see
-// docs/feature-selection/README.md "Known deviations"), which this build
+// docs/feature-selection/README.md), which this build
 // treats as a conflict per task requirement #4 ("Do not silently fall
 // back.").
 fn parseFeatureList(gpa: std.mem.Allocator, opt_name: []const u8, csv: []const u8) []const FeatureName {
@@ -155,40 +155,81 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 
 pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
-        @panic("StarlingMonkey v0.4 requires Zig " ++ required_zig_version);
+        std.debug.print(
+            "error: StarlingMonkey requires Zig {s}; found {s}\n",
+            .{ required_zig_version, builtin.zig_version_string },
+        );
+        @panic("unsupported Zig version");
     }
     const optimize = b.standardOptimizeOption(.{});
-
+    const host_api_selection = b.option(
+        []const u8,
+        "host-api",
+        "Host API name under host-apis/ or a repository-relative implementation path",
+    ) orelse "wasi-0.2.10";
+    const host_api_dir = if (std.mem.indexOfScalar(u8, host_api_selection, '/') != null)
+        host_api_selection
+    else
+        b.pathJoin(&.{ "host-apis", host_api_selection });
+    const host_api_identity = std.fs.path.basename(host_api_dir);
+    const host_api_world = b.option(
+        []const u8,
+        "host-api-world",
+        "Default component world in the selected host API WIT package",
+    ) orelse "bindings";
     // Native, Node-free driver for the monolithic Zig/WABT componentization
     // pipeline. It is a host tool even though the runtime it builds targets
     // wasm32-wasi.
     const componentizer_options = b.addOptions();
     componentizer_options.addOption([]const u8, "version", "0.3.0");
     componentizer_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    componentizer_options.addOption([]const u8, "host_api", host_api_selection);
+    componentizer_options.addOption([]const u8, "host_api_world", host_api_world);
     const componentizer_mod = b.createModule(.{
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const feature_surface_lib = b.createModule(.{
+        .root_source_file = b.path("tools/feature-surface/surface.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    componentizer_mod.addImport("feature_surface", feature_surface_lib);
     componentizer_mod.addOptions("build_options", componentizer_options);
     const componentizer = b.addExecutable(.{
         .name = "starling-componentize",
         .root_module = componentizer_mod,
     });
     b.installArtifact(componentizer);
+    const feature_surface_mod = b.createModule(.{
+        .root_source_file = b.path("tools/feature-surface/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const feature_surface = b.addExecutable(.{
+        .name = "starling-feature-surface",
+        .root_module = feature_surface_mod,
+    });
+    b.installArtifact(feature_surface);
     const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
-    b.installArtifact(wabt);
+    const install_wabt = b.addInstallArtifact(wabt, .{});
+    b.getInstallStep().dependOn(&install_wabt.step);
+    const wabt_step = b.step("wabt", "Build and install the pinned WABT CLI");
+    wabt_step.dependOn(&install_wabt.step);
     const componentizer_step = b.step(
         "componentizer",
         "Build the native starling-componentize CLI",
     );
     componentizer_step.dependOn(&componentizer.step);
+    componentizer_step.dependOn(&feature_surface.step);
     const componentizer_test_mod = b.createModule(.{
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
     componentizer_test_mod.addOptions("build_options", componentizer_options);
+    componentizer_test_mod.addImport("feature_surface", feature_surface_lib);
     const componentizer_tests = b.addTest(.{ .root_module = componentizer_test_mod });
     const run_componentizer_tests = b.addRunArtifact(componentizer_tests);
     const componentizer_metadata_test_mod = b.createModule(.{
@@ -202,16 +243,20 @@ pub fn build(b: *std.Build) void {
     const run_componentizer_metadata_tests = b.addRunArtifact(
         componentizer_metadata_tests,
     );
+    const feature_surface_tests = b.addTest(.{ .root_module = feature_surface_mod });
+    const run_feature_surface_tests = b.addRunArtifact(feature_surface_tests);
     const componentizer_test_step = b.step(
         "componentizer-test",
         "Run native componentizer unit and fake-tool orchestration tests",
     );
     componentizer_test_step.dependOn(&run_componentizer_tests.step);
     componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
+    componentizer_test_step.dependOn(&run_feature_surface_tests.step);
     const componentizer_orchestration = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run.sh" },
     );
     componentizer_orchestration.addArtifactArg(componentizer);
+    componentizer_orchestration.addArg(host_api_selection);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
@@ -235,8 +280,13 @@ pub fn build(b: *std.Build) void {
     }
     componentizer_e2e.addArtifactArg(wabt);
     componentizer_e2e.addFileArg(
-        b.path("host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm"),
+        b.path(b.pathJoin(&.{
+            host_api_dir,
+            "preview1-adapter-release",
+            "wasi_snapshot_preview1.wasm",
+        })),
     );
+    componentizer_e2e.addArg(host_api_identity);
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
 
@@ -244,7 +294,6 @@ pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
 
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
-    const host_api_name = b.option([]const u8, "host-api", "Host API implementation under host-apis/") orelse "wasi-0.2.10";
     const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
     const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
@@ -359,8 +408,7 @@ pub fn build(b: *std.Build) void {
     // the componentized surface). This is an intentional deviation from the
     // reference (whose splicer runs on the compiled binary and always
     // leaves the JS-facing `fetch`/Request/Response surface present,
-    // failing only at the WASI-import call site) -- see
-    // docs/feature-selection/README.md "Known deviations".
+    // failing only at the WASI-import call site).
     const prune_fetch_builtins = !features.http and !features.fetch_event;
     const builtins_incl_base =
         \\// Generated by build.zig
@@ -406,7 +454,7 @@ pub fn build(b: *std.Build) void {
         .c_flags = c_flags.items,
         .common_includes = &common_includes,
         .builtins_incl_dir = builtins_incl_dir,
-        .host_api_dir = b.pathJoin(&.{ "host-apis", host_api_name }),
+        .host_api_dir = host_api_dir,
         .wasi020 = "host-apis/wasi-0.2.0",
         .wasi023 = "host-apis/wasi-0.2.3",
     };
@@ -529,6 +577,28 @@ pub fn build(b: *std.Build) void {
             raw_wasm = opt_out;
         }
     }
+    const feature_tuple = b.fmt(
+        "{d}{d}{d}{d}{d}",
+        .{
+            @intFromBool(features.stdio),
+            @intFromBool(features.random),
+            @intFromBool(features.clocks),
+            @intFromBool(features.http),
+            @intFromBool(features.fetch_event),
+        },
+    );
+    const provenance = b.addSystemCommand(&.{"python3"});
+    provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
+    provenance.addFileArg(raw_wasm);
+    const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
+    provenance.addArgs(&.{
+        host_api_identity,
+        feature_tuple,
+        component_world orelse host_api_world,
+        dispatch_world orelse "caller",
+    });
+    raw_wasm = provenanced_raw;
+
     const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
     b.getInstallStep().dependOn(&install_raw.step);
 
@@ -573,17 +643,32 @@ pub fn build(b: *std.Build) void {
     const adapter = if (preview1_adapter) |path|
         inputPath(b, path)
     else
-        b.path(b.pathJoin(&.{ ctx.wasi020, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
+        b.path(b.pathJoin(&.{ ctx.host_api_dir, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
     b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
-    if (component_wit) |wit_dir| {
-        const install_wit = b.addInstallDirectory(.{
-            .source_dir = inputPath(b, wit_dir),
-            .install_dir = .bin,
-            .install_subdir = "component-wit",
-            .include_extensions = &.{".wit"},
-        });
-        b.getInstallStep().dependOn(&install_wit.step);
-    }
+    const installed_component_wit = component_wit orelse
+        b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    const install_wit = b.addInstallDirectory(.{
+        .source_dir = inputPath(b, installed_component_wit),
+        .install_dir = .bin,
+        .install_subdir = "component-wit",
+        .include_extensions = &.{".wit"},
+    });
+    b.getInstallStep().dependOn(&install_wit.step);
+    const surface_wit = dispatch_wit orelse "tools/feature-surface";
+    const install_surface_wit = b.addInstallDirectory(.{
+        .source_dir = inputPath(b, surface_wit),
+        .install_dir = .bin,
+        .install_subdir = "surface-wit",
+        .include_extensions = &.{".wit"},
+    });
+    b.getInstallStep().dependOn(&install_surface_wit.step);
+    const install_feature_wit = b.addInstallDirectory(.{
+        .source_dir = b.path(b.pathJoin(&.{ ctx.host_api_dir, "wit" })),
+        .install_dir = .bin,
+        .install_subdir = "feature-wit",
+        .include_extensions = &.{".wit"},
+    });
+    b.getInstallStep().dependOn(&install_feature_wit.step);
 
     // componentize.sh references the tools via `$(dirname "$0")/…`, so install them
     // alongside it (relocatable, mirrors the CMake build directory layout).
@@ -594,7 +679,12 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("weval", .{})) |d|
         b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval"), "weval").step);
 
-    const componentize_sh = renderComponentizeScript(b, component_world);
+    const componentize_sh = renderComponentizeScript(
+        b,
+        component_world orelse host_api_world,
+        dispatch_world orelse "caller",
+        features,
+    );
     const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
     b.getInstallStep().dependOn(&inst_componentize.step);
     // Installed generated files aren't executable; componentize.sh is invoked
@@ -613,6 +703,9 @@ pub fn build(b: *std.Build) void {
     // humans inspecting `zig-out/bin/` to see what a given build selected.
     const features_json = b.fmt(
         \\{{
+        \\  "host-api": "{s}",
+        \\  "component-world": "{s}",
+        \\  "surface-world": "{s}",
         \\  "stdio": {},
         \\  "random": {},
         \\  "clocks": {},
@@ -620,7 +713,16 @@ pub fn build(b: *std.Build) void {
         \\  "fetch-event": {}
         \\}}
         \\
-    , .{ features.stdio, features.random, features.clocks, features.http, features.fetch_event });
+    , .{
+        host_api_identity,
+        component_world orelse host_api_world,
+        dispatch_world orelse "caller",
+        features.stdio,
+        features.random,
+        features.clocks,
+        features.http,
+        features.fetch_event,
+    });
     const features_json_file = b.addWriteFiles().add("features.json", features_json);
     b.getInstallStep().dependOn(&b.addInstallBinFile(features_json_file, "features.json").step);
 
@@ -708,6 +810,27 @@ pub fn build(b: *std.Build) void {
         b.step("resource-registry-test", "Run resource ownership and lifetime registry tests");
     resource_registry_test_step.dependOn(&run_resource_registry_tests.step);
     test_step.dependOn(resource_registry_test_step);
+    const task_selection_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    task_selection_test_mod.addIncludePath(b.path("host-apis/wasi-0.2.0"));
+    task_selection_test_mod.addCSourceFile(.{
+        .file = b.path("tests/task-selection.cpp"),
+        .flags = &.{ "-std=gnu++23", "-Wall", "-Wextra", "-Werror" },
+        .language = .cpp,
+    });
+    const task_selection_tests = b.addExecutable(.{
+        .name = "task-selection-tests",
+        .root_module = task_selection_test_mod,
+    });
+    const run_task_selection_tests = b.addRunArtifact(task_selection_tests);
+    const task_selection_test_step =
+        b.step("task-selection-test", "Run oldest-ready task selection tests");
+    task_selection_test_step.dependOn(&run_task_selection_tests.step);
+    test_step.dependOn(task_selection_test_step);
     const heap_limit_tests = b.addSystemCommand(&.{ "bash", "tests/js-heap-limit/run.sh" });
     heap_limit_tests.addArg(b.graph.zig_exe);
     if (b.lazyDependency("wasmtime", .{})) |d|
@@ -717,6 +840,15 @@ pub fn build(b: *std.Build) void {
     suite.addDirectoryArg(b.graph.path(.install_prefix, "bin"));
     suite.step.dependOn(b.getInstallStep());
     test_step.dependOn(&suite.step);
+    const runtime_eval_test_step = b.step(
+        "runtime-eval-test",
+        "Run real unsnapshotted runtime CLI invocation tests",
+    );
+    const runtime_eval = b.addSystemCommand(&.{ "bash", "tests/runtime-eval/run.sh" });
+    runtime_eval.addDirectoryArg(b.graph.path(.install_prefix, "bin"));
+    runtime_eval.step.dependOn(b.getInstallStep());
+    runtime_eval_test_step.dependOn(&runtime_eval.step);
+    test_step.dependOn(runtime_eval_test_step);
 
     // Typed native JS dispatch bridge E2E coverage: builds a dedicated
     // dispatch-enabled runtime, componentizes tests/fixtures/js-dispatch.js,
@@ -788,13 +920,17 @@ pub fn build(b: *std.Build) void {
     const feature_selection_macro_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-macro-default-tests.sh" });
     feature_selection_macro_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_test_step.dependOn(&feature_selection_macro_run.step);
+    const host_api_matrix_failure_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix-failure-proof.sh" },
+    );
+    feature_selection_test_step.dependOn(&host_api_matrix_failure_run.step);
     test_step.dependOn(feature_selection_test_step);
 
     // `zig build feature-selection-runtime-test`: the REQUIRED/FULL
     // component-level feature-selection suite
     // (tests/feature-selection/run-runtime-tests.sh). Unlike
     // `feature-selection-test` above, this actually builds a full
-    // StarlingMonkey runtime for each of 8 feature combinations,
+    // StarlingMonkey runtime for each of 10 feature combinations,
     // componentizes representative fixtures, inspects the resulting
     // import/export surface with `wasm-tools component wit`, and invokes
     // representative behavior through `wasmtime serve` -- see
@@ -807,6 +943,40 @@ pub fn build(b: *std.Build) void {
     const feature_selection_runtime_run = b.addSystemCommand(&.{ "bash", "tests/feature-selection/run-runtime-tests.sh" });
     feature_selection_runtime_run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     feature_selection_runtime_test_step.dependOn(&feature_selection_runtime_run.step);
+    const host_api_matrix_step = b.step(
+        "host-api-production-matrix-test",
+        "Run required Zig and CMake production matrices for every host API",
+    );
+    const host_api_zig_matrix_step = b.step(
+        "host-api-zig-production-matrix-test",
+        "Run version-matched Zig production component tests for every host API",
+    );
+    const host_api_zig_matrix_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix.sh", "zig" },
+    );
+    host_api_zig_matrix_run.addArg(b.graph.zig_exe);
+    host_api_zig_matrix_step.dependOn(&host_api_zig_matrix_run.step);
+    const host_api_cmake_matrix_step = b.step(
+        "host-api-cmake-production-matrix-test",
+        "Run version-matched CMake production component tests for every host API",
+    );
+    const host_api_cmake_matrix_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-host-api-matrix.sh", "cmake" },
+    );
+    host_api_cmake_matrix_run.addArg(b.graph.zig_exe);
+    host_api_cmake_matrix_step.dependOn(&host_api_cmake_matrix_run.step);
+    const custom_host_step = b.step(
+        "custom-host-production-test",
+        "Run non-bindings custom host production tests through Zig and CMake",
+    );
+    const custom_host_run = b.addSystemCommand(
+        &.{ "bash", "tests/feature-selection/run-custom-host-test.sh" },
+    );
+    custom_host_run.addArg(b.graph.zig_exe);
+    custom_host_step.dependOn(&custom_host_run.step);
+    host_api_matrix_step.dependOn(host_api_zig_matrix_step);
+    host_api_matrix_step.dependOn(host_api_cmake_matrix_step);
+    host_api_matrix_step.dependOn(custom_host_step);
     // `zig build wit-imports-e2e-test`: the "wit-imports" roadmap phase's E2E
     // suite (tests/e2e/wit-imports). Builds a dedicated dispatch-enabled
     // reactor against a fixture-specific WIT world that additionally
@@ -954,18 +1124,26 @@ pub fn build(b: *std.Build) void {
 
 // Render componentize.sh from componentize.sh.in, pointing the tool paths at the
 // binaries installed next to it (resolved at runtime via `$(dirname "$0")`).
-fn renderComponentizeScript(b: *std.Build, component_world: ?[]const u8) std.Build.LazyPath {
+fn renderComponentizeScript(
+    b: *std.Build,
+    component_world: ?[]const u8,
+    surface_target_world: []const u8,
+    features: Features,
+) std.Build.LazyPath {
     const template = @embedFile("componentize.sh.in");
     var buf = std.ArrayList(u8).empty;
     const gpa = b.allocator;
     var rest: []const u8 = template;
     const subs = [_]struct { from: []const u8, to: []const u8 }{
-        .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
-        .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
-        .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
         .{ .from = "@AOT@", .to = "0" },
+        .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
-        .{ .from = "@COMPONENT_WIT_DIR@", .to = "$(dirname \"$0\")/component-wit" },
+        .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },
+        .{ .from = "@FEATURE_STDIO@", .to = if (features.stdio) "1" else "0" },
+        .{ .from = "@FEATURE_RANDOM@", .to = if (features.random) "1" else "0" },
+        .{ .from = "@FEATURE_CLOCKS@", .to = if (features.clocks) "1" else "0" },
+        .{ .from = "@FEATURE_HTTP@", .to = if (features.http) "1" else "0" },
+        .{ .from = "@FEATURE_FETCH_EVENT@", .to = if (features.fetch_event) "1" else "0" },
     };
     outer: while (rest.len != 0) {
         for (subs) |s| {

@@ -46,8 +46,8 @@ The last two are the key **deviation probes**: this repository's `build.zig`
 cases), whereas ComponentizeJS 0.21.0 silently accepts both and proceeds
 using only the recognized/non-conflicting entries -- confirmed by this probe
 succeeding (not throwing) for both. This is an intentional,
-stricter-than-reference deviation; see
-`docs/feature-selection/README.md`'s "Known deviations".
+stricter-than-reference diagnostic; see
+`docs/feature-selection/README.md`.
 
 ## Running
 

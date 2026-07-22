@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const diagnostics = @import("diagnostics.zig");
 const metadata = @import("metadata.zig");
+const feature_surface = @import("feature_surface");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -17,7 +18,9 @@ const PipelineError = error{
     CommandFailed,
     DebugOutputCollision,
     EmptyRuntimeArgument,
+    EngineProvenanceMismatch,
     IncompatibleEngineOptions,
+    InvalidEngineProvenance,
     InvalidBuildRoot,
     InvalidBindingsManifest,
     InvalidMetadataDestination,
@@ -26,6 +29,7 @@ const PipelineError = error{
     InvalidUtf8Path,
     MetadataUnavailable,
     MissingBuildArtifact,
+    MissingEngineProvenance,
     MissingWitFiles,
     PublicationDirectoryChanged,
     RollbackIncomplete,
@@ -652,6 +656,7 @@ const ProtectedTree = struct {
     path: []const u8,
     manifest: TreeManifest,
     active: bool = true,
+    strict: bool = false,
     namespace_changed: bool = false,
     attribute_changed: bool = false,
 };
@@ -1807,6 +1812,11 @@ const Transaction = struct {
     ) !void {
         for (self.protected.items) |*protected| {
             if (!protected.active) continue;
+            if (protected.strict and
+                (protected.namespace_changed or protected.attribute_changed))
+            {
+                return error.TransactionChanged;
+            }
             const current = buildTreeManifest(
                 allocator,
                 io,
@@ -2202,6 +2212,10 @@ const Runtime = struct {
     adapter: Snapshot,
     component_wit: ?[]const u8,
     component_world: ?[]const u8,
+    surface_target_wit: ?[]const u8,
+    surface_target_world: ?[]const u8,
+    platform_wit: []const u8,
+    features: feature_surface.Features,
     bindings: ?[]const u8,
     dispatch_wit_digest: ?[]const u8,
     component_wit_digest: ?[]const u8,
@@ -2212,6 +2226,24 @@ const Runtime = struct {
     cache_lock: ?File,
 };
 
+const EngineProvenance = struct {
+    host_api: []const u8,
+    features: feature_surface.Features,
+    component_world: []const u8,
+    surface_world: []const u8,
+};
+
+const FeatureManifest = struct {
+    @"host-api": []const u8,
+    @"component-world": []const u8,
+    @"surface-world": []const u8,
+    stdio: bool,
+    random: bool,
+    clocks: bool,
+    http: bool,
+    @"fetch-event": bool,
+};
+
 const WizerTool = struct {
     executable: Snapshot,
     wasmtime_subcommand: bool,
@@ -2219,9 +2251,250 @@ const WizerTool = struct {
 
 const Tools = struct {
     wizer: WizerTool,
-    wabt: ?Snapshot,
+    wabt: Snapshot,
     wasm_tools: Snapshot,
 };
+
+const FeatureSurfaceCommandContext = struct {
+    diagnostic: *diagnostics.Context,
+    transaction: *Transaction,
+    transaction_storage: []const u8,
+    snapshot_index: usize = 0,
+};
+
+fn runFeatureSurfaceCommand(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    argv: []const []const u8,
+    cwd: []const u8,
+    verbose: bool,
+    command_log: ?*std.ArrayList(u8),
+) !void {
+    const context: *FeatureSurfaceCommandContext = @ptrCast(@alignCast(context_ptr));
+    context.diagnostic.begin(.adapt);
+    runCommand(
+        allocator,
+        io,
+        stage,
+        argv,
+        cwd,
+        null,
+        null,
+        verbose,
+        command_log orelse @panic("missing feature-surface command log"),
+        context.diagnostic,
+        context.transaction_storage,
+        context.transaction,
+    ) catch |err| {
+        try recordFeatureSurfaceWork(allocator, io, context.transaction);
+        return err;
+    };
+    try recordFeatureSurfaceWork(allocator, io, context.transaction);
+}
+
+fn featureSurfaceStorageRelative(
+    allocator: Allocator,
+    transaction: *const Transaction,
+    absolute: []const u8,
+) ![]const u8 {
+    const relative = try std.fs.path.relative(
+        allocator,
+        transaction.storage_path,
+        null,
+        transaction.storage_path,
+        absolute,
+    );
+    if (std.fs.path.isAbsolute(relative) or
+        std.mem.eql(u8, relative, "..") or
+        std.mem.startsWith(u8, relative, "../"))
+    {
+        return error.TransactionChanged;
+    }
+    return relative;
+}
+
+fn retainFeatureSurfaceFile(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    const relative = try featureSurfaceStorageRelative(
+        allocator,
+        context.transaction,
+        absolute,
+    );
+    const destination_relative = try std.fmt.allocPrint(
+        allocator,
+        "feature-surface-input-{d}",
+        .{context.snapshot_index},
+    );
+    context.snapshot_index += 1;
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ context.transaction.storage_path, destination_relative },
+    );
+    const snapshot = snapshotFileAt(
+        allocator,
+        io,
+        context.transaction.storage,
+        relative,
+        destination,
+        context.transaction,
+    ) catch |err| switch (err) {
+        error.InputChanged => return error.TransactionChanged,
+        else => return err,
+    };
+    context.transaction.protected.items[snapshot.protection].strict = true;
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        context.transaction.environ,
+        stage,
+    );
+    try verifyFeatureSurfaceContext(context, allocator, io);
+    return snapshot.path;
+}
+
+fn snapshotFeatureSurfaceTree(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+    stage: []const u8,
+    absolute: []const u8,
+) ![]const u8 {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    const transaction = context.transaction;
+    const source_relative = try featureSurfaceStorageRelative(
+        allocator,
+        transaction,
+        absolute,
+    );
+    try transaction.verifyIntegrity(allocator, io);
+    var source = try transaction.storage.openDir(
+        io,
+        source_relative,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    const source_identity = SourceIdentity.fromStat(try source.stat(io));
+
+    const destination_relative = try std.fmt.allocPrint(
+        allocator,
+        "feature-surface-input-{d}",
+        .{context.snapshot_index},
+    );
+    context.snapshot_index += 1;
+    try transaction.ensureStorageDirPath(
+        allocator,
+        io,
+        destination_relative,
+    );
+    var destination = try transaction.storage.openDir(
+        io,
+        destination_relative,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer destination.close(io);
+    var tree_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    _ = copyInputDirectory(
+        allocator,
+        io,
+        source,
+        destination,
+        source_relative,
+        "",
+        destination_relative,
+        "",
+        &.{},
+        &.{},
+        .reject,
+        &.{},
+        null,
+        &.{},
+        transaction,
+        &tree_hasher,
+    ) catch |err| switch (err) {
+        error.InputChanged => return error.TransactionChanged,
+        else => return err,
+    };
+    if (!source_identity.matches(try source.stat(io))) {
+        return error.TransactionChanged;
+    }
+    try sealSnapshotDirectory(io, destination);
+    const protection = try transaction.protectStoragePath(
+        allocator,
+        io,
+        destination_relative,
+    );
+    transaction.protected.items[protection].strict = true;
+    const retained = try transaction.retainStorageDirectory(
+        allocator,
+        io,
+        destination_relative,
+    );
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        stage,
+    );
+    try verifyFeatureSurfaceContext(context, allocator, io);
+    return retained;
+}
+
+fn verifyFeatureSurfaceContext(
+    context: *FeatureSurfaceCommandContext,
+    allocator: Allocator,
+    io: Io,
+) !void {
+    try context.transaction.verifyIntegrity(allocator, io);
+}
+
+fn verifyFeatureSurfaceInputs(
+    context_ptr: *anyopaque,
+    allocator: Allocator,
+    io: Io,
+) !void {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    try verifyFeatureSurfaceContext(context, allocator, io);
+}
+
+fn setFeatureSurfaceDiagnosticDetail(
+    context_ptr: *anyopaque,
+    detail: []const u8,
+) void {
+    const context: *FeatureSurfaceCommandContext =
+        @ptrCast(@alignCast(context_ptr));
+    context.diagnostic.detail = detail;
+}
+
+fn recordFeatureSurfaceWork(
+    allocator: Allocator,
+    io: Io,
+    transaction: *Transaction,
+) !void {
+    var work = try transaction.storage.openDir(
+        io,
+        "feature-surface",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer work.close(io);
+    try recordDebugBackupTree(
+        allocator,
+        io,
+        transaction,
+        work,
+        "feature-surface",
+    );
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -2637,6 +2910,12 @@ fn execute(
         publication_parent,
     );
 
+    try waitForCaptureTestBarrier(
+        allocator,
+        io,
+        environ,
+        "source",
+    );
     const input_snapshots = try snapshotInputs(
         allocator,
         io,
@@ -2655,7 +2934,6 @@ fn execute(
         cwd,
         executable_dir,
         config,
-        config.wit != null,
         &transaction,
     );
 
@@ -2689,10 +2967,10 @@ fn execute(
             allocator,
             io,
             cwd,
-            executable_dir,
             config,
             engine_override,
             &transaction,
+            diagnostic,
         )
     else
         try buildRuntime(
@@ -2828,8 +3106,10 @@ fn execute(
 
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
+    const wabt_used_for_embedding =
+        runtime.component_wit != null and config.wit != null and runtime.zig == null;
     const candidate: ChildOutput = if (runtime.component_wit) |component_wit| blk: {
-        const wabt = tools.wabt.?.path;
+        const use_wabt = config.wit != null and runtime.zig == null;
         var stripped_output = try createChildOutput(
             allocator,
             io,
@@ -2840,14 +3120,13 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt module strip",
-            &.{
-                wabt,
-                "module",
-                "strip",
-                "-o",
-                stripped_output.path,
-                initialized.path,
+            if (use_wabt) "wabt module strip" else "wasm-tools strip",
+            if (use_wabt) &.{
+                tools.wabt.path,      "module",         "strip", "-o",
+                stripped_output.path, initialized.path,
+            } else &.{
+                tools.wasm_tools.path, "strip",          "--all", "-o",
+                stripped_output.path,  initialized.path,
             },
             cwd,
             null,
@@ -2874,16 +3153,17 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt component embed",
-            &.{
-                wabt,
-                "component",
-                "embed",
-                "--world",
-                runtime.component_world.?,
-                "-o",
-                embedded_output.path,
-                component_wit,
+            if (use_wabt)
+                "wabt component embed"
+            else
+                "wasm-tools component embed",
+            if (use_wabt) &.{
+                tools.wabt.path,           "component", "embed",              "--world",
+                runtime.component_world.?, "-o",        embedded_output.path, component_wit,
+                stripped_output.path,
+            } else &.{
+                tools.wasm_tools.path, "component",               "embed", component_wit,
+                "--world",             runtime.component_world.?, "-o",    embedded_output.path,
                 stripped_output.path,
             },
             cwd,
@@ -2916,16 +3196,16 @@ fn execute(
         try runCommand(
             allocator,
             io,
-            "wabt component new",
-            &.{
-                wabt,
-                "component",
-                "new",
-                "--adapt",
-                adapter_arg,
-                "-o",
-                candidate_output.path,
-                embedded_output.path,
+            if (use_wabt)
+                "wabt component new"
+            else
+                "wasm-tools component new",
+            if (use_wabt) &.{
+                tools.wabt.path, "component",           "new",                "--adapt", adapter_arg,
+                "-o",            candidate_output.path, embedded_output.path,
+            } else &.{
+                tools.wasm_tools.path, "component", "new",                 "--adapt",
+                adapter_arg,           "-o",        candidate_output.path, embedded_output.path,
             },
             cwd,
             null,
@@ -2986,6 +3266,78 @@ fn execute(
         break :blk candidate_output;
     };
 
+    var surfaced = try createChildOutput(
+        allocator,
+        io,
+        &transaction,
+        "surfaced.wasm",
+    );
+    const surface_work_dir = try std.fs.path.join(
+        allocator,
+        &.{ transaction_storage, "feature-surface" },
+    );
+    try transaction.createStorageDir(
+        allocator,
+        io,
+        "feature-surface",
+        .fromMode(0o700),
+    );
+    var surface_command_context = FeatureSurfaceCommandContext{
+        .diagnostic = diagnostic,
+        .transaction = &transaction,
+        .transaction_storage = transaction_storage,
+    };
+    const wabt_used_for_surface = try feature_surface.apply(allocator, io, .{
+        .wabt = tools.wabt.path,
+        .wasm_tools = tools.wasm_tools.path,
+        .platform_wit = runtime.platform_wit,
+        .component = candidate.path,
+        .output = surfaced.path,
+        .work_dir = surface_work_dir,
+        .target_wit = runtime.surface_target_wit,
+        .target_world = runtime.surface_target_world,
+        .features = runtime.features,
+        .runtime_config = .snapshotted,
+        .inspect_candidate = true,
+        .cwd = cwd,
+        .verbose = config.verbose,
+        .command_log = &command_log,
+        .command_runner = .{
+            .context = &surface_command_context,
+            .run = runFeatureSurfaceCommand,
+        },
+        .generated_inputs = .{
+            .context = &surface_command_context,
+            .retain_file = retainFeatureSurfaceFile,
+            .snapshot_tree = snapshotFeatureSurfaceTree,
+            .verify = verifyFeatureSurfaceInputs,
+            .set_diagnostic_detail = setFeatureSurfaceDiagnosticDetail,
+        },
+    });
+    var surface_work = try transaction.storage.openDir(
+        io,
+        "feature-surface",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer surface_work.close(io);
+    try recordDebugBackupTree(
+        allocator,
+        io,
+        &transaction,
+        surface_work,
+        "feature-surface",
+    );
+    _ = try transaction.sealStorageTree(
+        allocator,
+        io,
+        "feature-surface",
+    );
+    try transaction.sealChildOutput(
+        allocator,
+        io,
+        &surfaced,
+    );
+
     var processed = try createChildOutput(
         allocator,
         io,
@@ -3026,7 +3378,7 @@ fn execute(
     metadata_args.appendSlice(allocator, &.{
         "--output",
         processed.path,
-        candidate.path,
+        surfaced.path,
     }) catch @panic("out of memory");
     diagnostic.begin(.metadata);
     try runCommand(
@@ -3099,12 +3451,12 @@ fn execute(
         const document = try buildMetadataDocument(
             allocator,
             io,
-            config,
             source_snapshot,
             initializer_snapshot,
             runtime_args,
             runtime,
             tools,
+            wabt_used_for_embedding or wabt_used_for_surface,
             preopen_snapshots.items,
             processed.path,
             imports,
@@ -3178,8 +3530,45 @@ fn execute(
             try copyDebugFile(io, child_output.path, debug_dir_handle, "embedded.wasm");
             try transaction.recordStoragePath(allocator, io, "debug/embedded.wasm");
         }
+        try copyDebugFile(
+            io,
+            candidate.path,
+            debug_dir_handle,
+            "component-before-feature-surface.wasm",
+        );
+        try transaction.recordStoragePath(
+            allocator,
+            io,
+            "debug/component-before-feature-surface.wasm",
+        );
+        try copyDebugFile(io, surfaced.path, debug_dir_handle, "surfaced.wasm");
+        try transaction.recordStoragePath(allocator, io, "debug/surfaced.wasm");
         try copyDebugFile(io, processed.path, debug_dir_handle, "component.wasm");
         try transaction.recordStoragePath(allocator, io, "debug/component.wasm");
+        const provider_wit = try std.fs.path.join(
+            allocator,
+            &.{ surface_work_dir, "feature-0-provider-wit", "component.wit" },
+        );
+        if (pathExists(io, provider_wit)) {
+            try copyDebugFile(io, provider_wit, debug_dir_handle, "feature-provider.wit");
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/feature-provider.wit",
+            );
+        }
+        const provider_component = try std.fs.path.join(
+            allocator,
+            &.{ surface_work_dir, "feature-provider-a.wasm" },
+        );
+        if (pathExists(io, provider_component)) {
+            try copyDebugFile(io, provider_component, debug_dir_handle, "feature-provider.wasm");
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/feature-provider.wasm",
+            );
+        }
         if (runtime.bindings) |path| {
             try copyDebugFile(io, path, debug_dir_handle, "component-bindings.zig");
             try transaction.recordStoragePath(
@@ -3254,10 +3643,10 @@ fn externalRuntime(
     allocator: Allocator,
     io: Io,
     cwd: []const u8,
-    executable_dir: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
     transaction: *Transaction,
+    diagnostic: *diagnostics.Context,
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     if (config.disable_features.len != 0 or
@@ -3267,81 +3656,479 @@ fn externalRuntime(
         return error.IncompatibleEngineOptions;
     }
     const engine_source = try absolutePath(allocator, cwd, engine_override);
-    const engine = (try captureInputFile(
+    const captured_engine = try captureInputFile(
         allocator,
         io,
         engine_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
         "engine",
-    )).snapshot;
-    const adapter_source = if (config.preview2_adapter) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        try absolutePath(
-            allocator,
-            cwd,
-            try siblingOrName(
-                allocator,
-                io,
-                executable_dir,
-                "preview1-adapter.wasm",
-                "preview1-adapter.wasm",
-            ),
+    );
+    const engine = captured_engine.snapshot;
+    const engine_dir = std.fs.path.dirname(captured_engine.resolved_path) orelse
+        return error.InvalidPath;
+    const manifest_source = try std.fs.path.join(
+        allocator,
+        &.{ engine_dir, "features.json" },
+    );
+    const manifest = (captureInputFile(
+        allocator,
+        io,
+        manifest_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "features.json" }),
+        transaction,
+        "engine provenance",
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling features.json",
+            .{},
         );
-    const adapter = (try captureInputFile(
+        return err;
+    }).snapshot;
+    const provenance = try loadEngineProvenance(
+        allocator,
+        io,
+        engine.path,
+        manifest.path,
+        diagnostic,
+    );
+    const adapter_source = try std.fs.path.join(
+        allocator,
+        &.{ engine_dir, "preview1-adapter.wasm" },
+    );
+    const adapter = (captureInputFile(
         allocator,
         io,
         adapter_source,
         try std.fs.path.join(allocator, &.{ transaction_dir, "preview2-adapter.wasm" }),
         transaction,
         "adapter",
-    )).snapshot;
-    const component_wit_source = if (config.component_wit orelse config.wit) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        null;
-    const dispatch_wit_source = if (config.wit) |path|
-        try absolutePath(allocator, cwd, path)
-    else
-        null;
-    const dispatch_wit = if (dispatch_wit_source) |path|
-        try stageWit(
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling preview1-adapter.wasm",
+            .{},
+        );
+        return err;
+    }).snapshot;
+    if (config.preview2_adapter) |path| {
+        const override = (try captureInputFile(
             allocator,
             io,
-            path,
-            try std.fs.path.join(allocator, &.{ transaction_dir, "dispatch-wit" }),
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "adapter-override.wasm" }),
             transaction,
-        )
-    else
-        null;
-    const component_wit = if (component_wit_source) |path|
-        if (dispatch_wit_source != null and std.mem.eql(u8, path, dispatch_wit_source.?))
-            dispatch_wit
-        else
-            try stageWit(
-                allocator,
-                io,
-                path,
-                try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
-                transaction,
-            )
-    else
-        null;
+            "adapter override",
+        )).snapshot;
+        if (!std.mem.eql(u8, adapter.digest, override.digest)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--preview2-adapter does not match the external engine package adapter",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
+    const component_wit = stageWit(
+        allocator,
+        io,
+        try std.fs.path.join(allocator, &.{ engine_dir, "component-wit" }),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit" }),
+        transaction,
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling component-wit",
+            .{},
+        );
+        return err;
+    };
+    const surface_target_wit = stageWit(
+        allocator,
+        io,
+        try std.fs.path.join(allocator, &.{ engine_dir, "surface-wit" }),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "surface-wit" }),
+        transaction,
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling surface-wit",
+            .{},
+        );
+        return err;
+    };
+    const platform_wit_source = try std.fs.path.join(
+        allocator,
+        &.{ engine_dir, "feature-wit" },
+    );
+    const platform_wit = stageWit(
+        allocator,
+        io,
+        platform_wit_source,
+        try std.fs.path.join(allocator, &.{ transaction_dir, "feature-wit" }),
+        transaction,
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine package requires sibling feature-wit",
+            .{},
+        );
+        return err;
+    };
+    var selected_component_wit = component_wit;
+    var selected_surface_target_wit = surface_target_wit;
+    if (config.component_wit) |path| {
+        const override = try stageWit(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "component-wit-override" }),
+            transaction,
+        );
+        if (!std.mem.eql(u8, component_wit.digest, override.digest)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--component-wit does not match the external engine package component-wit",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+        selected_component_wit = override;
+    }
+    if (config.wit) |path| {
+        const override = try stageWit(
+            allocator,
+            io,
+            try absolutePath(allocator, cwd, path),
+            try std.fs.path.join(allocator, &.{ transaction_dir, "wit-override" }),
+            transaction,
+        );
+        if (!std.mem.eql(u8, surface_target_wit.digest, override.digest)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--wit does not match the external engine package surface-wit",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+        selected_surface_target_wit = override;
+    }
+    if (config.component_world_name) |world| {
+        if (!std.mem.eql(u8, world, provenance.component_world)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--component-world-name does not match external engine provenance",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
+    if (config.world_name) |world| {
+        if (!std.mem.eql(u8, world, provenance.surface_world)) {
+            setExternalPackageDetail(
+                diagnostic,
+                "--world-name does not match external engine surface provenance",
+                .{},
+            );
+            return error.IncompatibleEngineOptions;
+        }
+    }
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = if (component_wit) |wit| wit.absolute else null,
-        .component_world = config.component_world_name orelse config.world_name,
+        .component_wit = selected_component_wit.absolute,
+        .component_world = provenance.component_world,
+        .surface_target_wit = selected_surface_target_wit.absolute,
+        .surface_target_world = provenance.surface_world,
+        .platform_wit = platform_wit.absolute,
+        .features = provenance.features,
         .bindings = null,
-        .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
-        .component_wit_digest = if (component_wit) |wit| wit.digest else null,
-        .features_known = false,
+        .dispatch_wit_digest = selected_surface_target_wit.digest,
+        .component_wit_digest = selected_component_wit.digest,
+        .features_known = true,
         .zig = null,
         .build_tools = &.{},
         .build_root_digest = null,
         .cache_lock = null,
     };
+}
+
+fn loadEngineProvenance(
+    allocator: Allocator,
+    io: Io,
+    engine: []const u8,
+    manifest_path: []const u8,
+    diagnostic: *diagnostics.Context,
+) !EngineProvenance {
+    const module = try readAbsoluteFile(allocator, io, engine);
+    const section = findEngineProvenanceSection(module) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine has invalid embedded feature/host provenance ({t})",
+            .{err},
+        );
+        return error.InvalidEngineProvenance;
+    } orelse {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine is missing embedded feature/host provenance",
+            .{},
+        );
+        return error.MissingEngineProvenance;
+    };
+    const parsed = parseEngineProvenance(section.metadata) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine has malformed embedded feature/host provenance ({t})",
+            .{err},
+        );
+        return error.InvalidEngineProvenance;
+    };
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(module[0..section.section_start]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, parsed.sha256, &digest_hex)) {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine provenance digest does not match the engine bytes",
+            .{},
+        );
+        return error.EngineProvenanceMismatch;
+    }
+
+    const manifest_text = readAbsoluteFile(
+        allocator,
+        io,
+        manifest_path,
+    ) catch {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine requires sibling features.json provenance",
+            .{},
+        );
+        return error.MissingEngineProvenance;
+    };
+    const manifest = std.json.parseFromSliceLeaky(
+        FeatureManifest,
+        allocator,
+        manifest_text,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine sibling features.json is invalid JSON ({t})",
+            .{err},
+        );
+        return error.InvalidEngineProvenance;
+    };
+    const manifest_features = feature_surface.Features{
+        .stdio = manifest.stdio,
+        .random = manifest.random,
+        .clocks = manifest.clocks,
+        .http = manifest.http,
+        .fetch_event = manifest.@"fetch-event",
+    };
+    if (!std.mem.eql(u8, parsed.host_api, manifest.@"host-api") or
+        !std.mem.eql(
+            u8,
+            parsed.component_world,
+            manifest.@"component-world",
+        ) or
+        !std.mem.eql(u8, parsed.surface_world, manifest.@"surface-world") or
+        !featuresEqual(parsed.features, manifest_features))
+    {
+        setExternalPackageDetail(
+            diagnostic,
+            "the external engine embedded provenance does not match sibling features.json",
+            .{},
+        );
+        return error.EngineProvenanceMismatch;
+    }
+    return .{
+        .host_api = parsed.host_api,
+        .features = parsed.features,
+        .component_world = parsed.component_world,
+        .surface_world = parsed.surface_world,
+    };
+}
+
+fn setExternalPackageDetail(
+    diagnostic: *diagnostics.Context,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    diagnostic.detail = std.fmt.allocPrint(
+        diagnostic.allocator,
+        format,
+        args,
+    ) catch "external engine package validation failed";
+}
+
+const EngineProvenanceSection = struct {
+    section_start: usize,
+    metadata: []const u8,
+};
+
+fn findEngineProvenanceSection(
+    module: []const u8,
+) !?EngineProvenanceSection {
+    const wasm_magic = "\x00asm\x01\x00\x00\x00";
+    if (module.len < wasm_magic.len or
+        !std.mem.eql(u8, module[0..wasm_magic.len], wasm_magic))
+    {
+        return error.InvalidWasm;
+    }
+
+    var found: ?EngineProvenanceSection = null;
+    var offset: usize = wasm_magic.len;
+    while (offset < module.len) {
+        const section_start = offset;
+        const section_id = module[offset];
+        offset += 1;
+        const size = try readUleb(module, &offset);
+        const section_end = std.math.add(usize, offset, size) catch
+            return error.InvalidWasm;
+        if (section_end > module.len) return error.InvalidWasm;
+        if (section_id == 0) {
+            var name_offset = offset;
+            const name_len = try readUleb(module, &name_offset);
+            const name_end = std.math.add(usize, name_offset, name_len) catch
+                return error.InvalidWasm;
+            if (name_end > section_end) return error.InvalidWasm;
+            if (std.mem.eql(
+                u8,
+                module[name_offset..name_end],
+                "starling:engine-provenance",
+            )) {
+                if (found != null or section_end != module.len) {
+                    return error.InvalidProvenanceSection;
+                }
+                found = .{
+                    .section_start = section_start,
+                    .metadata = module[name_end..section_end],
+                };
+            }
+        }
+        offset = section_end;
+    }
+    return found;
+}
+
+const ParsedEngineProvenance = struct {
+    sha256: []const u8,
+    host_api: []const u8,
+    features: feature_surface.Features,
+    component_world: []const u8,
+    surface_world: []const u8,
+};
+
+fn parseEngineProvenance(provenance_metadata: []const u8) !ParsedEngineProvenance {
+    var lines = std.mem.splitScalar(u8, provenance_metadata, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse return error.InvalidMetadata, "schema=1")) {
+        return error.InvalidMetadata;
+    }
+    const digest = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "sha256=",
+    );
+    if (digest.len != 64) return error.InvalidMetadata;
+    for (digest) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) {
+            return error.InvalidMetadata;
+        }
+    }
+    const host_api = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "host-api=",
+    );
+    const feature_tuple = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "features=",
+    );
+    const component_world = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "component-world=",
+    );
+    const surface_world = try metadataField(
+        lines.next() orelse return error.InvalidMetadata,
+        "surface-world=",
+    );
+    if ((lines.next() orelse return error.InvalidMetadata).len != 0 or
+        lines.next() != null or
+        !validMetadataValue(host_api) or
+        !validMetadataValue(component_world) or
+        !validMetadataValue(surface_world))
+    {
+        return error.InvalidMetadata;
+    }
+    return .{
+        .sha256 = digest,
+        .host_api = host_api,
+        .features = try featuresFromTuple(feature_tuple),
+        .component_world = component_world,
+        .surface_world = surface_world,
+    };
+}
+
+fn metadataField(line: []const u8, prefix: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, line, prefix) or line.len == prefix.len) {
+        return error.InvalidMetadata;
+    }
+    return line[prefix.len..];
+}
+
+fn validMetadataValue(value: []const u8) bool {
+    return value.len <= 256 and
+        std.unicode.utf8ValidateSlice(value) and
+        std.mem.indexOfAny(u8, value, "\x00\r\n=") == null;
+}
+
+fn featuresFromTuple(tuple: []const u8) !feature_surface.Features {
+    if (tuple.len != 5) return error.InvalidMetadata;
+    var values: [5]bool = undefined;
+    for (tuple, 0..) |byte, index| {
+        values[index] = switch (byte) {
+            '0' => false,
+            '1' => true,
+            else => return error.InvalidMetadata,
+        };
+    }
+    return .{
+        .stdio = values[0],
+        .random = values[1],
+        .clocks = values[2],
+        .http = values[3],
+        .fetch_event = values[4],
+    };
+}
+
+fn featuresEqual(
+    lhs: feature_surface.Features,
+    rhs: feature_surface.Features,
+) bool {
+    return lhs.stdio == rhs.stdio and
+        lhs.random == rhs.random and
+        lhs.clocks == rhs.clocks and
+        lhs.http == rhs.http and
+        lhs.fetch_event == rhs.fetch_event;
+}
+
+fn readUleb(bytes: []const u8, offset: *usize) !usize {
+    var value: usize = 0;
+    var shift: u6 = 0;
+    for (0..5) |_| {
+        if (offset.* >= bytes.len) return error.InvalidWasm;
+        const byte = bytes[offset.*];
+        offset.* += 1;
+        value |= @as(usize, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return value;
+        shift += 7;
+    }
+    return error.InvalidWasm;
 }
 
 fn buildRuntime(
@@ -3475,22 +4262,48 @@ fn buildRuntime(
             allocator,
             io,
             transaction.storage,
-            if (config.use_debug_build)
-                "build-root/host-apis/wasi-0.2.0/preview1-adapter-debug/wasi_snapshot_preview1.wasm"
-            else
-                "build-root/host-apis/wasi-0.2.0/preview1-adapter-release/wasi_snapshot_preview1.wasm",
+            try std.fs.path.join(
+                allocator,
+                &.{
+                    "build-root",
+                    try selectedHostApiPath(allocator),
+                    if (config.use_debug_build)
+                        "preview1-adapter-debug/wasi_snapshot_preview1.wasm"
+                    else
+                        "preview1-adapter-release/wasi_snapshot_preview1.wasm",
+                },
+            ),
             adapter_destination,
             transaction,
         );
 
+    const needs_bindings = (config.debug_bindings or config.metadata_out != null) and
+        dispatch_wit != null;
     const key = try runtimeKey(
         allocator,
         config,
         if (dispatch_wit) |wit| wit.digest else null,
         if (component_wit) |wit| wit.digest else null,
+        build_options.host_api_world,
+        adapter_input.digest,
+        needs_bindings,
         build_snapshot.digest,
         zig_install,
     );
+    var locks = try ensureCacheDirectory(
+        allocator,
+        io,
+        cache.directory,
+        cache.path,
+        "locks",
+    );
+    defer locks.close(io);
+    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{key});
+    const cache_lock = try acquireCacheLock(io, locks.directory, lock_name);
+    const lock_file = cache_lock.file;
+    errdefer lock_file.close(io);
+    errdefer lock_file.unlock(io);
+
     var runtimes = try ensureCacheDirectory(
         allocator,
         io,
@@ -3516,19 +4329,6 @@ fn buildRuntime(
     );
     defer cache_bin.close(io);
     try verifyNoSymlinkTree(io, cache_bin.directory);
-    var locks = try ensureCacheDirectory(
-        allocator,
-        io,
-        cache.directory,
-        cache.path,
-        "locks",
-    );
-    defer locks.close(io);
-    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{key});
-    const cache_lock = try acquireCacheLock(io, locks.directory, lock_name);
-    const lock_file = cache_lock.file;
-    errdefer lock_file.close(io);
-    errdefer lock_file.unlock(io);
 
     var zig_global = try ensureCacheDirectory(
         allocator,
@@ -3614,6 +4414,12 @@ fn buildRuntime(
             "-Dpreview1-adapter={s}",
             .{adapter_input.path},
         ),
+        try std.fmt.allocPrint(allocator, "-Dhost-api={s}", .{build_options.host_api}),
+        try std.fmt.allocPrint(
+            allocator,
+            "-Dhost-api-world={s}",
+            .{build_options.host_api_world},
+        ),
     }) catch @panic("out of memory");
     if (dispatch_wit) |wit| {
         argv.appendSlice(allocator, &.{
@@ -3645,8 +4451,6 @@ fn buildRuntime(
             ),
         ) catch @panic("out of memory");
     }
-    const needs_bindings = (config.debug_bindings or config.metadata_out != null) and
-        dispatch_wit != null;
     if (needs_bindings) {
         argv.append(allocator, "-Dcomponentizer-debug-bindings=true") catch
             @panic("out of memory");
@@ -3787,14 +4591,51 @@ fn buildRuntime(
     );
     try verifyNoSymlinkTree(io, cache_bin.directory);
 
+    const features = resolveFeatures(config);
+    const platform_wit = try stageRuntimeWit(
+        allocator,
+        io,
+        runtime_bin,
+        "feature-wit",
+        try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-feature-wit" }),
+        transaction,
+    );
+    const runtime_component_wit = if (component_wit) |wit| wit else blk: {
+        break :blk try stageRuntimeWit(
+            allocator,
+            io,
+            runtime_bin,
+            "component-wit",
+            try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-component-wit" }),
+            transaction,
+        );
+    };
+    const runtime_component_world = config.component_world_name orelse
+        config.world_name orelse
+        build_options.host_api_world;
+    const surface_target_wit = if (dispatch_wit) |wit| wit else blk: {
+        break :blk try stageRuntimeWit(
+            allocator,
+            io,
+            runtime_bin,
+            "surface-wit",
+            try std.fs.path.join(allocator, &.{ transaction_dir, "runtime-surface-wit" }),
+            transaction,
+        );
+    };
+    const surface_target_world = config.world_name orelse "caller";
     return .{
         .engine = engine,
         .adapter = adapter,
-        .component_wit = if (component_wit) |wit| wit.absolute else null,
-        .component_world = config.component_world_name orelse config.world_name,
+        .component_wit = runtime_component_wit.absolute,
+        .component_world = runtime_component_world,
+        .surface_target_wit = surface_target_wit.absolute,
+        .surface_target_world = surface_target_world,
+        .platform_wit = platform_wit.absolute,
+        .features = features,
         .bindings = bindings,
-        .dispatch_wit_digest = if (dispatch_wit) |wit| wit.digest else null,
-        .component_wit_digest = if (component_wit) |wit| wit.digest else null,
+        .dispatch_wit_digest = surface_target_wit.digest,
+        .component_wit_digest = runtime_component_wit.digest,
         .features_known = true,
         .zig = zig_install,
         .build_tools = build_tools,
@@ -4254,11 +5095,40 @@ fn runtimeBuildSelections(
         selections.append(allocator, try allocator.dupe(u8, line)) catch
             @panic("out of memory");
     }
+    const host_api_path = try selectedHostApiPath(allocator);
+    for (selections.items) |existing| {
+        if (std.mem.eql(u8, existing, host_api_path)) break;
+    } else {
+        selections.append(allocator, host_api_path) catch
+            @panic("out of memory");
+    }
     return .{
         .paths = selections.toOwnedSlice(allocator) catch
             @panic("out of memory"),
         .manifest_digest = try metadata.sha256Bytes(allocator, source),
     };
+}
+
+fn selectedHostApiPath(allocator: Allocator) ![]const u8 {
+    const selection = build_options.host_api;
+    if (std.fs.path.isAbsolute(selection) or
+        std.mem.indexOfScalar(u8, selection, '\\') != null)
+    {
+        return error.InvalidBuildRoot;
+    }
+    var components = std.mem.splitScalar(u8, selection, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.InvalidBuildRoot;
+        }
+    }
+    if (std.mem.indexOfScalar(u8, selection, '/') != null) {
+        return allocator.dupe(u8, selection);
+    }
+    return std.fs.path.join(allocator, &.{ "host-apis", selection });
 }
 
 fn copyEnvironment(
@@ -4278,7 +5148,6 @@ fn resolveTools(
     cwd: []const u8,
     executable_dir: []const u8,
     config: *const cli.Config,
-    needs_wabt: bool,
     transaction: *Transaction,
 ) !Tools {
     const transaction_dir = transaction.storage_path;
@@ -4321,9 +5190,7 @@ fn resolveTools(
             "wasm-tools",
             "wasm-tools",
         );
-    const wabt_source = if (!needs_wabt)
-        null
-    else if (config.wabt_bin) |path|
+    const wabt_source = if (config.wabt_bin) |path|
         try absolutePath(allocator, cwd, path)
     else if (environ.get("WABT")) |path|
         try absolutePath(allocator, cwd, path)
@@ -4348,17 +5215,14 @@ fn resolveTools(
         transaction,
         "wasm-tools",
     )).snapshot;
-    const wabt = if (wabt_source) |path|
-        (try captureInputFile(
-            allocator,
-            io,
-            try resolveExecutable(allocator, io, environ, path),
-            try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
-            transaction,
-            "wabt",
-        )).snapshot
-    else
-        null;
+    const wabt = (try captureInputFile(
+        allocator,
+        io,
+        try resolveExecutable(allocator, io, environ, wabt_source),
+        try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
+        transaction,
+        "wabt",
+    )).snapshot;
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
 }
 
@@ -4516,6 +5380,25 @@ fn stageWit(
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer source_dir.close(io);
+    const staged = try stageWitDirectory(
+        allocator,
+        io,
+        source_dir,
+        stage_path,
+        transaction,
+    );
+    try retained_source.verify(io);
+    return staged;
+}
+
+fn stageWitDirectory(
+    allocator: Allocator,
+    io: Io,
+    source_dir: Dir,
+    stage_path: []const u8,
+    transaction: *Transaction,
+) !StagedWit {
+    const stage_relative = std.fs.path.basename(stage_path);
     var walker = try source_dir.walk(allocator);
     defer walker.deinit();
     var files: std.ArrayList([]const u8) = .empty;
@@ -4587,7 +5470,6 @@ fn stageWit(
         io,
         stage_relative,
     );
-    try retained_source.verify(io);
     return .{
         .absolute = try transaction.retainStorageDirectory(
             allocator,
@@ -4598,20 +5480,54 @@ fn stageWit(
     };
 }
 
+fn stageRuntimeWit(
+    allocator: Allocator,
+    io: Io,
+    runtime_bin: Dir,
+    source_path: []const u8,
+    stage_path: []const u8,
+    transaction: *Transaction,
+) !StagedWit {
+    var source = try runtime_bin.openDir(
+        io,
+        source_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer source.close(io);
+    return stageWitDirectory(
+        allocator,
+        io,
+        source,
+        stage_path,
+        transaction,
+    );
+}
+
 fn runtimeKey(
     allocator: Allocator,
     config: *const cli.Config,
     dispatch_digest: ?[]const u8,
     component_digest: ?[]const u8,
+    host_api_world: []const u8,
+    adapter_digest: []const u8,
+    needs_bindings: bool,
     build_root_digest: []const u8,
     zig: ZigSnapshot,
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hasher, "schema", "1");
+    hashField(&hasher, "schema", "3");
     hashField(&hasher, "version", build_options.version);
+    hashField(&hasher, "host-api", build_options.host_api);
+    hashField(&hasher, "host-api-world", host_api_world);
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
+    hashField(&hasher, "preview1-adapter", adapter_digest);
+    hashField(
+        &hasher,
+        "componentizer-debug-bindings",
+        if (needs_bindings) "true" else "false",
+    );
     hashField(&hasher, "build-root", build_root_digest);
     hashField(&hasher, "zig", zig.executable.digest);
     hashField(&hasher, "zig-lib", zig.lib_digest);
@@ -4639,12 +5555,12 @@ fn hashField(
 fn buildMetadataDocument(
     allocator: Allocator,
     io: Io,
-    config: *const cli.Config,
     source: InputSnapshot,
     initializer: ?InputSnapshot,
     runtime_args: []const u8,
     runtime: Runtime,
     tools: Tools,
+    wabt_invoked: bool,
     preopens: []const RetainedDirectory,
     component: []const u8,
     imports: metadata.Imports,
@@ -4652,14 +5568,14 @@ fn buildMetadataDocument(
     var features: std.ArrayList(metadata.Feature) = .empty;
     var feature_fields: std.ArrayList([2][]const u8) = .empty;
     if (runtime.features_known) {
-        for (cli.feature_names) |name| {
-            var enabled = true;
-            for (config.disable_features) |disabled| {
-                if (std.mem.eql(u8, name, disabled)) enabled = false;
-            }
-            for (config.enable_features) |explicitly_enabled| {
-                if (std.mem.eql(u8, name, explicitly_enabled)) enabled = true;
-            }
+        const enabled_features = [_]bool{
+            runtime.features.stdio,
+            runtime.features.random,
+            runtime.features.clocks,
+            runtime.features.http,
+            runtime.features.fetch_event,
+        };
+        for (cli.feature_names, enabled_features) |name, enabled| {
             features.append(allocator, .{ .name = name, .enabled = enabled }) catch
                 @panic("out of memory");
             feature_fields.append(
@@ -4678,11 +5594,11 @@ fn buildMetadataDocument(
         null;
 
     const dispatch_world = metadata.World{
-        .name = config.world_name,
+        .name = runtime.surface_target_world,
         .wit_sha256 = runtime.dispatch_wit_digest,
     };
     const component_world = metadata.World{
-        .name = config.component_world_name orelse config.world_name,
+        .name = runtime.component_world,
         .wit_sha256 = runtime.component_wit_digest,
     };
     const world_fields = [_][2][]const u8{
@@ -4721,13 +5637,13 @@ fn buildMetadataDocument(
         if (tools.wizer.wasmtime_subcommand) "wasmtime-wizer" else "wizer",
         tools.wizer.executable,
     );
-    if (tools.wabt) |wabt| {
+    if (wabt_invoked) {
         try appendToolSnapshot(
             allocator,
             &tool_values,
             &tool_fields,
             "wabt",
-            wabt,
+            tools.wabt,
         );
     }
     try appendToolSnapshot(
@@ -8507,7 +9423,11 @@ const debug_generated_names = [_][]const u8{
     "initialized.wasm",
     "stripped.wasm",
     "embedded.wasm",
+    "component-before-feature-surface.wasm",
+    "surfaced.wasm",
     "component.wasm",
+    "feature-provider.wit",
+    "feature-provider.wasm",
     "component-bindings.zig",
     "commands.txt",
     "metadata.json",
@@ -9659,6 +10579,29 @@ fn joinComma(allocator: Allocator, values: []const []const u8) ![]const u8 {
     return std.mem.join(allocator, ",", values);
 }
 
+fn resolveFeatures(config: *const cli.Config) feature_surface.Features {
+    var features = feature_surface.Features{};
+    for (config.disable_features) |name| setFeature(&features, name, false);
+    for (config.enable_features) |name| setFeature(&features, name, true);
+    return features;
+}
+
+fn setFeature(features: *feature_surface.Features, name: []const u8, enabled: bool) void {
+    if (std.mem.eql(u8, name, "stdio")) {
+        features.stdio = enabled;
+    } else if (std.mem.eql(u8, name, "random")) {
+        features.random = enabled;
+    } else if (std.mem.eql(u8, name, "clocks")) {
+        features.clocks = enabled;
+    } else if (std.mem.eql(u8, name, "http")) {
+        features.http = enabled;
+    } else if (std.mem.eql(u8, name, "fetch-event")) {
+        features.fetch_event = enabled;
+    } else {
+        unreachable;
+    }
+}
+
 fn siblingOrName(
     allocator: Allocator,
     io: Io,
@@ -9759,6 +10702,22 @@ fn pathKindNoFollowAt(directory: Dir, io: Io, path: []const u8) !?File.Kind {
 fn requireFile(io: Io, path: []const u8) !void {
     const stat = Dir.cwd().statFile(io, path, .{}) catch return error.MissingBuildArtifact;
     if (stat.kind != .file) return error.MissingBuildArtifact;
+}
+
+fn readAbsoluteFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) ![]const u8 {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var dir = try Dir.openDirAbsolute(io, parent, .{});
+    defer dir.close(io);
+    return dir.readFileAlloc(
+        io,
+        std.fs.path.basename(path),
+        allocator,
+        .unlimited,
+    );
 }
 
 fn requireDestinationFileOrMissing(
@@ -10186,6 +11145,9 @@ test "runtime cache key excludes JavaScript source" {
         &config,
         "a",
         "b",
+        "bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
@@ -10196,6 +11158,9 @@ test "runtime cache key excludes JavaScript source" {
         &config,
         "a",
         "b",
+        "bindings",
+        "adapter",
+        false,
         "root",
         zig,
     );
@@ -10285,4 +11250,74 @@ test "runtime build selections include only selected closures" {
     ));
     try std.testing.expect(!treePathSelected("deps/source", &selected));
     try std.testing.expect(!treePathSelected(".zig-cache", &selected));
+}
+
+test "runtime cache key includes the authoritative host API world" {
+    var config = cli.Config{ .source = "source.js" };
+    const snapshot = Snapshot{
+        .path = "zig",
+        .storage_path = "zig",
+        .digest = "zig-digest",
+        .protection = 0,
+    };
+    const zig = ZigSnapshot{
+        .executable = snapshot,
+        .lib_dir = "lib",
+        .lib_digest = "lib-digest",
+    };
+    const bindings = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        null,
+        null,
+        "bindings",
+        "adapter",
+        false,
+        "root",
+        zig,
+    );
+    defer std.testing.allocator.free(bindings);
+    const custom = try runtimeKey(
+        std.testing.allocator,
+        &config,
+        null,
+        null,
+        "custom-bindings",
+        "adapter",
+        false,
+        "root",
+        zig,
+    );
+    defer std.testing.allocator.free(custom);
+    try std.testing.expect(!std.mem.eql(u8, bindings, custom));
+}
+
+test "engine provenance requires a complete feature and topology tuple" {
+    const parsed = try parseEngineProvenance(
+        "schema=1\n" ++
+            "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
+            "host-api=wasi-0.2.3\n" ++
+            "features=01001\n" ++
+            "component-world=custom-bindings\n" ++
+            "surface-world=caller\n",
+    );
+    try std.testing.expectEqualStrings("wasi-0.2.3", parsed.host_api);
+    try std.testing.expect(!parsed.features.stdio);
+    try std.testing.expect(parsed.features.random);
+    try std.testing.expect(parsed.features.fetch_event);
+    try std.testing.expectEqualStrings(
+        "custom-bindings",
+        parsed.component_world,
+    );
+    try std.testing.expectError(
+        error.InvalidMetadata,
+        parseEngineProvenance(
+            "schema=1\n" ++
+                "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
+                "host-api=wasi-0.2.3\n" ++
+                "features=1111\n" ++
+                "component-world=bindings\n" ++
+                "surface-world=caller\n",
+        ),
+    );
 }

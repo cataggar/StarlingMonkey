@@ -25,6 +25,13 @@ function handler(event) {
     }
 
     try {
+      AbortSignal.timeout(0);
+      results.push('abort-timeout:ok');
+    } catch (e) {
+      results.push('abort-timeout:caught:' + e.message);
+    }
+
+    try {
       await fetch('http://example.invalid/');
       results.push('http:ok');
     } catch (e) {

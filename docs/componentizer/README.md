@@ -9,12 +9,16 @@ command string):
 
 1. Select and cache a WIT-specific `zig build` of `starling-raw.wasm`.
 2. Pre-initialize the JavaScript module with Wizer.
-3. Strip and embed the selected component world with WABT.
+3. Strip and embed the selected component world with `wasm-tools`.
 4. Adapt the reactor into a component.
-5. Add standard `language=JavaScript` and
+5. Generate and compose feature-surface providers with pinned WABT so
+   disabled/runtime-only
+   WASI interfaces do not leak into the caller's world while unmatched
+   consumer imports continue to bubble through the composed component.
+6. Add standard `language=JavaScript` and
    `processed-by=starling-componentize` producers metadata.
-6. Validate the completed candidate with `wasm-tools`.
-7. `fsync` and transactionally publish the requested outputs.
+7. Validate the completed candidate with `wasm-tools`.
+8. `fsync` and transactionally publish the requested outputs.
 
 Any failure before the durable publication commit leaves existing component
 and metadata outputs unchanged and never publishes a partial debug directory.
@@ -59,11 +63,15 @@ zig-out/bin/starling-componentize --version
 zig build componentizer-test -Doptimize=ReleaseSmall
 ```
 
-The default install places the CLI beside `wasmtime`, `wasm-tools`,
-`wabt`, `preview1-adapter.wasm`, and `starling-raw.wasm`. The bundled WABT
-contains the reactor adapter and typed-export fixes required by this pipeline.
+The default install places the CLI beside `wasmtime`, `wasm-tools`, `wabt`,
+`preview1-adapter.wasm`, and `starling-raw.wasm`.
+`starling-feature-surface` and the selected `feature-wit` closure are installed
+beside them and shared with the shell componentizer.
+The installed preview1 adapter and feature-provider WIT closure match the
+selected host API version, so componentization does not mix interface or
+resource identities across WASI releases.
 The componentizer test target is the required gate: it runs unit and fake-tool
-coverage plus real WABT/Wizer relinks for two distinct WIT worlds.
+coverage plus real `wasm-tools`/Wizer relinks for two distinct WIT worlds.
 
 ## Per-run WIT worlds
 
@@ -74,6 +82,10 @@ The monolithic runtime needs two related WIT views:
 - `--component-wit` / `--component-world-name` selects the complete world
   embedded into the core module. It must include StarlingMonkey's WASI
   imports/exports as well as the user exports.
+
+Feature surfacing is derived from the `--wit` caller/export world, not the
+larger component embedding world. The finished candidate is inspected before
+runtime-only WASI imports are composed away.
 
 They may point to the same directory/world only when that world already
 contains the complete component closure. For the repository's standard
@@ -90,7 +102,10 @@ zig-out/bin/starling-componentize \
 ```
 
 WIT files are content-hashed and staged under the build root. Runtime prefixes
-are keyed by the two WIT closures, worlds, feature selection, and build mode.
+are keyed by the componentizer's embedded host API, the two WIT closures,
+worlds, feature selection, and build mode. Every nested build receives that
+exact `-Dhost-api`; an installed componentizer cannot silently fall back to a
+different adapter/provider identity.
 The CLI still invokes `zig build` on every run so source/toolchain changes
 cannot reuse stale output; Zig's own dependency cache makes an unchanged
 monolithic relink a fast cache hit. JavaScript source is deliberately excluded
@@ -110,12 +125,16 @@ replacement. Only the exact effective-cache
 directory identity is excluded if it is nested inside a snapshotted source
 tree.
 
-Use `--engine` only with a `starling-raw.wasm` already built for the exact WIT
-and feature selection. Build-changing feature/debug options are rejected with
-that override. Public imports metadata for a WIT-selected run requires the
-generated bindings retained by the native runtime build, so `--metadata-out`
-with both `--engine` and `--wit` is rejected rather than reporting an
-incomplete imports list.
+`--engine` accepts only a `starling-raw.wasm` carrying StarlingMonkey's
+integrity-bound embedded engine provenance and a matching sibling
+`features.json`. The provenance records the host API, complete five-feature
+tuple, component world, and surface world and is bound to the core module by a
+SHA-256 digest. The componentizer selects the adapter and WIT closures beside
+that engine, so pure/mixed engines and older supported WASI versions retain
+their exact surface instead of inheriting the componentizer executable's
+defaults. Missing, tampered, or mismatched provenance is rejected before
+Wizer runs. Build-changing feature/debug options remain incompatible with an
+external engine.
 
 ## Diagnostics
 
