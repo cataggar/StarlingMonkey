@@ -282,7 +282,7 @@ if(NOT ZIG_VERSION STREQUAL STARLING_ZIG_VERSION)
 endif()
 
 set(WABT_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/wabt-install")
-set(WABT_BIN "${WABT_PREFIX}/bin/wabt")
+set(WABT_BIN "${CMAKE_CURRENT_BINARY_DIR}/wabt")
 set(WABT_LOCAL_CACHE "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/wabt-local")
 set(WABT_GLOBAL_CACHE "${CMAKE_CURRENT_BINARY_DIR}/zig-cache/wabt-global")
 add_custom_command(
@@ -295,6 +295,8 @@ add_custom_command(
             "${ZIG_PROGRAM}" build wabt
             --prefix "${WABT_PREFIX}"
             -Doptimize=ReleaseSmall
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${WABT_PREFIX}/bin/wabt" "${WABT_BIN}"
     DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/build.zig"
             "${CMAKE_CURRENT_SOURCE_DIR}/build.zig.zon"
