@@ -71,6 +71,8 @@ for version in "${VERSIONS[@]}"; do
       check_wit_versions "$version" "$runtime/component-wit"
       component="$prefix/pure-shell.wasm"
       WABT="$ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+      WABT_COMPOSE_BIN="$runtime/wabt" \
+      WASM_TOOLS_BIN="$runtime/wasm-tools" \
         "$runtime/componentize.sh" "$FIXTURE" -o "$component"
       native_component="$prefix/pure-native.wasm"
       native_cache="$SHARED_NATIVE_CACHE"
@@ -116,6 +118,8 @@ for version in "${VERSIONS[@]}"; do
       check_wit_versions "$version" "$runtime/component-wit"
       component="$prefix/pure-shell.wasm"
       WABT="$ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+      WABT_COMPOSE_BIN="$runtime/wabt" \
+      WASM_TOOLS_BIN="$runtime/wasm-tools" \
         "$runtime/componentize.sh" "$FIXTURE" -o "$component"
       ctest --test-dir "$build_dir" -R '^componentize-exact-surface$' \
         --output-on-failure

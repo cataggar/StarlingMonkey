@@ -100,6 +100,7 @@ NATIVE_DEBUG="$PREFIX/native-debug"
 echo "[wit-imports e2e] componentizing through the installed shell"
 FEATURE_SURFACE_BEFORE="$SHELL_BEFORE" \
 WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+WABT_COMPOSE_BIN="$BIN/wabt" \
 WASM_TOOLS_BIN="$BIN/wasm-tools" \
   "$BIN/componentize.sh" tests/e2e/wit-imports/component.js -o "$COMPONENT"
 
@@ -435,6 +436,7 @@ OUTPUT_JSON="$PREFIX/output.json"
 echo "[wit-imports e2e] checking literal member precedence over camelCase"
 LITERAL_COMPONENT="$PREFIX/wit-imports-literal-names.wasm"
 WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+WABT_COMPOSE_BIN="$BIN/wabt" \
 WASM_TOOLS_BIN="$BIN/wasm-tools" \
   "$BIN/componentize.sh" tests/e2e/wit-imports/component-literal-names.js -o "$LITERAL_COMPONENT"
 "$BIN/wasm-tools" validate --features all "$LITERAL_COMPONENT"
@@ -453,6 +455,7 @@ assert_field "literal kebab-case member takes precedence over camelCase alias in
 echo "[wit-imports e2e] checking literal namespace precedence over camelCase"
 LITERAL_NAMESPACE_COMPONENT="$PREFIX/wit-imports-literal-namespace.wasm"
 WABT="$REPO_ROOT/tests/e2e/native-dispatch/wabt-shim.sh" \
+WABT_COMPOSE_BIN="$BIN/wabt" \
 WASM_TOOLS_BIN="$BIN/wasm-tools" \
   "$BIN/componentize.sh" tests/e2e/wit-imports/component-literal-namespace.js \
     -o "$LITERAL_NAMESPACE_COMPONENT"
