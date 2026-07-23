@@ -3814,8 +3814,6 @@ fn verifyManagedPrefixOwnership(
     const recovering = manifest == null and try managedCurrentExists(io, managed);
     for (expected.names) |name| {
         const exists = try managedLinkState(allocator, io, bin, name);
-        if (manifest != null and !exists)
-            return error.InstallOwnershipConflict;
         if (manifest == null and exists and !recovering)
             return error.InstallOwnershipConflict;
     }
