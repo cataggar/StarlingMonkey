@@ -35,7 +35,9 @@ build target="all" *flags:
         {{ quote(zig) }} build "${zig_step[@]}" --prefix '{{ builddir }}' \
             -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
         if [[ '{{ target }}' == starling ]]; then
-            output='{{ builddir }}.starling.wasm.build'
+            output_dir='{{ builddir }}-outputs'
+            mkdir -p "$output_dir"
+            output="$output_dir/starling.wasm"
             trap 'rm -f "$output"' EXIT
             '{{ builddir }}/bin/componentize.sh' \
                 --output "$output"
