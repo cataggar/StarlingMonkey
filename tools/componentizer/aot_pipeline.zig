@@ -3630,6 +3630,128 @@ const RetainedExecPlan = struct {
     }
 };
 
+pub const RetainedSnapshotExecutable = struct {
+    package: CapturedWevalPackage,
+    plan: RetainedExecPlan,
+
+    pub fn close(self: RetainedSnapshotExecutable, io: Io) void {
+        self.plan.close(io);
+        self.package.close(io);
+    }
+
+    pub fn verify(self: RetainedSnapshotExecutable, io: Io) !void {
+        self.plan.verify(io) catch return error.TransactionChanged;
+    }
+
+    pub fn run(
+        self: RetainedSnapshotExecutable,
+        allocator: Allocator,
+        io: Io,
+        argv: []const []const u8,
+        cwd: []const u8,
+        environ: ?*const std.process.Environ.Map,
+        stdin_path: ?[]const u8,
+        stdout_file: ?File,
+        stderr_file: ?File,
+    ) !std.process.Child.Term {
+        var helper_args: std.ArrayList([]const u8) = .empty;
+        helper_args.appendSlice(allocator, self.plan.helper_argv) catch
+            @panic("out of memory");
+        helper_args.appendSlice(allocator, argv) catch @panic("out of memory");
+        var retained_inputs: std.ArrayList(std.posix.fd_t) = .empty;
+        for (argv) |arg|
+            try appendRetainedDescriptors(allocator, &retained_inputs, arg);
+        if (stdin_path) |path|
+            try appendRetainedDescriptors(allocator, &retained_inputs, path);
+        const term = try runRetainedHelperProcessTerm(
+            allocator,
+            io,
+            helper_args.items,
+            retained_inputs.items,
+            cwd,
+            environ,
+            stdin_path,
+            stdout_file,
+            stderr_file,
+        );
+        self.plan.verify(io) catch return error.TransactionChanged;
+        return term;
+    }
+};
+
+fn appendRetainedDescriptors(
+    allocator: Allocator,
+    descriptors: *std.ArrayList(std.posix.fd_t),
+    value: []const u8,
+) !void {
+    const prefix = "/proc/self/fd/";
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, value, offset, prefix)) |start| {
+        const digits_start = start + prefix.len;
+        var end = digits_start;
+        while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {}
+        if (end == digits_start) {
+            offset = digits_start;
+            continue;
+        }
+        const descriptor = std.fmt.parseInt(
+            std.posix.fd_t,
+            value[digits_start..end],
+            10,
+        ) catch return error.UnsupportedRetainedExecution;
+        if (descriptor < 3) return error.UnsupportedRetainedExecution;
+        var present = false;
+        for (descriptors.items) |existing| {
+            if (existing == descriptor) {
+                present = true;
+                break;
+            }
+        }
+        if (!present)
+            descriptors.append(allocator, descriptor) catch @panic("out of memory");
+        offset = end;
+    }
+}
+
+pub fn prepareRetainedSnapshotExecutable(
+    allocator: Allocator,
+    io: Io,
+    selected: []const u8,
+    package_root: []const u8,
+    provenance: []const u8,
+) !RetainedSnapshotExecutable {
+    const package = captureWevalPackage(allocator, io, .{
+        .selected = selected,
+        .package_root = package_root,
+        .provenance = provenance,
+    }) catch |err| switch (err) {
+        error.NotDir => return error.UnsupportedRetainedExecution,
+        else => return err,
+    };
+    errdefer package.close(io);
+    const plan = try createRetainedExecPlan(allocator, io, package);
+    errdefer plan.close(io);
+    try plan.verify(io);
+    return .{ .package = package, .plan = plan };
+}
+
+pub fn validateRetainedSnapshotExecutable(
+    allocator: Allocator,
+    io: Io,
+    selected: []const u8,
+    package_root: []const u8,
+    provenance: []const u8,
+) !void {
+    const retained = try prepareRetainedSnapshotExecutable(
+        allocator,
+        io,
+        selected,
+        package_root,
+        provenance,
+    );
+    defer retained.close(io);
+}
+
 const ElfClosureInfo = struct {
     interpreter: ?[]const u8,
     needed: []const []const u8,
@@ -5936,6 +6058,34 @@ fn runRetainedHelperProcess(
     environ: ?*const std.process.Environ.Map,
     stdin_path: ?[]const u8,
 ) !void {
+    const term = try runRetainedHelperProcessTerm(
+        allocator,
+        io,
+        helper_args,
+        retained_inputs,
+        cwd,
+        environ,
+        stdin_path,
+        null,
+        null,
+    );
+    if (!term.success()) {
+        std.debug.print("error: {s} failed\n", .{stage});
+        return error.CommandFailed;
+    }
+}
+
+fn runRetainedHelperProcessTerm(
+    allocator: Allocator,
+    io: Io,
+    helper_args: []const []const u8,
+    retained_inputs: []const std.posix.fd_t,
+    cwd: []const u8,
+    environ: ?*const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    stdout_file: ?File,
+    stderr_file: ?File,
+) !std.process.Child.Term {
     if (builtin.os.tag != .linux)
         return error.UnsupportedRetainedExecution;
     const linux = std.os.linux;
@@ -5977,6 +6127,14 @@ fn runRetainedHelperProcess(
             linux.exit_group(126);
         if (linux.errno(linux.dup2(stdin_file.handle, 0)) != .SUCCESS)
             linux.exit_group(126);
+        if (stdout_file) |file| {
+            if (linux.errno(linux.dup2(file.handle, 1)) != .SUCCESS)
+                linux.exit_group(126);
+        }
+        if (stderr_file) |file| {
+            if (linux.errno(linux.dup2(file.handle, 2)) != .SUCCESS)
+                linux.exit_group(126);
+        }
         retainedExecHelper(
             allocator,
             io,
@@ -6003,12 +6161,13 @@ fn runRetainedHelperProcess(
         else => return error.CommandFailed,
     }
     const wait_status: u32 = @bitCast(status);
-    if (!linux.W.IFEXITED(wait_status) or
-        linux.W.EXITSTATUS(wait_status) != 0)
-    {
-        std.debug.print("error: {s} failed\n", .{stage});
-        return error.CommandFailed;
-    }
+    if (linux.W.IFEXITED(wait_status))
+        return .{ .exited = linux.W.EXITSTATUS(wait_status) };
+    if (linux.W.IFSIGNALED(wait_status))
+        return .{ .signal = linux.W.TERMSIG(wait_status) };
+    if (linux.W.IFSTOPPED(wait_status))
+        return .{ .stopped = linux.W.STOPSIG(wait_status) };
+    return .{ .unknown = wait_status };
 }
 
 fn currentEnvironmentMap(

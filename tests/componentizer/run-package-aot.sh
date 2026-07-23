@@ -263,6 +263,56 @@ grep -Fq "generation $(sed -n 's/^key=//p' \
 assert_bundle "$RELEASE"
 cmp "$RELEASE/starling-raw-weval.wasm" "$PREFIX_B/bin/starling-raw.wasm"
 
+BUNDLE_STAGE_HOOK="$SCRATCH/bundle-stage-race-hook"
+mkdir "$BUNDLE_STAGE_HOOK"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$BUNDLE_STAGE_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-switch \
+  "$PACKAGE_SCRIPT" "$PREFIX_A" "$RELEASE" \
+    >"$SCRATCH/bundle-stage-race.log" 2>&1 &
+bundle_stage_pid=$!
+wait_for_hook "$BUNDLE_STAGE_HOOK/before-bundle-switch.ready"
+bundle_stage="$(find "$SCRATCH" -maxdepth 1 \
+  -name '.release.starling-aot-generation-*' -print -quit)"
+test -n "$bundle_stage"
+mv "$bundle_stage" "$bundle_stage.validated"
+mkdir "$bundle_stage"
+printf 'unvalidated bundle\n' > "$bundle_stage/unvalidated"
+touch "$BUNDLE_STAGE_HOOK/before-bundle-switch.continue"
+if wait "$bundle_stage_pid"; then
+  echo "FAIL: replaced unvalidated bundle stage was published" >&2
+  exit 1
+fi
+grep -Fq SealPathRace "$SCRATCH/bundle-stage-race.log"
+assert_bundle "$RELEASE"
+cmp "$RELEASE/starling-raw-weval.wasm" "$PREFIX_B/bin/starling-raw.wasm"
+rm -rf "$bundle_stage"
+mv "$bundle_stage.validated" "$bundle_stage"
+"$PREFIX_A/bin/starling-aot-cache" recover-bundle --target "$RELEASE"
+
+BUNDLE_PARENT_ROOT="$SCRATCH/bundle parent root"
+BUNDLE_PARENT="$BUNDLE_PARENT_ROOT/parent"
+BUNDLE_PARENT_TARGET="$BUNDLE_PARENT/release"
+BUNDLE_PARENT_HOOK="$SCRATCH/bundle-parent-race-hook"
+mkdir -p "$BUNDLE_PARENT" "$BUNDLE_PARENT_HOOK"
+"$PACKAGE_SCRIPT" "$PREFIX_A" "$BUNDLE_PARENT_TARGET" \
+  >"$SCRATCH/bundle-parent-initial.log" 2>&1
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$BUNDLE_PARENT_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-bundle-switch \
+  "$PACKAGE_SCRIPT" "$PREFIX_B" "$BUNDLE_PARENT_TARGET" \
+    >"$SCRATCH/bundle-parent-race.log" 2>&1 &
+bundle_parent_pid=$!
+wait_for_hook "$BUNDLE_PARENT_HOOK/before-bundle-switch.ready"
+mv "$BUNDLE_PARENT" "$BUNDLE_PARENT.retained"
+mkdir "$BUNDLE_PARENT"
+printf 'unvalidated parent\n' > "$BUNDLE_PARENT/unvalidated"
+rm -rf "$BUNDLE_PARENT"
+mv "$BUNDLE_PARENT.retained" "$BUNDLE_PARENT"
+touch "$BUNDLE_PARENT_HOOK/before-bundle-switch.continue"
+wait "$bundle_parent_pid"
+assert_bundle "$BUNDLE_PARENT_TARGET"
+cmp "$BUNDLE_PARENT_TARGET/starling-raw-weval.wasm" \
+  "$PREFIX_B/bin/starling-raw.wasm"
+
 CRASH_RELEASE="$SCRATCH/crash release"
 mkdir "$CRASH_RELEASE"
 "$PACKAGE_SCRIPT" "$PREFIX_A" "$CRASH_RELEASE" \
@@ -375,7 +425,7 @@ make_prefix_generation() {
   generation="$SCRATCH/.existing build prefix.generation-$label-$serial"
   bin="$generation/bin"
   rm -rf "$generation"
-  mkdir -p "$bin"
+  mkdir -p "$bin" "$generation/shared"
   cp "$source/bin/starling-raw.wasm" "$bin/"
   cp "$source/bin/starling-ics.wevalcache" "$bin/"
   cp "$source/bin/starling-ics.wevalcache.manifest" "$bin/"
@@ -387,12 +437,13 @@ make_prefix_generation() {
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/starling-componentize"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/componentize.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/wabt"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$generation/shared/wabt.real"
   printf 'preview adapter %s\n' "$label" > "$bin/preview1-adapter.wasm"
   printf '{"generation":"%s"}\n' "$label" > "$bin/features.json"
   printf 'console.log("smoke %s");\n' "$label" > "$bin/smoke.js"
   chmod +x "$bin/starling-aot-cache" "$bin/weval" "$bin/wasm-tools" \
     "$bin/wasmtime" "$bin/starling-componentize" "$bin/componentize.sh" \
-    "$bin/wabt"
+    "$bin/wabt" "$generation/shared/wabt.real"
   printf '%s\n' "$generation"
 }
 
@@ -424,6 +475,109 @@ test -f "$BUILD_PREFIX/.starling-aot-engine/owner"
 test -f "$BUILD_PREFIX/.starling-aot-engine/ownership.manifest"
 test -L "$BUILD_PREFIX/bin/starling-raw.wasm"
 BUILD_INODE="$(stat -c '%d:%i' "$BUILD_PREFIX")"
+
+for kind in dangling absolute escaping intermediate; do
+  unsafe_generation="$(make_prefix_generation B "unsafe-$kind")"
+  rm "$unsafe_generation/bin/wabt"
+  case "$kind" in
+    dangling)
+      ln -s missing "$unsafe_generation/bin/wabt"
+      ;;
+    absolute)
+      ln -s "$PREFIX_B/bin/wabt" "$unsafe_generation/bin/wabt"
+      ;;
+    escaping)
+      ln -s ../../outside-wabt "$unsafe_generation/bin/wabt"
+      ;;
+    intermediate)
+      mkdir "$unsafe_generation/links"
+      ln -s ../../outside "$unsafe_generation/links/escape"
+      ln -s ../links/escape/wabt "$unsafe_generation/bin/wabt"
+      ;;
+  esac
+  if "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$unsafe_generation" \
+    --feature-abi package-race-B \
+    >"$SCRATCH/unsafe-prefix-$kind.log" 2>&1
+  then
+    echo "FAIL: $kind generation symlink was accepted" >&2
+    exit 1
+  fi
+  grep -Fq InvalidDestinationKind "$SCRATCH/unsafe-prefix-$kind.log"
+  assert_prefix "$BUILD_PREFIX" A
+done
+
+internal_generation="$(make_prefix_generation A internal-link)"
+rm "$internal_generation/bin/wabt"
+ln -s ../shared/wabt.real "$internal_generation/bin/wabt"
+"$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+  --target "$BUILD_PREFIX" \
+  --generation "$internal_generation" \
+  --feature-abi package-race-A
+test "$(readlink "$BUILD_PREFIX/.starling-aot-engine/current/bin/wabt")" = \
+  "../shared/wabt.real"
+assert_prefix "$BUILD_PREFIX" A
+
+STAGE_RACE_HOOK="$SCRATCH/prefix-stage-race-hook"
+mkdir "$STAGE_RACE_HOOK"
+generation_b="$(make_prefix_generation B stage-race)"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$STAGE_RACE_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-prefix-switch \
+  "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$generation_b" \
+    --feature-abi package-race-B \
+    >"$SCRATCH/prefix-stage-race.log" 2>&1 &
+stage_race_pid=$!
+wait_for_hook "$STAGE_RACE_HOOK/before-prefix-switch.ready"
+stage_path="$(find "$BUILD_PREFIX/.starling-aot-engine" -maxdepth 1 \
+  -name '.current.starling-aot-generation-*' -print -quit)"
+test -n "$stage_path"
+mv "$stage_path" "$stage_path.validated"
+mkdir "$stage_path"
+printf 'unvalidated tree\n' > "$stage_path/unvalidated"
+touch "$STAGE_RACE_HOOK/before-prefix-switch.continue"
+if wait "$stage_race_pid"; then
+  echo "FAIL: replaced unvalidated stage was published" >&2
+  exit 1
+fi
+grep -Fq SealPathRace "$SCRATCH/prefix-stage-race.log"
+assert_prefix "$BUILD_PREFIX" A
+rm -rf "$stage_path"
+mv "$stage_path.validated" "$stage_path"
+"$PREFIX_A/bin/starling-aot-cache" recover-bundle --target "$BUILD_PREFIX"
+assert_prefix "$BUILD_PREFIX" A
+
+PARENT_RACE_HOOK="$SCRATCH/prefix-parent-race-hook"
+mkdir "$PARENT_RACE_HOOK"
+generation_b="$(make_prefix_generation B parent-race)"
+STARLING_AOT_CACHE_TEST_HOOK_DIR="$PARENT_RACE_HOOK" \
+STARLING_AOT_CACHE_TEST_WAIT_AT=before-prefix-switch \
+  "$PREFIX_B/bin/starling-aot-cache" publish-prefix \
+    --target "$BUILD_PREFIX" \
+    --generation "$generation_b" \
+    --feature-abi package-race-B \
+    >"$SCRATCH/prefix-parent-race.log" 2>&1 &
+parent_race_pid=$!
+wait_for_hook "$PARENT_RACE_HOOK/before-prefix-switch.ready"
+mv "$BUILD_PREFIX/.starling-aot-engine" \
+  "$BUILD_PREFIX/.starling-aot-engine.retained"
+mkdir "$BUILD_PREFIX/.starling-aot-engine"
+printf 'replacement parent\n' > \
+  "$BUILD_PREFIX/.starling-aot-engine/unvalidated"
+rm -rf "$BUILD_PREFIX/.starling-aot-engine"
+mv "$BUILD_PREFIX/.starling-aot-engine.retained" \
+  "$BUILD_PREFIX/.starling-aot-engine"
+touch "$PARENT_RACE_HOOK/before-prefix-switch.continue"
+wait "$parent_race_pid"
+assert_prefix "$BUILD_PREFIX" B
+"$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+  --target "$BUILD_PREFIX" \
+  --generation "$generation_a" \
+  --feature-abi package-race-A
+assert_prefix "$BUILD_PREFIX" A
+
 for phase in \
   prefix-files-durable \
   prefix-validated \

@@ -400,10 +400,6 @@ pub fn build(b: *std.Build) void {
     aot_fake_orchestration.addArtifactArg(aot_cache_tool);
     if (b.lazyDependency("wasm-tools", .{})) |dep|
         aot_fake_orchestration.addFileArg(dep.path("wasm-tools"));
-    aot_fake_orchestration.setEnvironmentVariable(
-        "STARLING_COMPONENTIZER_AOT_PIPELINE",
-        "1",
-    );
     componentizer_test_step.dependOn(&aot_fake_orchestration.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },

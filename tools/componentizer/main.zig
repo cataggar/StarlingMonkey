@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const cli = @import("cli.zig");
+const aot_cache = @import("aot_cache.zig");
 const aot_pipeline = @import("aot_pipeline.zig");
+const cli = @import("cli.zig");
 const diagnostics = @import("diagnostics.zig");
 const metadata = @import("metadata.zig");
 const feature_surface = @import("feature_surface");
@@ -17,6 +18,7 @@ const runtime_build_manifest = "tools/componentizer/runtime-build-inputs.txt";
 const PipelineError = error{
     CacheDirectoryChanged,
     CommandFailed,
+    CorruptAotCache,
     DebugOutputCollision,
     EmptyRuntimeArgument,
     EngineProvenanceMismatch,
@@ -26,14 +28,17 @@ const PipelineError = error{
     InvalidBindingsManifest,
     InvalidMetadataDestination,
     InvalidPath,
+    InvalidAotCache,
     InvalidToolManifest,
     InvalidUtf8Path,
     MetadataUnavailable,
+    MissingAotCache,
     MissingBuildArtifact,
     MissingEngineProvenance,
     MissingWitFiles,
     PublicationDirectoryChanged,
     RollbackIncomplete,
+    StaleAotCache,
     UnrepresentableRuntimeArgument,
     UnsupportedWitEntry,
     UnsupportedZigVersion,
@@ -431,6 +436,11 @@ const InputSnapshot = struct {
     shares_source_tree: bool,
 };
 
+const InputSnapshots = struct {
+    source: InputSnapshot,
+    initializer: ?InputSnapshot,
+};
+
 const TreeSnapshot = struct {
     file: Snapshot,
     entry: []const u8,
@@ -441,6 +451,16 @@ const ZigSnapshot = struct {
     executable: Snapshot,
     lib_dir: []const u8,
     lib_digest: []const u8,
+};
+
+const AotRuntime = struct {
+    weval: Snapshot,
+    weval_tree_digest: []const u8,
+    retained_weval: aot_pipeline.RetainedSnapshotExecutable,
+    weval_is_bash_script: bool,
+    cache: Snapshot,
+    manifest: Snapshot,
+    validated: aot_cache.Validated,
 };
 
 const EntryIdentity = struct {
@@ -2225,6 +2245,7 @@ const Runtime = struct {
     build_tools: []const metadata.Tool,
     build_root_digest: ?[]const u8,
     cache_lock: ?File,
+    aot: ?AotRuntime,
 };
 
 const EngineProvenance = struct {
@@ -2251,7 +2272,7 @@ const WizerTool = struct {
 };
 
 const Tools = struct {
-    wizer: WizerTool,
+    wizer: ?WizerTool,
     wabt: Snapshot,
     wasm_tools: Snapshot,
 };
@@ -2260,6 +2281,7 @@ const FeatureSurfaceCommandContext = struct {
     diagnostic: *diagnostics.Context,
     transaction: *Transaction,
     transaction_storage: []const u8,
+    environ: *const std.process.Environ.Map,
     snapshot_index: usize = 0,
 };
 
@@ -2281,7 +2303,7 @@ fn runFeatureSurfaceCommand(
         stage,
         argv,
         cwd,
-        null,
+        context.environ,
         null,
         verbose,
         command_log orelse @panic("missing feature-surface command log"),
@@ -2384,7 +2406,8 @@ fn snapshotFeatureSurfaceTree(
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer source.close(io);
-    const source_identity = SourceIdentity.fromStat(try source.stat(io));
+    const source_stat = try source.stat(io);
+    const source_identity = SourceIdentity.fromStat(source_stat);
 
     const destination_relative = try std.fmt.allocPrint(
         allocator,
@@ -2500,16 +2523,14 @@ fn recordFeatureSurfaceWork(
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (init.environ_map.get("STARLING_COMPONENTIZER_AOT_PIPELINE")) |value| {
-        if (std.mem.eql(u8, value, "1")) return aot_pipeline.main(init);
-    }
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--aot")) return aot_pipeline.main(init);
-    }
     var diagnostic = diagnostics.Context{
         .allocator = allocator,
         .io = init.io,
         .format = cli.detectDiagnosticFormat(args),
+    };
+    reserveStandardDescriptors() catch |err| {
+        diagnostic.report(err);
+        std.process.exit(1);
     };
     var action = cli.parse(allocator, args) catch |err| {
         diagnostic.reportParse(err, parseErrorMessage(err));
@@ -2533,6 +2554,32 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+    }
+}
+
+fn reserveStandardDescriptors() !void {
+    if (builtin.os.tag != .linux) return;
+    for (0..3) |index| {
+        const handle: std.posix.fd_t = @intCast(index);
+        switch (std.posix.errno(std.posix.system.fcntl(
+            handle,
+            std.posix.F.GETFD,
+            @as(usize, 0),
+        ))) {
+            .SUCCESS => continue,
+            .BADF => {},
+            else => return error.SystemResources,
+        }
+        const replacement = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            "/dev/null",
+            .{ .ACCMODE = .RDWR, .CLOEXEC = false },
+            0,
+        );
+        if (replacement != handle) {
+            _ = std.os.linux.close(replacement);
+            return error.SystemResources;
+        }
     }
 }
 
@@ -2567,7 +2614,7 @@ fn execute(
     const source_argument = try absolutePath(
         allocator,
         cwd,
-        config.source orelse return error.InvalidPath,
+        config.source orelse config.engine orelse return error.InvalidPath,
     );
     const source_path = source_argument;
     try validateArgument(source_path);
@@ -2822,10 +2869,30 @@ fn execute(
         io,
         transaction_safe_to_remove,
     );
+    var synthetic_protection: ?usize = null;
+    const retained_source_path = if (config.source != null)
+        source_path
+    else blk: {
+        const synthetic = try std.fs.path.join(
+            allocator,
+            &.{ transaction_storage, "output-only-source.js" },
+        );
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = synthetic,
+            .data = "",
+        });
+        try transaction.recordStorageAbsolute(allocator, io, synthetic);
+        synthetic_protection = try transaction.sealStorageFile(
+            allocator,
+            io,
+            "output-only-source.js",
+        );
+        break :blk synthetic;
+    };
     var retained_source = retainAbsoluteInputFile(
         allocator,
         io,
-        source_path,
+        retained_source_path,
         environ,
         "source",
     ) catch |err| switch (err) {
@@ -2929,14 +2996,45 @@ fn execute(
         environ,
         "source",
     );
-    const input_snapshots = try snapshotInputs(
-        allocator,
-        io,
-        &retained_source,
-        if (retained_initializer) |*value| value else null,
-        input_exclusions.items,
-        &transaction,
-    );
+    const input_snapshots = if (config.source != null)
+        try snapshotInputs(
+            allocator,
+            io,
+            &retained_source,
+            if (retained_initializer) |*value| value else null,
+            input_exclusions.items,
+            &transaction,
+        )
+    else blk: {
+        const child_path = try transaction.retainStorageFile(
+            allocator,
+            io,
+            "output-only-source.js",
+            false,
+        );
+        var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+            undefined;
+        std.crypto.hash.sha2.Sha256.hash("", &digest_bytes, .{});
+        const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+        const source_snapshot = InputSnapshot{
+            .file = .{
+                .path = child_path,
+                .storage_path = retained_source_path,
+                .digest = try allocator.dupe(u8, &digest_hex),
+                .protection = synthetic_protection.?,
+            },
+            .logical_path = "",
+            .host_dir = transaction.storage_path,
+            .guest_dir = "/",
+            .tree_entry = "output-only-source.js",
+            .tree_digest = try allocator.dupe(u8, &digest_hex),
+            .shares_source_tree = false,
+        };
+        break :blk InputSnapshots{
+            .source = source_snapshot,
+            .initializer = @as(?InputSnapshot, null),
+        };
+    };
     const source_snapshot = input_snapshots.source;
     const initializer_snapshot = input_snapshots.initializer;
 
@@ -2948,6 +3046,12 @@ fn execute(
         executable_dir,
         config,
         &transaction,
+    );
+    try waitForComponentizerTestHook(
+        allocator,
+        io,
+        environ,
+        "tools-resolved",
     );
 
     var preopen_snapshots: std.ArrayList(RetainedDirectory) = .empty;
@@ -2975,15 +3079,19 @@ fn execute(
         ) catch @panic("out of memory");
     }
 
+    var command_log: std.ArrayList(u8) = .empty;
     const runtime = if (config.engine) |engine_override|
         try externalRuntime(
             allocator,
             io,
+            environ,
             cwd,
             config,
             engine_override,
+            tools,
             &transaction,
             diagnostic,
+            &command_log,
         )
     else
         try buildRuntime(
@@ -2999,6 +3107,7 @@ fn execute(
             diagnostic,
             &transaction,
         );
+    defer if (runtime.aot) |aot| aot.retained_weval.close(io);
     defer if (runtime.cache_lock) |lock| {
         lock.unlock(io);
         lock.close(io);
@@ -3008,13 +3117,16 @@ fn execute(
         allocator,
         &.{ transaction_storage, "runtime-args.txt" },
     );
-    const runtime_args = try renderRuntimeArgs(
-        allocator,
-        cwd,
-        source_snapshot.logical_path,
-        if (initializer_snapshot) |snapshot| snapshot.logical_path else null,
-        config,
-    );
+    const runtime_args = if (config.source != null)
+        try renderRuntimeArgs(
+            allocator,
+            cwd,
+            source_snapshot.logical_path,
+            if (initializer_snapshot) |snapshot| snapshot.logical_path else null,
+            config,
+        )
+    else
+        try allocator.dupe(u8, "");
     try Dir.cwd().writeFile(io, .{
         .sub_path = runtime_args_path,
         .data = runtime_args,
@@ -3032,90 +3144,246 @@ fn execute(
         false,
     );
 
-    var command_log: std.ArrayList(u8) = .empty;
     var initialized = try createChildOutput(
         allocator,
         io,
         &transaction,
         "initialized.wasm",
     );
-    var wizer_args: std.ArrayList([]const u8) = .empty;
-    wizer_args.append(allocator, tools.wizer.executable.path) catch @panic("out of memory");
-    if (tools.wizer.wasmtime_subcommand) {
-        wizer_args.append(allocator, "wizer") catch @panic("out of memory");
-        wizer_args.appendSlice(allocator, &.{
-            "-S",
-            "cli",
-            "-S",
-            "inherit-env",
-            "-W",
-            "bulk-memory",
-            "-W",
-            "unknown-imports-trap",
-        }) catch @panic("out of memory");
-    } else {
-        wizer_args.appendSlice(allocator, &.{
-            "--allow-wasi",
-            "--init-func",
-            "wizer-initialize",
-            "--inherit-env",
-            "true",
-            "--wasm-bulk-memory",
-            "true",
-        }) catch @panic("out of memory");
+    var pipeline_env = std.process.Environ.Map.init(allocator);
+    try copyEnvironment(&pipeline_env, environ);
+    if (try sanitizedPipelinePath(allocator, io, environ, cwd, config)) |path| {
+        try pipeline_env.put("PATH", path);
     }
-
-    try addMappedPreopen(
-        allocator,
-        &wizer_args,
-        source_snapshot.host_dir,
-        source_snapshot.guest_dir,
-    );
-    if (initializer_snapshot) |snapshot| {
-        if (!std.mem.eql(u8, snapshot.host_dir, source_snapshot.host_dir)) {
-            try addMappedPreopen(
+    try pipeline_env.put("WASMTIME_BACKTRACE_DETAILS", "1");
+    _ = pipeline_env.swapRemove("STARLINGMONKEY_CONFIG");
+    _ = pipeline_env.swapRemove("RUST_MIN_STACK");
+    if (runtime.aot != null) {
+        try pipeline_env.put(
+            "RUST_MIN_STACK",
+            try std.fmt.allocPrint(
                 allocator,
-                &wizer_args,
-                snapshot.host_dir,
-                snapshot.guest_dir,
-            );
-        }
+                "{d}",
+                .{
+                    config.aot_min_stack_size orelse
+                        aot_cache.default_min_stack_size,
+                },
+            ),
+        );
     }
-    for (preopen_snapshots.items) |preopen| {
+    if (config.source != null) {
+        var wizer_args: std.ArrayList([]const u8) = .empty;
+        if (runtime.aot) |aot| {
+            wizer_args.appendSlice(allocator, &.{
+                aot.weval.path,
+                "weval",
+                "-w",
+                "--init-func",
+                "wizer-initialize",
+                "--cache-ro",
+                aot.cache.path,
+            }) catch @panic("out of memory");
+            if (config.verbose) {
+                wizer_args.appendSlice(allocator, &.{
+                    "--verbose",
+                    "--show-stats",
+                }) catch @panic("out of memory");
+            }
+        } else if (tools.wizer.?.wasmtime_subcommand) {
+            wizer_args.append(allocator, tools.wizer.?.executable.path) catch
+                @panic("out of memory");
+            wizer_args.append(allocator, "wizer") catch @panic("out of memory");
+            wizer_args.appendSlice(allocator, &.{
+                "-S",
+                "cli",
+                "-S",
+                "inherit-env",
+                "-W",
+                "bulk-memory",
+                "-W",
+                "unknown-imports-trap",
+            }) catch @panic("out of memory");
+        } else {
+            wizer_args.append(allocator, tools.wizer.?.executable.path) catch
+                @panic("out of memory");
+            wizer_args.appendSlice(allocator, &.{
+                "--allow-wasi",
+                "--init-func",
+                "wizer-initialize",
+                "--inherit-env",
+                "true",
+                "--wasm-bulk-memory",
+                "true",
+            }) catch @panic("out of memory");
+        }
+
         try addMappedPreopen(
             allocator,
             &wizer_args,
-            preopen.absolute,
-            preopen.guest,
+            source_snapshot.host_dir,
+            source_snapshot.guest_dir,
         );
-    }
-    wizer_args.appendSlice(allocator, &.{ "-o", initialized.path, runtime.engine.path }) catch
-        @panic("out of memory");
+        if (initializer_snapshot) |snapshot| {
+            if (!std.mem.eql(u8, snapshot.host_dir, source_snapshot.host_dir)) {
+                try addMappedPreopen(
+                    allocator,
+                    &wizer_args,
+                    snapshot.host_dir,
+                    snapshot.guest_dir,
+                );
+            }
+        }
+        for (preopen_snapshots.items) |preopen| {
+            try addMappedPreopen(
+                allocator,
+                &wizer_args,
+                preopen.absolute,
+                preopen.guest,
+            );
+        }
+        wizer_args.appendSlice(
+            allocator,
+            if (runtime.aot != null)
+                &.{ "-o", initialized.path, "-i", runtime.engine.path }
+            else
+                &.{ "-o", initialized.path, runtime.engine.path },
+        ) catch @panic("out of memory");
 
-    var pipeline_env = std.process.Environ.Map.init(allocator);
-    try copyEnvironment(&pipeline_env, environ);
-    try pipeline_env.put("WASMTIME_BACKTRACE_DETAILS", "1");
-    _ = pipeline_env.swapRemove("STARLINGMONKEY_CONFIG");
-    diagnostic.begin(.initialize);
-    try runCommand(
-        allocator,
-        io,
-        "wizer",
-        wizer_args.items,
-        cwd,
-        &pipeline_env,
-        runtime_args_child_path,
-        config.verbose,
-        &command_log,
-        diagnostic,
-        transaction_storage,
-        &transaction,
-    );
+        diagnostic.begin(.initialize);
+        if (runtime.aot) |aot| {
+            var retained_args: std.ArrayList([]const u8) = .empty;
+            if (aot.weval_is_bash_script) {
+                retained_args.appendSlice(
+                    allocator,
+                    &.{ aot.weval.path, aot.weval.path },
+                ) catch @panic("out of memory");
+                retained_args.appendSlice(allocator, wizer_args.items[1..]) catch
+                    @panic("out of memory");
+            }
+            try runRetainedAotCommand(
+                allocator,
+                io,
+                aot.retained_weval,
+                if (aot.weval_is_bash_script)
+                    retained_args.items
+                else
+                    wizer_args.items,
+                cwd,
+                &pipeline_env,
+                runtime_args_child_path,
+                config.verbose,
+                &command_log,
+                diagnostic,
+                transaction_storage,
+                &transaction,
+            );
+        } else {
+            try runCommand(
+                allocator,
+                io,
+                "wizer",
+                wizer_args.items,
+                cwd,
+                &pipeline_env,
+                runtime_args_child_path,
+                config.verbose,
+                &command_log,
+                diagnostic,
+                transaction_storage,
+                &transaction,
+            );
+        }
+    } else {
+        if (runtime.aot) |aot| {
+            var args: std.ArrayList([]const u8) = .empty;
+            args.appendSlice(allocator, &.{
+                aot.weval.path,
+                "weval",
+                "-w",
+                "--init-func",
+                "starling-aot-runtime-initialize",
+                "--cache-ro",
+                aot.cache.path,
+                "-o",
+                initialized.path,
+                "-i",
+                runtime.engine.path,
+            }) catch @panic("out of memory");
+            var retained_args: std.ArrayList([]const u8) = .empty;
+            if (aot.weval_is_bash_script) {
+                retained_args.appendSlice(
+                    allocator,
+                    &.{ aot.weval.path, aot.weval.path },
+                ) catch @panic("out of memory");
+                retained_args.appendSlice(allocator, args.items[1..]) catch
+                    @panic("out of memory");
+            }
+            diagnostic.begin(.initialize);
+            try runRetainedAotCommand(
+                allocator,
+                io,
+                aot.retained_weval,
+                if (aot.weval_is_bash_script)
+                    retained_args.items
+                else
+                    args.items,
+                cwd,
+                &pipeline_env,
+                runtime_args_child_path,
+                config.verbose,
+                &command_log,
+                diagnostic,
+                transaction_storage,
+                &transaction,
+            );
+        } else {
+            var input = try Dir.cwd().openFile(io, runtime.engine.path, .{
+                .allow_directory = false,
+            });
+            defer input.close(io);
+            var output_file = try transaction.storage.openFile(
+                io,
+                initialized.relative,
+                .{
+                    .mode = .read_write,
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                },
+            );
+            defer output_file.close(io);
+            var buffer: [64 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (true) {
+                const count = try input.readPositional(
+                    io,
+                    &.{&buffer},
+                    offset,
+                );
+                if (count == 0) break;
+                try output_file.writePositionalAll(
+                    io,
+                    buffer[0..count],
+                    offset,
+                );
+                offset += count;
+            }
+            try output_file.setLength(io, offset);
+            try output_file.sync(io);
+        }
+    }
     try transaction.sealChildOutput(
         allocator,
         io,
         &initialized,
     );
+    if (runtime.aot) |aot| {
+        try aot_cache.validateWevalPackage(
+            allocator,
+            io,
+            aot.weval.path,
+            aot.validated,
+        );
+    }
 
     var stripped: ?ChildOutput = null;
     var embedded: ?ChildOutput = null;
@@ -3142,7 +3410,7 @@ fn execute(
                 stripped_output.path,  initialized.path,
             },
             cwd,
-            null,
+            &pipeline_env,
             null,
             config.verbose,
             &command_log,
@@ -3180,7 +3448,7 @@ fn execute(
                 stripped_output.path,
             },
             cwd,
-            null,
+            &pipeline_env,
             null,
             config.verbose,
             &command_log,
@@ -3221,7 +3489,7 @@ fn execute(
                 adapter_arg,           "-o",        candidate_output.path, embedded_output.path,
             },
             cwd,
-            null,
+            &pipeline_env,
             null,
             config.verbose,
             &command_log,
@@ -3263,7 +3531,7 @@ fn execute(
                 initialized.path,
             },
             cwd,
-            null,
+            &pipeline_env,
             null,
             config.verbose,
             &command_log,
@@ -3299,6 +3567,7 @@ fn execute(
         .diagnostic = diagnostic,
         .transaction = &transaction,
         .transaction_storage = transaction_storage,
+        .environ = &pipeline_env,
     };
     const wabt_used_for_surface = try feature_surface.apply(allocator, io, .{
         .wabt = tools.wabt.path,
@@ -3400,7 +3669,7 @@ fn execute(
         "wasm-tools metadata add",
         metadata_args.items,
         cwd,
-        null,
+        &pipeline_env,
         null,
         config.verbose,
         &command_log,
@@ -3427,7 +3696,7 @@ fn execute(
             processed.path,
         },
         cwd,
-        null,
+        &pipeline_env,
         null,
         config.verbose,
         &command_log,
@@ -3590,6 +3859,19 @@ fn execute(
                 "debug/component-bindings.zig",
             );
         }
+        if (runtime.aot) |aot| {
+            try copyDebugFile(
+                io,
+                aot.manifest.path,
+                debug_dir_handle,
+                "aot-cache.manifest",
+            );
+            try transaction.recordStoragePath(
+                allocator,
+                io,
+                "debug/aot-cache.manifest",
+            );
+        }
         try copyDebugFile(io, command_log_path, debug_dir_handle, "commands.txt");
         try transaction.recordStoragePath(allocator, io, "debug/commands.txt");
         if (metadata_json) |json| {
@@ -3655,11 +3937,14 @@ fn execute(
 fn externalRuntime(
     allocator: Allocator,
     io: Io,
+    environ: *std.process.Environ.Map,
     cwd: []const u8,
     config: *const cli.Config,
     engine_override: []const u8,
+    tools: Tools,
     transaction: *Transaction,
     diagnostic: *diagnostics.Context,
+    command_log: *std.ArrayList(u8),
 ) !Runtime {
     const transaction_dir = transaction.storage_path;
     if (config.disable_features.len != 0 or
@@ -3676,6 +3961,12 @@ fn externalRuntime(
         try std.fs.path.join(allocator, &.{ transaction_dir, "engine.wasm" }),
         transaction,
         "engine",
+    );
+    try waitForComponentizerTestHook(
+        allocator,
+        io,
+        transaction.environ,
+        "external-package-engine-captured",
     );
     const engine = captured_engine.snapshot;
     const engine_dir = std.fs.path.dirname(captured_engine.resolved_path) orelse
@@ -3847,6 +4138,115 @@ fn externalRuntime(
             return error.IncompatibleEngineOptions;
         }
     }
+    const wit_validation = [_]struct {
+        label: []const u8,
+        path: []const u8,
+        world: []const u8,
+    }{
+        .{
+            .label = "validate external component WIT",
+            .path = selected_component_wit.absolute,
+            .world = provenance.component_world,
+        },
+        .{
+            .label = "validate external surface WIT",
+            .path = selected_surface_target_wit.absolute,
+            .world = provenance.surface_world,
+        },
+    };
+    for (wit_validation) |validation| {
+        runCommand(
+            allocator,
+            io,
+            validation.label,
+            &.{
+                tools.wasm_tools.path,
+                "component",
+                "embed",
+                "--all-features",
+                "--world",
+                validation.world,
+                "--dummy",
+                "--output",
+                "/dev/null",
+                validation.path,
+            },
+            cwd,
+            null,
+            null,
+            config.verbose,
+            command_log,
+            diagnostic,
+            transaction.storage_path,
+            transaction,
+        ) catch |err| switch (err) {
+            error.SystemResources,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.InputChanged,
+            => return err,
+            else => return error.InvalidEngineProvenance,
+        };
+    }
+    runCommand(
+        allocator,
+        io,
+        "validate external feature WIT",
+        &.{
+            tools.wasm_tools.path,
+            "component",
+            "wit",
+            "--wasm",
+            "--output",
+            "/dev/null",
+            platform_wit.absolute,
+        },
+        cwd,
+        null,
+        null,
+        config.verbose,
+        command_log,
+        diagnostic,
+        transaction.storage_path,
+        transaction,
+    ) catch |err| switch (err) {
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.InputChanged,
+        => return err,
+        else => return error.InvalidEngineProvenance,
+    };
+    const aot = if (config.aot)
+        try prepareAotRuntime(
+            allocator,
+            io,
+            environ,
+            cwd,
+            config,
+            engine,
+            engine_dir,
+            provenance.host_api,
+            provenance.features,
+            transaction,
+        )
+    else
+        null;
+    if (aot != null) {
+        try waitForComponentizerTestHook(
+            allocator,
+            io,
+            transaction.environ,
+            "aot-inputs-captured",
+        );
+    }
+    try waitForComponentizerTestHook(
+        allocator,
+        io,
+        transaction.environ,
+        "external-inputs-snapshotted",
+    );
+    try transaction.verifyRetainedIntegrity();
     return .{
         .engine = engine,
         .adapter = adapter,
@@ -3864,6 +4264,7 @@ fn externalRuntime(
         .build_tools = &.{},
         .build_root_digest = null,
         .cache_lock = null,
+        .aot = aot,
     };
 }
 
@@ -4232,16 +4633,27 @@ fn buildRuntime(
     }
 
     const zig_source = if (config.zig_bin) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (environ.get("ZIG")) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else
         build_options.zig_exe;
-    const zig_resolved = try resolveExecutable(allocator, io, environ, zig_source);
+    const zig_resolved = try resolveConfiguredExecutable(
+        allocator,
+        io,
+        environ,
+        cwd,
+        zig_source,
+    );
+    const zig_canonical = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        zig_resolved,
+        allocator,
+    );
     const zig_install = try snapshotZigInstallation(
         allocator,
         io,
-        zig_resolved,
+        zig_canonical,
         environ,
         build_root,
         build_snapshot.absolute,
@@ -4378,34 +4790,36 @@ fn buildRuntime(
         "runtime-prefix",
         .fromMode(0o700),
     );
-    try transaction.createStorageDir(
-        allocator,
-        io,
-        "runtime-prefix/bin",
-        .fromMode(0o700),
-    );
+    const runtime_bin_relative = if (config.aot)
+        "runtime-prefix/.starling-aot-engine/current/bin"
+    else
+        "runtime-prefix/bin";
+    if (!config.aot) {
+        try transaction.createStorageDir(
+            allocator,
+            io,
+            runtime_bin_relative,
+            .fromMode(0o700),
+        );
+    }
     const prefix_child_path = try transaction.retainStorageDirectory(
         allocator,
         io,
         "runtime-prefix",
     );
-    _ = try transaction.retainStorageDirectory(
-        allocator,
-        io,
-        "runtime-prefix/bin",
-    );
+    if (!config.aot) {
+        _ = try transaction.retainStorageDirectory(
+            allocator,
+            io,
+            runtime_bin_relative,
+        );
+    }
     var runtime_prefix = try transaction.storage.openDir(
         io,
         "runtime-prefix",
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer runtime_prefix.close(io);
-    var runtime_bin = try transaction.storage.openDir(
-        io,
-        "runtime-prefix/bin",
-        .{ .iterate = true, .follow_symlinks = false },
-    );
-    defer runtime_bin.close(io);
     const zig_global_child_path = try cacheDirectoryChildPath(
         allocator,
         zig_global,
@@ -4443,6 +4857,10 @@ fn buildRuntime(
             try std.fmt.allocPrint(allocator, "-Ddispatch-wit={s}", .{wit.absolute}),
             try std.fmt.allocPrint(allocator, "-Ddispatch-world={s}", .{config.world_name.?}),
         }) catch @panic("out of memory");
+    }
+    if (config.aot) {
+        argv.append(allocator, "-Daot-engine=true") catch
+            @panic("out of memory");
     }
     if (config.disable_features.len != 0) {
         argv.append(
@@ -4493,7 +4911,10 @@ fn buildRuntime(
         try setDirectoryInherited(directory, true);
         inherited_count += 1;
     }
-    try runtime_prefix.setPermissions(io, .fromMode(0o500));
+    try runtime_prefix.setPermissions(
+        io,
+        .fromMode(if (config.aot) 0o700 else 0o500),
+    );
     diagnostic.begin(.runtime_build);
     try runCommandRedacted(
         allocator,
@@ -4522,6 +4943,12 @@ fn buildRuntime(
         );
     }
     try runtime_prefix.setPermissions(io, .fromMode(0o700));
+    var runtime_bin = try transaction.storage.openDir(
+        io,
+        runtime_bin_relative,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
+    defer runtime_bin.close(io);
     try verifyNoSymlinkTree(io, runtime_bin);
     try recordDebugBackupTree(
         allocator,
@@ -4637,6 +5064,25 @@ fn buildRuntime(
         );
     };
     const surface_target_world = config.world_name orelse "caller";
+    const runtime_bin_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, runtime_bin_relative },
+    );
+    const aot = if (config.aot)
+        try prepareAotRuntime(
+            allocator,
+            io,
+            environ,
+            cwd,
+            config,
+            engine,
+            runtime_bin_path,
+            build_options.host_api,
+            features,
+            transaction,
+        )
+    else
+        null;
     return .{
         .engine = engine,
         .adapter = adapter,
@@ -4654,6 +5100,318 @@ fn buildRuntime(
         .build_tools = build_tools,
         .build_root_digest = build_snapshot.digest,
         .cache_lock = lock_file,
+        .aot = aot,
+    };
+}
+
+const AotWevalSource = struct {
+    selected: []const u8,
+    package_root: []const u8,
+};
+
+fn resolveAotBundleSources(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    override: ?[]const u8,
+    default_dir: []const u8,
+) !struct { cache: []const u8, manifest: []const u8 } {
+    const root = if (override) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        default_dir;
+    const stat = Dir.cwd().statFile(
+        io,
+        root,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (stat != null and stat.?.kind == .file) {
+        return .{
+            .cache = root,
+            .manifest = try std.fmt.allocPrint(
+                allocator,
+                "{s}.manifest",
+                .{root},
+            ),
+        };
+    }
+    return .{
+        .cache = try std.fs.path.join(
+            allocator,
+            &.{ root, aot_cache.cache_basename },
+        ),
+        .manifest = try std.fs.path.join(
+            allocator,
+            &.{ root, aot_cache.manifest_basename },
+        ),
+    };
+}
+
+fn describeAotWevalSource(
+    allocator: Allocator,
+    io: Io,
+    selected_path: []const u8,
+) !AotWevalSource {
+    if (std.mem.eql(u8, std.fs.path.basename(selected_path), "weval")) {
+        if (std.fs.path.dirname(selected_path)) |parent| {
+            if (std.mem.eql(u8, std.fs.path.basename(parent), "bin")) {
+                if (std.fs.path.dirname(parent)) |prefix| {
+                    const packaged = try std.fs.path.join(
+                        allocator,
+                        &.{ prefix, "weval-package", "weval" },
+                    );
+                    if (pathExists(io, packaged)) {
+                        return describeAotWevalSource(
+                            allocator,
+                            io,
+                            packaged,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    _ = try Dir.realPathFileAbsoluteAlloc(io, selected_path, allocator);
+    const package_root = std.fs.path.dirname(selected_path) orelse
+        return error.MissingAotCache;
+    return .{
+        .selected = selected_path,
+        .package_root = package_root,
+    };
+}
+
+fn resolveAotWevalSource(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    config: *const cli.Config,
+    default_dir: []const u8,
+) !AotWevalSource {
+    if (config.weval_bin orelse environ.get("WEVAL_BIN")) |configured| {
+        const executable = try resolveExecutable(
+            allocator,
+            io,
+            environ,
+            configured,
+        );
+        return describeAotWevalSource(allocator, io, executable);
+    }
+    const default_parent = std.fs.path.dirname(default_dir);
+    const candidates = [_]?[]const u8{
+        try std.fs.path.join(
+            allocator,
+            &.{ default_dir, "weval-package", "weval" },
+        ),
+        if (default_parent) |parent|
+            try std.fs.path.join(
+                allocator,
+                &.{ parent, "weval-package", "weval" },
+            )
+        else
+            null,
+        try std.fs.path.join(allocator, &.{ default_dir, "weval" }),
+    };
+    for (candidates) |candidate_optional| {
+        const candidate = candidate_optional orelse continue;
+        if (pathExists(io, candidate)) {
+            return describeAotWevalSource(allocator, io, candidate);
+        }
+    }
+    return error.MissingAotCache;
+}
+
+fn expectedAotFeatureAbi(
+    allocator: Allocator,
+    host_api: []const u8,
+    features: feature_surface.Features,
+) ![]const u8 {
+    return aot_cache.featureAbi(
+        allocator,
+        features.stdio,
+        features.random,
+        features.clocks,
+        features.http,
+        features.fetch_event,
+        "ReleaseSmall",
+        host_api,
+        true,
+    );
+}
+
+fn mapAotValidationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.FileNotFound,
+        error.MissingCacheArtifact,
+        => error.MissingAotCache,
+        error.CorruptCache,
+        error.InvalidCacheFormat,
+        => error.CorruptAotCache,
+        error.IncompleteCache,
+        error.InvalidCacheSchema,
+        error.InvalidManifest,
+        error.SqliteUnavailable,
+        error.SealPathAlias,
+        => error.InvalidAotCache,
+        error.StaleEngine,
+        error.StaleFeatureAbi,
+        error.StaleTool,
+        => error.StaleAotCache,
+        else => err,
+    };
+}
+
+fn prepareAotRuntime(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    config: *const cli.Config,
+    engine: Snapshot,
+    default_dir: []const u8,
+    host_api: []const u8,
+    features: feature_surface.Features,
+    transaction: *Transaction,
+) !AotRuntime {
+    const bundle = try resolveAotBundleSources(
+        allocator,
+        io,
+        cwd,
+        config.aot_cache_dir,
+        default_dir,
+    );
+    const weval_source = try resolveAotWevalSource(
+        allocator,
+        io,
+        environ,
+        config,
+        default_dir,
+    );
+    const cache = captureInputFile(
+        allocator,
+        io,
+        bundle.cache,
+        try std.fs.path.join(
+            allocator,
+            &.{ transaction.storage_path, aot_cache.cache_basename },
+        ),
+        transaction,
+        "AOT cache",
+    ) catch |err| return mapAotValidationError(err);
+    const manifest = captureInputFile(
+        allocator,
+        io,
+        bundle.manifest,
+        try std.fs.path.join(
+            allocator,
+            &.{ transaction.storage_path, aot_cache.manifest_basename },
+        ),
+        transaction,
+        "AOT cache manifest",
+    ) catch |err| return mapAotValidationError(err);
+    const weval_tree = snapshotRetainedDirectory(
+        allocator,
+        io,
+        weval_source.package_root,
+        "aot-weval-package",
+        weval_source.package_root,
+        "starling-componentizer-aot-weval-package-v1",
+        &.{},
+        &.{},
+        .preserve_internal,
+        "weval",
+        transaction,
+    ) catch |err| return mapAotValidationError(err);
+    const weval_path = try std.fs.path.join(
+        allocator,
+        &.{
+            weval_tree.absolute,
+            std.fs.path.basename(weval_source.selected),
+        },
+    );
+    const weval = Snapshot{
+        .path = weval_path,
+        .storage_path = weval_path,
+        .digest = try metadata.sha256File(allocator, io, weval_path),
+        .protection = 0,
+    };
+    const weval_bytes = try readAbsoluteFile(allocator, io, weval.path);
+    const shebang_end = std.mem.indexOfScalar(u8, weval_bytes, '\n');
+    const weval_is_bash_script = if (shebang_end) |end|
+        std.mem.eql(u8, weval_bytes[0..end], "#!/usr/bin/env bash") or
+            std.mem.eql(u8, weval_bytes[0..end], "#!/bin/bash") or
+            std.mem.eql(u8, weval_bytes[0..end], "#!/usr/bin/bash")
+    else
+        false;
+    const retained_weval = if (weval_is_bash_script) blk: {
+        try transaction.ensureStorageDirPath(
+            allocator,
+            io,
+            "aot-weval-interpreter",
+        );
+        const bash_source = "/usr/bin/bash";
+        const bash = try captureInputFile(
+            allocator,
+            io,
+            bash_source,
+            try std.fs.path.join(
+                allocator,
+                &.{ transaction.storage_path, "aot-weval-interpreter/bash" },
+            ),
+            transaction,
+            "AOT Weval script interpreter",
+        );
+        break :blk try aot_pipeline.prepareRetainedSnapshotExecutable(
+            allocator,
+            io,
+            bash.snapshot.storage_path,
+            try std.fs.path.join(
+                allocator,
+                &.{ transaction.storage_path, "aot-weval-interpreter" },
+            ),
+            bash_source,
+        );
+    } else try aot_pipeline.prepareRetainedSnapshotExecutable(
+        allocator,
+        io,
+        try std.fs.path.join(
+            allocator,
+            &.{
+                transaction.storage_path,
+                "aot-weval-package",
+                std.fs.path.basename(weval_source.selected),
+            },
+        ),
+        try std.fs.path.join(
+            allocator,
+            &.{ transaction.storage_path, "aot-weval-package" },
+        ),
+        weval_source.selected,
+    );
+    const expected_feature_abi = try expectedAotFeatureAbi(
+        allocator,
+        host_api,
+        features,
+    );
+    const validated = aot_cache.validate(
+        allocator,
+        io,
+        engine.path,
+        weval.path,
+        cache.snapshot.path,
+        manifest.snapshot.path,
+        expected_feature_abi,
+    ) catch |err| return mapAotValidationError(err);
+    return .{
+        .weval = weval,
+        .weval_tree_digest = weval_tree.digest,
+        .retained_weval = retained_weval,
+        .weval_is_bash_script = weval_is_bash_script,
+        .cache = cache.snapshot,
+        .manifest = manifest.snapshot,
+        .validated = validated,
     };
 }
 
@@ -4883,7 +5641,8 @@ fn snapshotDirectoryTree(
         .file => return error.InvalidPath,
     };
     try retained_source.verify(io);
-    const source_identity = SourceIdentity.fromStat(try source.stat(io));
+    const source_stat = try source.stat(io);
+    const source_identity = SourceIdentity.fromStat(source_stat);
     var destination = try Dir.openDirAbsolute(
         io,
         destination_path,
@@ -4956,6 +5715,7 @@ fn snapshotDirectoryTree(
     );
     if (!source_identity.matches(try source.stat(io))) return error.InputChanged;
     try retained_source.verify(io);
+    try destination.setPermissions(io, source_stat.permissions);
     try sealSnapshotDirectory(io, destination);
     _ = try transaction.protectStoragePath(
         allocator,
@@ -5154,6 +5914,147 @@ fn copyEnvironment(
     }
 }
 
+fn captureTool(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    source: []const u8,
+    storage_name: []const u8,
+    capture_package: bool,
+    transaction: *Transaction,
+) !Snapshot {
+    const resolved = try resolveConfiguredExecutable(
+        allocator,
+        io,
+        environ,
+        cwd,
+        source,
+    );
+    if (!capture_package) {
+        return (try captureInputFile(
+            allocator,
+            io,
+            resolved,
+            try std.fs.path.join(
+                allocator,
+                &.{ transaction.storage_path, storage_name },
+            ),
+            transaction,
+            storage_name,
+        )).snapshot;
+    }
+
+    const canonical = try Dir.realPathFileAbsoluteAlloc(
+        io,
+        resolved,
+        allocator,
+    );
+    const parent = std.fs.path.dirname(canonical) orelse return error.InvalidPath;
+    const basename = std.fs.path.basename(canonical);
+    const storage_relative = try std.fmt.allocPrint(
+        allocator,
+        "{s}-package",
+        .{storage_name},
+    );
+    const retained = try snapshotRetainedDirectory(
+        allocator,
+        io,
+        parent,
+        storage_relative,
+        storage_relative,
+        "starling-componentizer-tool-package-v1",
+        &.{},
+        &.{},
+        .dereference_files,
+        storage_name,
+        transaction,
+    );
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ retained.absolute, basename },
+    );
+    const storage_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction.storage_path, storage_relative, basename },
+    );
+    var executable = try Dir.cwd().openFile(io, storage_path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer executable.close(io);
+    const digest_bytes = try hashOpenFile(io, executable);
+    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    return .{
+        .path = path,
+        .storage_path = storage_path,
+        .digest = try allocator.dupe(u8, &digest_hex),
+        .protection = transaction.protected.items.len - 1,
+    };
+}
+
+fn sanitizedPipelinePath(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    config: *const cli.Config,
+) !?[]const u8 {
+    const original = environ.get("PATH") orelse return null;
+    var excluded: std.ArrayList([]const u8) = .empty;
+    const configured = [_]?[]const u8{
+        config.wizer_bin,
+        config.wasmtime_bin,
+        config.wabt_bin,
+        config.wasm_tools_bin,
+        environ.get("WIZER_BIN"),
+        environ.get("WASMTIME_BIN"),
+        environ.get("WABT"),
+        environ.get("WASM_TOOLS_BIN"),
+    };
+    for (configured) |source| {
+        const value = source orelse continue;
+        const resolved = resolveConfiguredExecutable(
+            allocator,
+            io,
+            environ,
+            cwd,
+            value,
+        ) catch continue;
+        const parent = std.fs.path.dirname(resolved) orelse continue;
+        var duplicate = false;
+        for (excluded.items) |existing| {
+            if (std.mem.eql(u8, existing, parent)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) excluded.append(
+            allocator,
+            try allocator.dupe(u8, parent),
+        ) catch @panic("out of memory");
+    }
+    var result: std.ArrayList(u8) = .empty;
+    var entries = std.mem.splitScalar(u8, original, std.fs.path.delimiter);
+    while (entries.next()) |entry| {
+        if (entry.len == 0) continue;
+        var omit = false;
+        for (excluded.items) |directory| {
+            if (std.mem.eql(u8, entry, directory)) {
+                omit = true;
+                break;
+            }
+        }
+        if (omit) continue;
+        if (result.items.len != 0) {
+            result.append(allocator, std.fs.path.delimiter) catch
+                @panic("out of memory");
+        }
+        result.appendSlice(allocator, entry) catch @panic("out of memory");
+    }
+    return result.toOwnedSlice(allocator) catch @panic("out of memory");
+}
+
 fn resolveTools(
     allocator: Allocator,
     io: Io,
@@ -5163,7 +6064,6 @@ fn resolveTools(
     config: *const cli.Config,
     transaction: *Transaction,
 ) !Tools {
-    const transaction_dir = transaction.storage_path;
     const standalone_wizer = try std.fs.path.join(
         allocator,
         &.{ executable_dir, "wizer" },
@@ -5174,13 +6074,13 @@ fn resolveTools(
                 (environ.get("WASMTIME_BIN") != null or
                     !pathExists(io, standalone_wizer))));
     const wizer_executable = if (config.wizer_bin) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (config.wasmtime_bin) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (environ.get("WIZER_BIN")) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (environ.get("WASMTIME_BIN")) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else blk: {
         if (pathExists(io, standalone_wizer)) break :blk standalone_wizer;
         break :blk try siblingOrName(
@@ -5192,9 +6092,9 @@ fn resolveTools(
         );
     };
     const wasm_tools_source = if (config.wasm_tools_bin) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (environ.get("WASM_TOOLS_BIN")) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else
         try siblingOrName(
             allocator,
@@ -5204,38 +6104,44 @@ fn resolveTools(
             "wasm-tools",
         );
     const wabt_source = if (config.wabt_bin) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else if (environ.get("WABT")) |path|
-        try absolutePath(allocator, cwd, path)
+        path
     else
         try siblingOrName(allocator, io, executable_dir, "wabt", "wabt");
-    const wizer = WizerTool{
-        .executable = (try captureInputFile(
+    const wizer: ?WizerTool = if (config.aot or config.source == null) null else WizerTool{
+        .executable = try captureTool(
             allocator,
             io,
-            try resolveExecutable(allocator, io, environ, wizer_executable),
-            try std.fs.path.join(allocator, &.{ transaction_dir, "wizer" }),
-            transaction,
+            environ,
+            cwd,
+            wizer_executable,
             "wizer",
-        )).snapshot,
+            false,
+            transaction,
+        ),
         .wasmtime_subcommand = wizer_is_wasmtime,
     };
-    const wasm_tools = (try captureInputFile(
+    const wasm_tools = try captureTool(
         allocator,
         io,
-        try resolveExecutable(allocator, io, environ, wasm_tools_source),
-        try std.fs.path.join(allocator, &.{ transaction_dir, "wasm-tools" }),
-        transaction,
+        environ,
+        cwd,
+        wasm_tools_source,
         "wasm-tools",
-    )).snapshot;
-    const wabt = (try captureInputFile(
+        false,
+        transaction,
+    );
+    const wabt = try captureTool(
         allocator,
         io,
-        try resolveExecutable(allocator, io, environ, wabt_source),
-        try std.fs.path.join(allocator, &.{ transaction_dir, "wabt" }),
-        transaction,
+        environ,
+        cwd,
+        wabt_source,
         "wabt",
-    )).snapshot;
+        config.wabt_bin != null or environ.get("WABT") != null,
+        transaction,
+    );
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
 }
 
@@ -5532,6 +6438,7 @@ fn runtimeKey(
     hashField(&hasher, "version", build_options.version);
     hashField(&hasher, "host-api", build_options.host_api);
     hashField(&hasher, "host-api-world", host_api_world);
+    hashField(&hasher, "aot", if (config.aot) "true" else "false");
     hashField(&hasher, "optimize", if (config.use_debug_build) "Debug" else "ReleaseSmall");
     hashField(&hasher, "dispatch-wit", dispatch_digest orelse "");
     hashField(&hasher, "component-wit", component_digest orelse "");
@@ -5643,13 +6550,30 @@ fn buildMetadataDocument(
         tool_fields.append(allocator, .{ tool.name, tool.sha256 }) catch
             @panic("out of memory");
     }
-    try appendToolSnapshot(
-        allocator,
-        &tool_values,
-        &tool_fields,
-        if (tools.wizer.wasmtime_subcommand) "wasmtime-wizer" else "wizer",
-        tools.wizer.executable,
-    );
+    if (tools.wizer) |wizer| {
+        try appendToolSnapshot(
+            allocator,
+            &tool_values,
+            &tool_fields,
+            if (wizer.wasmtime_subcommand) "wasmtime-wizer" else "wizer",
+            wizer.executable,
+        );
+    }
+    if (runtime.aot) |aot| {
+        tool_values.append(allocator, .{
+            .name = "weval",
+            .sha256 = aot.weval.digest,
+            .lib_tree_sha256 = aot.weval_tree_digest,
+        }) catch @panic("out of memory");
+        tool_fields.append(
+            allocator,
+            .{ "weval", aot.weval.digest },
+        ) catch @panic("out of memory");
+        tool_fields.append(
+            allocator,
+            .{ "weval-package", aot.weval_tree_digest },
+        ) catch @panic("out of memory");
+    }
     if (wabt_invoked) {
         try appendToolSnapshot(
             allocator,
@@ -5735,6 +6659,24 @@ fn appendToolSnapshot(
     fields.append(allocator, .{ name, executable.digest }) catch @panic("out of memory");
 }
 
+fn resolveConfiguredExecutable(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    cwd: []const u8,
+    executable: []const u8,
+) ![]const u8 {
+    if (std.fs.path.isAbsolute(executable) or
+        std.mem.indexOfScalar(u8, executable, std.fs.path.sep) != null)
+    {
+        const path = try absolutePath(allocator, cwd, executable);
+        if (!try isExecutableFile(io, path))
+            return error.MissingBuildArtifact;
+        return path;
+    }
+    return resolveExecutable(allocator, io, environ, executable);
+}
+
 fn resolveExecutable(
     allocator: Allocator,
     io: Io,
@@ -5742,13 +6684,15 @@ fn resolveExecutable(
     executable: []const u8,
 ) ![]const u8 {
     if (std.fs.path.isAbsolute(executable)) {
-        try requireFile(io, executable);
+        if (!try isExecutableFile(io, executable))
+            return error.MissingBuildArtifact;
         return allocator.dupe(u8, executable);
     }
     if (std.mem.indexOfScalar(u8, executable, std.fs.path.sep) != null) {
         const cwd = try std.process.currentPathAlloc(io, allocator);
         const path = try absolutePath(allocator, cwd, executable);
-        try requireFile(io, path);
+        if (!try isExecutableFile(io, path))
+            return error.MissingBuildArtifact;
         return path;
     }
     const path_value = environ.get("PATH") orelse return error.MissingBuildArtifact;
@@ -5756,9 +6700,19 @@ fn resolveExecutable(
     while (entries.next()) |entry| {
         if (entry.len == 0) continue;
         const candidate = try std.fs.path.join(allocator, &.{ entry, executable });
-        if (pathExists(io, candidate)) return candidate;
+        if (try isExecutableFile(io, candidate)) return candidate;
     }
     return error.MissingBuildArtifact;
+}
+
+fn isExecutableFile(io: Io, path: []const u8) !bool {
+    const stat = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => return false,
+        else => return err,
+    };
+    if (stat.kind != .file) return false;
+    return !File.Permissions.has_executable_bit or
+        stat.permissions.toMode() & 0o111 != 0;
 }
 
 const BuildToolManifest = struct {
@@ -5865,7 +6819,7 @@ fn snapshotInputs(
     retained_initializer: ?*RetainedInputPath,
     excluded_paths: []const InputExclusion,
     transaction: *Transaction,
-) !struct { source: InputSnapshot, initializer: ?InputSnapshot } {
+) !InputSnapshots {
     try retained_source.verify(io);
     if (retained_initializer) |value| try value.verify(io);
     const source = retained_source.resolved_path;
@@ -6564,7 +7518,14 @@ fn sealSnapshotDirectory(io: Io, directory: Dir) !void {
             else => return error.UnsupportedInputEntry,
         }
     }
-    try directory.setPermissions(io, .fromMode(0o500));
+    const stat = try directory.stat(io);
+    try directory.setPermissions(
+        io,
+        .fromMode(
+            stat.permissions.toMode() &
+                ~@as(std.posix.mode_t, 0o222),
+        ),
+    );
 }
 
 fn normalizeTreePath(allocator: Allocator, path: []const u8) ![]const u8 {
@@ -9295,6 +10256,39 @@ fn waitForCaptureTestBarrier(
     return error.CommandFailed;
 }
 
+fn waitForComponentizerTestHook(
+    allocator: Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    stage: []const u8,
+) !void {
+    const directory = environ.get(
+        "STARLING_COMPONENTIZER_TEST_HOOK_DIR",
+    ) orelse return;
+    const selected = environ.get(
+        "STARLING_COMPONENTIZER_TEST_WAIT_AT",
+    ) orelse return;
+    if (!std.mem.eql(u8, selected, stage)) return;
+    const ready = try std.fs.path.join(
+        allocator,
+        &.{ directory, try std.fmt.allocPrint(allocator, "{s}.ready", .{stage}) },
+    );
+    const release = try std.fs.path.join(
+        allocator,
+        &.{ directory, try std.fmt.allocPrint(allocator, "{s}.continue", .{stage}) },
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = ready,
+        .data = "ready\n",
+    });
+    var attempts: usize = 0;
+    while (attempts < 30_000) : (attempts += 1) {
+        if (pathExists(io, release)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.CommandFailed;
+}
+
 fn waitForSpawnTestBarrier(
     allocator: Allocator,
     io: Io,
@@ -10368,6 +11362,128 @@ const BoundedChildOutput = struct {
         );
     }
 };
+
+fn runRetainedAotCommand(
+    allocator: Allocator,
+    io: Io,
+    retained: aot_pipeline.RetainedSnapshotExecutable,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ: *const std.process.Environ.Map,
+    stdin_path: ?[]const u8,
+    verbose: bool,
+    command_log: *std.ArrayList(u8),
+    diagnostic: *diagnostics.Context,
+    transaction_storage: []const u8,
+    transaction: *Transaction,
+) !void {
+    const stage = "weval AOT";
+    const redactions = &.{Redaction{
+        .path = transaction_storage,
+        .replacement = "<transaction>",
+    }};
+    command_log.appendSlice(allocator, stage) catch @panic("out of memory");
+    command_log.append(allocator, '\n') catch @panic("out of memory");
+    for (argv) |arg| {
+        const stable_arg = try applyRedactions(allocator, arg, redactions);
+        command_log.appendSlice(allocator, "  ") catch @panic("out of memory");
+        command_log.appendSlice(allocator, stable_arg) catch @panic("out of memory");
+        command_log.append(allocator, '\n') catch @panic("out of memory");
+    }
+    if (verbose and diagnostic.format == .human) {
+        try File.stderr().writeStreamingAll(io, "[weval AOT]\n");
+        for (argv) |arg| {
+            const stable_arg = try applyRedactions(allocator, arg, redactions);
+            try File.stderr().writeStreamingAll(
+                io,
+                try std.fmt.allocPrint(allocator, "  {s}\n", .{stable_arg}),
+            );
+        }
+    }
+
+    var stdout_output = try createChildOutput(
+        allocator,
+        io,
+        transaction,
+        "weval-stdout.log",
+    );
+    var stderr_output = try createChildOutput(
+        allocator,
+        io,
+        transaction,
+        "weval-stderr.log",
+    );
+    var stdout_file = try Dir.openFileAbsolute(io, stdout_output.path, .{
+        .mode = .read_write,
+        .allow_directory = false,
+    });
+    var stdout_open = true;
+    defer if (stdout_open) stdout_file.close(io);
+    var stderr_file = try Dir.openFileAbsolute(io, stderr_output.path, .{
+        .mode = .read_write,
+        .allow_directory = false,
+    });
+    var stderr_open = true;
+    defer if (stderr_open) stderr_file.close(io);
+
+    try transaction.prepareChild(io);
+    var child_prepared = true;
+    defer if (child_prepared) transaction.finishChild(io) catch {};
+    try retained.verify(io);
+    try transaction.verifyRetainedIntegrity();
+    try transaction.verifyChildHandleIdentities(io);
+    try waitForComponentizerTestHook(
+        allocator,
+        io,
+        transaction.environ,
+        "retained-environment-captured-weval",
+    );
+    try waitForSpawnTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        stage,
+        .before,
+    );
+    const term = try retained.run(
+        allocator,
+        io,
+        argv,
+        cwd,
+        environ,
+        stdin_path,
+        stdout_file,
+        stderr_file,
+    );
+    try transaction.verifyChildHandleIdentities(io);
+    try transaction.verifyRetainedIntegrity();
+    try waitForSpawnTestBarrier(
+        allocator,
+        io,
+        transaction.environ,
+        stage,
+        .after,
+    );
+    try transaction.finishChild(io);
+    child_prepared = false;
+    stdout_file.close(io);
+    stdout_open = false;
+    stderr_file.close(io);
+    stderr_open = false;
+    try transaction.sealChildOutput(allocator, io, &stdout_output);
+    try transaction.sealChildOutput(allocator, io, &stderr_output);
+    const stdout = try readAbsoluteFile(allocator, io, stdout_output.path);
+    const stderr = try readAbsoluteFile(allocator, io, stderr_output.path);
+    if (diagnostic.format == .human) {
+        if (stdout.len != 0) try File.stdout().writeStreamingAll(io, stdout);
+        if (term.success() and stderr.len != 0)
+            try File.stderr().writeStreamingAll(io, stderr);
+    }
+    if (!term.success()) {
+        diagnostic.commandFailed(stage, term, stderr, null);
+        return error.CommandFailed;
+    }
+}
 
 fn runCommand(
     allocator: Allocator,

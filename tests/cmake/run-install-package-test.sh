@@ -26,8 +26,9 @@ then
   echo "CMake WEVAL=ON unexpectedly configured successfully" >&2
   exit 1
 fi
-grep -q 'CMake WEVAL builds are no longer supported' \
+grep -Fq 'CMake WEVAL=ON is disabled because it cannot produce the sealed, validated' \
   "$WORK/weval.out" "$WORK/weval.err"
+grep -Fq 'AOT cache.' "$WORK/weval.out" "$WORK/weval.err"
 if find "$REJECTED_BUILD" -type f \
     \( -name 'starling*.wasm' -o -name '*.wevalcache' \
        -o -name '*.wevalcache.manifest' \) -print -quit |

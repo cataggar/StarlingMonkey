@@ -3651,6 +3651,7 @@ fn managedPrefixEntries(
         .follow_symlinks = false,
     });
     defer generation.close(io);
+    try validateSealedSymlinkTree(allocator, io, generation);
     var bin = generation.openDir(io, "bin", .{
         .iterate = true,
         .follow_symlinks = false,
@@ -4006,12 +4007,12 @@ fn publishGenerationDirectory(
     try copyDirectoryContents(io, source_generation, generation);
     try generation.setPermissions(io, source_generation_stat.permissions);
     try syncDirectoryTree(io, generation);
+    try validateSealedSymlinkTree(allocator, io, generation);
     try runSealHook(allocator, io, hooks, "prefix-files-durable");
     try validateInstalledPrefix(
         allocator,
         io,
-        target_parent_path,
-        stage_name,
+        generation,
         expected_feature_abi,
     );
     try syncDirectoryTree(io, generation);
@@ -4060,13 +4061,26 @@ fn publishGenerationDirectory(
         );
         return err;
     };
-    generation.close(io);
-    generation_closed = true;
+    if (try targetDirectoryInode(io, parent, stage_name) != record.new_inode)
+        return error.SealPathRace;
     if (old_inode != null)
         try exchangeNames(allocator, parent, stage_name, parent, target_name)
     else
         try parent.renamePreserve(stage_name, parent, target_name, io);
     try syncDir(io, parent);
+    if (try targetDirectoryInode(io, parent, target_name) != record.new_inode or
+        @as(u128, @intCast((try generation.stat(io)).inode)) != record.new_inode)
+    {
+        try rollbackUnexpectedDirectorySwitch(
+            allocator,
+            io,
+            parent,
+            record,
+        );
+        return error.SealPathRace;
+    }
+    generation.close(io);
+    generation_closed = true;
     try writeBundlePhase(
         allocator,
         io,
@@ -4087,8 +4101,6 @@ fn publishGenerationDirectory(
         );
         return err;
     };
-    if (try targetDirectoryInode(io, parent, target_name) != record.new_inode)
-        return error.TransactionRecoveryRequired;
     try writeBundlePhase(
         allocator,
         io,
@@ -4143,15 +4155,6 @@ pub fn publishBundleDirectory(
         .follow_symlinks = true,
     });
     defer parent.close(io);
-    var canonical_parent_buffer: [Dir.max_path_bytes]u8 = undefined;
-    const canonical_parent_length = try parent.realPath(
-        io,
-        &canonical_parent_buffer,
-    );
-    const canonical_parent = try allocator.dupe(
-        u8,
-        canonical_parent_buffer[0..canonical_parent_length],
-    );
     const control = try bundleControlNames(allocator, target_name);
     var lock = try openPrivateControlFile(
         io,
@@ -4301,10 +4304,8 @@ pub fn publishBundleDirectory(
     try runSealHook(allocator, io, hooks, "bundle-manifest-staged");
     try syncDir(io, stage);
 
-    const stage_absolute = try std.fs.path.join(
-        allocator,
-        &.{ canonical_parent, stage_name },
-    );
+    try validateSealedSymlinkTree(allocator, io, stage);
+    const stage_absolute = try descriptorDirectoryPath(allocator, stage);
     const staged_engine = try std.fs.path.join(
         allocator,
         &.{ stage_absolute, engine_name },
@@ -4375,13 +4376,26 @@ pub fn publishBundleDirectory(
         );
         return err;
     };
-    stage.close(io);
-    stage_closed = true;
+    if (try targetDirectoryInode(io, parent, stage_name) != record.new_inode)
+        return error.SealPathRace;
     if (old_inode) |_|
         try exchangeNames(allocator, parent, stage_name, parent, target_name)
     else
         try parent.renamePreserve(stage_name, parent, target_name, io);
     try syncDir(io, parent);
+    if (try targetDirectoryInode(io, parent, target_name) != record.new_inode or
+        @as(u128, @intCast((try stage.stat(io)).inode)) != record.new_inode)
+    {
+        try rollbackUnexpectedDirectorySwitch(
+            allocator,
+            io,
+            parent,
+            record,
+        );
+        return error.SealPathRace;
+    }
+    stage.close(io);
+    stage_closed = true;
     try writeBundlePhase(
         allocator,
         io,
@@ -4402,8 +4416,6 @@ pub fn publishBundleDirectory(
         );
         return err;
     };
-    if (try targetDirectoryInode(io, parent, target_name) != record.new_inode)
-        return error.TransactionRecoveryRequired;
     try writeBundlePhase(
         allocator,
         io,
@@ -4739,17 +4751,202 @@ fn syncDirectoryTree(io: Io, directory: Dir) !void {
     try syncDir(io, directory);
 }
 
+fn descriptorDirectoryPath(allocator: Allocator, directory: Dir) ![]const u8 {
+    if (builtin.os.tag != .linux) return error.InvalidDestinationKind;
+    return std.fmt.allocPrint(
+        allocator,
+        "/proc/self/fd/{d}",
+        .{directory.handle},
+    );
+}
+
+fn normalizeSealedPath(
+    allocator: Allocator,
+    parts: []const []const u8,
+) ![]const u8 {
+    var components: std.ArrayList([]const u8) = .empty;
+    defer components.deinit(allocator);
+    for (parts) |part| {
+        if (std.fs.path.isAbsolute(part) or
+            std.mem.indexOfScalar(u8, part, 0) != null)
+        {
+            return error.InvalidDestinationKind;
+        }
+        var iterator = std.mem.splitScalar(u8, part, '/');
+        while (iterator.next()) |component| {
+            if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+            if (std.mem.eql(u8, component, "..")) {
+                if (components.items.len == 0)
+                    return error.InvalidDestinationKind;
+                _ = components.pop();
+                continue;
+            }
+            if (components.items.len == 64)
+                return error.InvalidDestinationKind;
+            components.append(allocator, component) catch
+                @panic("out of memory");
+        }
+    }
+    var result: std.ArrayList(u8) = .empty;
+    for (components.items, 0..) |component, index| {
+        if (index != 0) result.append(allocator, '/') catch
+            @panic("out of memory");
+        result.appendSlice(allocator, component) catch
+            @panic("out of memory");
+    }
+    return result.toOwnedSlice(allocator) catch @panic("out of memory");
+}
+
+fn joinSealedComponents(
+    allocator: Allocator,
+    components: []const []const u8,
+) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    for (components, 0..) |component, index| {
+        if (index != 0) result.append(allocator, '/') catch
+            @panic("out of memory");
+        result.appendSlice(allocator, component) catch
+            @panic("out of memory");
+    }
+    return result.toOwnedSlice(allocator) catch @panic("out of memory");
+}
+
+fn resolveSealedPath(
+    allocator: Allocator,
+    io: Io,
+    root: Dir,
+    path: []const u8,
+    depth: usize,
+) !void {
+    if (depth == 64) return error.InvalidDestinationKind;
+    const normalized = try normalizeSealedPath(allocator, &.{path});
+    if (normalized.len == 0) return;
+    var components: std.ArrayList([]const u8) = .empty;
+    defer components.deinit(allocator);
+    var split = std.mem.splitScalar(u8, normalized, '/');
+    while (split.next()) |component| {
+        components.append(allocator, component) catch
+            @panic("out of memory");
+    }
+
+    var opened: [64]Dir = undefined;
+    var opened_count: usize = 0;
+    defer while (opened_count != 0) {
+        opened_count -= 1;
+        opened[opened_count].close(io);
+    };
+    var current = root;
+    for (components.items, 0..) |component, index| {
+        const stat = current.statFile(
+            io,
+            component,
+            .{ .follow_symlinks = false },
+        ) catch return error.InvalidDestinationKind;
+        if (stat.kind == .sym_link) {
+            var target_buffer: [Dir.max_path_bytes]u8 = undefined;
+            const target_length = current.readLink(
+                io,
+                component,
+                &target_buffer,
+            ) catch return error.InvalidDestinationKind;
+            const prefix = try joinSealedComponents(
+                allocator,
+                components.items[0..index],
+            );
+            const suffix = try joinSealedComponents(
+                allocator,
+                components.items[index + 1 ..],
+            );
+            const target = target_buffer[0..target_length];
+            const resolved = try normalizeSealedPath(
+                allocator,
+                &.{ prefix, target, suffix },
+            );
+            return resolveSealedPath(
+                allocator,
+                io,
+                root,
+                resolved,
+                depth + 1,
+            );
+        }
+        if (index + 1 == components.items.len) {
+            if (stat.kind != .file and stat.kind != .directory)
+                return error.InvalidDestinationKind;
+            return;
+        }
+        if (stat.kind != .directory) return error.InvalidDestinationKind;
+        opened[opened_count] = current.openDir(io, component, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch return error.InvalidDestinationKind;
+        current = opened[opened_count];
+        opened_count += 1;
+    }
+}
+
+fn validateSealedSymlinkDirectory(
+    allocator: Allocator,
+    io: Io,
+    root: Dir,
+    directory: Dir,
+    relative: []const u8,
+) !void {
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        const child_relative = if (relative.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fs.path.join(allocator, &.{ relative, entry.name });
+        switch (entry.kind) {
+            .file => {},
+            .directory => {
+                var child = try directory.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(io);
+                try validateSealedSymlinkDirectory(
+                    allocator,
+                    io,
+                    root,
+                    child,
+                    child_relative,
+                );
+            },
+            .sym_link => try resolveSealedPath(
+                allocator,
+                io,
+                root,
+                child_relative,
+                0,
+            ),
+            else => return error.InvalidDestinationKind,
+        }
+    }
+}
+
+fn validateSealedSymlinkTree(
+    allocator: Allocator,
+    io: Io,
+    root: Dir,
+) !void {
+    return validateSealedSymlinkDirectory(
+        allocator,
+        io,
+        root,
+        root,
+        "",
+    );
+}
+
 fn validateInstalledPrefix(
     allocator: Allocator,
     io: Io,
-    parent_path: []const u8,
-    generation_name: []const u8,
+    generation: Dir,
     expected_feature_abi: []const u8,
 ) !void {
-    const generation_path = try std.fs.path.join(
-        allocator,
-        &.{ parent_path, generation_name },
-    );
+    const generation_path = try descriptorDirectoryPath(allocator, generation);
     const bin_path = try std.fs.path.join(
         allocator,
         &.{ generation_path, "bin" },
@@ -4841,6 +5038,50 @@ fn bundleControlNames(
             .{encoded[0..24]},
         ),
     };
+}
+
+fn rollbackUnexpectedDirectorySwitch(
+    allocator: Allocator,
+    io: Io,
+    parent: Dir,
+    record: BundleRecord,
+) !void {
+    const target_inode = try targetDirectoryInode(
+        io,
+        parent,
+        record.target_name,
+    );
+    const stage_inode = try targetDirectoryInode(
+        io,
+        parent,
+        record.stage_name,
+    );
+    if (record.old_inode) |old_inode| {
+        if (stage_inode == null or stage_inode.? != old_inode)
+            return error.TransactionRecoveryRequired;
+        try exchangeNames(
+            allocator,
+            parent,
+            record.target_name,
+            parent,
+            record.stage_name,
+        );
+        try syncDir(io, parent);
+        if (try targetDirectoryInode(io, parent, record.target_name) != old_inode)
+            return error.TransactionRecoveryRequired;
+        return;
+    }
+    if (target_inode == null or stage_inode != null)
+        return error.TransactionRecoveryRequired;
+    try parent.renamePreserve(
+        record.target_name,
+        parent,
+        record.stage_name,
+        io,
+    );
+    try syncDir(io, parent);
+    if (try targetDirectoryInode(io, parent, record.target_name) != null)
+        return error.TransactionRecoveryRequired;
 }
 
 fn removeBundleStage(io: Io, parent: Dir, record: BundleRecord) !void {
@@ -5350,23 +5591,27 @@ pub fn validateWithHooks(
         io,
         weval_path,
     );
-    if (!std.mem.eql(u8, weval_package.provenance, weval.resolved) or
-        !std.mem.eql(
-            u8,
-            parsed.weval_package_sha256,
-            weval_package.digest,
-        ) or
-        !std.mem.eql(
-            u8,
-            parsed.weval_selected_relative,
-            weval_package.selected_relative,
-        ) or
-        !std.mem.eql(
-            u8,
-            parsed.weval_selected_basename,
-            weval_package.selected_basename,
-        ))
+    var package_executable = try Dir.openFileAbsolute(
+        io,
+        weval_package.provenance,
+        .{ .allow_directory = false, .follow_symlinks = false },
+    );
+    defer package_executable.close(io);
+    if (!sameIdentity(try package_executable.stat(io), weval.identity))
         return error.StaleTool;
+    if (!std.mem.eql(
+        u8,
+        parsed.weval_package_sha256,
+        weval_package.digest,
+    ) or !std.mem.eql(
+        u8,
+        parsed.weval_selected_relative,
+        weval_package.selected_relative,
+    ) or !std.mem.eql(
+        u8,
+        parsed.weval_selected_basename,
+        weval_package.selected_basename,
+    )) return error.StaleTool;
     const weval_sha = try rehashStableFileHex(allocator, io, weval);
     if (!std.mem.eql(u8, parsed.weval_sha256, weval_sha)) return error.StaleTool;
     if (expected_feature_abi) |expected| {

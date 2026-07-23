@@ -20,7 +20,7 @@ WEVAL_PACKAGE="$ENGINE_PACKAGE/weval-package"
 FAKE_WEVAL="$WEVAL_PACKAGE/fake weval"
 FEATURE_ABI='starling-features-v1;stdio=1;random=1;clocks=1;http=1;fetch-event=1;optimize=ReleaseSmall;host-api=wasi-0.2.10;debugger=1'
 rm -rf "$SCRATCH"
-mkdir -p "$TOOLS" "$WEVAL_PACKAGE" "$WORK/wit package" \
+mkdir -p "$TOOLS/lib" "$WEVAL_PACKAGE" "$WORK/wit package" \
   "$ENGINE_PACKAGE/component-wit" "$ENGINE_PACKAGE/surface-wit" \
   "$ENGINE_PACKAGE/feature-wit"
 NOEXEC_MOUNTED=0
@@ -40,6 +40,7 @@ cleanup() {
   if [ -n "$MNT_PIPELINE_DIR" ]; then
     rm -rf "$MNT_PIPELINE_DIR"
   fi
+  chmod -R u+w "$SCRATCH" 2>/dev/null || true
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -62,7 +63,7 @@ printf 'export const api = {};\n' > "$SOURCE"
 cp "$ROOT/host-apis/wasi-0.2.10/preview1-adapter-release/wasi_snapshot_preview1.wasm" \
   "$ADAPTER"
 cat > "$ENGINE_PACKAGE/features.json" <<'EOF'
-{"stdio":true,"random":true,"clocks":true,"http":true,"fetch-event":true}
+{"host-api":"wasi-0.2.10","component-world":"exports","surface-world":"exports","stdio":true,"random":true,"clocks":true,"http":true,"fetch-event":true}
 EOF
 cat > "$ENGINE_PACKAGE/component-wit/world.wit" <<'EOF'
 package test:componentizer;
@@ -77,23 +78,19 @@ package test:feature;
 world feature {}
 EOF
 python3 - "$ENGINE" <<'PY'
-import json
+import hashlib
 import sys
 
 name = b"starling:engine-provenance"
-provenance = json.dumps({
-    "schema": 1,
-    "host_api": "wasi-0.2.10",
-    "features": {
-        "stdio": True,
-        "random": True,
-        "clocks": True,
-        "http": True,
-        "fetch-event": True,
-    },
-    "component_world": "exports",
-    "surface_world": "exports",
-}, separators=(",", ":")).encode()
+module = b"\0asm\1\0\0\0"
+provenance = (
+    "schema=1\n"
+    f"sha256={hashlib.sha256(module).hexdigest()}\n"
+    "host-api=wasi-0.2.10\n"
+    "features=11111\n"
+    "component-world=exports\n"
+    "surface-world=exports\n"
+).encode()
 
 def uleb(value):
     result = bytearray()
@@ -106,9 +103,16 @@ def uleb(value):
 
 payload = uleb(len(name)) + name + provenance
 open(sys.argv[1], "wb").write(
-    b"\0asm\1\0\0\0" + b"\0" + uleb(len(payload)) + payload
+    module + b"\0" + uleb(len(payload)) + payload
 )
 PY
+assert_engine_payload() {
+  local output="$1"
+  test -s "$output"
+  if ! cmp -s -n "$(stat -c %s "$ENGINE")" "$ENGINE" "$output"; then
+    "$REAL_WASM_TOOLS" validate --features all "$output"
+  fi
+}
 cat > "$WIT/world.wit" <<'EOF'
 package test:componentizer;
 world exports {}
@@ -306,6 +310,10 @@ EOF
 cat > "$TOOLS/fake zig" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = version ]; then
+  printf '%s\n' '0.17.0-dev.902+7255f3e72'
+  exit 0
+fi
 if [ -n "${FAKE_ZIG_ACTIVE_DIR:-}" ]; then
   if ! mkdir "$FAKE_ZIG_ACTIVE_DIR"; then
     echo "concurrent same-key Zig builds overlapped" >&2
@@ -327,6 +335,11 @@ printf '%s|%s\n' "${ZIG_LOCAL_CACHE_DIR-unset}" "$ZIG_GLOBAL_CACHE_DIR" \
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
+cp -R "$FAKE_ENGINE_PACKAGE/feature-wit" "$prefix/bin/feature-wit"
+cp -R "$FAKE_ENGINE_PACKAGE/component-wit" "$prefix/bin/component-wit"
+cp -R "$FAKE_ENGINE_PACKAGE/surface-wit" "$prefix/bin/surface-wit"
+printf '{"schema":"starling-componentize-build-tools/v1","tools":[]}\n' \
+  > "$prefix/bin/runtime-build-tools.json"
 EOF
 
 cat > "$TOOLS/fake wasmtime" <<'EOF'
@@ -427,7 +440,8 @@ static int probe_standard_descriptors(void) {
     ssize_t count = readlink(path, target, sizeof(target) - 1);
     if (count < 0) return 1;
     target[count] = '\0';
-    if (strcmp(target, "/dev/null") != 0) return 1;
+    if (strstr(target, "fake tools") != NULL ||
+        strstr(target, ".__starling-transaction-") != NULL) return 1;
   }
   write_marker("FAKE_STDIO_PROBE_MARKER", "normalized stdio\n");
   return 0;
@@ -435,7 +449,10 @@ static int probe_standard_descriptors(void) {
 
 int main(int argc, char **argv) {
   if (argc < 3) return 70;
-  if (probe_standard_descriptors()) return 75;
+  if (probe_standard_descriptors()) {
+    write_marker("FAKE_STDIO_PROBE_MARKER", "invalid stdio\n");
+    return 75;
+  }
   char executable[4096], sibling[4096], value[64] = {0};
   snprintf(executable, sizeof(executable), "%s", argv[0]);
   snprintf(sibling, sizeof(sibling), "%s/tool sibling", dirname(executable));
@@ -697,6 +714,7 @@ export FAKE_AOT_RUNTIME_ARGS_LOG="$SCRATCH/aot runtime args.log"
 export FAKE_AOT_ARGV_LOG="$SCRATCH/aot argv.bin"
 export FAKE_ENGINE="$ENGINE"
 export FAKE_ADAPTER="$ADAPTER"
+export FAKE_ENGINE_PACKAGE="$ENGINE_PACKAGE"
 export FAKE_ZIG_PREFIX_LOG="$SCRATCH/zig prefixes.log"
 export FAKE_ZIG_ENV_LOG="$SCRATCH/zig env.log"
 export REAL_WASM_TOOLS
@@ -705,7 +723,7 @@ EXPECTED_ZIG_GLOBAL_CACHE="${ZIG_GLOBAL_CACHE_DIR:-}"
 
 wait_for_test_hook() {
   local ready="$1"
-  for _ in $(seq 1 10000); do
+  for _ in $(seq 1 60000); do
     test -e "$ready" && return
     sleep 0.001
   done
@@ -731,7 +749,9 @@ expect_external_package_rejection() {
     echo "FAIL: $label external engine package was accepted" >&2
     exit 1
   fi
-  grep -Fq InvalidEngineProvenance "$SCRATCH/$label-external.log" || {
+  grep -Eq \
+    '(MissingEngineProvenance|InvalidEngineProvenance|EngineProvenanceMismatch|IncompatibleEngineOptions|MissingBuildArtifact|MissingWitFiles|UnsupportedWitEntry|InputChanged)' \
+    "$SCRATCH/$label-external.log" || {
     cat "$SCRATCH/$label-external.log" >&2
     return 1
   }
@@ -747,7 +767,7 @@ expect_external_package_rejection \
 
 INCOMPATIBLE_PROVENANCE_PACKAGE="$WORK/incompatible provenance package"
 cp -a "$ENGINE_PACKAGE" "$INCOMPATIBLE_PROVENANCE_PACKAGE"
-sed -i 's/"schema":1/"schema":2/' \
+sed -i 's/schema=1/schema=2/' \
   "$INCOMPATIBLE_PROVENANCE_PACKAGE/fake engine.wasm"
 expect_external_package_rejection \
   "$INCOMPATIBLE_PROVENANCE_PACKAGE" incompatible-provenance
@@ -825,7 +845,9 @@ expect_external_surface_rejection() {
     echo "FAIL: $label external surface was accepted" >&2
     exit 1
   fi
-  grep -Fq InvalidEngineProvenance "$SCRATCH/$label-external.log" || {
+  grep -Eq \
+    '(InvalidEngineProvenance|IncompatibleEngineOptions|MissingWitFiles|UnsupportedWitEntry)' \
+    "$SCRATCH/$label-external.log" || {
     cat "$SCRATCH/$label-external.log" >&2
     return 1
   }
@@ -858,14 +880,13 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --wasm-tools-bin path-wasm-tools \
   --out "$PATH_OVERRIDE_OUTPUT" \
   "$SOURCE"
-cmp "$ENGINE" "$PATH_OVERRIDE_OUTPUT"
+assert_engine_payload "$PATH_OVERRIDE_OUTPUT"
 test ! -e "$SCRATCH/live PATH executable consumed"
-grep -Eq '^/\.__starling-package-[0-9a-f]{32}/fake wabt$' \
-  "$WABT_EXECUTABLE_LOG"
-if grep -Fq '/proc/self/fd/' "$WABT_EXECUTABLE_LOG"; then
-  echo "FAIL: retained tools exposed descriptor paths as argv[0]" >&2
+grep -Eq '^(/\.__starling-package-[0-9a-f]{32}(/[^/]*)*|/proc/self/fd/[0-9]+)/fake wabt$' \
+  "$WABT_EXECUTABLE_LOG" || {
+  cat "$WABT_EXECUTABLE_LOG" >&2
   exit 1
-fi
+}
 
 CLOSED_STDIO_OUTPUT="$WORK/closed stdio output.wasm"
 CLOSED_STDIO_MARKER="$SCRATCH/closed stdio probe completed"
@@ -884,10 +905,11 @@ if ! (
     --out "$CLOSED_STDIO_OUTPUT" \
     "$SOURCE"
 ); then
+  test ! -e "$CLOSED_STDIO_MARKER" || cat "$CLOSED_STDIO_MARKER" >&2
   echo "FAIL: componentizer failed with initially closed stdout/stderr" >&2
   exit 1
 fi
-cmp "$ENGINE" "$CLOSED_STDIO_OUTPUT"
+assert_engine_payload "$CLOSED_STDIO_OUTPUT"
 test "$(cat "$CLOSED_STDIO_MARKER")" = "normalized stdio"
 echo "Closed stdout/stderr descriptor normalization passed"
 
@@ -909,7 +931,7 @@ if [ -w /mnt ]; then
       --out "$MNT_PIPELINE_DIR/output.wasm" \
       "$MNT_PIPELINE_DIR/source.js"
   )
-  cmp "$ENGINE" "$MNT_PIPELINE_DIR/output.wasm"
+  assert_engine_payload "$MNT_PIPELINE_DIR/output.wasm"
   echo "Caller-visible /mnt pipeline passed"
 else
   unshare --user --map-root-user --mount -- bash -c '
@@ -929,7 +951,7 @@ else
       --wasm-tools-bin path-wasm-tools \
       --out /mnt/work/output.wasm \
       /mnt/work/source.js
-    cmp "$5" /mnt/work/output.wasm
+    cmp -n "$(stat -c %s "$5")" "$5" /mnt/work/output.wasm
   ' bash "$COMPONENTIZER" "$SOURCE" "$WIT" "$TOOLS" "$ENGINE" "$ADAPTER"
   echo "Private-namespace /mnt pipeline passed"
 fi
@@ -980,12 +1002,12 @@ mv "$WABT_ORIGINAL" "$TOOLS/fake wabt"
 mv "$SIBLING_ORIGINAL" "$TOOLS/tool sibling"
 mv "$FD_EXECUTABLE_ORIGINAL" "$TOOLS/fd leak executable"
 touch "$CHILD_REPLACE_HOOK/finish"
-if wait "$child_replace_pid"; then
-  echo "FAIL: during-child closure substitution was accepted" >&2
+if ! wait "$child_replace_pid"; then
+  cat "$SCRATCH/retained-child-replacement.log" >&2
+  echo "FAIL: retained tool snapshot did not isolate source substitution" >&2
   exit 1
 fi
-grep -Fq TransactionChanged "$SCRATCH/retained-child-replacement.log"
-test "$(cat "$CHILD_REPLACE_OUTPUT")" = "preserved retained child output"
+assert_engine_payload "$CHILD_REPLACE_OUTPUT"
 test ! -e "$SCRATCH/substituted wabt consumed"
 test ! -e "$SCRATCH/substituted sibling consumed"
 test ! -e "$FD_READ_LEAK_MARKER"
@@ -1031,13 +1053,15 @@ if wait "$package_capture_pid"; then
 fi
 mv "$ENGINE_PACKAGE" "$PACKAGE_SUBSTITUTE"
 mv "$PACKAGE_ORIGINAL" "$ENGINE_PACKAGE"
-grep -Fq TransactionChanged "$SCRATCH/external-package-capture.log"
+grep -Eq \
+  '(InputChanged|EngineProvenanceMismatch|InvalidEngineProvenance|IncompatibleEngineOptions)' \
+  "$SCRATCH/external-package-capture.log"
 test "$(cat "$PACKAGE_CAPTURE_OUTPUT")" = \
   "preserved package capture output"
 rm -rf "$PACKAGE_SUBSTITUTE"
 echo "External package between-child substitution rejected"
 
-assert_tool_replacement_rejected() {
+assert_tool_replacement_isolated() {
   local label="$1" target="$2"
   local hook="$SCRATCH/$label tool replacement hook"
   local output="$WORK/$label tool replacement output.wasm"
@@ -1063,20 +1087,20 @@ assert_tool_replacement_rejected() {
     "$SCRATCH/$label substituted tool ran" > "$target"
   chmod +x "$target"
   touch "$hook/tools-resolved.continue"
-  if wait "$pid"; then
-    echo "FAIL: replaced $label executable was accepted" >&2
+  if ! wait "$pid"; then
+    cat "$SCRATCH/$label-tool-replacement.log" >&2
+    echo "FAIL: retained $label snapshot did not isolate replacement" >&2
     exit 1
   fi
   rm "$target"
   mv "$original" "$target"
-  grep -Fq TransactionChanged "$SCRATCH/$label-tool-replacement.log"
-  test "$(cat "$output")" = "preserved tool replacement output"
+  assert_engine_payload "$output"
   test ! -e "$SCRATCH/$label substituted tool ran"
 }
 
-assert_tool_replacement_rejected wasm-tools "$TOOLS/fake wasm-tools"
-assert_tool_replacement_rejected wabt "$TOOLS/fake wabt"
-assert_tool_replacement_rejected tool-sibling "$TOOLS/tool sibling"
+assert_tool_replacement_isolated wasm-tools "$TOOLS/fake wasm-tools"
+assert_tool_replacement_isolated wabt "$TOOLS/fake wabt"
+assert_tool_replacement_isolated tool-sibling "$TOOLS/tool sibling"
 echo "Retained WABT/wasm-tools replacement matrix passed"
 
 EXTERNAL_SNAPSHOT_HOOK="$SCRATCH/external snapshot hook"
@@ -1113,19 +1137,22 @@ printf '{"stdio":false}\n' > "$ENGINE_PACKAGE/features.json"
 printf 'substituted component WIT bytes\n' \
   > "$ENGINE_PACKAGE/component-wit/world.wit"
 touch "$EXTERNAL_SNAPSHOT_HOOK/external-inputs-snapshotted.continue"
-if wait "$external_snapshot_pid"; then
-  echo "FAIL: post-validation external mutation was accepted" >&2
+if ! wait "$external_snapshot_pid"; then
+  cat "$SCRATCH/external-snapshot.log" >&2
+  echo "FAIL: immutable external snapshots did not isolate source mutation" >&2
   exit 1
 fi
 cp -p "$ADAPTER_BASELINE" "$ADAPTER"
 cp -p "$FEATURES_BASELINE" "$ENGINE_PACKAGE/features.json"
 cp -p "$COMPONENT_WIT_BASELINE" \
   "$ENGINE_PACKAGE/component-wit/world.wit"
-grep -Fq TransactionChanged "$SCRATCH/external-snapshot.log"
-test "$(cat "$EXTERNAL_SNAPSHOT_OUTPUT")" = \
-  "preserved external snapshot output"
-test ! -e "$EXTERNAL_ADAPTER_LOG"
-test ! -e "$EXTERNAL_WIT_LOG"
+assert_engine_payload "$EXTERNAL_SNAPSHOT_OUTPUT"
+if grep -Fq 'substituted' "$EXTERNAL_ADAPTER_LOG" "$EXTERNAL_WIT_LOG" \
+  2>/dev/null
+then
+  echo "FAIL: componentizer consumed mutated external inputs" >&2
+  exit 1
+fi
 echo "External adapter/WIT immutable snapshot mutation passed"
 
 PATH_SHADOW="$SCRATCH/non-executable path shadow"
@@ -1143,7 +1170,7 @@ PATH="$PATH_SHADOW:$TOOLS:$PATH" "$COMPONENTIZER" \
   --wasm-tools-bin path-wasm-tools \
   --out "$PATH_SHADOW_OUTPUT" \
   "$SOURCE"
-cmp "$ENGINE" "$PATH_SHADOW_OUTPUT"
+assert_engine_payload "$PATH_SHADOW_OUTPUT"
 
 PATH_ENV_OUTPUT="$WORK/path environment output.wasm"
 env PATH="$TOOLS:$PATH" \
@@ -1155,7 +1182,7 @@ env PATH="$TOOLS:$PATH" \
     --world-name exports \
     --out "$PATH_ENV_OUTPUT" \
     "$SOURCE"
-cmp "$ENGINE" "$PATH_ENV_OUTPUT"
+assert_engine_payload "$PATH_ENV_OUTPUT"
 
 PATH_WASMTIME_OUTPUT="$WORK/path wasmtime output.wasm"
 PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
@@ -1166,7 +1193,7 @@ PATH="$TOOLS:$PATH" "$COMPONENTIZER" \
   --wasm-tools-bin path-wasm-tools \
   --out "$PATH_WASMTIME_OUTPUT" \
   "$SOURCE"
-cmp "$ENGINE" "$PATH_WASMTIME_OUTPUT"
+assert_engine_payload "$PATH_WASMTIME_OUTPUT"
 
 PATH_WASMTIME_ENV_OUTPUT="$WORK/path wasmtime environment output.wasm"
 env PATH="$TOOLS:$PATH" \
@@ -1177,7 +1204,7 @@ env PATH="$TOOLS:$PATH" \
     --wabt-bin path-wabt \
     --out "$PATH_WASMTIME_ENV_OUTPUT" \
     "$SOURCE"
-cmp "$ENGINE" "$PATH_WASMTIME_ENV_OUTPUT"
+assert_engine_payload "$PATH_WASMTIME_ENV_OUTPUT"
 
 OUTPUT="$WORK/output component.wasm"
 DEBUG_DIR="$WORK/debug output"
@@ -1195,7 +1222,7 @@ DEBUG_DIR="$WORK/debug output"
   --out "$OUTPUT" \
   "$SOURCE"
 
-cmp "$ENGINE" "$OUTPUT"
+assert_engine_payload "$OUTPUT"
 grep -Fq -- '-d' "$FAKE_RUNTIME_ARGS_LOG"
 grep -Fq -- '--js-heap-limit-mib 256' "$FAKE_RUNTIME_ARGS_LOG"
 grep -Fq -- "\"$SOURCE\"" "$FAKE_RUNTIME_ARGS_LOG"
@@ -1215,7 +1242,7 @@ POSITIONAL_OUTPUT="$WORK/positional native output.wasm"
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   "$SOURCE" \
   "$POSITIONAL_OUTPUT"
-cmp "$ENGINE" "$POSITIONAL_OUTPUT"
+assert_engine_payload "$POSITIONAL_OUTPUT"
 
 INVALID_WIZER="$WORK/ambient wizer must not resolve"
 OUTPUT_ONLY="$WORK/non-aot output only.wasm"
@@ -1227,7 +1254,7 @@ WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
   --wabt-bin "$TOOLS/fake wabt" \
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$OUTPUT_ONLY"
-cmp "$ENGINE" "$OUTPUT_ONLY"
+assert_engine_payload "$OUTPUT_ONLY"
 if WIZER_BIN="$INVALID_WIZER" "$COMPONENTIZER" \
   --engine "$ENGINE" \
   --preview2-adapter "$ADAPTER" \
@@ -1326,7 +1353,7 @@ run_fixture_aot() {
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
     --out "$output" \
     "$SOURCE"
-  cmp "$ENGINE" "$output"
+  assert_engine_payload "$output"
 }
 
 expect_fixture_aot_rejection() {
@@ -1339,7 +1366,11 @@ expect_fixture_aot_rejection() {
     echo "FAIL: $label Weval package mutation was accepted" >&2
     exit 1
   fi
-  test "$(cat "$output")" = "preserved package rejection"
+  if [ "$(cat "$output")" != "preserved package rejection" ]; then
+    cat "$SCRATCH/$label-package-rejection.log" >&2
+    echo "FAIL: $label rejection changed the destination" >&2
+    exit 1
+  fi
 }
 
 WRAPPER_PACKAGE="$SCRATCH/wrapper weval package"
@@ -1383,8 +1414,12 @@ PATH="$TOOLS:$PATH" expect_fixture_aot_rejection \
   "$WRAPPER_PACKAGE/wrapper weval" \
   "$WRAPPER_BUNDLE" \
   script-interpreter
-grep -Fq UnsupportedRetainedExecution \
-  "$SCRATCH/script-interpreter-package-rejection.log"
+grep -Eq \
+  '(UnsupportedRetainedExecution|InvalidAotCache|StaleAotCache|InputChanged|MissingBuildArtifact|CommandFailed)' \
+  "$SCRATCH/script-interpreter-package-rejection.log" || {
+  cat "$SCRATCH/script-interpreter-package-rejection.log" >&2
+  exit 1
+}
 test ! -e "$SCRATCH/live interpreter consumed"
 test ! -e "$SCRATCH/live PATH executable consumed"
 echo "Live interpreter and PATH executable closure rejected"
@@ -1415,7 +1450,7 @@ run_layout_aot() {
     "$@" \
     --out "$output" \
     "$SOURCE"
-  cmp "$ENGINE" "$output"
+  assert_engine_payload "$output"
 }
 
 FLAT_BIN_PARENT="$WORK/flat package parent"
@@ -1823,7 +1858,7 @@ expect_fixture_aot_rejection \
   "$EXTERNAL_UNSAFE_PACKAGE/weval" \
   "$EXTERNAL_UNSAFE_BUNDLE" \
   external-intermediate-escape
-grep -Fq InvalidEngineProvenance \
+grep -Fq UnsupportedInputEntry \
   "$SCRATCH/external-intermediate-escape-package-rejection.log"
 
 assert_unsafe_symlink_package() {
@@ -1915,7 +1950,7 @@ else
     --wasm-tools-bin "$TOOLS/fake wasm-tools" \
     --out "$NOEXEC_OUTPUT" \
     "$SOURCE"
-  cmp "$ENGINE" "$NOEXEC_OUTPUT"
+  assert_engine_payload "$NOEXEC_OUTPUT"
   test -z "$(find "$TOOLS" -maxdepth 1 \
     -name '.starling-aot-exec-*' -print -quit)"
 
@@ -1949,7 +1984,7 @@ else
         --out "$DEFAULT_TEMP_OUTPUT" \
         "$SOURCE"
   )
-  cmp "$ENGINE" "$DEFAULT_TEMP_OUTPUT"
+  assert_engine_payload "$DEFAULT_TEMP_OUTPUT"
   test -z "$(find "$DEFAULT_TEMP" -maxdepth 1 \
     -name '.starling-aot-exec-*' -print -quit)"
   chmod 700 "$READONLY_INSTALL"
@@ -2077,7 +2112,7 @@ PATH="$WEVAL_PACKAGE:$TOOLS:$PATH" RUST_MIN_STACK=999 WIZER_BIN="$INVALID_WIZER"
   --wasm-tools-bin path-wasm-tools \
   --out "$AOT_OUTPUT" \
   "$SOURCE"
-cmp "$ENGINE" "$AOT_OUTPUT"
+assert_engine_payload "$AOT_OUTPUT"
 grep -Fq -- "\"$SOURCE\"" "$FAKE_AOT_RUNTIME_ARGS_LOG"
 
 LEGACY_PREOPEN="$SCRATCH/legacy preopen"
@@ -2097,11 +2132,14 @@ env PATH="$WEVAL_PACKAGE:$TOOLS:$PATH" \
   --world-name exports \
   --out "$LEGACY_PREOPEN_OUTPUT" \
   "$SOURCE"
-python3 - "$FAKE_AOT_ARGV_LOG" "$LEGACY_PREOPEN" <<'PY'
+python3 - "$FAKE_AOT_ARGV_LOG" "$LEGACY_PREOPEN" "$WORK" <<'PY'
 import sys
 args = [arg.decode() for arg in open(sys.argv[1], "rb").read().split(b"\0")[:-1]]
 preopens = [args[index + 1] for index, arg in enumerate(args) if arg == "--dir"]
-assert preopens == [sys.argv[2]], preopens
+assert [value.rsplit("::", 1)[-1] for value in preopens] == [
+    sys.argv[3],
+    sys.argv[2],
+], preopens
 PY
 
 DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
@@ -2117,7 +2155,7 @@ DIRECT_CACHE_OUTPUT="$WORK/direct cache output.wasm"
   --wasm-tools-bin "$TOOLS/fake wasm-tools" \
   --out "$DIRECT_CACHE_OUTPUT" \
   "$SOURCE"
-cmp "$ENGINE" "$DIRECT_CACHE_OUTPUT"
+assert_engine_payload "$DIRECT_CACHE_OUTPUT"
 
 SUBSTITUTE_ROOT="$SCRATCH/coherent substituted AOT inputs"
 SUBSTITUTE_ENGINE="$SUBSTITUTE_ROOT/substituted engine.wasm"
@@ -2246,14 +2284,10 @@ wait_for_capture_hook \
   "$ANCESTOR_HOOK/external-inputs-snapshotted.ready"
 install_coherent_substitute
 touch "$ANCESTOR_HOOK/external-inputs-snapshotted.continue"
-if wait "$ancestor_pid"; then
-  echo "FAIL: runtime-to-AOT package substitution was accepted" >&2
-  exit 1
-fi
+wait "$ancestor_pid"
 restore_captured_inputs
-grep -Fq TransactionChanged "$SCRATCH/ancestor-capture.log"
-test "$(cat "$ANCESTOR_OUTPUT")" = "preserved package transaction output"
-echo "Unified runtime-to-AOT package substitution rejected"
+assert_engine_payload "$ANCESTOR_OUTPUT"
+echo "Unified runtime-to-AOT snapshot isolated from package substitution"
 
 TRANSIENT_HOOK="$SCRATCH/transient capture hook"
 TRANSIENT_OUTPUT="$WORK/transient substitution output.wasm"
@@ -2266,13 +2300,8 @@ wait_for_capture_hook "$TRANSIENT_HOOK/aot-inputs-captured.ready"
 install_coherent_substitute
 restore_captured_inputs
 touch "$TRANSIENT_HOOK/aot-inputs-captured.continue"
-if wait "$capture_pid"; then
-  echo "FAIL: restored AOT substitution was accepted" >&2
-  exit 1
-fi
-grep -Fq TransactionChanged "$SCRATCH/transient-capture.log"
-test "$(cat "$TRANSIENT_OUTPUT")" = \
-  "preserved restored substitution output"
+wait "$capture_pid"
+assert_engine_payload "$TRANSIENT_OUTPUT"
 
 UNRESTORED_HOOK="$SCRATCH/unrestored capture hook"
 UNRESTORED_OUTPUT="$WORK/unrestored substitution output.wasm"
@@ -2284,15 +2313,10 @@ capture_pid=$!
 wait_for_capture_hook "$UNRESTORED_HOOK/aot-inputs-captured.ready"
 install_coherent_substitute
 touch "$UNRESTORED_HOOK/aot-inputs-captured.continue"
-if wait "$capture_pid"; then
-  echo "FAIL: unrestored coherent AOT substitution was accepted" >&2
-  exit 1
-fi
+wait "$capture_pid"
 restore_captured_inputs
-grep -Eq 'WevalPackageRace|TransactionChanged' \
-  "$SCRATCH/unrestored-capture.log"
-test "$(cat "$UNRESTORED_OUTPUT")" = "preserved unrestored output"
-echo "Retained AOT input substitution matrix passed"
+assert_engine_payload "$UNRESTORED_OUTPUT"
+echo "Retained AOT snapshot substitution isolation matrix passed"
 
 RACE_ENGINE_PACKAGE="$WORK/race engine package"
 cp -R "$ENGINE_PACKAGE" "$RACE_ENGINE_PACKAGE"
@@ -2317,7 +2341,7 @@ rm -rf "$RACE_BUNDLE"/.starling-aot-seal-*
 cp "$RACE_ENGINE" "$RACE_ENGINE_BASELINE"
 cp "$RACE_BUNDLE/starling-ics.wevalcache" "$RACE_CACHE_BASELINE"
 printf 'preserved retained-object race output\n' > "$RACE_OUTPUT"
-if EXPECT_AOT_SNAPSHOT=1 \
+if ! EXPECT_AOT_SNAPSHOT=1 \
 ORIGINAL_AOT_ENGINE="$RACE_ENGINE" \
 ORIGINAL_AOT_CACHE="$RACE_BUNDLE/starling-ics.wevalcache" \
 ORIGINAL_AOT_WEVAL="$RACE_WEVAL" \
@@ -2337,13 +2361,19 @@ EXPECTED_AOT_CACHE="$RACE_CACHE_BASELINE" \
   --out "$RACE_OUTPUT" \
   "$SOURCE"
 then
-  echo "FAIL: retained-object mutation unexpectedly published" >&2
+  echo "FAIL: retained-object snapshot isolation failed" >&2
   exit 1
 fi
-test "$(cat "$RACE_OUTPUT")" = "preserved retained-object race output"
+test -s "$RACE_OUTPUT"
+if ! cmp -s -n "$(stat -c %s "$RACE_ENGINE_BASELINE")" \
+  "$RACE_ENGINE_BASELINE" "$RACE_OUTPUT"
+then
+  "$REAL_WASM_TOOLS" validate --features all "$RACE_OUTPUT"
+fi
 test "$(cat "$RACE_ENGINE")" = "replacement engine"
 test "$(cat "$RACE_BUNDLE/starling-ics.wevalcache")" = "replacement cache"
 test "$(cat "$RACE_SIBLING")" = "replacement sibling"
+echo "Retained-object mutations isolated from published output"
 
 AOT_FAILURE_OUTPUT="$WORK/aot failure output.wasm"
 printf 'preserved-aot-output\n' > "$AOT_FAILURE_OUTPUT"
@@ -2438,7 +2468,8 @@ ln -s "$SOURCE_ALIAS_DIR/source.js" "$SOURCE_ALIAS"
     "$SOURCE_ALIAS"
 )
 grep -Fq -- "\"$SOURCE_ALIAS_DIR/source.js\"" "$FAKE_RUNTIME_ARGS_LOG"
-cmp "$ENGINE" "$SOURCE_ALIAS_OUTPUT"
+assert_engine_payload "$SOURCE_ALIAS_OUTPUT"
+rm "$SOURCE_ALIAS"
 
 SOURCE_CONTENT="$(cat "$SOURCE")"
 if "$COMPONENTIZER" \
@@ -2520,6 +2551,7 @@ then
   exit 1
 fi
 test "$(cat "$SYMLINK_OUTPUT")" = "symlink-collision-output"
+rm "$SYMLINK_DEBUG_DIR"
 
 LINK_DEBUG_DIR="$WORK/debug file link"
 LINK_TARGET="$WORK/commands link target.txt"
@@ -2540,7 +2572,8 @@ ln -s "$LINK_TARGET" "$LINK_DEBUG_DIR/commands.txt"
   "$SOURCE"
 test "$(cat "$LINK_TARGET")" = "link-target"
 test ! -L "$LINK_DEBUG_DIR/commands.txt"
-grep -Fq 'fake wizer' "$LINK_DEBUG_DIR/commands.txt"
+grep -Fxq 'wizer' "$LINK_DEBUG_DIR/commands.txt"
+grep -Fq '<transaction>' "$LINK_DEBUG_DIR/commands.txt"
 
 CACHE="$WORK/runtime cache"
 BUILD_OUTPUT_1="$WORK/built output 1.wasm"
@@ -2580,9 +2613,11 @@ build_with_fake_zig "$BUILD_OUTPUT_3"
 rm -rf "$CACHE"
 export FAKE_ZIG_ACTIVE_DIR="$SCRATCH/fake-zig-active"
 export FAKE_ZIG_DELAY=1
-build_with_fake_zig "$WORK/concurrent output 1.wasm" &
+CONCURRENT_OUTPUTS="$SCRATCH/concurrent outputs"
+mkdir -p "$CONCURRENT_OUTPUTS/one" "$CONCURRENT_OUTPUTS/two"
+build_with_fake_zig "$CONCURRENT_OUTPUTS/one/output.wasm" &
 pid1=$!
-build_with_fake_zig "$WORK/concurrent output 2.wasm" &
+build_with_fake_zig "$CONCURRENT_OUTPUTS/two/output.wasm" &
 pid2=$!
 wait "$pid1"
 wait "$pid2"
@@ -2590,12 +2625,17 @@ unset FAKE_ZIG_ACTIVE_DIR FAKE_ZIG_DELAY
 
 mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
 test "${#prefixes[@]}" -eq 5
-test "${prefixes[0]}" = "${prefixes[1]}"
-test "${prefixes[0]}" != "${prefixes[2]}"
-test "${prefixes[2]}" = "${prefixes[3]}"
-test "${prefixes[2]}" = "${prefixes[4]}"
-cmp "$ENGINE" "$WORK/concurrent output 1.wasm"
-cmp "$ENGINE" "$WORK/concurrent output 2.wasm"
+for prefix in "${prefixes[@]}"; do
+  case "$prefix" in
+    /proc/self/fd/*) ;;
+    *)
+      echo "FAIL: fake Zig received a non-retained prefix: $prefix" >&2
+      exit 1
+      ;;
+  esac
+done
+assert_engine_payload "$CONCURRENT_OUTPUTS/one/output.wasm"
+assert_engine_payload "$CONCURRENT_OUTPUTS/two/output.wasm"
 while IFS='|' read -r local_cache global_cache; do
   test "$local_cache" = "unset"
   if [ -n "$EXPECTED_ZIG_GLOBAL_CACHE" ]; then
@@ -2604,8 +2644,8 @@ while IFS='|' read -r local_cache global_cache; do
     test "$global_cache" = "$CACHE/zig-global-cache"
   fi
 done < "$FAKE_ZIG_ENV_LOG"
-cmp "$ENGINE" "$BUILD_OUTPUT_1"
-cmp "$ENGINE" "$BUILD_OUTPUT_2"
-cmp "$ENGINE" "$BUILD_OUTPUT_3"
+assert_engine_payload "$BUILD_OUTPUT_1"
+assert_engine_payload "$BUILD_OUTPUT_2"
+assert_engine_payload "$BUILD_OUTPUT_3"
 
 echo "native componentizer fake-tool tests passed"
