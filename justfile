@@ -35,13 +35,14 @@ build target="all" *flags:
         {{ quote(zig) }} build "${zig_step[@]}" --prefix '{{ builddir }}' \
             -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
         if [[ '{{ target }}' == starling ]]; then
-            output_dir='{{ builddir }}-outputs'
+            output_dir="${XDG_CACHE_HOME:-$HOME/.cache}/starling-aot-output-$$"
             mkdir -p "$output_dir"
             output="$output_dir/starling.wasm"
-            trap 'rm -f "$output"' EXIT
+            trap 'rm -rf "$output_dir"' EXIT
             '{{ builddir }}/bin/componentize.sh' \
                 --output "$output"
             mv "$output" '{{ builddir }}/starling.wasm'
+            rmdir "$output_dir"
             trap - EXIT
         fi
         exit
