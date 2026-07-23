@@ -28,6 +28,9 @@ if [[ $aot -ne 0 && "$aot_driver" == native ]]; then
   if [[ -d "$managed_dir" ]]; then
     package_dir="$managed_dir"
   fi
+  weval="${WEVAL:-$package_dir/weval}"
+  wabt="${WABT:-$package_dir/wabt}"
+  wasm_tools="${WASM_TOOLS:-$package_dir/wasm-tools}"
   aot_args=(
     --aot
     --legacy-wrapper-preopen
