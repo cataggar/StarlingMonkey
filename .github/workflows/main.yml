@@ -156,6 +156,9 @@ jobs:
     - name: Build AOT dependencies
       run: ./deps/build-deps.sh --all
 
+    - name: Fetch pinned Zig dependencies
+      run: zig build --fetch=all
+
     - name: Build and test sealed AOT runtime
       run: |
         just builddir=zig-out-aot aot-test
