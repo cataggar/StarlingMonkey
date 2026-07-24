@@ -75,6 +75,7 @@ for version in "${VERSIONS[@]}"; do
       WASM_TOOLS_BIN="$runtime/wasm-tools" \
         "$runtime/componentize.sh" "$FIXTURE" -o "$component"
       native_component="$prefix/pure-native.wasm"
+      native_metadata="$prefix/pure-native.metadata.json"
       native_cache="$SHARED_NATIVE_CACHE"
       WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
         --build-root "$ROOT" \
@@ -83,6 +84,7 @@ for version in "${VERSIONS[@]}"; do
         --wasmtime-bin "$runtime/wasmtime" \
         --wasm-tools-bin "$runtime/wasm-tools" \
         --disable stdio,random,clocks,http,fetch-event \
+        --metadata-out "$native_metadata" \
         --out "$native_component" \
         "$FIXTURE"
       # Native runtimes stay transaction-private; the cache records identity
@@ -91,13 +93,45 @@ for version in "${VERSIONS[@]}"; do
         -eq "$version_index"
       check_component "$version" "$runtime" "$native_component"
       external_component="$prefix/pure-external-engine.wasm"
+      external_metadata="$prefix/pure-external-engine.metadata.json"
       WASM_TOOLS_BIN="$runtime/wasm-tools" "$runtime/starling-componentize" \
         --engine "$runtime/starling-raw.wasm" \
         --wasmtime-bin "$runtime/wasmtime" \
         --wasm-tools-bin "$runtime/wasm-tools" \
+        --metadata-out "$external_metadata" \
         --out "$external_component" \
         "$FIXTURE"
       check_component "$version" "$runtime" "$external_component"
+      python3 - "$native_metadata" "$external_metadata" "$version" <<'PY'
+import json
+import re
+import sys
+
+native, external = [
+    json.load(open(path, encoding="utf-8"))["provenance"]
+    for path in sys.argv[1:3]
+]
+for provenance in (native, external):
+    assert provenance["dispatch_world"]["name"] == "caller", provenance
+    assert provenance["component_world"]["name"] == "bindings", provenance
+    assert [(feature["name"], feature["enabled"])
+            for feature in provenance["features"]] == [
+        ("stdio", False),
+        ("random", False),
+        ("clocks", False),
+        ("http", False),
+        ("fetch-event", False),
+    ], provenance
+    for field in ("worlds_sha256", "features_sha256"):
+        assert re.fullmatch(r"[0-9a-f]{64}", provenance[field]), provenance
+    for world in ("dispatch_world", "component_world"):
+        assert re.fullmatch(
+            r"[0-9a-f]{64}", provenance[world]["wit_sha256"]
+        ), provenance
+for field in ("dispatch_world", "component_world",
+              "worlds_sha256", "features", "features_sha256"):
+    assert native[field] == external[field], (sys.argv[3], field)
+PY
       ;;
     cmake)
       prefix="$BUILD_ROOT/wasi-$version"

@@ -20,12 +20,15 @@ WORK="$CACHE/work with spaces"
 WIZER_OUTPUT="$WORK/wizer component.wasm"
 AOT_OUTPUT="$WORK/aot component.wasm"
 AOT_CACHED_OUTPUT="$WORK/aot cached component.wasm"
+AOT_RETAINED_OUTPUT="$WORK/aot retained closure component.wasm"
 AOT_REPRIMED_OUTPUT="$WORK/aot reprimed component.wasm"
 AOT_RUNTIME_OUTPUT="$WORK/aot runtime component.wasm"
 AOT_RUNTIME_INVOKE_OUTPUT="$WORK/aot runtime invocation component.wasm"
 SOURCE="$ROOT/tests/fixtures/js-dispatch.js"
 PRIMER="$ROOT/tools/componentizer/aot-cache-primer.js"
 PRIMER_BACKUP="$CACHE/aot-cache-primer.js.original"
+WEVAL_PACKAGE="$(dirname "$(realpath "$WEVAL")")"
+WEVAL_PACKAGE_BACKUP="${WEVAL_PACKAGE}.retained-test-backup"
 
 if [ -e "$CACHE" ]; then
   chmod -R u+w "$CACHE" 2>/dev/null || true
@@ -34,6 +37,10 @@ fi
 mkdir -p "$WORK"
 cp -p "$PRIMER" "$PRIMER_BACKUP"
 cleanup() {
+  if [ -e "$WEVAL_PACKAGE_BACKUP" ]; then
+    rm -rf "$WEVAL_PACKAGE"
+    mv "$WEVAL_PACKAGE_BACKUP" "$WEVAL_PACKAGE"
+  fi
   cp -p "$PRIMER_BACKUP" "$PRIMER"
   chmod -R u+w "$CACHE" 2>/dev/null || true
   rm -rf "$CACHE"
@@ -105,6 +112,41 @@ AOT_BUNDLE="$(dirname "${manifests[0]}")"
 test -s "$AOT_BUNDLE/starling-raw.wasm"
 test -s "$AOT_BUNDLE/starling-ics.wevalcache"
 grep -Fq 'engine_abi=spidermonkey-pbl-weval-aot-ics-v1' "${manifests[0]}"
+
+RETAINED_HOOK="$CACHE/retained closure hook"
+RETAINED_LOG="$CACHE/retained closure.log"
+mkdir "$RETAINED_HOOK"
+(
+  export STARLING_COMPONENTIZER_TEST_HOOK_DIR="$RETAINED_HOOK"
+  export STARLING_COMPONENTIZER_TEST_WAIT_AT=retained-environment-captured-weval
+  componentize aot "$AOT_RETAINED_OUTPUT"
+) >"$RETAINED_LOG" 2>&1 &
+retained_pid=$!
+for _ in $(seq 1 6000); do
+  test -e "$RETAINED_HOOK/retained-environment-captured-weval.ready" && break
+  kill -0 "$retained_pid" 2>/dev/null || {
+    cat "$RETAINED_LOG" >&2
+    wait "$retained_pid"
+  }
+  sleep 0.1
+done
+test -e "$RETAINED_HOOK/retained-environment-captured-weval.ready"
+mv "$WEVAL_PACKAGE" "$WEVAL_PACKAGE_BACKUP"
+mkdir "$WEVAL_PACKAGE"
+printf '#!/bin/sh\nexit 127\n' > "$WEVAL_PACKAGE/$(basename "$WEVAL")"
+chmod +x "$WEVAL_PACKAGE/$(basename "$WEVAL")"
+touch "$RETAINED_HOOK/retained-environment-captured-weval.continue"
+if ! wait "$retained_pid"; then
+  cat "$RETAINED_LOG" >&2
+  exit 1
+fi
+rm -rf "$WEVAL_PACKAGE"
+mv "$WEVAL_PACKAGE_BACKUP" "$WEVAL_PACKAGE"
+! grep -Eq 'exit(ed with code)? 127|UnsupportedRetainedExecution' "$RETAINED_LOG"
+"$WASM_TOOLS" validate --features all "$AOT_RETAINED_OUTPUT"
+test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' \
+  "$AOT_RETAINED_OUTPUT")" = 5
+echo "Published-cache Weval execution used only its retained closure"
 
 prime_clean_cache() {
   local directory="$1" primer="$2"

@@ -12529,4 +12529,25 @@ test "engine provenance requires a complete feature and topology tuple" {
             "{\"schema\":1,\"sha256\":\"short\"}",
         ),
     );
+    try std.testing.expectError(
+        error.InvalidMetadata,
+        parseEngineProvenance(
+            std.testing.allocator,
+            "schema=1\n" ++
+                "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
+                "host-api=wasi-0.2.3\nfeatures=01001\n" ++
+                "component-world=custom-bindings\nsurface-world=caller\n",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidMetadata,
+        parseEngineProvenance(
+            std.testing.allocator,
+            "{\"schema\":1," ++
+                "\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"," ++
+                "\"host_api\":\"wasi-0.2.3\"," ++
+                "\"features\":{\"stdio\":false,\"random\":true,\"clocks\":false,\"http\":false}," ++
+                "\"component_world\":\"custom-bindings\",\"surface_world\":\"caller\"}",
+        ),
+    );
 }

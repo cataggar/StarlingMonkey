@@ -47,6 +47,7 @@ grep -q '"component-world": "custom-bindings"' \
 
 NATIVE_CACHE="$BUILD_ROOT/native componentizer cache"
 NATIVE_COMPONENT="$BUILD_ROOT/native custom component.wasm"
+NATIVE_METADATA="$BUILD_ROOT/native custom metadata.json"
 WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   "$ZIG_PREFIX/bin/starling-componentize" \
   --build-root "$ROOT" \
@@ -54,6 +55,7 @@ WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   --zig-bin "$ZIG" \
   --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
   --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
+  --metadata-out "$NATIVE_METADATA" \
   --out "$NATIVE_COMPONENT" \
   "$FIXTURE"
 "$ZIG_PREFIX/bin/wasm-tools" validate --features all "$NATIVE_COMPONENT"
@@ -71,22 +73,54 @@ import pathlib
 import sys
 
 module = pathlib.Path(sys.argv[1]).read_bytes()
-assert b"component-world=custom-bindings\n" in module
-assert b"component-world=bindings\n" not in module
+assert b'"component_world":"custom-bindings"' in module
+assert b'"component_world":"bindings"' not in module
 PY
 
 EXTERNAL_COMPONENT="$BUILD_ROOT/native external custom component.wasm"
+EXTERNAL_METADATA="$BUILD_ROOT/native external custom metadata.json"
 WASM_TOOLS_BIN="$ZIG_PREFIX/bin/wasm-tools" \
   "$ZIG_PREFIX/bin/starling-componentize" \
   --engine "$RELEASE_RUNTIME/starling-raw.wasm" \
   --wasmtime-bin "$ZIG_PREFIX/bin/wasmtime" \
   --wasm-tools-bin "$ZIG_PREFIX/bin/wasm-tools" \
+  --metadata-out "$EXTERNAL_METADATA" \
   --out "$EXTERNAL_COMPONENT" \
   "$FIXTURE"
 "$ZIG_PREFIX/bin/wasm-tools" validate --features all "$EXTERNAL_COMPONENT"
 EXTERNAL_WIT="$BUILD_ROOT/native external custom component.wit"
 "$ZIG_PREFIX/bin/wasm-tools" component wit "$EXTERNAL_COMPONENT" \
   -o "$EXTERNAL_WIT"
+python3 - "$NATIVE_METADATA" "$EXTERNAL_METADATA" <<'PY'
+import json
+import re
+import sys
+
+native, external = [
+    json.load(open(path, encoding="utf-8"))["provenance"]
+    for path in sys.argv[1:]
+]
+for provenance in (native, external):
+    assert provenance["dispatch_world"]["name"] == "caller", provenance
+    assert provenance["component_world"]["name"] == "custom-bindings", provenance
+    assert [(feature["name"], feature["enabled"])
+            for feature in provenance["features"]] == [
+        ("stdio", True),
+        ("random", True),
+        ("clocks", True),
+        ("http", True),
+        ("fetch-event", True),
+    ], provenance
+    for field in ("worlds_sha256", "features_sha256"):
+        assert re.fullmatch(r"[0-9a-f]{64}", provenance[field]), provenance
+    for world in ("dispatch_world", "component_world"):
+        assert re.fullmatch(
+            r"[0-9a-f]{64}", provenance[world]["wit_sha256"]
+        ), provenance
+for field in ("dispatch_world", "component_world",
+              "worlds_sha256", "features", "features_sha256"):
+    assert native[field] == external[field], (field, native[field], external[field])
+PY
 python3 "$ROOT/tests/feature-selection/check-production-surface.py" \
   "$ROOT/tests/feature-selection/reference/expected/import-surfaces.json" \
   defaults \

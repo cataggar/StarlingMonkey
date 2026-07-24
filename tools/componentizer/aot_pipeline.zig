@@ -388,6 +388,34 @@ fn retainedExecHelper(
         propagation: u64,
         userns_fd: u64,
     };
+    var mount_attr: MountAttr = .{
+        .attr_set = 0x2 | 0x4 | 0x8,
+        .attr_clr = 0,
+        .propagation = 0,
+        .userns_fd = 0,
+    };
+    switch (linux.errno(linux.syscall5(
+        .mount_setattr,
+        @as(u32, @bitCast(@as(i32, linux.AT.FDCWD))),
+        @intFromPtr(host_path_z.ptr),
+        linux.AT.RECURSIVE,
+        @intFromPtr(&mount_attr),
+        @sizeOf(MountAttr),
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    switch (linux.errno(linux.mount(
+        null,
+        host_path_z,
+        null,
+        linux.MS.BIND | linux.MS.REMOUNT | linux.MS.NOEXEC |
+            linux.MS.NOSUID | linux.MS.NODEV,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
     for (exec_args[1..], 1..) |arg, arg_index| {
         if (!std.mem.eql(u8, exec_args[arg_index - 1], "--dir")) continue;
         const separator = std.mem.indexOf(u8, arg, "::") orelse continue;
@@ -417,65 +445,28 @@ fn retainedExecHelper(
             allocator,
             &.{ host_path, guest_path[1..] },
         );
-        var target = try Dir.openDirAbsolute(io, target_path, .{
+        var target_probe = try Dir.openDirAbsolute(io, target_path, .{
             .iterate = true,
             .follow_symlinks = false,
         });
-        defer target.close(io);
+        target_probe.close(io);
         const target_path_z = try allocator.dupeSentinel(u8, target_path, 0);
-        var source_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const source_length = try Dir.cwd().readLink(
-            io,
-            source_path,
-            &source_buffer,
-        );
-        const resolved_source = source_buffer[0..source_length];
-        if (!std.fs.path.isAbsolute(resolved_source))
-            return error.UnsupportedRetainedExecution;
-        const source_path_z = try allocator.dupeSentinel(
-            u8,
-            resolved_source,
-            0,
-        );
-        switch (linux.errno(linux.mount(
-            source_path_z,
-            target_path_z,
-            null,
-            linux.MS.BIND | linux.MS.REC,
-            0,
-        ))) {
+        try stageRetainedDirectory(io, source_fd, target_path_z);
+        var retained_mount_attr = mount_attr;
+        retained_mount_attr.attr_set |= 0x1;
+        const retained_attr_error = linux.errno(linux.syscall5(
+            .mount_setattr,
+            @as(u32, @bitCast(@as(i32, linux.AT.FDCWD))),
+            @intFromPtr(target_path_z.ptr),
+            linux.AT.RECURSIVE,
+            @intFromPtr(&retained_mount_attr),
+            @sizeOf(MountAttr),
+        ));
+        switch (retained_attr_error) {
             .SUCCESS => {},
             else => return error.UnsupportedRetainedExecution,
         }
         exec_args[arg_index] = guest_path;
-    }
-    var mount_attr: MountAttr = .{
-        .attr_set = 0x2 | 0x4 | 0x8,
-        .attr_clr = 0,
-        .propagation = 0,
-        .userns_fd = 0,
-    };
-    switch (linux.errno(linux.syscall5(
-        .mount_setattr,
-        @as(u32, @bitCast(@as(i32, linux.AT.FDCWD))),
-        @intFromPtr(host_path_z.ptr),
-        linux.AT.RECURSIVE,
-        @intFromPtr(&mount_attr),
-        @sizeOf(MountAttr),
-    ))) {
-        .SUCCESS => {},
-        else => return error.UnsupportedRetainedExecution,
-    }
-    switch (linux.errno(linux.mount(
-        null,
-        host_path_z,
-        null,
-        linux.MS.BIND | linux.MS.REMOUNT | linux.MS.NOEXEC |
-            linux.MS.NOSUID | linux.MS.NODEV,
-        0,
-    ))) {
-        .SUCCESS => {},
-        else => return error.UnsupportedRetainedExecution,
     }
     var host_root = try Dir.openDirAbsolute(io, "/", .{
         .iterate = true,
@@ -3756,6 +3747,136 @@ fn retainedDescriptor(value: []const u8) !std.posix.fd_t {
     ) catch return error.UnsupportedRetainedExecution;
     if (descriptor < 3) return error.UnsupportedRetainedExecution;
     return descriptor;
+}
+
+fn stageRetainedDirectory(
+    io: Io,
+    descriptor: std.posix.fd_t,
+    target: [:0]const u8,
+) !void {
+    if (builtin.os.tag != .linux or descriptor < 3)
+        return error.UnsupportedRetainedExecution;
+    const linux = std.os.linux;
+    switch (linux.errno(linux.mount(
+        "starling-retained-input",
+        target.ptr,
+        "tmpfs",
+        linux.MS.NOEXEC | linux.MS.NOSUID | linux.MS.NODEV,
+        0,
+    ))) {
+        .SUCCESS => {},
+        else => return error.UnsupportedRetainedExecution,
+    }
+    const source: Dir = .{ .handle = descriptor };
+    var destination = try Dir.openDirAbsolute(io, target, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer destination.close(io);
+    var entries: usize = 0;
+    try copyRetainedDirectory(io, source, destination, 0, &entries);
+}
+
+fn copyRetainedDirectory(
+    io: Io,
+    source: Dir,
+    destination: Dir,
+    depth: usize,
+    entries: *usize,
+) !void {
+    if (depth > 128) return error.UnsupportedRetainedExecution;
+    var iterator = source.iterate();
+    while (try iterator.next(io)) |entry| {
+        entries.* += 1;
+        if (entries.* > 100_000)
+            return error.UnsupportedRetainedExecution;
+        switch (entry.kind) {
+            .directory => {
+                try destination.createDir(
+                    io,
+                    entry.name,
+                    File.Permissions.fromMode(0o700),
+                );
+                var source_child = try source.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer source_child.close(io);
+                var destination_child = try destination.openDir(
+                    io,
+                    entry.name,
+                    .{
+                        .iterate = true,
+                        .follow_symlinks = false,
+                    },
+                );
+                defer destination_child.close(io);
+                try copyRetainedDirectory(
+                    io,
+                    source_child,
+                    destination_child,
+                    depth + 1,
+                    entries,
+                );
+                const stat = try source_child.stat(io);
+                try destination_child.setPermissions(
+                    io,
+                    File.Permissions.fromMode(
+                        stat.permissions.toMode() & 0o555,
+                    ),
+                );
+            },
+            .file => {
+                var input = try source.openFile(io, entry.name, .{
+                    .follow_symlinks = false,
+                });
+                defer input.close(io);
+                const stat = try input.stat(io);
+                if (stat.kind != .file)
+                    return error.UnsupportedRetainedExecution;
+                var output = try destination.createFile(io, entry.name, .{
+                    .read = true,
+                    .truncate = true,
+                });
+                defer output.close(io);
+                var buffer: [64 * 1024]u8 = undefined;
+                var offset: u64 = 0;
+                while (offset < stat.size) {
+                    const count = try input.readPositional(
+                        io,
+                        &.{&buffer},
+                        offset,
+                    );
+                    if (count == 0) return error.TransactionChanged;
+                    try output.writePositionalAll(
+                        io,
+                        buffer[0..count],
+                        offset,
+                    );
+                    offset += count;
+                }
+                try output.setPermissions(
+                    io,
+                    File.Permissions.fromMode(
+                        stat.permissions.toMode() & 0o555,
+                    ),
+                );
+                try output.sync(io);
+            },
+            .sym_link => {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const length = try source.readLink(io, entry.name, &buffer);
+                try destination.symLink(
+                    io,
+                    buffer[0..length],
+                    entry.name,
+                    .{},
+                );
+            },
+            else => return error.UnsupportedRetainedExecution,
+        }
+    }
+    try syncPackageDirectory(io, destination);
 }
 
 fn appendRetainedDescriptors(

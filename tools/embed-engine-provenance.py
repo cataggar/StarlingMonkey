@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import hashlib
+import json
 import pathlib
 import re
 import sys
@@ -91,13 +92,22 @@ def main() -> None:
 
     base = without_existing_provenance(pathlib.Path(source).read_bytes())
     digest = hashlib.sha256(base).hexdigest()
-    metadata = (
-        "schema=1\n"
-        f"sha256={digest}\n"
-        f"host-api={host_api}\n"
-        f"features={features}\n"
-        f"component-world={component_world}\n"
-        f"surface-world={surface_world}\n"
+    metadata = json.dumps(
+        {
+            "schema": 1,
+            "sha256": digest,
+            "host_api": host_api,
+            "features": {
+                "stdio": features[0] == "1",
+                "random": features[1] == "1",
+                "clocks": features[2] == "1",
+                "http": features[3] == "1",
+                "fetch-event": features[4] == "1",
+            },
+            "component_world": component_world,
+            "surface_world": surface_world,
+        },
+        separators=(",", ":"),
     ).encode()
     custom_payload = write_uleb(len(SECTION_NAME)) + SECTION_NAME + metadata
     section = b"\0" + write_uleb(len(custom_payload)) + custom_payload
