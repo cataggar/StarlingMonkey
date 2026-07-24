@@ -11,20 +11,6 @@ pub fn main(init: std.process.Init) !void {
             .{args[0]},
         );
     }
-    const json = try std.fmt.allocPrint(
-        allocator,
-        "{{\"schema\":1,\"host_api\":\"{s}\",\"features\":{{\"stdio\":{s},\"random\":{s},\"clocks\":{s},\"http\":{s},\"fetch-event\":{s}}},\"component_world\":\"{s}\",\"surface_world\":\"{s}\"}}",
-        .{
-            args[3],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[4],
-            args[5],
-        },
-    );
     const Dir = std.Io.Dir;
     var input = try Dir.cwd().openFile(init.io, args[1], .{});
     defer input.close(init.io);
@@ -36,6 +22,7 @@ pub fn main(init: std.process.Init) !void {
 
     const stat = try input.stat(init.io);
     var offset: u64 = 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     while (offset < stat.size) {
         const count = try input.readPositional(
@@ -44,9 +31,28 @@ pub fn main(init: std.process.Init) !void {
             offset,
         );
         if (count == 0) return error.UnexpectedEndOfFile;
+        hasher.update(buffer[0..count]);
         try output.writePositionalAll(init.io, buffer[0..count], offset);
         offset += count;
     }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"sha256\":\"{s}\",\"host_api\":\"{s}\",\"features\":{{\"stdio\":{s},\"random\":{s},\"clocks\":{s},\"http\":{s},\"fetch-event\":{s}}},\"component_world\":\"{s}\",\"surface_world\":\"{s}\"}}",
+        .{
+            &digest_hex,
+            args[3],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[4],
+            args[5],
+        },
+    );
 
     const name_length = encodeUleb(section_name.len);
     const payload_length = name_length.len + section_name.len + json.len;

@@ -3527,11 +3527,18 @@ pub fn publishPrefixDirectory(
     hooks: SealHooks,
 ) !void {
     const target_absolute = try absoluteSealPath(allocator, io, target_path);
-    try Dir.cwd().createDirPath(io, target_absolute);
-    var prefix = Dir.openDirAbsolute(io, target_absolute, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch return error.InstallOwnershipConflict;
+    var prefix = if (isProcDescriptorPath(target_absolute))
+        Dir.openDirAbsolute(io, target_absolute, .{
+            .iterate = true,
+            .follow_symlinks = true,
+        }) catch return error.InstallOwnershipConflict
+    else blk: {
+        try Dir.cwd().createDirPath(io, target_absolute);
+        break :blk Dir.openDirAbsolute(io, target_absolute, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch return error.InstallOwnershipConflict;
+    };
     defer prefix.close(io);
     if ((try prefix.stat(io)).kind != .directory)
         return error.InstallOwnershipConflict;
@@ -3573,6 +3580,22 @@ pub fn publishPrefixDirectory(
         managed,
         expected,
     );
+}
+
+fn isProcDescriptorPath(path: []const u8) bool {
+    var components = std.mem.splitScalar(u8, path, '/');
+    if (!std.mem.eql(u8, components.next() orelse return false, "")) return false;
+    if (!std.mem.eql(u8, components.next() orelse return false, "proc")) return false;
+    const process = components.next() orelse return false;
+    if (!std.mem.eql(u8, process, "self")) {
+        if (process.len == 0) return false;
+        for (process) |byte| if (!std.ascii.isDigit(byte)) return false;
+    }
+    if (!std.mem.eql(u8, components.next() orelse return false, "fd")) return false;
+    const descriptor = components.next() orelse return false;
+    if (descriptor.len == 0) return false;
+    for (descriptor) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return components.next() == null;
 }
 
 const ManagedPrefixEntries = struct {
@@ -3883,7 +3906,7 @@ fn ensureManagedPrefixOwnership(
     );
 }
 
-fn publishGenerationDirectory(
+pub fn publishGenerationDirectory(
     allocator: Allocator,
     io: Io,
     target_path: []const u8,
@@ -5090,7 +5113,29 @@ fn removeBundleStage(io: Io, parent: Dir, record: BundleRecord) !void {
     else
         record.new_inode;
     if (inode.? != expected) return error.TransactionRecoveryRequired;
+    var stage = try parent.openDir(io, record.stage_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer stage.close(io);
+    try makeDirectoryTreeWritable(io, stage);
+    if (try targetDirectoryInode(io, parent, record.stage_name) != expected)
+        return error.TransactionRecoveryRequired;
     try parent.deleteTree(io, record.stage_name);
+}
+
+fn makeDirectoryTreeWritable(io: Io, directory: Dir) !void {
+    try directory.setPermissions(io, File.Permissions.fromMode(0o700));
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        var child = try directory.openDir(io, entry.name, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        defer child.close(io);
+        try makeDirectoryTreeWritable(io, child);
+    }
 }
 
 fn replacePrivateFile(

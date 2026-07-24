@@ -412,6 +412,17 @@ pub fn build(b: *std.Build) void {
     aot_componentizer_test_step.dependOn(aot_seal_alias_test_step);
     aot_componentizer_test_step.dependOn(aot_seal_transaction_test_step);
     aot_componentizer_test_step.dependOn(aot_shell_test_step);
+    const runtime_closure_regression = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-runtime-build-closure-regressions.sh" },
+    );
+    runtime_closure_regression.addFileArg(
+        b.path("tests/componentizer/run-runtime-build-closure.sh"),
+    );
+    runtime_closure_regression.addFileArg(
+        b.path("tools/componentizer/runtime-build-inputs.txt"),
+    );
+    runtime_closure_regression.addArg("zig");
+    aot_componentizer_test_step.dependOn(&runtime_closure_regression.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
     );
@@ -451,7 +462,10 @@ pub fn build(b: *std.Build) void {
         &.{ "bash", "tests/componentizer/run-aot.sh" },
     );
     aot_engine_test.addArtifactArg(componentizer);
-    aot_engine_test.addArg(b.graph.zig_exe);
+    // A cached Zig build runner retains b.graph.zig_exe from the runner that
+    // compiled it. Resolve the active, exact-version toolchain when this
+    // command executes instead of embedding an ephemeral setup-zig path.
+    aot_engine_test.addArg("zig");
     if (b.lazyDependency("wasmtime", .{})) |dep| {
         aot_engine_test.addFileArg(dep.path("wasmtime"));
     }
@@ -470,6 +484,14 @@ pub fn build(b: *std.Build) void {
         aot_engine_test.addFileArg(dep.path("weval"));
     }
     aot_engine_test.addArtifactArg(aot_cache_tool);
+    const runtime_closure_check = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-runtime-build-closure.sh" },
+    );
+    runtime_closure_check.addFileArg(
+        b.path("tools/componentizer/runtime-build-inputs.txt"),
+    );
+    runtime_closure_check.addArg("zig");
+    aot_engine_test.step.dependOn(&runtime_closure_check.step);
     aot_engine_test_step.dependOn(&aot_engine_test.step);
 
     // StarlingMonkey only targets wasm32-wasi (reactor).

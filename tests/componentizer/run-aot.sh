@@ -7,7 +7,7 @@ if [ "$#" -ne 8 ]; then
 fi
 
 COMPONENTIZER="$1"
-ZIG="$2"
+ZIG="${STARLING_ZIG:-$2}"
 WASMTIME="$3"
 WASM_TOOLS="$4"
 WABT="$5"
@@ -291,12 +291,26 @@ componentize aot "$AOT_REPRIMED_OUTPUT"
 "$WASM_TOOLS" validate --features all "$AOT_REPRIMED_OUTPUT"
 test "$("$WASMTIME" run -S cli -S http --invoke 'add(2, 3)' "$AOT_REPRIMED_OUTPUT")" = 5
 
-NEW_CACHE_SHA="$(sha256sum "$AOT_BUNDLE/starling-ics.wevalcache" | cut -d ' ' -f 1)"
-NEW_MANIFEST_CACHE_SHA="$(sed -n 's/^cache_sha256=//p' "${manifests[0]}")"
-NEW_MANIFEST_PRIMER_SHA="$(sed -n 's/^primer_sha256=//p' "${manifests[0]}")"
+NEW_PRIMER_SHA="$(sha256sum "$PRIMER" | cut -d ' ' -f 1)"
+NEW_MANIFEST=
+NEW_MANIFEST_COUNT=0
+while IFS= read -r manifest; do
+  if test "$(sed -n 's/^primer_sha256=//p' "$manifest")" = "$NEW_PRIMER_SHA"; then
+    NEW_MANIFEST="$manifest"
+    NEW_MANIFEST_COUNT=$((NEW_MANIFEST_COUNT + 1))
+  fi
+done < <(
+  find "$CACHE/runtime cache/runtimes" \
+    -name starling-ics.wevalcache.manifest -type f
+)
+test "$NEW_MANIFEST_COUNT" -eq 1
+NEW_AOT_BUNDLE="$(dirname "$NEW_MANIFEST")"
+NEW_CACHE_SHA="$(sha256sum "$NEW_AOT_BUNDLE/starling-ics.wevalcache" | cut -d ' ' -f 1)"
+NEW_MANIFEST_CACHE_SHA="$(sed -n 's/^cache_sha256=//p' "$NEW_MANIFEST")"
+NEW_MANIFEST_PRIMER_SHA="$(sed -n 's/^primer_sha256=//p' "$NEW_MANIFEST")"
 test "$NEW_CACHE_SHA" != "$OLD_CACHE_SHA"
 test "$NEW_MANIFEST_CACHE_SHA" = "$NEW_CACHE_SHA"
 test "$NEW_MANIFEST_PRIMER_SHA" != "$OLD_PRIMER_SHA"
-test "$NEW_MANIFEST_PRIMER_SHA" = "$(sha256sum "$PRIMER" | cut -d ' ' -f 1)"
+test "$NEW_MANIFEST_PRIMER_SHA" = "$NEW_PRIMER_SHA"
 
 echo "Wizer/AOT behavioral equivalence passed"

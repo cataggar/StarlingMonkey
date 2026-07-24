@@ -332,6 +332,7 @@ done
 printf '%s\n' "$prefix" >> "$FAKE_ZIG_PREFIX_LOG"
 printf '%s|%s\n' "${ZIG_LOCAL_CACHE_DIR-unset}" "$ZIG_GLOBAL_CACHE_DIR" \
   >> "$FAKE_ZIG_ENV_LOG"
+bash -c 'test -d "$1"' _ "$prefix"
 mkdir -p "$prefix/bin"
 cp "$FAKE_ENGINE" "$prefix/bin/starling-raw.wasm"
 cp "$FAKE_ADAPTER" "$prefix/bin/preview1-adapter.wasm"
@@ -2629,7 +2630,7 @@ mapfile -t prefixes < "$FAKE_ZIG_PREFIX_LOG"
 test "${#prefixes[@]}" -eq 5
 for prefix in "${prefixes[@]}"; do
   case "$prefix" in
-    /proc/self/fd/*) ;;
+    /proc/[0-9]*/fd/[0-9]*) ;;
     *)
       echo "FAIL: fake Zig received a non-retained prefix: $prefix" >&2
       exit 1

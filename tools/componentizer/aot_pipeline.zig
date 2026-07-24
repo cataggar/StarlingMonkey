@@ -329,6 +329,10 @@ fn retainedExecHelper(
     if (args.len < 6 + entry_args + 2 or
         !std.mem.eql(u8, args[6 + entry_args], "--"))
         return error.UnsupportedRetainedExecution;
+    const child_args = args[7 + entry_args ..];
+    if (child_args.len == 0)
+        return error.UnsupportedRetainedExecution;
+    const exec_args = try allocator.dupe([]const u8, child_args);
     const linux = std.os.linux;
     const original_cwd = try std.process.currentPathAlloc(io, allocator);
     try enterPrivateUserMountNamespace(io);
@@ -384,6 +388,67 @@ fn retainedExecHelper(
         propagation: u64,
         userns_fd: u64,
     };
+    for (exec_args[1..], 1..) |arg, arg_index| {
+        if (!std.mem.eql(u8, exec_args[arg_index - 1], "--dir")) continue;
+        const separator = std.mem.indexOf(u8, arg, "::") orelse continue;
+        if (std.mem.indexOfPos(u8, arg, separator + 2, "::") != null)
+            return error.UnsupportedRetainedExecution;
+        const source_path = arg[0..separator];
+        const guest_path = arg[separator + 2 ..];
+        const source_fd = try retainedDescriptor(source_path);
+        var retained = false;
+        for (retained_inputs) |fd| {
+            if (fd == source_fd) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained or
+            guest_path.len < 2 or
+            !std.fs.path.isAbsolute(guest_path))
+            return error.UnsupportedRetainedExecution;
+        const normalized_guest = try std.fs.path.resolve(
+            allocator,
+            &.{guest_path},
+        );
+        if (!std.mem.eql(u8, normalized_guest, guest_path))
+            return error.UnsupportedRetainedExecution;
+        const target_path = try std.fs.path.join(
+            allocator,
+            &.{ host_path, guest_path[1..] },
+        );
+        var target = try Dir.openDirAbsolute(io, target_path, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        defer target.close(io);
+        const target_path_z = try allocator.dupeSentinel(u8, target_path, 0);
+        var source_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const source_length = try Dir.cwd().readLink(
+            io,
+            source_path,
+            &source_buffer,
+        );
+        const resolved_source = source_buffer[0..source_length];
+        if (!std.fs.path.isAbsolute(resolved_source))
+            return error.UnsupportedRetainedExecution;
+        const source_path_z = try allocator.dupeSentinel(
+            u8,
+            resolved_source,
+            0,
+        );
+        switch (linux.errno(linux.mount(
+            source_path_z,
+            target_path_z,
+            null,
+            linux.MS.BIND | linux.MS.REC,
+            0,
+        ))) {
+            .SUCCESS => {},
+            else => return error.UnsupportedRetainedExecution,
+        }
+        exec_args[arg_index] = guest_path;
+    }
     var mount_attr: MountAttr = .{
         .attr_set = 0x2 | 0x4 | 0x8,
         .attr_clr = 0,
@@ -528,16 +593,13 @@ fn retainedExecHelper(
         allocator,
         &.{ "/", package_component, selected_relative },
     );
-    const child_args = args[7 + entry_args ..];
-    if (child_args.len == 0)
-        return error.UnsupportedRetainedExecution;
     var argv_z = try allocator.allocSentinel(
         ?[*:0]const u8,
-        child_args.len,
+        exec_args.len,
         null,
     );
     argv_z[0] = (try allocator.dupeSentinel(u8, selected_path, 0)).ptr;
-    for (child_args[1..], 1..) |arg, arg_index|
+    for (exec_args[1..], 1..) |arg, arg_index|
         argv_z[arg_index] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
     const envp: [*:null]const ?[*:0]const u8 = child_env orelse
         @ptrCast(std.c.environ);
@@ -553,7 +615,7 @@ fn retainedExecHelper(
         );
         var loader_argv = try allocator.allocSentinel(
             ?[*:0]const u8,
-            child_args.len + 8,
+            exec_args.len + 8,
             null,
         );
         const fixed = [_][]const u8{
@@ -570,7 +632,7 @@ fn retainedExecHelper(
         for (fixed, 0..) |arg, arg_index|
             loader_argv[arg_index] =
                 (try allocator.dupeSentinel(u8, arg, 0)).ptr;
-        for (child_args[1..], fixed.len..) |arg, arg_index|
+        for (exec_args[1..], fixed.len..) |arg, arg_index|
             loader_argv[arg_index] =
                 (try allocator.dupeSentinel(u8, arg, 0)).ptr;
         try closeUnallowlistedDescriptors(
@@ -3678,6 +3740,23 @@ pub const RetainedSnapshotExecutable = struct {
         return term;
     }
 };
+
+fn retainedDescriptor(value: []const u8) !std.posix.fd_t {
+    const prefix = "/proc/self/fd/";
+    if (!std.mem.startsWith(u8, value, prefix) or value.len == prefix.len)
+        return error.UnsupportedRetainedExecution;
+    for (value[prefix.len..]) |byte| {
+        if (!std.ascii.isDigit(byte))
+            return error.UnsupportedRetainedExecution;
+    }
+    const descriptor = std.fmt.parseInt(
+        std.posix.fd_t,
+        value[prefix.len..],
+        10,
+    ) catch return error.UnsupportedRetainedExecution;
+    if (descriptor < 3) return error.UnsupportedRetainedExecution;
+    return descriptor;
+}
 
 fn appendRetainedDescriptors(
     allocator: Allocator,

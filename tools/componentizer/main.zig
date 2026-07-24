@@ -1254,6 +1254,33 @@ const Transaction = struct {
         return child_path;
     }
 
+    fn retainStorageDirectoryForDescendants(
+        self: *Transaction,
+        allocator: Allocator,
+        io: Io,
+        path: []const u8,
+    ) ![]const u8 {
+        const child_path = try self.retainStorageDirectory(
+            allocator,
+            io,
+            path,
+        );
+        if (builtin.os.tag != .linux) return child_path;
+        for (self.child_anchors.items) |anchor| {
+            if (!std.mem.eql(u8, anchor.storage_path, path)) continue;
+            const directory = switch (anchor.handle) {
+                .directory => |value| value,
+                .file => return error.TransactionChanged,
+            };
+            return stableDescendantHandlePath(
+                allocator,
+                directory.handle,
+                child_path,
+            );
+        }
+        unreachable;
+    }
+
     fn sealChildOutput(
         self: *Transaction,
         allocator: Allocator,
@@ -2611,11 +2638,11 @@ fn execute(
     diagnostic.begin(.inputs);
     try validateConfiguredPaths(config);
     const cwd = try std.process.currentPathAlloc(io, allocator);
-    const source_argument = try absolutePath(
-        allocator,
-        cwd,
-        config.source orelse config.engine orelse return error.InvalidPath,
-    );
+    const configured_source = config.source orelse config.engine;
+    const source_argument = if (configured_source) |path|
+        try absolutePath(allocator, cwd, path)
+    else
+        try allocator.dupe(u8, cwd);
     const source_path = source_argument;
     try validateArgument(source_path);
     const initializer_path = if (config.initializer_script_path) |path|
@@ -2660,7 +2687,8 @@ fn execute(
         output_name,
         error.InvalidPath,
     );
-    if (std.mem.eql(u8, source_path, resolved_output) or
+    if ((configured_source != null and
+        std.mem.eql(u8, source_path, resolved_output)) or
         (initializer_path != null and
             std.mem.eql(u8, initializer_path.?, resolved_output)))
     {
@@ -2704,7 +2732,8 @@ fn execute(
             error.InvalidMetadataDestination,
         );
         if (std.mem.eql(u8, resolved, resolved_output) or
-            std.mem.eql(u8, resolved, source_path) or
+            (configured_source != null and
+                std.mem.eql(u8, resolved, source_path)) or
             (initializer_path != null and
                 std.mem.eql(u8, resolved, initializer_path.?)))
         {
@@ -2754,7 +2783,8 @@ fn execute(
             if (kind != .directory) return error.DebugOutputCollision;
         }
         if (pathContains(resolved, resolved_output) or
-            pathContains(resolved, source_path) or
+            (configured_source != null and
+                pathContains(resolved, source_path)) or
             (initializer_path != null and
                 pathContains(resolved, initializer_path.?)) or
             (metadata_output != null and pathContains(resolved, metadata_output.?)))
@@ -3329,7 +3359,7 @@ fn execute(
                     args.items,
                 cwd,
                 &pipeline_env,
-                runtime_args_child_path,
+                null,
                 config.verbose,
                 &command_log,
                 diagnostic,
@@ -3579,7 +3609,10 @@ fn execute(
         .target_wit = runtime.surface_target_wit,
         .target_world = runtime.surface_target_world,
         .features = runtime.features,
-        .runtime_config = .snapshotted,
+        .runtime_config = if (config.source != null)
+            .snapshotted
+        else
+            .external,
         .inspect_candidate = true,
         .cwd = cwd,
         .verbose = config.verbose,
@@ -4291,7 +4324,10 @@ fn loadEngineProvenance(
         );
         return error.MissingEngineProvenance;
     };
-    const parsed = parseEngineProvenance(section.metadata) catch |err| {
+    const parsed = parseEngineProvenance(
+        allocator,
+        section.metadata,
+    ) catch |err| {
         setExternalPackageDetail(
             diagnostic,
             "the external engine has malformed embedded feature/host provenance ({t})",
@@ -4440,51 +4476,56 @@ const ParsedEngineProvenance = struct {
     surface_world: []const u8,
 };
 
-fn parseEngineProvenance(provenance_metadata: []const u8) !ParsedEngineProvenance {
-    var lines = std.mem.splitScalar(u8, provenance_metadata, '\n');
-    if (!std.mem.eql(u8, lines.next() orelse return error.InvalidMetadata, "schema=1")) {
+const JsonEngineProvenance = struct {
+    schema: u32,
+    sha256: []const u8,
+    host_api: []const u8,
+    features: struct {
+        stdio: bool,
+        random: bool,
+        clocks: bool,
+        http: bool,
+        @"fetch-event": bool,
+    },
+    component_world: []const u8,
+    surface_world: []const u8,
+};
+
+fn parseEngineProvenance(
+    allocator: Allocator,
+    provenance_metadata: []const u8,
+) !ParsedEngineProvenance {
+    const parsed = std.json.parseFromSliceLeaky(
+        JsonEngineProvenance,
+        allocator,
+        provenance_metadata,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.InvalidMetadata;
+    if (parsed.schema != 1 or parsed.sha256.len != 64)
         return error.InvalidMetadata;
-    }
-    const digest = try metadataField(
-        lines.next() orelse return error.InvalidMetadata,
-        "sha256=",
-    );
-    if (digest.len != 64) return error.InvalidMetadata;
-    for (digest) |byte| {
+    for (parsed.sha256) |byte| {
         if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) {
             return error.InvalidMetadata;
         }
     }
-    const host_api = try metadataField(
-        lines.next() orelse return error.InvalidMetadata,
-        "host-api=",
-    );
-    const feature_tuple = try metadataField(
-        lines.next() orelse return error.InvalidMetadata,
-        "features=",
-    );
-    const component_world = try metadataField(
-        lines.next() orelse return error.InvalidMetadata,
-        "component-world=",
-    );
-    const surface_world = try metadataField(
-        lines.next() orelse return error.InvalidMetadata,
-        "surface-world=",
-    );
-    if ((lines.next() orelse return error.InvalidMetadata).len != 0 or
-        lines.next() != null or
-        !validMetadataValue(host_api) or
-        !validMetadataValue(component_world) or
-        !validMetadataValue(surface_world))
+    if (!validMetadataValue(parsed.host_api) or
+        !validMetadataValue(parsed.component_world) or
+        !validMetadataValue(parsed.surface_world))
     {
         return error.InvalidMetadata;
     }
     return .{
-        .sha256 = digest,
-        .host_api = host_api,
-        .features = try featuresFromTuple(feature_tuple),
-        .component_world = component_world,
-        .surface_world = surface_world,
+        .sha256 = parsed.sha256,
+        .host_api = parsed.host_api,
+        .features = .{
+            .stdio = parsed.features.stdio,
+            .random = parsed.features.random,
+            .clocks = parsed.features.clocks,
+            .http = parsed.features.http,
+            .fetch_event = parsed.features.@"fetch-event",
+        },
+        .component_world = parsed.component_world,
+        .surface_world = parsed.surface_world,
     };
 }
 
@@ -4802,7 +4843,7 @@ fn buildRuntime(
             .fromMode(0o700),
         );
     }
-    const prefix_child_path = try transaction.retainStorageDirectory(
+    const prefix_child_path = try transaction.retainStorageDirectoryForDescendants(
         allocator,
         io,
         "runtime-prefix",
@@ -4962,6 +5003,27 @@ fn buildRuntime(
         io,
         "runtime-prefix",
     );
+    const features = resolveFeatures(config);
+    if (config.aot) {
+        try aot_cache.publishGenerationDirectory(
+            allocator,
+            io,
+            try std.fs.path.join(allocator, &.{ prefix.path, "current" }),
+            try std.fs.path.join(
+                allocator,
+                &.{
+                    transaction.storage_path,
+                    "runtime-prefix/.starling-aot-engine/current",
+                },
+            ),
+            try expectedAotFeatureAbi(
+                allocator,
+                build_options.host_api,
+                features,
+            ),
+            .{},
+        );
+    }
     try verifyCacheLayout(
         cache,
         &runtimes,
@@ -5031,7 +5093,6 @@ fn buildRuntime(
     );
     try verifyNoSymlinkTree(io, cache_bin.directory);
 
-    const features = resolveFeatures(config);
     const platform_wit = try stageRuntimeWit(
         allocator,
         io,
@@ -5289,13 +5350,18 @@ fn prepareAotRuntime(
         config,
         default_dir,
     );
+    try transaction.ensureStorageDirPath(allocator, io, "aot-cache-inputs");
     const cache = captureInputFile(
         allocator,
         io,
         bundle.cache,
         try std.fs.path.join(
             allocator,
-            &.{ transaction.storage_path, aot_cache.cache_basename },
+            &.{
+                transaction.storage_path,
+                "aot-cache-inputs",
+                aot_cache.cache_basename,
+            },
         ),
         transaction,
         "AOT cache",
@@ -5306,7 +5372,11 @@ fn prepareAotRuntime(
         bundle.manifest,
         try std.fs.path.join(
             allocator,
-            &.{ transaction.storage_path, aot_cache.manifest_basename },
+            &.{
+                transaction.storage_path,
+                "aot-cache-inputs",
+                aot_cache.manifest_basename,
+            },
         ),
         transaction,
         "AOT cache manifest",
@@ -12149,6 +12219,20 @@ fn stableHandlePath(
     return std.fmt.allocPrint(allocator, "{s}/{d}", .{ prefix, handle });
 }
 
+fn stableDescendantHandlePath(
+    allocator: Allocator,
+    handle: std.posix.fd_t,
+    fallback: []const u8,
+) ![]const u8 {
+    if (builtin.os.tag != .linux)
+        return stableHandlePath(allocator, handle, fallback);
+    return std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ std.os.linux.getpid(), handle },
+    );
+}
+
 fn setDirectoryInherited(directory: Dir, inherited: bool) !void {
     return setHandleInherited(directory.handle, inherited);
 }
@@ -12210,7 +12294,7 @@ test "runtime arguments reject line injection" {
     try std.testing.expectError(
         error.UnrepresentableRuntimeArgument,
         renderRuntimeArgs(
-            std.testing.allocator,
+            std.heap.page_allocator,
             "/work",
             "/work/source.js",
             null,
@@ -12227,7 +12311,7 @@ test "runtime arguments reject parser-ambiguous whitespace and quoting" {
     try std.testing.expectError(
         error.UnrepresentableRuntimeArgument,
         renderRuntimeArgs(
-            std.testing.allocator,
+            std.heap.page_allocator,
             "/work",
             "/work/source.js",
             null,
@@ -12423,12 +12507,12 @@ test "runtime cache key includes the authoritative host API world" {
 
 test "engine provenance requires a complete feature and topology tuple" {
     const parsed = try parseEngineProvenance(
-        "schema=1\n" ++
-            "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
-            "host-api=wasi-0.2.3\n" ++
-            "features=01001\n" ++
-            "component-world=custom-bindings\n" ++
-            "surface-world=caller\n",
+        std.testing.allocator,
+        "{\"schema\":1," ++
+            "\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"," ++
+            "\"host_api\":\"wasi-0.2.3\"," ++
+            "\"features\":{\"stdio\":false,\"random\":true,\"clocks\":false,\"http\":false,\"fetch-event\":true}," ++
+            "\"component_world\":\"custom-bindings\",\"surface_world\":\"caller\"}",
     );
     try std.testing.expectEqualStrings("wasi-0.2.3", parsed.host_api);
     try std.testing.expect(!parsed.features.stdio);
@@ -12441,12 +12525,8 @@ test "engine provenance requires a complete feature and topology tuple" {
     try std.testing.expectError(
         error.InvalidMetadata,
         parseEngineProvenance(
-            "schema=1\n" ++
-                "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" ++
-                "host-api=wasi-0.2.3\n" ++
-                "features=1111\n" ++
-                "component-world=bindings\n" ++
-                "surface-world=caller\n",
+            std.testing.allocator,
+            "{\"schema\":1,\"sha256\":\"short\"}",
         ),
     );
 }

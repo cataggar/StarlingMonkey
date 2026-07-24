@@ -476,6 +476,16 @@ test -f "$BUILD_PREFIX/.starling-aot-engine/ownership.manifest"
 test -L "$BUILD_PREFIX/bin/starling-raw.wasm"
 BUILD_INODE="$(stat -c '%d:%i' "$BUILD_PREFIX")"
 
+DESCRIPTOR_PREFIX="$SCRATCH/descriptor anchored prefix"
+mkdir -p "$DESCRIPTOR_PREFIX/bin"
+exec {descriptor_prefix_fd}<"$DESCRIPTOR_PREFIX"
+"$PREFIX_A/bin/starling-aot-cache" publish-prefix \
+  --target "/proc/$$/fd/$descriptor_prefix_fd" \
+  --generation "$generation_a" \
+  --feature-abi package-race-A
+exec {descriptor_prefix_fd}<&-
+assert_prefix "$DESCRIPTOR_PREFIX" A
+
 for kind in dangling absolute escaping intermediate; do
   unsafe_generation="$(make_prefix_generation B "unsafe-$kind")"
   rm "$unsafe_generation/bin/wabt"
