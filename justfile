@@ -99,8 +99,7 @@ aot-build *flags:
 aot-test: aot-build
     {{ justdir }}/tests/componentizer/run-legacy-aot-targets.sh \
         {{ quote(zig) }} '{{ builddir }}'
-    {{ quote(zig) }} build componentizer-test --prefix '{{ builddir }}' \
-        -Doptimize=ReleaseSmall -Daot-engine=true
+    {{ quote(zig) }} build componentizer-test -Doptimize=ReleaseSmall
     {{ quote(zig) }} build aot-engine-test --prefix '{{ builddir }}' \
         -Doptimize=ReleaseSmall -Daot-engine=true
 
