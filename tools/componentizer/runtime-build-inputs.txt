@@ -14,6 +14,9 @@ deps/openssl-zig/libx32/libcrypto.a
 deps/sm-obj-zig/dist/include
 deps/sm-obj-zig/dist/libspidermonkey.a
 deps/sm-obj-zig/js/src/js-confdefs.h
+deps/sm-obj-zig-aot/dist/include
+deps/sm-obj-zig-aot/dist/libspidermonkey.a
+deps/sm-obj-zig-aot/js/src/js-confdefs.h
 target/wasm32-wasip1/release/librust_staticlib.a
 zig-pkg
 LICENSE
