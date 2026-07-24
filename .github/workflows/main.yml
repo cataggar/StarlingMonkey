@@ -153,6 +153,20 @@ jobs:
     - name: Install cbindgen
       run: cargo install cbindgen --locked --version 0.29.3
 
+    - name: Permit retained AOT user namespaces
+      run: |
+        if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; then
+          sudo tee /etc/apparmor.d/starling-componentizer-ci >/dev/null <<EOF
+        abi <abi/4.0>,
+        include <tunables/global>
+
+        profile starling-componentizer-ci "${GITHUB_WORKSPACE}/**/starling-componentize" flags=(unconfined) {
+          userns,
+        }
+        EOF
+          sudo apparmor_parser -r -W /etc/apparmor.d/starling-componentizer-ci
+        fi
+
     - name: Build AOT dependencies
       run: ./deps/build-deps.sh --all
 
