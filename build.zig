@@ -401,6 +401,18 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("wasm-tools", .{})) |dep|
         aot_fake_orchestration.addFileArg(dep.path("wasm-tools"));
     componentizer_test_step.dependOn(&aot_fake_orchestration.step);
+    const aot_componentizer_test_step = b.step(
+        "aot-componentizer-test",
+        "Run focused componentizer units and AOT orchestration gates",
+    );
+    aot_componentizer_test_step.dependOn(&run_componentizer_tests.step);
+    aot_componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
+    aot_componentizer_test_step.dependOn(&run_feature_surface_tests.step);
+    aot_componentizer_test_step.dependOn(&aot_fake_orchestration.step);
+    aot_componentizer_test_step.dependOn(aot_package_test_step);
+    aot_componentizer_test_step.dependOn(aot_seal_alias_test_step);
+    aot_componentizer_test_step.dependOn(aot_seal_transaction_test_step);
+    aot_componentizer_test_step.dependOn(aot_shell_test_step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
     );

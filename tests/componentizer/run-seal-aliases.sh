@@ -171,12 +171,14 @@ test "$(stat -c '%d:%i:%f' "$FIFO_OUTPUT")" = "$FIFO_ID"
 test ! -e "$WORK/fifo cache"
 
 SOCKET_OUTPUT="$WORK/socket output"
-python3 - "$SOCKET_OUTPUT" <<'PY'
+python3 - "$WORK" "$(basename "$SOCKET_OUTPUT")" <<'PY'
+import os
 import socket
 import sys
 
+os.chdir(sys.argv[1])
 sock = socket.socket(socket.AF_UNIX)
-sock.bind(sys.argv[1])
+sock.bind(sys.argv[2])
 sock.close()
 PY
 SOCKET_ID="$(stat -c '%d:%i:%f' "$SOCKET_OUTPUT")"
