@@ -933,7 +933,7 @@ if [ -w /mnt ]; then
   )
   assert_engine_payload "$MNT_PIPELINE_DIR/output.wasm"
   echo "Caller-visible /mnt pipeline passed"
-else
+elif unshare --user --map-root-user true 2>/dev/null; then
   unshare --user --map-root-user --mount -- bash -c '
     set -euo pipefail
     mount -t tmpfs -o mode=700 starling-mnt-pipeline /mnt
@@ -954,6 +954,8 @@ else
     cmp -n "$(stat -c %s "$5")" "$5" /mnt/work/output.wasm
   ' bash "$COMPONENTIZER" "$SOURCE" "$WIT" "$TOOLS" "$ENGINE" "$ADAPTER"
   echo "Private-namespace /mnt pipeline passed"
+else
+  echo "SKIP: private user namespaces are unavailable"
 fi
 
 CHILD_REPLACE_HOOK="$SCRATCH/retained child replacement hook"
