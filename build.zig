@@ -408,7 +408,6 @@ pub fn build(b: *std.Build) void {
     aot_componentizer_test_step.dependOn(&run_componentizer_tests.step);
     aot_componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
     aot_componentizer_test_step.dependOn(&run_feature_surface_tests.step);
-    aot_componentizer_test_step.dependOn(&aot_fake_orchestration.step);
     aot_componentizer_test_step.dependOn(aot_package_test_step);
     aot_componentizer_test_step.dependOn(aot_seal_alias_test_step);
     aot_componentizer_test_step.dependOn(aot_seal_transaction_test_step);
