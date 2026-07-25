@@ -3,6 +3,7 @@ justdir := justfile_directory()
 mode := 'debug'
 builddir := justdir / 'cmake-build-' + mode
 reconfigure := 'false'
+zig := env_var_or_default('ZIG', 'zig')
 
 alias b := build
 alias t := test
@@ -20,13 +21,30 @@ default:
 build target="all" *flags:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo 'Setting build directory to {{ builddir }}, build type {{ if mode == "weval" { "Release (weval)" } else { capitalize(mode) } }}'
+    echo 'Setting build directory to {{ builddir }}, build type {{ if mode == "weval" { "ReleaseSmall (Zig AOT)" } else { capitalize(mode) } }}'
+
+    if [[ '{{ mode }}' == weval ]]; then
+        case '{{ target }}' in
+            ''|all|starling|starling-raw.wasm|starling-ics.wevalcache)
+                zig_step=()
+                ;;
+            *)
+                zig_step=('{{ target }}')
+                ;;
+        esac
+        {{ quote(zig) }} build "${zig_step[@]}" --prefix '{{ builddir }}' \
+            -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
+        if [[ '{{ target }}' == starling ]]; then
+            cp '{{ builddir }}/bin/starling-raw.wasm' \
+                '{{ builddir }}/starling.wasm'
+        fi
+        exit
+    fi
 
     # Only run configure step if build directory doesn't exist yet
     if ! {{ path_exists(builddir) }} || {{ reconfigure }} = 'true'; then
         cmake -S . -B {{ builddir }} {{ flags }} \
-            -DCMAKE_BUILD_TYPE={{ if mode == "weval" { "Release" } else { capitalize(mode) } }} \
-            {{ if mode == "weval" { "-DUSE_WASM_OPT=OFF -DWEVAL=ON" } else { "" } }}
+            -DCMAKE_BUILD_TYPE={{ capitalize(mode) }}
     else
         echo 'build directory already exists, skipping cmake configure'
     fi
@@ -36,7 +54,13 @@ build target="all" *flags:
 
 # Run clean target
 clean:
-    cmake --build {{ builddir }} --target clean
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ '{{ mode }}' == weval ]]; then
+        rm -rf '{{ builddir }}'
+    else
+        cmake --build '{{ builddir }}' --target clean
+    fi
 
 [private]
 [confirm('proceed?')]
@@ -55,7 +79,7 @@ lint-fix: (build "clang-tidy-fix")
 
 # Componentize js script
 componentize script="" outfile="starling.wasm": build
-    {{ builddir }}/componentize.sh {{ script }} -o {{ outfile }}
+    {{ if mode == "weval" { builddir / "bin/componentize.sh" } else { builddir / "componentize.sh" } }} {{ script }} -o {{ outfile }}
 
 # Componentize and serve script with wasmtime
 serve script: (componentize script)
@@ -65,9 +89,44 @@ serve script: (componentize script)
 format *ARGS:
     {{ justdir }}/scripts/clang-format.sh {{ ARGS }}
 
-# Run integration test
-test regex="": (build "integration-test-server") (build "wpt-runtime")
-    ctest --test-dir {{ builddir }} -j {{ ncpus }} --output-on-failure {{ if regex == "" { regex } else { "-R " + regex } }}
+# Build and test the sealed Zig AOT runtime
+[group('aot')]
+aot-build *flags:
+    {{ quote(zig) }} build --prefix '{{ builddir }}' \
+        -Doptimize=ReleaseSmall -Daot-engine=true {{ flags }}
+
+[group('aot')]
+aot-test: aot-build
+    {{ justdir }}/tests/componentizer/run-legacy-aot-targets.sh \
+        {{ quote(zig) }} '{{ builddir }}'
+    {{ quote(zig) }} build aot-componentizer-test -Doptimize=ReleaseSmall
+    STARLING_ZIG={{ quote(zig) }} {{ quote(zig) }} build aot-engine-test --prefix '{{ builddir }}' \
+        -Doptimize=ReleaseSmall -Daot-engine=true
+
+[group('aot')]
+aot-build-prefix-test: aot-build
+    {{ justdir }}/tests/componentizer/run-build-prefix-publication.sh \
+        {{ quote(zig) }} '{{ builddir }}'
+
+[group('aot')]
+aot-package outdir="release-artifacts": aot-build
+    {{ justdir }}/scripts/package-aot-release.sh '{{ builddir }}' '{{ outdir }}'
+
+# Run integration tests, or the componentizer/AOT suites for mode=weval
+test regex="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ '{{ mode }}' == weval ]]; then
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} \
+            builddir='{{ builddir }}' aot-test
+    else
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} mode='{{ mode }}' \
+            builddir='{{ builddir }}' build integration-test-server
+        just --justfile '{{ justdir }}/justfile' zig={{ quote(zig) }} mode='{{ mode }}' \
+            builddir='{{ builddir }}' build wpt-runtime
+        ctest --test-dir '{{ builddir }}' -j '{{ ncpus }}' --output-on-failure \
+            {{ if regex == "" { regex } else { "-R " + regex } }}
+    fi
 
 # Run web platform test suite
 [group('wpt')]

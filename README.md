@@ -85,7 +85,8 @@ An alternative build uses [Zig](https://ziglang.org/) 0.17 as the C/C++ toolchai
 `build.zig` rather than CMake. This is experimental and currently Linux/x86_64 only.
 
 Requirements: `zig` 0.17, `rustup` (the toolchain in `rust-toolchain.toml` plus the
-`wasm32-wasip1` target), `python3`, a host `clang`/`clang++`, `make`, `curl`, `git`.
+`wasm32-wasip1` target), `python3`, host `libsqlite3`, a host `clang`/`clang++`,
+`make`, `curl`, `git`.
 
 ```console
 # 1. Build the native dependencies (SpiderMonkey from source, OpenSSL, Rust crates)
@@ -105,6 +106,50 @@ The runtime can then be componentized and served just like the CMake build:
 zig-out/bin/componentize.sh path/to/index.js -o index.wasm
 zig-out/bin/wasmtime serve -S cli --dir . index.wasm
 ```
+
+Weval AOT uses a distinct SpiderMonkey build and a sealed, engine-specific IC
+cache. All v0.4 AOT builds use exactly Zig
+`0.17.0-dev.902+7255f3e72`; another 0.17 development build is not supported.
+Build that variant and select it explicitly:
+
+```console
+./deps/build-deps.sh --all
+zig build -Doptimize=ReleaseSmall -Daot-engine=true
+zig-out/bin/starling-componentize --aot \
+  --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
+  --world-name js-exports \
+  --component-wit host-apis/wasi-0.2.10/wit \
+  --component-world-name js-dispatch \
+  --out app.wasm app.js
+```
+
+CMake intentionally rejects `WEVAL=ON`; only the Zig AOT path creates and
+validates the sealed cache required for no-fallback AOT componentization.
+The `just` AOT recipes use that same path (legacy `mode=weval` builds are
+routed to Zig rather than CMake):
+
+```console
+just builddir=build-aot aot-test
+just builddir=build-aot aot-build-prefix-test
+just builddir=build-aot aot-package release-artifacts
+```
+
+The package recipe validates the AOT engine and its sealed cache before
+publishing `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
+`starling-ics.wevalcache.manifest`. Publication is serialized per release
+directory. AOT installs stage the complete prefix privately before the same
+crash-recoverable whole-directory generation switch used by packaging,
+preserving the three public package filenames.
+The main v0.4 release inventory is exactly those three inseparable AOT files
+plus `starling-raw.wasm`, `starling-raw-debug.wasm`, `starling.wasm`,
+`starling-debug.wasm`, and `preview1-adapter.wasm`. The release gate rejects
+extra files, including `starling-raw-weval-external.wasm`, and incomplete or
+unsealed AOT bundles.
+Non-AOT `just build` modes continue to use CMake.
+
+See [`docs/componentizer/README.md`](docs/componentizer/README.md) for AOT
+cache controls, integrity/ABI keys, custom-engine packaging, deterministic
+failure behavior, and the Wizer/AOT equivalence test.
 
 The Zig build also installs `starling-componentize`, a host-native, Node-free
 CLI that drives the monolithic Zig/Wizer/WABT pipeline without shell command

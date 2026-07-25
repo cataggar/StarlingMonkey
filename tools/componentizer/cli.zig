@@ -1,17 +1,17 @@
 const std = @import("std");
 const diagnostics = @import("diagnostics.zig");
 
-pub const version = "0.3.0";
+pub const version = "0.4.1";
 
 pub const usage =
-    \\Usage: starling-componentize [options] <source.js>
+    \\Usage: starling-componentize [options] [source.js] [output.wasm]
     \\
     \\Options:
     \\  -w, --wit <dir>                    WIT directory used to generate dispatch bindings
     \\  -n, --world-name <name>            Dispatch world selected from --wit
     \\      --component-wit <dir>          Complete component WIT closure (defaults to --wit)
     \\      --component-world-name <name>  Component world (defaults to --world-name)
-    \\  -o, --out <file>                   Output component (defaults to <source>.wasm)
+    \\  -o, --out, --output <file>         Output component (defaults to <source>.wasm)
     \\  -d, --disable <feature[,feature]>  Disable platform features; repeatable
     \\      --enable <feature[,feature]>   Re-enable platform features; repeatable
     \\      --runtime-args <args>          Raw StarlingMonkey runtime argument string
@@ -30,7 +30,7 @@ pub const usage =
     \\      --wasmtime-bin <file>           Override Wasmtime's wizer subcommand
     \\      --wabt-bin <file>              Override the WABT executable
     \\      --wasm-tools-bin <file>        Override the wasm-tools executable
-    \\      --weval-bin <file>             Reserve a Weval override for --aot
+    \\      --weval-bin <file>             Override the Weval executable
     \\      --build-root <dir>             Override StarlingMonkey source-root discovery
     \\      --cache-dir <dir>              Override the monolithic runtime cache
     \\      --metadata-out <file>          Write deterministic imports/provenance JSON
@@ -40,9 +40,9 @@ pub const usage =
     \\      --debug-bindings               Preserve generated bindings and intermediates
     \\      --debug-dir <dir>              Directory for debug intermediates
     \\      --enable-wizer-logging         Print successful Wizer output
-    \\      --aot                          Use Weval AOT (not implemented yet)
-    \\      --aot-cache-dir <dir>          Reserve the AOT cache location
-    \\      --aot-min-stack-size <bytes>   Reserve the AOT minimum stack size
+    \\      --aot                          Use the Weval AOT engine and cache
+    \\      --aot-cache-dir <dir>          Override the validated AOT cache bundle
+    \\      --aot-min-stack-size <bytes>   Set Weval's RUST_MIN_STACK (default: 8 MiB)
     \\  -v, --verbose                      Print structured pipeline commands
     \\  -V, --version                      Print the componentizer version
     \\  -h, --help                         Print this help
@@ -61,7 +61,7 @@ pub const Action = union(enum) {
 };
 
 pub const Config = struct {
-    source: []const u8,
+    source: ?[]const u8 = null,
     output: ?[]const u8 = null,
     wit: ?[]const u8 = null,
     world_name: ?[]const u8 = null,
@@ -76,6 +76,7 @@ pub const Config = struct {
     init_location: ?[]const u8 = null,
     js_heap_limit_mib: ?u32 = null,
     preopen_dirs: []const []const u8 = &.{},
+    legacy_wrapper_preopen: bool = false,
     legacy_script: bool = false,
     wpt_mode: bool = false,
     engine: ?[]const u8 = null,
@@ -94,6 +95,9 @@ pub const Config = struct {
     use_debug_build: bool = false,
     debug_bindings: bool = false,
     enable_wizer_logging: bool = false,
+    aot: bool = false,
+    aot_cache_dir: ?[]const u8 = null,
+    aot_min_stack_size: ?u64 = null,
     verbose: bool = false,
 
     pub fn deinit(config: *Config, allocator: std.mem.Allocator) void {
@@ -108,6 +112,8 @@ pub const Config = struct {
 pub const ParseError = error{
     ConflictingFeatures,
     InvalidHeapLimit,
+    InvalidAotMinStackSize,
+    IncompatibleAotOptions,
     InvalidDiagnosticFormat,
     MissingSource,
     MissingValue,
@@ -116,7 +122,7 @@ pub const ParseError = error{
     UnexpectedComponentWorld,
     UnknownArgument,
     UnknownFeature,
-    UnsupportedAot,
+    AotOptionRequiresAot,
 };
 
 pub const feature_names = [_][]const u8{
@@ -212,8 +218,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
     var preopen_dirs: std.ArrayList([]const u8) = .empty;
     errdefer preopen_dirs.deinit(allocator);
 
-    var config = Config{ .source = "" };
-    var aot_requested = false;
+    var config = Config{};
     var aot_option_seen = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -230,7 +235,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
             config.component_wit = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--component-world-name")) {
             config.component_world_name = try nextValue(args, &i);
-        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--out")) {
+        } else if (std.mem.eql(u8, arg, "-o") or
+            std.mem.eql(u8, arg, "--out") or
+            std.mem.eql(u8, arg, "--output"))
+        {
             config.output = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--disable")) {
             try appendVariadicFeatures(allocator, &disabled, args, &i);
@@ -257,6 +265,8 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
             config.js_heap_limit_mib = value;
         } else if (std.mem.eql(u8, arg, "--preopen-dir")) {
             preopen_dirs.append(allocator, try nextValue(args, &i)) catch @panic("out of memory");
+        } else if (std.mem.eql(u8, arg, "--legacy-wrapper-preopen")) {
+            config.legacy_wrapper_preopen = true;
         } else if (std.mem.eql(u8, arg, "--engine")) {
             config.engine = try nextValue(args, &i);
         } else if (std.mem.eql(u8, arg, "--preview2-adapter")) {
@@ -298,25 +308,33 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
         } else if (std.mem.eql(u8, arg, "--enable-wizer-logging")) {
             config.enable_wizer_logging = true;
         } else if (std.mem.eql(u8, arg, "--aot")) {
-            aot_requested = true;
-        } else if (std.mem.eql(u8, arg, "--aot-cache-dir") or
-            std.mem.eql(u8, arg, "--aot-min-stack-size"))
-        {
-            _ = try nextValue(args, &i);
+            config.aot = true;
+        } else if (std.mem.eql(u8, arg, "--aot-cache-dir")) {
+            config.aot_cache_dir = try nextValue(args, &i);
+            aot_option_seen = true;
+        } else if (std.mem.eql(u8, arg, "--aot-min-stack-size")) {
+            const raw = try nextValue(args, &i);
+            const value = std.fmt.parseInt(u64, raw, 10) catch
+                return error.InvalidAotMinStackSize;
+            if (value == 0) return error.InvalidAotMinStackSize;
+            config.aot_min_stack_size = value;
             aot_option_seen = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownArgument;
-        } else if (config.source.len != 0) {
-            return error.MultipleSources;
-        } else {
+        } else if (config.source == null) {
             config.source = arg;
+        } else if (config.output == null) {
+            config.output = arg;
+        } else {
+            return error.MultipleSources;
         }
     }
 
-    if (aot_requested or aot_option_seen) return error.UnsupportedAot;
-    if (config.source.len == 0) return error.MissingSource;
+    if (aot_option_seen and !config.aot) return error.AotOptionRequiresAot;
+    if (config.aot and config.use_debug_build) return error.IncompatibleAotOptions;
+    if (config.source == null and config.output == null) return error.MissingSource;
     if ((config.wit == null) != (config.world_name == null)) return error.MissingWitWorld;
     if (config.component_wit != null and config.wit == null) return error.UnexpectedComponentWorld;
     if (config.component_world_name != null and config.wit == null) {
@@ -355,6 +373,7 @@ test "parses the native componentizer surface" {
         "--enable-script-debugging",
         "--preopen-dir",
         "extra dir",
+        "--legacy-wrapper-preopen",
         "--wabt-bin",
         "tools/wabt",
         "--js-heap-limit-mib",
@@ -374,13 +393,14 @@ test "parses the native componentizer surface" {
         else => {},
     };
     const config = action.run;
-    try std.testing.expectEqualStrings("source file.js", config.source);
+    try std.testing.expectEqualStrings("source file.js", config.source.?);
     try std.testing.expectEqualStrings("out file.wasm", config.output.?);
     try std.testing.expectEqual(@as(usize, 2), config.disable_features.len);
     try std.testing.expectEqualStrings("random", config.disable_features[1]);
     try std.testing.expectEqual(@as(u32, 256), config.js_heap_limit_mib.?);
     try std.testing.expectEqualStrings("tools/wabt", config.wabt_bin.?);
     try std.testing.expect(config.debug_bindings);
+    try std.testing.expect(config.legacy_wrapper_preopen);
     try std.testing.expectEqual(diagnostics.Format.json, config.diagnostic_format);
     try std.testing.expectEqualStrings("metadata.json", config.metadata_out.?);
 }
@@ -426,13 +446,77 @@ test "requires WIT and world together" {
     try std.testing.expectError(error.MissingWitWorld, parse(std.testing.allocator, &args));
 }
 
-test "rejects AOT until the dedicated AOT phase lands" {
+test "parses AOT controls" {
     const args = [_][]const u8{
         "starling-componentize",
         "--aot",
+        "--weval-bin",
+        "tools/weval",
+        "--aot-cache-dir",
+        "cache bundle",
+        "--aot-min-stack-size",
+        "16777216",
         "source.js",
     };
-    try std.testing.expectError(error.UnsupportedAot, parse(std.testing.allocator, &args));
+    var action = try parse(std.testing.allocator, &args);
+    defer switch (action) {
+        .run => |*config| config.deinit(std.testing.allocator),
+        else => {},
+    };
+    try std.testing.expect(action.run.aot);
+    try std.testing.expectEqualStrings("cache bundle", action.run.aot_cache_dir.?);
+    try std.testing.expectEqual(@as(u64, 16777216), action.run.aot_min_stack_size.?);
+}
+
+test "preserves legacy output forms" {
+    const positional_args = [_][]const u8{
+        "starling-componentize",
+        "source.js",
+        "positional output.wasm",
+    };
+    var positional = try parse(std.testing.allocator, &positional_args);
+    defer positional.run.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("source.js", positional.run.source.?);
+    try std.testing.expectEqualStrings("positional output.wasm", positional.run.output.?);
+
+    const output_only_args = [_][]const u8{
+        "starling-componentize",
+        "--output",
+        "runtime component.wasm",
+    };
+    var output_only = try parse(std.testing.allocator, &output_only_args);
+    defer output_only.run.deinit(std.testing.allocator);
+    try std.testing.expect(output_only.run.source == null);
+    try std.testing.expectEqualStrings("runtime component.wasm", output_only.run.output.?);
+}
+
+test "rejects AOT-only controls without AOT" {
+    const args = [_][]const u8{
+        "starling-componentize",
+        "--aot-cache-dir",
+        "cache",
+        "source.js",
+    };
+    try std.testing.expectError(error.AotOptionRequiresAot, parse(std.testing.allocator, &args));
+}
+
+test "rejects debug AOT and invalid stack sizes" {
+    const debug_args = [_][]const u8{
+        "starling-componentize",
+        "--aot",
+        "--use-debug-build",
+        "source.js",
+    };
+    try std.testing.expectError(error.IncompatibleAotOptions, parse(std.testing.allocator, &debug_args));
+
+    const stack_args = [_][]const u8{
+        "starling-componentize",
+        "--aot",
+        "--aot-min-stack-size",
+        "0",
+        "source.js",
+    };
+    try std.testing.expectError(error.InvalidAotMinStackSize, parse(std.testing.allocator, &stack_args));
 }
 
 test "detects JSON diagnostics before full argument parsing" {

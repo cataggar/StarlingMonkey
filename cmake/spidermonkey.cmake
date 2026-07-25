@@ -8,8 +8,6 @@ else()
     set(SM_BUILD_TYPE release)
 endif()
 
-option(WEVAL "Build with a SpiderMonkey variant that supports weval-based AOT compilation" OFF)
-
 if (WEVAL)
     set(SM_BUILD_TYPE "${SM_BUILD_TYPE}_weval")
 endif()

@@ -20,6 +20,49 @@ fn dependencyExecutable(
     @panic("dependency executable not found");
 }
 
+fn addPrefixBinFile(
+    b: *std.Build,
+    generation: ?*std.Build.Step.WriteFile,
+    source: std.Build.LazyPath,
+    name: []const u8,
+) *std.Build.Step {
+    if (generation) |private| {
+        _ = private.addCopyFile(
+            source,
+            b.fmt("bin/{s}", .{name}),
+        );
+        return &private.step;
+    }
+    const install = b.addInstallBinFile(source, name);
+    b.getInstallStep().dependOn(&install.step);
+    return &install.step;
+}
+
+fn addPrefixBinDirectory(
+    b: *std.Build,
+    generation: ?*std.Build.Step.WriteFile,
+    source: std.Build.LazyPath,
+    name: []const u8,
+    include_extensions: ?[]const []const u8,
+) *std.Build.Step {
+    if (generation) |private| {
+        _ = private.addCopyDirectory(
+            source,
+            b.fmt("bin/{s}", .{name}),
+            .{ .include_extensions = include_extensions },
+        );
+        return &private.step;
+    }
+    const install = b.addInstallDirectory(.{
+        .source_dir = source,
+        .install_dir = .bin,
+        .install_subdir = name,
+        .include_extensions = include_extensions,
+    });
+    b.getInstallStep().dependOn(&install.step);
+    return &install.step;
+}
+
 fn inputPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
     return if (std.fs.path.isAbsolute(path))
         .{ .cwd_relative = path }
@@ -156,12 +199,20 @@ fn resolveFeatures(b: *std.Build, defaults: Features) Features {
 pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
         std.debug.print(
-            "error: StarlingMonkey requires Zig {s}; found {s}\n",
+            "error: StarlingMonkey v0.4 requires Zig {s}; found {s}\n",
             .{ required_zig_version, builtin.zig_version_string },
         );
         @panic("unsupported Zig version");
     }
     const optimize = b.standardOptimizeOption(.{});
+    const aot_engine = b.option(
+        bool,
+        "aot-engine",
+        "Build the PBL+Weval SpiderMonkey variant and its sealed IC cache",
+    ) orelse false;
+    const aot_generation = if (aot_engine) b.addWriteFiles() else null;
+    var aot_generation_chmod: ?*std.Build.Step.Run = null;
+
     const host_api_selection = b.option(
         []const u8,
         "host-api",
@@ -189,6 +240,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true,
     });
     const feature_surface_lib = b.createModule(.{
         .root_source_file = b.path("tools/feature-surface/surface.zig"),
@@ -201,7 +253,34 @@ pub fn build(b: *std.Build) void {
         .name = "starling-componentize",
         .root_module = componentizer_mod,
     });
-    b.installArtifact(componentizer);
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        componentizer.getEmittedBin(),
+        "starling-componentize",
+    );
+    const aot_cache_tool = b.addExecutable(.{
+        .name = "starling-aot-cache",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/componentizer/aot_cache_seal.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        aot_cache_tool.getEmittedBin(),
+        "starling-aot-cache",
+    );
+    const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
+    const wabt_install_step = addPrefixBinFile(
+        b,
+        aot_generation,
+        wabt.getEmittedBin(),
+        "wabt",
+    );
     const feature_surface_mod = b.createModule(.{
         .root_source_file = b.path("tools/feature-surface/main.zig"),
         .target = b.graph.host,
@@ -211,12 +290,9 @@ pub fn build(b: *std.Build) void {
         .name = "starling-feature-surface",
         .root_module = feature_surface_mod,
     });
-    b.installArtifact(feature_surface);
-    const wabt = dependencyExecutable(b.dependency("wabt", .{}), "wabt");
-    const install_wabt = b.addInstallArtifact(wabt, .{});
-    b.getInstallStep().dependOn(&install_wabt.step);
+    if (!aot_engine) b.installArtifact(feature_surface);
     const wabt_step = b.step("wabt", "Build and install the pinned WABT CLI");
-    wabt_step.dependOn(&install_wabt.step);
+    wabt_step.dependOn(wabt_install_step);
     const componentizer_step = b.step(
         "componentizer",
         "Build the native starling-componentize CLI",
@@ -227,6 +303,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/componentizer/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true,
     });
     componentizer_test_mod.addOptions("build_options", componentizer_options);
     componentizer_test_mod.addImport("feature_surface", feature_surface_lib);
@@ -250,6 +327,64 @@ pub fn build(b: *std.Build) void {
         "Run native componentizer unit and fake-tool orchestration tests",
     );
     componentizer_test_step.dependOn(&run_componentizer_tests.step);
+    const aot_package_test_step = b.step(
+        "aot-package-test",
+        "Race two validated AOT bundles through release publication",
+    );
+    const aot_package_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-package-aot.sh" },
+    );
+    aot_package_test.addArtifactArg(aot_cache_tool);
+    aot_package_test.addFileArg(b.path("scripts/package-aot-release.sh"));
+    aot_package_test_step.dependOn(&aot_package_test.step);
+    componentizer_test_step.dependOn(aot_package_test_step);
+    const aot_seal_alias_test_step = b.step(
+        "aot-seal-alias-test",
+        "Reject all AOT seal input/output filesystem aliases",
+    );
+    const aot_seal_alias_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-seal-aliases.sh" },
+    );
+    aot_seal_alias_test.addArtifactArg(aot_cache_tool);
+    aot_seal_alias_test_step.dependOn(&aot_seal_alias_test.step);
+    componentizer_test_step.dependOn(aot_seal_alias_test_step);
+    const aot_seal_transaction_test_step = b.step(
+        "aot-seal-transaction-test",
+        "Race descriptor-anchored AOT seal publication and rollback",
+    );
+    const aot_seal_transaction_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-seal-transactions.sh" },
+    );
+    aot_seal_transaction_test.addArtifactArg(aot_cache_tool);
+    aot_seal_transaction_test_step.dependOn(&aot_seal_transaction_test.step);
+    componentizer_test_step.dependOn(aot_seal_transaction_test_step);
+    const aot_shell_test_step = b.step(
+        "aot-shell-test",
+        "Test AOT shell tool resolution and recursive Zig forwarding",
+    );
+    const aot_shell_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot-shell-regressions.sh" },
+    );
+    aot_shell_test_step.dependOn(&aot_shell_test.step);
+    componentizer_test_step.dependOn(aot_shell_test_step);
+    const archive_test = b.addSystemCommand(
+        &.{ "bash", "deps/test-spidermonkey-archive.sh" },
+    );
+    archive_test.addArg(b.graph.zig_exe);
+    componentizer_test_step.dependOn(&archive_test.step);
+    const release_inventory_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-release-inventory.sh" },
+    );
+    release_inventory_test.addFileArg(
+        b.path("scripts/check-release-artifacts.sh"),
+    );
+    componentizer_test_step.dependOn(&release_inventory_test.step);
+    const zig_version_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-zig-version.sh" },
+    );
+    zig_version_test.addFileArg(b.path("scripts/require-zig-version.sh"));
+    zig_version_test.addArg(b.graph.zig_exe);
+    componentizer_test_step.dependOn(&zig_version_test.step);
     componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
     componentizer_test_step.dependOn(&run_feature_surface_tests.step);
     const componentizer_orchestration = b.addSystemCommand(
@@ -258,6 +393,36 @@ pub fn build(b: *std.Build) void {
     componentizer_orchestration.addArtifactArg(componentizer);
     componentizer_orchestration.addArg(host_api_selection);
     componentizer_test_step.dependOn(&componentizer_orchestration.step);
+    const aot_fake_orchestration = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot-fake.sh" },
+    );
+    aot_fake_orchestration.addArtifactArg(componentizer);
+    aot_fake_orchestration.addArtifactArg(aot_cache_tool);
+    if (b.lazyDependency("wasm-tools", .{})) |dep|
+        aot_fake_orchestration.addFileArg(dep.path("wasm-tools"));
+    componentizer_test_step.dependOn(&aot_fake_orchestration.step);
+    const aot_componentizer_test_step = b.step(
+        "aot-componentizer-test",
+        "Run focused componentizer units and AOT orchestration gates",
+    );
+    aot_componentizer_test_step.dependOn(&run_componentizer_tests.step);
+    aot_componentizer_test_step.dependOn(&run_componentizer_metadata_tests.step);
+    aot_componentizer_test_step.dependOn(&run_feature_surface_tests.step);
+    aot_componentizer_test_step.dependOn(aot_package_test_step);
+    aot_componentizer_test_step.dependOn(aot_seal_alias_test_step);
+    aot_componentizer_test_step.dependOn(aot_seal_transaction_test_step);
+    aot_componentizer_test_step.dependOn(aot_shell_test_step);
+    const runtime_closure_regression = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-runtime-build-closure-regressions.sh" },
+    );
+    runtime_closure_regression.addFileArg(
+        b.path("tests/componentizer/run-runtime-build-closure.sh"),
+    );
+    runtime_closure_regression.addFileArg(
+        b.path("tools/componentizer/runtime-build-inputs.txt"),
+    );
+    runtime_closure_regression.addArg("zig");
+    aot_componentizer_test_step.dependOn(&runtime_closure_regression.step);
     const absolute_wit_inputs = b.addSystemCommand(
         &.{ "bash", "tests/componentizer/run-absolute-wit.sh" },
     );
@@ -289,12 +454,55 @@ pub fn build(b: *std.Build) void {
     componentizer_e2e.addArg(host_api_identity);
     componentizer_e2e_step.dependOn(&componentizer_e2e.step);
     componentizer_test_step.dependOn(componentizer_e2e_step);
+    const aot_engine_test_step = b.step(
+        "aot-engine-test",
+        "Build Wizer/AOT variants and prove component behavior is equivalent",
+    );
+    const aot_engine_test = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-aot.sh" },
+    );
+    aot_engine_test.addArtifactArg(componentizer);
+    // A cached Zig build runner retains b.graph.zig_exe from the runner that
+    // compiled it. Resolve the active, exact-version toolchain when this
+    // command executes instead of embedding an ephemeral setup-zig path.
+    aot_engine_test.addArg("zig");
+    if (b.lazyDependency("wasmtime", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("wasmtime"));
+    }
+    if (b.lazyDependency("wasm-tools", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("wasm-tools"));
+    }
+    aot_engine_test.addArtifactArg(wabt);
+    aot_engine_test.addFileArg(
+        b.path(b.pathJoin(&.{
+            host_api_dir,
+            "preview1-adapter-release",
+            "wasi_snapshot_preview1.wasm",
+        })),
+    );
+    if (b.lazyDependency("weval", .{})) |dep| {
+        aot_engine_test.addFileArg(dep.path("weval"));
+    }
+    aot_engine_test.addArtifactArg(aot_cache_tool);
+    const runtime_closure_check = b.addSystemCommand(
+        &.{ "bash", "tests/componentizer/run-runtime-build-closure.sh" },
+    );
+    runtime_closure_check.addFileArg(
+        b.path("tools/componentizer/runtime-build-inputs.txt"),
+    );
+    runtime_closure_check.addArg("zig");
+    aot_engine_test.step.dependOn(&runtime_closure_check.step);
+    aot_engine_test_step.dependOn(&aot_engine_test.step);
 
     // StarlingMonkey only targets wasm32-wasi (reactor).
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
 
     const enable_debugger = b.option(bool, "debugger", "Enable JS debugger socket support") orelse true;
-    const use_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds") orelse true;
+    const requested_wasm_opt = b.option(bool, "wasm-opt", "Optimize starling-raw.wasm with wasm-opt for release builds");
+    const use_wasm_opt = requested_wasm_opt orelse !aot_engine;
+    if (aot_engine and use_wasm_opt) {
+        @panic("-Daot-engine requires -Dwasm-opt=false (the default for AOT builds)");
+    }
     const preview1_adapter = b.option([]const u8, "preview1-adapter", "Retained preview1 adapter supplied by the componentizer");
     const component_wit = b.option([]const u8, "component-wit", "WIT directory whose exported functions dispatch to JavaScript");
     const component_world = b.option([]const u8, "component-world", "World to generate JavaScript-backed exports for");
@@ -324,10 +532,30 @@ pub fn build(b: *std.Build) void {
         .fetch_event = b.option(bool, "feature-fetch-event", "Enable the incoming FetchEvent/http-incoming-handler surface (addEventListener('fetch', ...)); default true") orelse true,
     };
     const features = resolveFeatures(b, feature_defaults);
+    const feature_abi = b.fmt(
+        "starling-features-v1;stdio={d};random={d};clocks={d};http={d};" ++
+            "fetch-event={d};optimize={s};host-api={s};debugger={d}",
+        .{
+            @intFromBool(features.stdio),
+            @intFromBool(features.random),
+            @intFromBool(features.clocks),
+            @intFromBool(features.http),
+            @intFromBool(features.fetch_event),
+            @tagName(optimize),
+            host_api_identity,
+            @intFromBool(enable_debugger),
+        },
+    );
 
     // SpiderMonkey artifacts built from source with Zig (see deps/mozconfig-zig).
-    const sm_dist = b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
-    const sm_confdefs = b.option([]const u8, "spidermonkey-confdefs", "Path to js-confdefs.h") orelse "deps/sm-obj-zig/js/src/js-confdefs.h";
+    const sm_dist = if (aot_engine)
+        b.option([]const u8, "spidermonkey-aot-dist", "Path to an explicitly AOT-enabled Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig-aot/dist"
+    else
+        b.option([]const u8, "spidermonkey-dist", "Path to the Zig-built SpiderMonkey dist dir") orelse "deps/sm-obj-zig/dist";
+    const sm_confdefs = if (aot_engine)
+        b.option([]const u8, "spidermonkey-aot-confdefs", "Path to the explicitly AOT-enabled js-confdefs.h") orelse "deps/sm-obj-zig-aot/js/src/js-confdefs.h"
+    else
+        b.option([]const u8, "spidermonkey-confdefs", "Path to js-confdefs.h") orelse "deps/sm-obj-zig/js/src/js-confdefs.h";
     const sm_include = b.pathJoin(&.{ sm_dist, "include" });
     const sm_lib = b.pathJoin(&.{ sm_dist, "libspidermonkey.a" });
 
@@ -489,11 +717,15 @@ pub fn build(b: *std.Build) void {
         addWitArg(b, bindgen, inputPath(b, wit_dir));
         bindgen.addArgs(&.{ "--world", dispatch_world.?, "--dispatch", "js_dispatch", "--js-imports", "-o" });
         generated_bindings = bindgen.addOutputFileArg("component_bindings.zig");
-        const install_bindings = b.addInstallFile(
-            generated_bindings.?,
-            "wit-bindgen/component_bindings.zig",
-        );
-        wit_bindgen_step.dependOn(&install_bindings.step);
+        if (aot_engine) {
+            wit_bindgen_step.dependOn(&bindgen.step);
+        } else {
+            const install_bindings = b.addInstallFile(
+                generated_bindings.?,
+                "wit-bindgen/component_bindings.zig",
+            );
+            wit_bindgen_step.dependOn(&install_bindings.step);
+        }
     }
 
     const link_mod = b.createModule(.{
@@ -528,8 +760,11 @@ pub fn build(b: *std.Build) void {
     }
     if (componentizer_debug_bindings) {
         if (generated_bindings) |bindings| {
-            b.getInstallStep().dependOn(
-                &b.addInstallBinFile(bindings, "component-bindings.zig").step,
+            _ = addPrefixBinFile(
+                b,
+                aot_generation,
+                bindings,
+                "component-bindings.zig",
             );
         }
     }
@@ -577,30 +812,138 @@ pub fn build(b: *std.Build) void {
             raw_wasm = opt_out;
         }
     }
-    const feature_tuple = b.fmt(
-        "{d}{d}{d}{d}{d}",
-        .{
-            @intFromBool(features.stdio),
-            @intFromBool(features.random),
-            @intFromBool(features.clocks),
-            @intFromBool(features.http),
-            @intFromBool(features.fetch_event),
-        },
-    );
-    const provenance = b.addSystemCommand(&.{"python3"});
-    provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
-    provenance.addFileArg(raw_wasm);
-    const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
-    provenance.addArgs(&.{
-        host_api_identity,
-        feature_tuple,
-        component_world orelse host_api_world,
-        dispatch_world orelse "caller",
+    const provenance_tool = b.addExecutable(.{
+        .name = "starling-engine-provenance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "tools/componentizer/engine_provenance.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
     });
-    raw_wasm = provenanced_raw;
+    const add_provenance = b.addRunArtifact(provenance_tool);
+    add_provenance.addFileArg(raw_wasm);
+    const provenance_wasm =
+        add_provenance.addOutputFileArg("starling-raw.wasm");
+    add_provenance.addArgs(&.{
+        host_api_identity,
+        component_world orelse "js-dispatch",
+        dispatch_world orelse "js-exports",
+        if (features.stdio) "true" else "false",
+        if (features.random) "true" else "false",
+        if (features.clocks) "true" else "false",
+        if (features.http) "true" else "false",
+        if (features.fetch_event) "true" else "false",
+    });
+    if (aot_engine) raw_wasm = provenance_wasm;
+    var aot_bundle_publish: ?*std.Build.Step.Run = null;
 
-    const install_raw = b.addInstallBinFile(raw_wasm, "starling-raw.wasm");
-    b.getInstallStep().dependOn(&install_raw.step);
+    if (aot_engine) {
+        if (is_debug) @panic("-Daot-engine does not support Debug builds");
+        const weval_dep = b.lazyDependency("weval", .{}) orelse
+            @panic("the pinned Weval artifact is required for -Daot-engine");
+        const cache_primer = b.path("tools/componentizer/aot-cache-primer.js");
+        const prime_cache = std.Build.Step.Run.create(b, "prime Weval IC cache");
+        prime_cache.addFileArg(weval_dep.path("weval"));
+        prime_cache.addFileInput(cache_primer);
+        prime_cache.addArgs(&.{
+            "weval",
+            "-w",
+            "--init-func",
+            "starling-aot-cache-initialize",
+            "--dir",
+            ".",
+            "--cache",
+        });
+        const cache = prime_cache.addOutputFileArg("starling-ics.wevalcache");
+        prime_cache.addArg("-i");
+        prime_cache.addFileArg(raw_wasm);
+        prime_cache.addArg("-o");
+        _ = prime_cache.addOutputFileArg("primed-starling-raw.wasm");
+        prime_cache.setCwd(b.path("."));
+        prime_cache.setStdIn(.{ .bytes = "tools/componentizer/aot-cache-primer.js\n" });
+        prime_cache.removeEnvironmentVariable("STARLINGMONKEY_CONFIG");
+        prime_cache.removeEnvironmentVariable("ENABLE_PBL");
+        prime_cache.setEnvironmentVariable("RUST_MIN_STACK", "8388608");
+        prime_cache.setEnvironmentVariable("WASMTIME_BACKTRACE_DETAILS", "1");
+
+        const seal_cache = b.addRunArtifact(aot_cache_tool);
+        seal_cache.addArg("seal");
+        seal_cache.addArg("--engine");
+        seal_cache.addFileArg(raw_wasm);
+        seal_cache.addArg("--weval");
+        seal_cache.addFileArg(weval_dep.path("weval"));
+        seal_cache.addArg("--cache");
+        seal_cache.addFileArg(cache);
+        seal_cache.addArg("--cache-out");
+        const sealed_cache =
+            seal_cache.addOutputFileArg("starling-ics.wevalcache");
+        seal_cache.addArg("--primer");
+        seal_cache.addFileArg(cache_primer);
+        seal_cache.addArgs(&.{ "--feature-abi", feature_abi, "--out" });
+        const manifest = seal_cache.addOutputFileArg("starling-ics.wevalcache.manifest");
+
+        _ = addPrefixBinFile(
+            b,
+            aot_generation,
+            raw_wasm,
+            "starling-raw.wasm",
+        );
+        _ = addPrefixBinFile(
+            b,
+            aot_generation,
+            sealed_cache,
+            "starling-ics.wevalcache",
+        );
+        _ = addPrefixBinFile(
+            b,
+            aot_generation,
+            manifest,
+            "starling-ics.wevalcache.manifest",
+        );
+
+        const publish_bundle = b.addRunArtifact(aot_cache_tool);
+        publish_bundle.addArg("publish-prefix");
+        publish_bundle.addArg("--target");
+        publish_bundle.addDirectoryArg(
+            b.graph.path(.install_prefix, ""),
+        );
+        publish_bundle.addArg("--generation");
+        publish_bundle.addDirectoryArg(aot_generation.?.getDirectory());
+        publish_bundle.addArgs(&.{ "--feature-abi", feature_abi });
+        publish_bundle.has_side_effects = true;
+        aot_bundle_publish = publish_bundle;
+        const aot_step = b.step(
+            "aot-engine",
+            "Build and install the AOT engine with its sealed Weval cache",
+        );
+        aot_step.dependOn(&publish_bundle.step);
+    }
+    if (!aot_engine) {
+        const feature_tuple = b.fmt(
+            "{d}{d}{d}{d}{d}",
+            .{
+                @intFromBool(features.stdio),
+                @intFromBool(features.random),
+                @intFromBool(features.clocks),
+                @intFromBool(features.http),
+                @intFromBool(features.fetch_event),
+            },
+        );
+        const provenance = b.addSystemCommand(&.{"python3"});
+        provenance.addFileArg(b.path("tools/embed-engine-provenance.py"));
+        provenance.addFileArg(raw_wasm);
+        const provenanced_raw = provenance.addOutputFileArg("starling-raw.wasm");
+        provenance.addArgs(&.{
+            host_api_identity,
+            feature_tuple,
+            component_world orelse host_api_world,
+            dispatch_world orelse "caller",
+        });
+        raw_wasm = provenanced_raw;
+        _ = addPrefixBinFile(b, null, raw_wasm, "starling-raw.wasm");
+    }
 
     var tool_manifest: std.ArrayList(u8) = .empty;
     tool_manifest.appendSlice(
@@ -616,11 +959,12 @@ pub fn build(b: *std.Build) void {
             "    {{\"name\": \"{s}\", \"path\": \"runtime-build-tools/{s}\"}}",
             .{ tool.name, tool.name },
         )) catch @panic("OOM");
-        const install_tool = b.addInstallBinFile(
+        _ = addPrefixBinFile(
+            b,
+            aot_generation,
             tool.executable,
             b.fmt("runtime-build-tools/{s}", .{tool.name}),
         );
-        b.getInstallStep().dependOn(&install_tool.step);
     }
     tool_manifest.appendSlice(
         gpa,
@@ -630,11 +974,11 @@ pub fn build(b: *std.Build) void {
         "runtime-build-tools.json",
         tool_manifest.items,
     );
-    b.getInstallStep().dependOn(
-        &b.addInstallBinFile(
-            tool_manifest_file,
-            "runtime-build-tools.json",
-        ).step,
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        tool_manifest_file,
+        "runtime-build-tools.json",
     );
 
     // ---- Componentization tooling (port of componentize.sh.in + adapter copy) ----
@@ -644,56 +988,90 @@ pub fn build(b: *std.Build) void {
         inputPath(b, path)
     else
         b.path(b.pathJoin(&.{ ctx.host_api_dir, if (is_debug) "preview1-adapter-debug" else "preview1-adapter-release", "wasi_snapshot_preview1.wasm" }));
-    b.getInstallStep().dependOn(&b.addInstallBinFile(adapter, "preview1-adapter.wasm").step);
-    const installed_component_wit = component_wit orelse
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        adapter,
+        "preview1-adapter.wasm",
+    );
+    const component_package_wit = component_wit orelse
         b.pathJoin(&.{ ctx.host_api_dir, "wit" });
-    const install_wit = b.addInstallDirectory(.{
-        .source_dir = inputPath(b, installed_component_wit),
-        .install_dir = .bin,
-        .install_subdir = "component-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_wit.step);
     const surface_wit = dispatch_wit orelse "tools/feature-surface";
-    const install_surface_wit = b.addInstallDirectory(.{
-        .source_dir = inputPath(b, surface_wit),
-        .install_dir = .bin,
-        .install_subdir = "surface-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_surface_wit.step);
-    const install_feature_wit = b.addInstallDirectory(.{
-        .source_dir = b.path(b.pathJoin(&.{ ctx.host_api_dir, "wit" })),
-        .install_dir = .bin,
-        .install_subdir = "feature-wit",
-        .include_extensions = &.{".wit"},
-    });
-    b.getInstallStep().dependOn(&install_feature_wit.step);
+    const feature_wit = b.pathJoin(&.{ ctx.host_api_dir, "wit" });
+    for ([_]struct { source: []const u8, destination: []const u8 }{
+        .{
+            .source = component_package_wit,
+            .destination = "component-wit",
+        },
+        .{
+            .source = surface_wit,
+            .destination = "surface-wit",
+        },
+        .{
+            .source = feature_wit,
+            .destination = "feature-wit",
+        },
+    }) |wit| {
+        _ = addPrefixBinDirectory(
+            b,
+            aot_generation,
+            inputPath(b, wit.source),
+            wit.destination,
+            &.{".wit"},
+        );
+    }
 
     // componentize.sh references the tools via `$(dirname "$0")/…`, so install them
     // alongside it (relocatable, mirrors the CMake build directory layout).
     if (b.lazyDependency("wasm-tools", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasm-tools"), "wasm-tools").step);
+        _ = addPrefixBinFile(b, aot_generation, d.path("wasm-tools"), "wasm-tools");
     if (b.lazyDependency("wasmtime", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("wasmtime"), "wasmtime").step);
-    if (b.lazyDependency("weval", .{})) |d|
-        b.getInstallStep().dependOn(&b.addInstallBinFile(d.path("weval"), "weval").step);
+        _ = addPrefixBinFile(b, aot_generation, d.path("wasmtime"), "wasmtime");
+    if (b.lazyDependency("weval", .{})) |d| {
+        if (aot_generation) |generation| {
+            _ = generation.addCopyDirectory(
+                d.path("."),
+                "weval-package",
+                .{},
+            );
+            _ = addPrefixBinFile(b, aot_generation, d.path("weval"), "weval");
+        } else {
+            _ = addPrefixBinFile(b, aot_generation, d.path("weval"), "weval");
+        }
+    }
 
     const componentize_sh = renderComponentizeScript(
         b,
         component_world orelse host_api_world,
+        aot_engine,
         dispatch_world orelse "caller",
         features,
     );
-    const inst_componentize = b.addInstallBinFile(componentize_sh, "componentize.sh");
-    b.getInstallStep().dependOn(&inst_componentize.step);
+    const inst_componentize = addPrefixBinFile(
+        b,
+        aot_generation,
+        componentize_sh,
+        "componentize.sh",
+    );
     // Installed generated files aren't executable; componentize.sh is invoked
     // directly (e.g. by tests/test.sh), so mark it +x after install.
-    const installed_componentize = b.graph.path(.install_prefix, "bin/componentize.sh");
-    const chmod = b.addSystemCommand(&.{ "chmod", "+x" });
-    chmod.addFileArg(installed_componentize);
-    chmod.step.dependOn(&inst_componentize.step);
-    b.getInstallStep().dependOn(&chmod.step);
+    const installed_componentize = b.graph.path(
+        .install_prefix,
+        "bin/componentize.sh",
+    );
+    if (aot_generation) |generation| {
+        const chmod = b.addSystemCommand(&.{ "chmod", "+x" });
+        chmod.addFileArg(
+            generation.getDirectory().path(b, "bin/componentize.sh"),
+        );
+        chmod.step.dependOn(inst_componentize);
+        aot_generation_chmod = chmod;
+    } else {
+        const chmod = b.addSystemCommand(&.{ "chmod", "+x" });
+        chmod.addFileArg(installed_componentize);
+        chmod.step.dependOn(inst_componentize);
+        b.getInstallStep().dependOn(&chmod.step);
+    }
 
     // features.json: a machine-readable record of the resolved feature
     // selection for this build, installed next to componentize.sh/
@@ -724,7 +1102,12 @@ pub fn build(b: *std.Build) void {
         features.fetch_event,
     });
     const features_json_file = b.addWriteFiles().add("features.json", features_json);
-    b.getInstallStep().dependOn(&b.addInstallBinFile(features_json_file, "features.json").step);
+    _ = addPrefixBinFile(
+        b,
+        aot_generation,
+        features_json_file,
+        "features.json",
+    );
 
     // `zig build smoke-test`: componentize a trivial script and validate the
     // resulting component. Runs the *installed* componentize.sh so it finds
@@ -733,7 +1116,7 @@ pub fn build(b: *std.Build) void {
     // is covered by the ported test suite, not this build step.)
     const smoke = b.step("smoke-test", "Componentize a trivial script and validate the component");
     const smoke_js = b.addWriteFiles().add("smoke.js", "addEventListener('fetch', e => e.respondWith(new Response('ok')));\nconsole.log('smoke ok');\n");
-    b.getInstallStep().dependOn(&b.addInstallBinFile(smoke_js, "smoke.js").step);
+    _ = addPrefixBinFile(b, aot_generation, smoke_js, "smoke.js");
     const installed_smoke_js = b.graph.path(.install_prefix, "bin/smoke.js");
     const smoke_out = b.graph.path(.install_prefix, "bin/smoke.wasm");
     const smoke_run = std.Build.Step.Run.create(b, "componentize smoke");
@@ -1066,9 +1449,14 @@ pub fn build(b: *std.Build) void {
         engine_mod.addObjectFile(b.path("target/wasm32-wasip1/release/librust_staticlib.a"));
         engine_mod.addObjectFile(b.path(sm_lib));
         const engine_step = b.step("engine-dylib-experiment", "world-shell-spike: link the engine as a PIC dylib");
-        const inst_engine = b.addInstallBinFile(engine_lib.getEmittedBin(), "starling-engine.wasm");
-        inst_engine.step.dependOn(&engine_lib.step);
-        engine_step.dependOn(&inst_engine.step);
+        const inst_engine = addPrefixBinFile(
+            b,
+            aot_generation,
+            engine_lib.getEmittedBin(),
+            "starling-engine.wasm",
+        );
+        inst_engine.dependOn(&engine_lib.step);
+        engine_step.dependOn(inst_engine);
     }
 
     // ---- EXPERIMENT (world-shell-integration): thin, WIT-specific "shell" PIC
@@ -1116,9 +1504,23 @@ pub fn build(b: *std.Build) void {
         shell_mod.addImport("js_dispatch", js_dispatch);
         const shell_lib = b.addLibrary(.{ .name = "starling-shell", .root_module = shell_mod, .linkage = .dynamic });
         const shell_step = b.step("shell-dylib-experiment", "world-shell-integration: link a thin WIT shell as a PIC dylib");
-        const inst_shell = b.addInstallBinFile(shell_lib.getEmittedBin(), "starling-shell.wasm");
-        inst_shell.step.dependOn(&shell_lib.step);
-        shell_step.dependOn(&inst_shell.step);
+        const inst_shell = addPrefixBinFile(
+            b,
+            aot_generation,
+            shell_lib.getEmittedBin(),
+            "starling-shell.wasm",
+        );
+        inst_shell.dependOn(&shell_lib.step);
+        shell_step.dependOn(inst_shell);
+    }
+
+    if (aot_bundle_publish) |publisher| {
+        const install = b.getInstallStep();
+        if (install.dependencies.items.len != 0)
+            @panic("AOT installation prerequisites must target the private generation");
+        if (aot_generation_chmod) |chmod|
+            publisher.step.dependOn(&chmod.step);
+        install.dependOn(&publisher.step);
     }
 }
 
@@ -1127,6 +1529,7 @@ pub fn build(b: *std.Build) void {
 fn renderComponentizeScript(
     b: *std.Build,
     component_world: ?[]const u8,
+    aot_engine: bool,
     surface_target_world: []const u8,
     features: Features,
 ) std.Build.LazyPath {
@@ -1135,7 +1538,11 @@ fn renderComponentizeScript(
     const gpa = b.allocator;
     var rest: []const u8 = template;
     const subs = [_]struct { from: []const u8, to: []const u8 }{
-        .{ .from = "@AOT@", .to = "0" },
+        .{ .from = "@WASMTIME_DIR@", .to = "$(dirname \"$0\")" },
+        .{ .from = "@WASM_TOOLS_BIN@", .to = "$(dirname \"$0\")/wasm-tools" },
+        .{ .from = "@WEVAL_BIN@", .to = "$(dirname \"$0\")/weval" },
+        .{ .from = "@AOT@", .to = if (aot_engine) "1" else "0" },
+        .{ .from = "@AOT_DRIVER@", .to = "native" },
         .{ .from = "@EXTERNAL_RUNTIME_FILE@", .to = "starling-raw.wasm" },
         .{ .from = "@COMPONENT_WORLD@", .to = component_world orelse "" },
         .{ .from = "@SURFACE_TARGET_WORLD@", .to = surface_target_world },

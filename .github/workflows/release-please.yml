@@ -66,6 +66,7 @@ jobs:
           just mode=release builddir=build-release build starling
           just mode=relwithdebinfo builddir=build-debug build starling
           ./deps/build-deps.sh --all
+          just builddir=build-aot aot-build
 
       - name: Validate CMake host API release matrix
         env:
@@ -88,23 +89,8 @@ jobs:
 
           # Supporting artifacts
           cp build-release/preview1-adapter.wasm release-artifacts
-
-          expected="$(
-            printf '%s\n' \
-              preview1-adapter.wasm \
-              starling-debug.wasm \
-              starling-raw-debug.wasm \
-              starling-raw.wasm \
-              starling.wasm
-          )"
-          actual="$(
-            find release-artifacts -maxdepth 1 -type f -printf '%f\n' | sort
-          )"
-          if [ "$actual" != "$expected" ]; then
-            echo "unexpected release inventory" >&2
-            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
-            exit 1
-          fi
+          just builddir=build-aot aot-package release-artifacts
+          ./scripts/check-release-artifacts.sh release-artifacts
 
           echo "Release artifacts:"
           ls -la release-artifacts/

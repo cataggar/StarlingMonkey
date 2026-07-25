@@ -47,6 +47,7 @@
 /*-build.log
 /*-copy.log
 /deps/sm-obj-zig/
+/deps/sm-obj-zig-aot/
 /deps/spidermonkey-source/
 /deps/mozbuild-state/
 /deps/openssl-zig/
@@ -59,6 +60,7 @@
 /deps/link.log
 /deps/rust-staticlib-build/
 /deps/mozconfig-zig
+/deps/mozconfig-zig-aot
 
 # Compatibility harness (tests/compat): Python bytecode cache and the
 # opt-in reference mode's Node.js dependencies/build output.
@@ -89,4 +91,5 @@ tests/compat/runtime/invoker/target/
 # Native componentizer fake-tool orchestration scratch.
 tests/componentizer/.scratch/
 tests/componentizer/.real-cache/
+tests/componentizer/.aot-real-cache/
 tests/runtime-eval/.scratch/

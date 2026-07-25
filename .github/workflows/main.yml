@@ -71,7 +71,7 @@ jobs:
         tree spidermonkey-dist-${{ matrix.build }}
         echo "SPIDERMONKEY_BINARIES=$(pwd)/spidermonkey-dist-${{ matrix.build }}" >> $GITHUB_ENV
 
-    - uses: actions/setup-node@v2
+    - uses: actions/setup-node@v4
       with:
         node-version: 'lts/*'
 
@@ -126,6 +126,78 @@ jobs:
       if: matrix.build == 'debug' && github.base_ref != 'zig17'
       run: just lint
 
+  test-aot:
+    name: Test sealed Zig AOT
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-aot
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-aot
+      STARLING_REQUIRE_NOEXEC: 1
+      STARLING_NOEXEC_SUDO: 1
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0-dev.902+7255f3e72
+
+    - name: Install Just
+      uses: taiki-e/install-action@just
+
+    - name: Install Rust WASI target
+      run: rustup target add wasm32-wasip1
+
+    - name: Install cbindgen
+      run: cargo install cbindgen --locked --version 0.29.3
+
+    - name: Permit retained AOT user namespaces
+      run: |
+        if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; then
+          sudo tee /etc/apparmor.d/starling-componentizer-ci >/dev/null <<EOF
+        abi <abi/4.0>,
+        include <tunables/global>
+
+        profile starling-componentizer-ci "${GITHUB_WORKSPACE}/**/starling-componentize" flags=(unconfined) {
+          userns,
+        }
+        EOF
+          sudo apparmor_parser -r -W /etc/apparmor.d/starling-componentizer-ci
+        fi
+
+    - name: Build AOT dependencies
+      run: ./deps/build-deps.sh --all
+
+    - name: Fetch pinned Zig dependencies
+      run: zig build --fetch=all
+
+    - name: Build and test sealed AOT runtime
+      run: |
+        just builddir=zig-out-aot aot-test
+        just builddir=zig-out-aot aot-build-prefix-test
+
+    - name: Clean up noexec test mount
+      if: always()
+      run: |
+        mountpoint="${{ github.workspace }}/tests/componentizer/.scratch/noexec output"
+        if mountpoint -q "$mountpoint"; then
+          sudo -n umount "$mountpoint"
+        fi
+
+    - name: Validate AOT package assembly
+      run: just builddir=zig-out-aot aot-package release-artifacts
+
+    - name: Upload validated AOT package
+      uses: actions/upload-artifact@v4
+      with:
+        name: starling-aot
+        path: |
+          release-artifacts/starling-raw-weval.wasm
+          release-artifacts/starling-ics.wevalcache
+          release-artifacts/starling-ics.wevalcache.manifest
+
   feature-surface-acceptance:
     name: Required Zig and CMake feature-surface matrices
     runs-on: ubuntu-latest
@@ -168,7 +240,7 @@ jobs:
           -Doptimize=ReleaseSmall
 
   release-spidermonkey:
-    needs: [test, feature-surface-acceptance]
+    needs: [test, test-aot, feature-surface-acceptance]
     if: needs.test.outputs.SM_TAG_EXISTS == 'false' && (github.event_name == 'push' && 
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest

@@ -5,8 +5,8 @@
 #include <utility>
 
 #include "builtin.h"
-#include "extension-api.h"
 #include "config-parser.h"
+#include "extension-api.h"
 #include "host_api.h"
 #include "js_dispatch.h"
 #include "wasi/api.h"
@@ -18,7 +18,7 @@
 
 api::Engine *engine;
 
-api::Engine* initialize(std::vector<std::string_view> args) {
+api::Engine *initialize(std::vector<std::string_view> args) {
   auto config_parser = starling::ConfigParser();
   config_parser.apply_env()->apply_args(std::move(args));
   return new api::Engine(config_parser.take());
@@ -50,7 +50,7 @@ static uint64_t mono_clock_offset = 0;
 
 // This overrides wasi-libc's weakly linked implementation of clock_gettime to ensure that
 // monotonic clocks really are monotonic, even across resumptions of wizer snapshots.
-int clock_gettime(clockid_t clock, timespec * ts) {
+int clock_gettime(clockid_t clock, timespec *ts) {
   __wasi_clockid_t clock_id = 0;
   if (clock == CLOCK_REALTIME) {
     clock_id = __WASI_CLOCKID_REALTIME;
@@ -72,7 +72,16 @@ int clock_gettime(clockid_t clock, timespec * ts) {
   return 0;
 }
 
-void wizen() {
+static void finalize_snapshot() {
+  // Ensure runtime libc observes the resumed invocation's environment rather
+  // than the environment used while creating the snapshot.
+  __wasi_timestamp_t t = 0;
+  MOZ_RELEASE_ASSERT(!__wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &t));
+  mono_clock_offset = std::max(mono_clock_offset, t);
+  __wasilibc_deinitialize_environ();
+}
+
+void wizen_impl(bool skip_export_validation) {
   std::string args;
   std::getline(std::cin, args);
   auto config_parser = starling::ConfigParser();
@@ -80,17 +89,24 @@ void wizen() {
   auto config = config_parser.take();
   config->pre_initialize = true;
   ENGINE = new api::Engine(std::move(config));
-  if (!starling_validate_required_exports()) {
+  if (!skip_export_validation && !starling_validate_required_exports()) {
     ENGINE->abort("validating required JavaScript exports");
   }
   ENGINE->finish_pre_initialization();
   configuration_mode = RuntimeConfigurationMode::Snapshotted;
+  finalize_snapshot();
+}
 
-  // Ensure that the monotonic clock is always increasing, even across multiple resumptions.
-  __wasi_timestamp_t t = 0;
-  MOZ_RELEASE_ASSERT(!__wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &t));
-  mono_clock_offset = std::max(mono_clock_offset, t);
-  __wasilibc_deinitialize_environ();
+void wizen() { wizen_impl(false); }
+
+extern "C" __attribute__((export_name("starling-aot-cache-initialize"))) void
+starling_aot_cache_initialize() {
+  wizen_impl(true);
+}
+
+extern "C" __attribute__((export_name("starling-aot-runtime-initialize"))) void
+starling_aot_runtime_initialize() {
+  finalize_snapshot();
 }
 
 WIZER_INIT(wizen);
@@ -128,14 +144,14 @@ extern "C" bool exports_wasi_cli_run_run() {
 // Embedders that invoke JavaScript-backed exports directly need an explicit
 // depth-zero lifecycle checkpoint without entering the one-shot WASI CLI path.
 extern "C" STARLING_ENGINE_EXPORT
-    __attribute__((export_name("starling-js-shutdown-resources")))
-bool starling_js_shutdown_resources() {
+    __attribute__((export_name("starling-js-shutdown-resources"))) bool
+    starling_js_shutdown_resources() {
   return ENGINE && starling::shutdown_resources(ENGINE);
 }
 
 extern "C" STARLING_ENGINE_EXPORT
-    __attribute__((export_name("starling-js-exported-resource-count")))
-uint32_t starling_js_exported_resource_count() {
+    __attribute__((export_name("starling-js-exported-resource-count"))) uint32_t
+    starling_js_exported_resource_count() {
   return static_cast<uint32_t>(starling::exported_resource_count());
 }
 

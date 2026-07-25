@@ -9,13 +9,36 @@
 # Prerequisites: zig 0.17 (with `zig cc`), rustup (channel from rust-toolchain.toml
 # + wasm32-wasip1 target), python3, a host clang/clang++, make, curl, git.
 #
-# Re-running skips steps whose outputs already exist; pass `--force` to rebuild.
+# Re-running skips steps whose outputs already exist. `--aot` builds only the
+# Weval/PBL SpiderMonkey variant, `--all` builds both variants, and `--force`
+# rebuilds whichever variants were selected.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPS="$ROOT/deps"
 WRAP="$DEPS/zig-wrappers"
-FORCE="${1:-}"
+FORCE=0
+BUILD_DEFAULT=1
+BUILD_AOT=0
+for arg in "$@"; do
+  case "$arg" in
+    --aot)
+      BUILD_DEFAULT=0
+      BUILD_AOT=1
+      ;;
+    --all)
+      BUILD_DEFAULT=1
+      BUILD_AOT=1
+      ;;
+    --force)
+      FORCE=1
+      ;;
+    *)
+      echo "usage: $0 [--aot|--all] [--force]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Versions (kept in sync with cmake/*.cmake).
 SM_TAG="FIREFOX_147_0_4_RELEASE_STARLING"
@@ -23,16 +46,62 @@ SM_REPO="https://github.com/bytecodealliance/firefox.git"
 OPENSSL_VERSION="3.0.17"
 
 command -v zig >/dev/null || { echo "zig not found on PATH"; exit 1; }
+"$ROOT/scripts/require-zig-version.sh" "$(command -v zig)"
 command -v cargo >/dev/null || { echo "cargo not found on PATH"; exit 1; }
+command -v flock >/dev/null || { echo "flock not found on PATH"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 1. SpiderMonkey (from source, with the Zig toolchain).
 # ---------------------------------------------------------------------------
 SM_SRC="$DEPS/spidermonkey-source"
-SM_OBJ="$DEPS/sm-obj-zig"
-SM_LIB="$SM_OBJ/dist/libspidermonkey.a"
-if [[ "$FORCE" == "--force" || ! -f "$SM_LIB" ]]; then
-  echo ">>> Building SpiderMonkey ($SM_TAG)"
+build_spidermonkey() {
+  local variant="$1"
+  local sm_obj="$2"
+  local sm_lib="$sm_obj/dist/libspidermonkey.a"
+  local sm_marker="$sm_lib.complete"
+  local archive_builder="$DEPS/assemble-spidermonkey-archive.sh"
+  local sm_base="$sm_obj/js/src/build/libjs_static.a"
+  local -a sm_objs=(
+    memory/build/Unified_cpp_memory_build0.o
+    memory/mozalloc/Unified_cpp_memory_mozalloc0.o
+    mfbt/Unified_cpp_mfbt0.o mfbt/Unified_cpp_mfbt1.o
+    mozglue/misc/AutoProfilerLabel.o mozglue/misc/ConditionVariable_noop.o
+    mozglue/misc/Debug.o mozglue/misc/Decimal.o mozglue/misc/MmapFaultHandler.o
+    mozglue/misc/Mutex_noop.o mozglue/misc/Now.o mozglue/misc/Printf.o
+    mozglue/misc/SIMD.o mozglue/misc/StackWalk.o mozglue/misc/TimeStamp.o
+    mozglue/misc/TimeStamp_posix.o mozglue/misc/Uptime.o
+    mozglue/static/lz4.o mozglue/static/lz4frame.o mozglue/static/lz4hc.o
+    mozglue/static/xxhash.o third_party/fmt/Unified_cpp_third_party_fmt0.o
+  )
+  local -a sm_object_paths=()
+  local object
+  for object in "${sm_objs[@]}"; do
+    sm_object_paths+=("$sm_obj/$object")
+  done
+
+  mkdir -p "$sm_obj"
+  local sm_lock_fd
+  exec {sm_lock_fd}>>"$sm_obj/.starling-spidermonkey-build.lock"
+  flock -x "$sm_lock_fd"
+  if [[ "$FORCE" -ne 1 ]] &&
+    bash "$archive_builder" --validate \
+      "$(command -v zig)" "$sm_lib" "$sm_marker" "$variant" "$SM_TAG" \
+      "$sm_base" "$sm_obj" "${sm_object_paths[@]}" 2>/dev/null
+  then
+    echo ">>> SpiderMonkey $variant up to date"
+    exec {sm_lock_fd}>&-
+    return
+  fi
+
+  local rebuild_objects="$FORCE"
+  for object in "$sm_base" "${sm_object_paths[@]}" \
+    "$sm_obj/js/src/js-confdefs.h"
+  do
+    [[ -f "$object" ]] || rebuild_objects=1
+  done
+
+  if [[ "$rebuild_objects" -eq 1 ]]; then
+    echo ">>> Building SpiderMonkey $variant ($SM_TAG)"
   if [[ ! -d "$SM_SRC/.git" ]]; then
     git clone --depth 1 --branch "$SM_TAG" "$SM_REPO" "$SM_SRC"
   fi
@@ -46,8 +115,11 @@ if [[ "$FORCE" == "--force" || ! -f "$SM_LIB" ]]; then
       && git -C "$SM_SRC" apply "$DEPS/patches/$p" || true
   done
 
-  MOZCONFIG="$DEPS/mozconfig-zig"
-  cat > "$MOZCONFIG" <<EOF
+  local mozconfig="$DEPS/mozconfig-zig"
+  if [[ "$variant" == "AOT" ]]; then
+    mozconfig="$DEPS/mozconfig-zig-aot"
+  fi
+  cat > "$mozconfig" <<EOF
 ac_add_options --enable-project=js
 ac_add_options --disable-js-shell
 ac_add_options --target=wasm32-unknown-wasi
@@ -64,10 +136,18 @@ ac_add_options --enable-js-streams
 ac_add_options --enable-portable-baseline-interp
 ac_add_options --disable-stdcxx-compat
 ac_add_options --disable-debug
-ac_add_options --prefix=$SM_OBJ/dist
-mk_add_options MOZ_OBJDIR=$SM_OBJ
+ac_add_options --prefix=$sm_obj/dist
+mk_add_options MOZ_OBJDIR=$sm_obj
 mk_add_options AUTOCLOBBER=1
 EOF
+  if [[ "$variant" == "AOT" ]]; then
+    cat >> "$mozconfig" <<'EOF'
+ac_add_options --enable-portable-baseline-interp-force
+ac_add_options --enable-aot-ics
+ac_add_options --enable-aot-ics-force
+ac_add_options --enable-pbl-weval
+EOF
+  fi
 
   # (Captured to a log file, not just left on the terminal, so the -fPIC
   # guard below can grep it directly: mach re-runs a second, unrelated
@@ -77,10 +157,10 @@ EOF
   # itself for the -fPIC probe racy. mach's own build console output, which
   # includes each configure probe result on one line
   # ("checking ... -fPIC... yes"), doesn't have that problem.)
-  BUILD_LOG="$DEPS/sm-build.log"
-  MOZCONFIG="$MOZCONFIG" MOZBUILD_STATE_PATH="$DEPS/mozbuild-state" LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib}" \
+  local build_log="$DEPS/sm-build-${variant,,}.log"
+  MOZCONFIG="$mozconfig" MOZBUILD_STATE_PATH="$DEPS/mozbuild-state" LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib}" \
     env CC="$WRAP/zig-cc" CXX="$WRAP/zig-cxx" AR="$WRAP/zig-ar" HOST_CC="${HOST_CC:-clang}" HOST_CXX="${HOST_CXX:-clang++}" \
-    python3 "$SM_SRC/mach" --no-interactive build 2>&1 | tee "$BUILD_LOG"
+    python3 "$SM_SRC/mach" --no-interactive build 2>&1 | tee "$build_log"
 
   # libspidermonkey.a must be usable as a wasm32-wasi -dynamic -fPIC dylib
   # (see docs/pic-spidermonkey.md): build/moz.configure/flags.configure
@@ -94,36 +174,35 @@ EOF
   # time.
   for probe in "checking whether the C compiler supports -fPIC... yes" \
                "checking whether the C++ compiler supports -fPIC... yes"; do
-    grep -qF "$probe" "$BUILD_LOG" || {
+    grep -qF "$probe" "$build_log" || {
       echo "ERROR: SpiderMonkey configure did not confirm -fPIC support" \
-        "($probe) -- see $BUILD_LOG; libspidermonkey.a would not be" \
+        "($probe) -- see $build_log; libspidermonkey.a would not be" \
         "usable as a wasm32-wasi -dynamic -fPIC dylib" >&2
       exit 1
     }
   done
-  echo ">>> Confirmed -fPIC is enabled for the SpiderMonkey build (see $BUILD_LOG)"
+  echo ">>> Confirmed -fPIC is enabled for the SpiderMonkey $variant build (see $build_log)"
+  else
+    echo ">>> Reassembling SpiderMonkey $variant archive"
+  fi
 
   # Combine libjs_static.a with the extra objects StarlingMonkey needs (matches
   # SM_OBJ_FILES in cmake/spidermonkey.cmake).
-  SM_OBJS=(
-    memory/build/Unified_cpp_memory_build0.o
-    memory/mozalloc/Unified_cpp_memory_mozalloc0.o
-    mfbt/Unified_cpp_mfbt0.o mfbt/Unified_cpp_mfbt1.o
-    mozglue/misc/AutoProfilerLabel.o mozglue/misc/ConditionVariable_noop.o
-    mozglue/misc/Debug.o mozglue/misc/Decimal.o mozglue/misc/MmapFaultHandler.o
-    mozglue/misc/Mutex_noop.o mozglue/misc/Now.o mozglue/misc/Printf.o
-    mozglue/misc/SIMD.o mozglue/misc/StackWalk.o mozglue/misc/TimeStamp.o
-    mozglue/misc/TimeStamp_posix.o mozglue/misc/Uptime.o
-    mozglue/static/lz4.o mozglue/static/lz4frame.o mozglue/static/lz4hc.o
-    mozglue/static/xxhash.o third_party/fmt/Unified_cpp_third_party_fmt0.o
-  )
-  mkdir -p "$SM_OBJ/dist"
-  cp "$SM_OBJ/js/src/build/libjs_static.a" "$SM_LIB"
-  ( cd "$SM_OBJ" && zig ar -q "$SM_LIB" "${SM_OBJS[@]}" )
-  cp -f "$SM_OBJ/js/src/js-confdefs.h" "$SM_OBJ/dist/include/js-confdefs.h"
-  echo ">>> SpiderMonkey done: $SM_LIB"
-else
-  echo ">>> SpiderMonkey up to date"
+  mkdir -p "$sm_obj/dist/include"
+  STARLING_SM_ARCHIVE_FORCE="$FORCE" \
+    bash "$archive_builder" \
+      "$(command -v zig)" "$sm_lib" "$sm_marker" "$variant" "$SM_TAG" \
+      "$sm_base" "$sm_obj" "${sm_object_paths[@]}"
+  cp -f "$sm_obj/js/src/js-confdefs.h" "$sm_obj/dist/include/js-confdefs.h"
+  exec {sm_lock_fd}>&-
+  echo ">>> SpiderMonkey $variant done: $sm_lib"
+}
+
+if [[ "$BUILD_DEFAULT" -eq 1 ]]; then
+  build_spidermonkey "default" "$DEPS/sm-obj-zig"
+fi
+if [[ "$BUILD_AOT" -eq 1 ]]; then
+  build_spidermonkey "AOT" "$DEPS/sm-obj-zig-aot"
 fi
 
 # ---------------------------------------------------------------------------
@@ -131,7 +210,7 @@ fi
 # ---------------------------------------------------------------------------
 SSL_SRC="$DEPS/openssl-src"
 SSL_INSTALL="$DEPS/openssl-zig"
-if [[ "$FORCE" == "--force" || ! -f "$SSL_INSTALL/libx32/libcrypto.a" ]]; then
+if [[ "$FORCE" -eq 1 || ! -f "$SSL_INSTALL/libx32/libcrypto.a" ]]; then
   echo ">>> Building OpenSSL $OPENSSL_VERSION"
   if [[ ! -d "$SSL_SRC" ]]; then
     curl -sL -o "$DEPS/openssl-$OPENSSL_VERSION.tar.gz" \
@@ -168,7 +247,7 @@ fi
 # 3. Rust crate bundle (single wasm32-wasip1 staticlib).
 # ---------------------------------------------------------------------------
 RUST_LIB="$ROOT/target/wasm32-wasip1/release/librust_staticlib.a"
-if [[ "$FORCE" == "--force" || ! -f "$RUST_LIB" ]]; then
+if [[ "$FORCE" -eq 1 || ! -f "$RUST_LIB" ]]; then
   echo ">>> Building Rust crate bundle"
   BD="$DEPS/rust-staticlib-build"
   rm -rf "$BD" && mkdir -p "$BD/.cargo"
@@ -202,4 +281,11 @@ else
 fi
 
 echo
-echo "All dependencies built. Now run: zig build -Doptimize=ReleaseSmall"
+if [[ "$BUILD_AOT" -eq 1 && "$BUILD_DEFAULT" -eq 0 ]]; then
+  echo "All AOT dependencies built. Now run: zig build -Doptimize=ReleaseSmall -Daot-engine=true"
+else
+  echo "All requested dependencies built. Standard: zig build -Doptimize=ReleaseSmall"
+  if [[ "$BUILD_AOT" -eq 1 ]]; then
+    echo "AOT: zig build -Doptimize=ReleaseSmall -Daot-engine=true"
+  fi
+fi

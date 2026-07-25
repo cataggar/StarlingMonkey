@@ -1,11 +1,10 @@
 cmake_minimum_required(VERSION 3.27)
 
+option(WEVAL "Build with a SpiderMonkey variant that supports weval-based AOT compilation" OFF)
 if(WEVAL)
     message(FATAL_ERROR
-        "CMake WEVAL builds are no longer supported. "
-        "Use the sealed Zig AOT path: "
-        "zig build -Doptimize=ReleaseSmall -Daot-engine=true."
-    )
+        "CMake WEVAL=ON is disabled because it cannot produce the sealed, validated AOT cache. "
+        "Use `zig build -Doptimize=ReleaseSmall -Daot-engine=true` instead.")
 endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -228,6 +227,8 @@ else()
     endif()
 endif()
 
+set(AOT 0)
+set(AOT_DRIVER "")
 set(ENGINE_PROVENANCE_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-engine-provenance.py"
 )
@@ -259,7 +260,6 @@ add_custom_command(
 )
 
 set(EXTERNAL_RUNTIME_FILE "starling-raw.wasm")
-set(AOT 0)
 
 set(RUNTIME_FILE "starling-raw.wasm")
 set(ADAPTER_FILE "preview1-adapter.wasm")

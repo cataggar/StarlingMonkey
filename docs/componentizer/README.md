@@ -8,7 +8,8 @@ The CLI performs these stages with structured process arguments (never a shell
 command string):
 
 1. Select and cache a WIT-specific `zig build` of `starling-raw.wasm`.
-2. Pre-initialize the JavaScript module with Wizer.
+2. Pre-initialize the JavaScript module with Wizer, or partially evaluate it
+   with the explicitly selected Weval AOT pipeline.
 3. Strip and embed the selected component world with `wasm-tools`.
 4. Adapt the reactor into a component.
 5. Generate and compose feature-surface providers with pinned WABT so
@@ -73,6 +74,268 @@ resource identities across WASI releases.
 The componentizer test target is the required gate: it runs unit and fake-tool
 coverage plus real `wasm-tools`/Wizer relinks for two distinct WIT worlds.
 
+## Weval AOT engine and cache
+
+The AOT engine is a separate SpiderMonkey build. It enables forced portable
+baseline interpretation, AOT inline caches, and PBL/Weval integration; a
+normal `deps/sm-obj-zig` archive is never relabeled as AOT. Build dependencies
+and a directly packaged AOT engine with:
+
+```console
+./deps/build-deps.sh --all
+zig build -Doptimize=ReleaseSmall -Daot-engine=true
+```
+
+`--all` builds both standard and AOT SpiderMonkey variants. An AOT Zig build
+defaults `-Dwasm-opt` to false, matching the upstream Weval build; explicitly
+enabling wasm-opt or selecting a Debug build is rejected. It installs:
+
+- `starling-raw.wasm`, linked against `deps/sm-obj-zig-aot`;
+- `starling-ics.wevalcache`, primed by pinned Weval 0.4.1;
+- `starling-ics.wevalcache.manifest`, the integrity and compatibility seal;
+- `starling-componentize`, `starling-aot-cache`, and the pinned tools.
+
+For a per-WIT production build, select AOT explicitly:
+
+```console
+zig-out/bin/starling-componentize \
+  --aot \
+  --wit host-apis/wasi-0.2.10/wit/deps/starling-js \
+  --world-name js-exports \
+  --component-wit host-apis/wasi-0.2.10/wit \
+  --component-world-name js-dispatch \
+  --out app.wasm \
+  app.js
+```
+
+The componentizer uses a distinct runtime-cache key for Wizer and AOT and
+passes `-Daot-engine=true` to the nested Zig build. Every v0.4 build uses
+exactly Zig `0.17.0-dev.902+7255f3e72`. The
+`starling-weval-cache-v2` seal keys the explicit AOT engine ABI, exact engine
+and selected Weval binary SHA-256 digests, a deterministic digest of the full
+Weval package tree, the selected relative path and basename, resolved
+feature/build/host ABI, dedicated cache-initializer ABI, and cache-primer
+digest. Schema v1 does not bind the complete package and is intentionally
+rejected rather than migrated or accepted as a fallback. A separate cache
+SHA-256 protects the SQLite bytes. Before sealing, the cache is rebuilt in deterministic row order with
+`created_time` normalized to zero and fixed SQLite storage settings, so clean
+primes of the same inputs produce byte-identical packaged databases. WIT
+closures, generated
+bindings, host APIs, source/toolchain changes, and linked libraries are bound
+by the engine digest; WIT/world and feature selections also remain in the
+outer runtime key. Sealing first opens Weval's database read-only, runs `integrity_check`, verifies
+the exact table/index shape, and requires a nonempty live row for the exact
+engine digest in `weval_cache.module_hash`. The canonical database is checked
+the same way before publication, and validation repeats those checks. Bytes in
+deleted or unrelated rows cannot bind a cache to an engine.
+
+Sealing retains no-follow handles for every input and the initially resolved
+output parents. SQLite parsing, hashing, integrity checks, schema checks, and
+live-row checks all consume those same handles. Object identity includes the
+filesystem/device, inode, and kind; stable reads check ctime and repeat content
+digests, so restored mtimes cannot hide in-place mutation. Publication acquires
+the sorted set of cache and manifest destination locks, uses private `0700`
+transaction directories, and maintains a checksummed two-slot journal with a
+durable clean baseline before its first transaction record. The journal records
+both old and new inode/content identities and durably advances around each
+cache, manifest, rollback, quarantine, and cleanup namespace operation.
+`seal`, `validate`, and the
+explicit `starling-aot-cache recover` command recover an interrupted
+transaction before doing new work. Recovery either restores both exact old
+objects or accepts both exact new objects. Rollback exchanges an object into
+quarantine before validating it; an unrelated raced replacement is restored
+when safe, never deleted, and keeps the journal/backups recoverable until its
+owner resolves the conflict. Every affected output and workspace directory is
+synced before committed, rolled-back, cleanup, and clean records.
+
+The lock, journal, and empty private transaction directories use hidden
+`.starling-aot-seal-*` names beside the cache. They are persistent control
+metadata, not package artifacts. Cache and manifest filenames and bytes remain
+unchanged and relocatable.
+
+`--aot-cache-dir` selects a read-only cache bundle containing the two
+`starling-ics.wevalcache*` files. It also accepts a direct cache-file path,
+with the manifest at `<path>.manifest`, for compatibility with callers that
+treat ComponentizeJS's `--aot-cache-dir` as a file option. `--engine --aot`
+defaults to a bundle beside the engine. `--weval-bin` must identify the exact
+selected package path in the seal. A Zig AOT installation owns the complete
+closure under `weval-package/`, with `weval-package/weval` as the managed
+selection. `bin/weval` is only a convenience entry point and resolves to that
+managed selection; it is not a second compatibility identity.
+
+An external engine package must carry schema-1
+`starling:engine-provenance`, a matching five-feature `features.json`,
+`preview1-adapter.wasm`, and nonempty `component-wit/`, `surface-wit/`, and
+`feature-wit/` trees containing the declared component and surface worlds.
+Missing or incompatible provenance, features, or worlds is rejected before
+the engine is used. AOT derives the required feature ABI from that validated
+provenance and requires the seal to match it. World validation uses
+`wasm-tools` to parse and embed the complete closures; comments, filename
+matches, and raw text do not satisfy it. Explicit `--wit`, `--world-name`,
+`--component-wit`, and `--component-world-name` selections must match the
+packaged closure digests and provenance exactly.
+
+Missing artifacts, malformed manifests, non-SQLite or
+checksum-corrupt caches, and engine/tool/feature mismatches all fail before
+initialization or output publication; there is no Wizer fallback.
+The engine, cache, manifest, adapter, complete component/surface/feature WIT
+closures, and every Weval package entry are retained by no-follow handles
+before a private per-run snapshot is assembled. Absolute paths are walked
+from a retained root handle; every ancestor is retained and identity-checked,
+so swapping and restoring an ancestor cannot redirect a capture. Snapshot
+bytes are read only from those handles, and children receive only private
+snapshot paths. Before/after object, namespace, and digest checks reject
+unrestored substitution or retained-object mutation.
+An external engine package is one descriptor-relative transaction: its root
+is retained once, every required sibling is captured through that root, and
+the complete tree is reverified after test/validation boundaries and before
+publication. A change after the snapshot boundary reports
+`TransactionChanged` and leaves any existing output untouched.
+For AOT, the root must also own the sealed cache and manifest plus
+`weval-package/`; an installed generation may place the runtime surface and
+seal under `bin/` with `weval-package/` beside it. Cache, manifest, or Weval
+overrides outside that same root are rejected rather than captured as a
+second transaction. The managed two-level layout is selected only from that
+validated structure and the selected Weval path, never merely because the
+runtime directory is named `bin`. A complete flat package named `bin` remains
+flat. If both flat and managed closures exist, the default flat
+`weval-package/weval` wins; an explicit path selects the matching validated
+closure.
+A transient rename/substitution is either detected as `TransactionChanged` or
+the original retained bytes are used; substituted bytes are never copied or
+executed. The Weval snapshot scope is the selected executable's canonical
+containing directory and all descendants (at most 4,096 entries, 32 levels,
+and 1 GiB of regular-file data). Descriptor-relative, no-follow traversal
+copies stable regular files, directories, and relative symlinks. Every
+relative symlink target, including each intermediate symlink, is recursively
+resolved against the captured package model and retained. Dangling, cyclic,
+absolute, package-escaping, and special-file layouts are rejected. The
+selected basename and internal symlink target are retained, so native
+argv[0]-dispatched tools and `$ORIGIN` sibling libraries see their original
+relative layout. Selected scripts are rejected: their interpreter and
+arbitrary PATH subprocess closure cannot be proven complete.
+
+Resolved WABT and `wasm-tools` executables are treated the same way. Their
+containing closures are retained and reverified through publication. On
+Linux, every captured regular file is copied from its retained descriptor into
+a write/grow/shrink-sealed memfd. The componentizer forks without reopening
+itself and enters a private user and mount namespace with direct Linux
+syscalls; no external `unshare` program is involved. A per-transaction tmpfs
+root contains the immutable package and a recursive, no-execute bind mirror
+of the original root filesystem. A chroot with top-level mirror links keeps
+all caller-visible absolute paths—including paths under `/mnt`—visible
+without overlaying any caller directory.
+
+Static native tools execute an immutable file descriptor with `execveat`.
+For dynamic ELF64 tools, the componentizer parses `PT_INTERP`, `DT_NEEDED`,
+and supported `$ORIGIN` RUNPATH entries, retains and verifies the exact loader
+and transitive shared libraries, and copies them into the sealed snapshot.
+DT_RPATH is rejected because its inherited transitive precedence is not
+modeled. Empty, absolute, ambiguous, or otherwise tokenized RUNPATH entries
+are rejected before any system-library fallback. The retained
+loader executes by descriptor with cache/hwcaps lookup disabled and a private
+library path; loader injection environment variables are removed. Live host
+mounts are no-execute, so PATH tools and uncaptured executable mappings cannot
+join the closure. At process startup, missing stdin/stdout/stderr descriptors
+are reserved with `/dev/null` before any capture can reuse descriptor 0, 1,
+or 2. Before `execveat`, every descriptor except stdio, the
+selected sealed executable or loader, and explicitly retained read-only
+engine/cache input handles is marked close-on-exec. Captured package directory
+handles therefore never reach tool code through `/proc/self/fd`. The pinned
+WABT, wasm-tools, and Weval binaries are covered;
+unsupported executable formats fail closed. Reusable tool snapshots avoid
+recapturing, rehashing, or resealing the package and runtime closure for each
+invocation; only the required private namespace materialization is repeated.
+Engine and cache reads likewise use retained file descriptors. Platforms without
+equivalent retained-handle execution fail closed. Diagnostics and debug
+command logs continue to identify the originally selected tool.
+Replacing a tool pathname after resolution therefore cannot select different
+bytes.
+
+Cache validation hashes the snapshot regular file actually reached by the
+selected executable, while execution uses the selected snapshot path. A
+content/metadata digest of the complete private package is checked immediately
+before and after execution. Thus neither Weval nor its sibling closure is
+reopened from the mutable source package after validation, and snapshots are
+removed on success or failure.
+
+Executable AOT snapshots are never placed under the output tree. Candidate
+roots inside the source package are excluded and every candidate is probed
+with an actual private executable before use. If explicit runtime/temp
+variables are absent, supported Unix hosts also try the platform default
+temporary directory (`/tmp`) before the current directory, so read-only
+installations and no-execute output mounts still work.
+The required CI gate provisions a real `noexec` tmpfs and fails if it cannot;
+local runs explicitly report `SKIP` rather than treating an ordinary
+filesystem probe as coverage.
+
+`--aot-min-stack-size` sets Weval's `RUST_MIN_STACK`. The deterministic
+default is 8 MiB, and ambient `RUST_MIN_STACK` and `STARLINGMONKEY_CONFIG`
+are removed so every snapshot-affecting input is explicit. All subprocess
+arguments are structured, including cache, source, output, and preopen paths
+containing spaces.
+
+An AOT `componentize.sh` installation delegates to the same native driver.
+`WEVAL_CACHE_DIR` and `AOT_MIN_STACK_SIZE` provide shell-entry-point
+equivalents for the two controls. `PREOPEN_DIR`, `--output`, positional
+output, and output-only runtime componentization retain the legacy wrapper
+behavior. CMake rejects `WEVAL=ON` with the Zig AOT build command because its
+legacy cache target cannot provide this sealed/validated contract.
+
+Run the focused cache and equivalence coverage with:
+
+```console
+zig build componentizer-test -Doptimize=ReleaseSmall
+zig build aot-engine-test -Doptimize=ReleaseSmall
+```
+
+The first includes shell-sibling, argv[0], real ELF `$ORIGIN`, symlink-selected
+executable, immutable-package mutation, noexec output/cwd, missing/stale/corrupt
+cache, descriptor/symlink/parent-retarget race, bundle rollback, and concurrent
+release-publication coverage. The second builds both real engine variants,
+validates both components, primes clean caches in separate directories to
+prove byte-for-byte reproducibility, and invokes the same typed JavaScript
+exports through Wasmtime to prove Wizer/AOT behavioral equivalence. Its
+fixtures and cache/output paths include spaces.
+
+Release packaging must keep the cache and manifest together. The repository's
+packaging gate builds through Zig and validates both the engine module and the
+sealed SQLite bundle before publication. AOT installation writes every prefix
+artifact, including Weval and the sealed bundle, to a build-cache generation;
+`starling-aot-cache publish-prefix` copies and validates that complete
+generation under the publication lock before atomically exchanging the prefix.
+Release packaging uses `publish-bundle` to overlay its three public artifacts
+into an equally private complete generation. Both commands use the same
+checksummed dual-slot journal and recover abandoned staging, switching,
+rollback, and cleanup phases before a new publisher starts. A target-scoped
+kernel lock serializes publishers and is automatically released on process
+termination; no child process inherits it.
+The public package layout remains three ordinary files with the existing
+names. Hidden `.starling-aot-publish-*` lock/journal files live beside, rather
+than inside, the switched directory:
+
+```console
+just builddir=build-aot aot-package release-artifacts
+```
+
+The GitHub v0.4 release contains exactly eight assets: the five non-AOT files
+`starling-raw.wasm`, `starling-raw-debug.wasm`, `starling.wasm`,
+`starling-debug.wasm`, and `preview1-adapter.wasm`, plus the inseparable AOT
+trio `starling-raw-weval.wasm`, `starling-ics.wevalcache`, and
+`starling-ics.wevalcache.manifest`. The inventory gate rejects external
+engines such as `starling-raw-weval-external.wasm`, unsealed caches, extra
+files, or a partial trio.
+
+For an already assembled bundle, run the same seal validation directly:
+
+```console
+build-aot/bin/starling-aot-cache validate \
+  --engine release-artifacts/starling-raw-weval.wasm \
+  --weval build-aot/bin/weval \
+  --cache release-artifacts/starling-ics.wevalcache \
+  --manifest release-artifacts/starling-ics.wevalcache.manifest
+```
+
 ## Per-run WIT worlds
 
 The monolithic runtime needs two related WIT views:
@@ -102,16 +365,19 @@ zig-out/bin/starling-componentize \
 ```
 
 WIT files are content-hashed and staged under the build root. Runtime prefixes
-are keyed by the componentizer's embedded host API, the two WIT closures,
-worlds, feature selection, and build mode. Every nested build receives that
-exact `-Dhost-api`; an installed componentizer cannot silently fall back to a
-different adapter/provider identity.
+are keyed by the pipeline/engine ABI, the componentizer's embedded host API,
+the two WIT closures and worlds, resolved feature ABI, and build mode. Every
+nested build receives that exact `-Dhost-api`; an installed componentizer
+cannot silently fall back to a different adapter/provider identity.
 The CLI still invokes `zig build` on every run so source/toolchain changes
 cannot reuse stale output; Zig's own dependency cache makes an unchanged
 monolithic relink a fast cache hit. JavaScript source is deliberately excluded
 from the runtime key. Per-input and per-runtime advisory locks make concurrent
 uses of one cache safe, and the runtime lock remains held until componentization
 has finished consuming the cached engine, adapter, and generated bindings.
+An explicit `ZIG_GLOBAL_CACHE_DIR` is preserved for nested builds; otherwise
+the CLI uses `<cache-dir>/zig-global-cache`. `ZIG_LOCAL_CACHE_DIR` is always
+removed.
 The effective default or explicit componentizer cache is canonicalized before
 source snapshotting and retained through an opened directory handle. Runtime,
 lock, and Zig local/global-cache directories are created and checked no-follow
@@ -329,7 +595,13 @@ sibling, then `PATH`. The principal overrides are `--zig-bin`,
 `--wasmtime-bin`/`--wizer-bin`, `--wabt-bin`, `--wasm-tools-bin`, and
 `--preview2-adapter`. `--wasmtime-bin` selects Wasmtime's `wizer` subcommand;
 `--wizer-bin` selects a standalone Wizer and uses its native
-`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options.
+`--allow-wasi`/`--inherit-env`/`--wasm-bulk-memory` options. Executable
+overrides may be absolute paths, relative paths containing a separator, or
+bare names resolved through `PATH`. Wizer is resolved only for a non-AOT run
+that actually initializes JavaScript; AOT and non-AOT output-only runs ignore
+ambient Wizer settings. The AOT runtime-only initializer snapshots no engine,
+but resets libc environment state and finalizes the monotonic-clock offset so
+runtime `STARLINGMONKEY_CONFIG` and `-e` arguments are observed after resume.
 For runtime builds, a valid `ZIG_LIB_DIR` takes precedence; standard archive
 and installed layouts are resolved next, with stable `zig env` execution as a
 fallback. The executable and complete library tree are copied together into
@@ -356,6 +628,5 @@ retained as the rollback anchor while unrelated entries are identity-checked
 and copied into the staged merge. The complete merged directory is published
 only after validation, with rollback on any publication failure.
 
-The CLI advertises the frozen ComponentizeJS 0.21 AOT option names but rejects
-them explicitly. Weval execution and cache controls belong to the separate
-`aot-engine` milestone; silently falling back to Wizer would be incorrect.
+The AOT option names match the frozen ComponentizeJS 0.21 CLI surface, while
+cache sealing and deterministic failure behavior are stricter.
