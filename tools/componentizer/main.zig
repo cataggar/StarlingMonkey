@@ -3076,6 +3076,7 @@ fn execute(
         executable_dir,
         config,
         &transaction,
+        diagnostic,
     );
     try waitForComponentizerTestHook(
         allocator,
@@ -5993,14 +5994,24 @@ fn captureTool(
     storage_name: []const u8,
     capture_package: bool,
     transaction: *Transaction,
+    diagnostic: *diagnostics.Context,
 ) !Snapshot {
-    const resolved = try resolveConfiguredExecutable(
+    const resolved = resolveConfiguredExecutable(
         allocator,
         io,
         environ,
         cwd,
         source,
-    );
+    ) catch |err| {
+        if (err == error.MissingBuildArtifact) {
+            diagnostic.detail = std.fmt.allocPrint(
+                diagnostic.allocator,
+                "required tool '{s}' was not found or is not executable: {s}",
+                .{ storage_name, source },
+            ) catch "a required tool was not found or is not executable";
+        }
+        return err;
+    };
     if (!capture_package) {
         return (try captureInputFile(
             allocator,
@@ -6133,6 +6144,7 @@ fn resolveTools(
     executable_dir: []const u8,
     config: *const cli.Config,
     transaction: *Transaction,
+    diagnostic: *diagnostics.Context,
 ) !Tools {
     const standalone_wizer = try std.fs.path.join(
         allocator,
@@ -6189,6 +6201,7 @@ fn resolveTools(
             "wizer",
             false,
             transaction,
+            diagnostic,
         ),
         .wasmtime_subcommand = wizer_is_wasmtime,
     };
@@ -6201,6 +6214,7 @@ fn resolveTools(
         "wasm-tools",
         false,
         transaction,
+        diagnostic,
     );
     const wabt = try captureTool(
         allocator,
@@ -6211,6 +6225,7 @@ fn resolveTools(
         "wabt",
         config.wabt_bin != null or environ.get("WABT") != null,
         transaction,
+        diagnostic,
     );
     return .{ .wizer = wizer, .wabt = wabt, .wasm_tools = wasm_tools };
 }

@@ -296,6 +296,8 @@ echo "Clean AOT cache reproducibility passed"
   --zig-bin "$ZIG" \
   --weval-bin "$WEVAL" \
   --preview2-adapter "$ADAPTER" \
+  --wasmtime-bin "$WASMTIME" \
+  --wabt-bin "$WABT" \
   --wasm-tools-bin "$WASM_TOOLS" \
   --out "$AOT_RUNTIME_INVOKE_OUTPUT"
 "$WASM_TOOLS" validate --features all "$AOT_RUNTIME_INVOKE_OUTPUT"
