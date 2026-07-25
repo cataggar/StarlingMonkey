@@ -39,6 +39,7 @@ const EngineFeatures = struct {
 
 const EngineProvenance = struct {
     schema: u32,
+    sha256: []const u8,
     host_api: []const u8,
     features: EngineFeatures,
     component_world: []const u8,
@@ -1925,7 +1926,9 @@ fn readEngineProvenance(
         return error.InvalidEngineProvenance;
     var offset: u64 = header.len;
     var provenance_json: ?[]const u8 = null;
+    var provenance_section_start: ?u64 = null;
     while (offset < engine.identity.stat.size) {
+        const section_start = offset;
         var section_id: [1]u8 = undefined;
         try readCapturedExact(io, engine, &section_id, offset);
         offset += 1;
@@ -1945,8 +1948,10 @@ fn readEngineProvenance(
             try readCapturedExact(io, engine, name, offset);
             offset += name_length;
             if (std.mem.eql(u8, name, "starling:engine-provenance")) {
-                if (provenance_json != null)
+                if (provenance_json != null or
+                    section_end != engine.identity.stat.size)
                     return error.InvalidEngineProvenance;
+                provenance_section_start = section_start;
                 const json_length = section_end - offset;
                 if (json_length == 0 or json_length > 16 * 1024)
                     return error.InvalidEngineProvenance;
@@ -1967,13 +1972,42 @@ fn readEngineProvenance(
         .{ .ignore_unknown_fields = true },
     ) catch return error.InvalidEngineProvenance;
     if (parsed.schema != 1 or
+        parsed.sha256.len != 64 or
         parsed.host_api.len == 0 or
         parsed.component_world.len == 0 or
         parsed.surface_world.len == 0)
         return error.InvalidEngineProvenance;
+    for (parsed.sha256) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f'))
+            return error.InvalidEngineProvenance;
+    }
     try validateRuntimeText(parsed.host_api);
     try validateRuntimeText(parsed.component_world);
     try validateRuntimeText(parsed.surface_world);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var digest_offset: u64 = 0;
+    const digest_end = provenance_section_start orelse
+        return error.InvalidEngineProvenance;
+    while (digest_offset < digest_end) {
+        const count: usize = @intCast(@min(
+            buffer.len,
+            digest_end - digest_offset,
+        ));
+        try readCapturedExact(
+            io,
+            engine,
+            buffer[0..count],
+            digest_offset,
+        );
+        hasher.update(buffer[0..count]);
+        digest_offset += count;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, parsed.sha256, &digest_hex))
+        return error.InvalidEngineProvenance;
     try verifyCapturedPackageFile(io, engine);
     return parsed;
 }
@@ -6494,6 +6528,110 @@ fn pathContains(parent: []const u8, child: []const u8) bool {
     if (!std.mem.startsWith(u8, child, parent)) return false;
     if (std.mem.endsWith(u8, parent, &.{std.fs.path.sep})) return true;
     return child.len > parent.len and child[parent.len] == std.fs.path.sep;
+}
+
+fn appendTestWasmUleb(
+    allocator: Allocator,
+    output: *std.ArrayList(u8),
+    initial_value: usize,
+) !void {
+    var value = initial_value;
+    while (true) {
+        const byte: u8 = @intCast(value & 0x7f);
+        value >>= 7;
+        try output.append(
+            allocator,
+            byte | if (value == 0) @as(u8, 0) else 0x80,
+        );
+        if (value == 0) return;
+    }
+}
+
+fn testEngineWithProvenance(
+    allocator: Allocator,
+    sha256: []const u8,
+) ![]u8 {
+    const name = "starling:engine-provenance";
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"sha256\":\"{s}\",\"host_api\":\"wasi-0.2.10\",\"features\":{{\"stdio\":true,\"random\":true,\"clocks\":true,\"http\":true,\"fetch-event\":true}},\"component_world\":\"exports\",\"surface_world\":\"exports\"}}",
+        .{sha256},
+    );
+    var payload: std.ArrayList(u8) = .empty;
+    try appendTestWasmUleb(allocator, &payload, name.len);
+    try payload.appendSlice(allocator, name);
+    try payload.appendSlice(allocator, json);
+    var module: std.ArrayList(u8) = .empty;
+    try module.appendSlice(allocator, "\x00asm\x01\x00\x00\x00");
+    try module.append(allocator, 0);
+    try appendTestWasmUleb(allocator, &module, payload.items.len);
+    try module.appendSlice(allocator, payload.items);
+    return module.toOwnedSlice(allocator);
+}
+
+test "AOT engine provenance binds metadata to engine bytes" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const engine_prefix = "\x00asm\x01\x00\x00\x00";
+    var expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+        undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        engine_prefix,
+        &expected_digest,
+        .{},
+    );
+    const expected_hex = std.fmt.bytesToHex(expected_digest, .lower);
+    const cases = [_]struct {
+        name: []const u8,
+        sha256: []const u8,
+        valid: bool,
+    }{
+        .{
+            .name = "matching.wasm",
+            .sha256 = &expected_hex,
+            .valid = true,
+        },
+        .{
+            .name = "mismatched.wasm",
+            .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+            .valid = false,
+        },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (cases) |case| {
+        const module = try testEngineWithProvenance(
+            allocator,
+            case.sha256,
+        );
+        var file = try tmp.dir.createFile(io, case.name, .{ .read = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, module, 0);
+        try file.sync(io);
+        const captured = CapturedPackageFile{
+            .file = file,
+            .identity = try packageFileIdentity(io, file),
+            .digest = try hashPackageFile(io, file),
+        };
+        if (case.valid) {
+            const provenance = try readEngineProvenance(
+                allocator,
+                io,
+                captured,
+            );
+            try std.testing.expectEqualStrings(
+                &expected_hex,
+                provenance.sha256,
+            );
+        } else {
+            try std.testing.expectError(
+                error.InvalidEngineProvenance,
+                readEngineProvenance(allocator, io, captured),
+            );
+        }
+    }
 }
 
 test "Unix AOT staging has a platform default temp root" {

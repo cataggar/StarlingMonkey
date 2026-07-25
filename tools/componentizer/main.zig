@@ -15,6 +15,10 @@ const File = Io.File;
 const required_zig_version = "0.17.0-dev.902+7255f3e72";
 const runtime_build_manifest = "tools/componentizer/runtime-build-inputs.txt";
 
+test {
+    std.testing.refAllDecls(aot_pipeline);
+}
+
 const PipelineError = error{
     CacheDirectoryChanged,
     CommandFailed,
